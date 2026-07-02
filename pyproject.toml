@@ -40,6 +40,10 @@ src = ["src", "tests", "eval"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
+[tool.ruff.lint.flake8-bugbear]
+# typer's API is call-in-default by design
+extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]

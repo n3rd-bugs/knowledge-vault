@@ -1,0 +1,29 @@
+# eval/golden.yaml — retrieval golden set (DATA-5, PLAN.md §8).
+# Grown continuously; Phase 1 gate: hit@5 >= 0.7. Phase 5 gate: >= 0.8.
+# Coverage per §8: >=2 code/identifier queries, >=2 cross-project gotcha
+# phrasings, >=1 Urdu (multilingual guarantee).
+
+- q: "why was TPS55288 chosen for the buck-boost stage"
+  expect_substr: ["TPS55288"]
+- q: "SPI mode polarity problem motor driver"          # cross-project gotcha recall
+  expect_substr: ["DRV8706"]
+- q: "docx page number footer nodejs"                  # snippet retrieval by identifiers
+  expect_substr: ["Footer"]
+- q: "بینن کی سلطنت کے بارے میں مواد"                    # multilingual path stays proven
+  expect_substr: ["Benin"]
+- q: "TPS55288 I2C output voltage"                     # identifier query 1
+  expect_substr: ["TPS55288"]
+- q: "drv_spi_write gotcha"                            # identifier query 2 (symbol lookup)
+  expect_substr: ["DRV8706"]
+- q: "have we hit SPI problems anywhere"               # cross-project gotcha phrasing 2
+  expect_substr: ["DRV8706"]
+- q: "systemd service keeps restarting how to debug"
+  expect_substr: ["journalctl"]
+- q: "UART dropping bytes at high baud rate"
+  expect_substr: ["UART RX"]
+- q: "how did we fix the UART byte loss"
+  expect_substr: ["ring buffer"]
+- q: "ollama gpu memory keep alive unload"
+  expect_substr: ["keep_alive"]
+- q: "add page numbers to a Word document footer"      # semantic paraphrase, no identifiers
+  expect_substr: ["Footer", "docx"]

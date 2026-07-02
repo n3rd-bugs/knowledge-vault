@@ -27,8 +27,9 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    kb_db_url: str = "postgresql://kb:${KB_DB_PASSWORD}@127.0.0.1:5433/kb"
+    kb_db_url: str = "postgresql://kb@127.0.0.1:5433/kb"
     kb_db_password: str = "change-me"
+    kb_db_schema: str = "public"  # tests point this at kb_test (CLAUDE.md §Code style)
     kb_token: str = "change-me-long-random"
     kb_bind: str = "127.0.0.1"
     kb_port: int = 8321

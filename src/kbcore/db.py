@@ -18,14 +18,20 @@ def connect() -> psycopg.Connection:
     """Open a new connection. The caller owns its lifecycle.
 
     Prefer :func:`transaction` for write paths so commit/rollback is automatic.
+    When ``kb_db_schema`` is not ``public`` (tests use ``kb_test``), the
+    session search_path targets that schema first, falling back to public for
+    the pgvector extension types.
     """
-    return psycopg.connect(settings.db_url)
+    kwargs: dict = {}
+    if settings.kb_db_schema != "public":
+        kwargs["options"] = f"-c search_path={settings.kb_db_schema},public"
+    return psycopg.connect(settings.db_url, **kwargs)
 
 
 @contextmanager
 def transaction() -> Iterator[psycopg.Connection]:
     """Yield a connection inside one transaction: commit on success, rollback on error."""
-    conn = psycopg.connect(settings.db_url)
+    conn = connect()
     try:
         with conn.transaction():
             yield conn

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
+from pathlib import Path
 
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
@@ -192,6 +193,35 @@ def list_projects() -> list[ProjectInfo]:
         )
         for n, d, r, desc, a, c, last in rows
     ]
+
+
+def _canonical_repo(path: str | Path) -> str:
+    """Normalize a repo path for comparison: strip trailing slash, expand ~, resolve."""
+    p = Path(str(path).rstrip("/\\")).expanduser()
+    try:
+        return str(p.resolve())
+    except OSError:
+        return str(p)
+
+
+def project_for_repo(path: str | Path) -> str | None:
+    """Registry project mapped to a local repo path via ``projects.repos`` (§7.5).
+
+    Both sides are canonicalized (trailing slash / ``~`` / symlink alias) before
+    comparison so a repo stored as ``~/work/x`` or ``x/`` still maps a resolved
+    input path (review finding — one-sided normalization split a project).
+    Returns None when no registry row claims the repo; the caller then falls
+    back to the repo dir name.
+    """
+    target = _canonical_repo(path)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT name, repos FROM projects WHERE array_length(repos, 1) > 0 ORDER BY name"
+        ).fetchall()
+    for name, repos in rows:
+        if any(_canonical_repo(stored) == target for stored in (repos or [])):
+            return name
+    return None
 
 
 def set_project(

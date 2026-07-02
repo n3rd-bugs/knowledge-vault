@@ -25,3 +25,7 @@ class InvalidOperation(KBError):
 
 class EmbedderUnavailable(KBError):
     """The Ollama embedding endpoint could not be reached or returned an error."""
+
+
+class ExtractorUnavailable(KBError):
+    """The Ollama extractor (/api/chat) could not be reached or returned unusable output."""

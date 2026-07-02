@@ -35,6 +35,7 @@ RELATIONS = (
     "alternative_to",
 )
 SOURCE_KINDS = ("manual", "chat", "file", "session", "git")
+REVIEW_REASONS = ("unverified_extraction", "contradiction", "dup_cluster")
 
 
 class CodeRef(BaseModel):
@@ -116,3 +117,28 @@ class ProjectInfo(BaseModel):
     archived: bool = False
     item_count: int = 0
     last_activity: datetime | None = None
+
+
+class SessionSummary(BaseModel):
+    """Result of ingesting a session transcript window (PLAN.md §7.2)."""
+
+    path: str
+    project: str
+    saved: int = 0
+    rejected: int = 0
+    offset: int = 0
+
+
+class RepoScanSummary(BaseModel):
+    """Result of a repo docs scan (PLAN.md §7.5)."""
+
+    repo: str
+    project: str
+    commit: str | None = None
+    ingested: list[str] = Field(default_factory=list)
+    skipped_dupes: int = 0
+    errors: int = 0  # docs that failed to ingest (bad bytes etc.), logged + skipped
+
+    @property
+    def saved(self) -> int:
+        return len(self.ingested)

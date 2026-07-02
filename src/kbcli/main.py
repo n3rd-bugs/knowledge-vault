@@ -218,6 +218,46 @@ def project_set(
     typer.echo(f"project {name} updated")
 
 
+@app.command("ingest-session")
+def ingest_session_cmd(
+    path: str = typer.Argument(..., help="path to the Claude Code .jsonl transcript"),
+    project: str = typer.Option(..., "--project", "-p"),
+    repo: str | None = typer.Option(None, "--repo", help="git worktree root (for code_ref)"),
+    branch: str | None = typer.Option(None, "--branch"),
+    commit: str | None = typer.Option(None, "--commit", help="short commit for code_ref"),
+) -> None:
+    """Extract unverified knowledge from a session transcript (§7.2, opt-in)."""
+    from kbworker.sessions import ingest_session
+
+    try:
+        summary = ingest_session(path, project, repo=repo, branch=branch, commit=commit)
+    except KBError as e:
+        _fail(e)
+    typer.echo(
+        f"session {summary.path}: {summary.saved} saved (unverified), "
+        f"{summary.rejected} rejected, offset {summary.offset}"
+    )
+
+
+@app.command("ingest-repo")
+def ingest_repo_cmd(
+    path: str = typer.Argument(..., help="path to a git repository"),
+) -> None:
+    """Ingest git-tracked docs from a repo — never source files (§7.5, Invariant 9)."""
+    from kbworker.reposcan import scan_repo
+
+    try:
+        summary = scan_repo(path)
+    except (KBError, ValueError) as e:
+        _fail(e)
+    typer.echo(
+        f"repo {summary.repo} (project={summary.project}, commit={summary.commit or '-'}): "
+        f"{summary.saved} docs ingested, {summary.skipped_dupes} duplicates skipped"
+    )
+    for uri in summary.ingested:
+        typer.echo(f"  + {uri}")
+
+
 @app.command()
 def seed() -> None:
     """Ingest the seed corpus (idempotent — safe to re-run)."""

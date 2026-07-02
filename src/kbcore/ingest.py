@@ -123,7 +123,7 @@ def ingest_in(
     source_id = row[0]
 
     if raw_content is not None and kind in ("file", "session", "git"):
-        raw_path = _store_raw(project, raw_content)
+        raw_path = archive_raw(project, raw_content)
         conn.execute("UPDATE sources SET raw_path = %s WHERE id = %s", (raw_path, source_id))
 
     full_meta = dict(meta or {})
@@ -210,12 +210,14 @@ def _insert_chunks(conn: psycopg.Connection, item_id: int, chunks: list[str]) ->
     )
 
 
-def _store_raw(project: str, raw: bytes) -> str:
-    """Store the original bytes zstd-compressed under KB_RAW (OPS-4).
+def archive_raw(project: str, raw: bytes) -> str:
+    """Store the original bytes zstd-compressed under KB_RAW (OPS-4). Idempotent.
 
     Keyed by the hash of the ORIGINAL bytes, not the scrubbed content hash —
     two originals whose scrubbed bodies coincide must not overwrite each
-    other's archive (review finding).
+    other's archive (review finding). Public so the inbox watcher can preserve
+    a distinct original even when the item itself dedupes away (a re-drop whose
+    raw bytes differ but scrub to an already-stored body).
     """
     directory = settings.raw / project
     directory.mkdir(parents=True, exist_ok=True)

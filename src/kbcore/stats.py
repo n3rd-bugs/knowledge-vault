@@ -42,6 +42,14 @@ def stats() -> dict[str, Any]:
                     WHERE project = 'kb-system' AND type = 'report')
             """
         ).fetchone()
+        # Guarded in a separate statement so kb_stats survives migration 002 not
+        # yet being applied (a missing table would fail the whole query at parse).
+        queue_exists = conn.execute("SELECT to_regclass('ingest_queue')").fetchone()[0]
+        queue_pending = (
+            conn.execute("SELECT count(*) FROM ingest_queue WHERE status = 'pending'").fetchone()[0]
+            if queue_exists
+            else 0
+        )
     items_total, chunks, entities, relations, review_open, last_report = scalar
     return {
         "items_total": items_total,
@@ -49,6 +57,7 @@ def stats() -> dict[str, Any]:
         "entities": entities,
         "relations": relations,
         "review_queue_open": review_open,
+        "ingest_queue_pending": queue_pending,
         "embed_model": settings.kb_embed_model,
         "last_consolidation": last_report.isoformat() if last_report else None,
         "by_type": by_type,

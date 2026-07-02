@@ -12,7 +12,7 @@ import logging
 
 from fastmcp.exceptions import ToolError
 
-from kbcore import graph, items, render, stats
+from kbcore import graph, ingest_queue, items, render, stats
 from kbcore import review as review_mod
 from kbcore.errors import KBError
 
@@ -89,4 +89,29 @@ def register(mcp) -> None:
         try:
             return render.render_stats(stats.stats())
         except KBError as e:
+            raise _wrap(e) from e
+
+    @mcp.tool
+    def kb_ingest_session(
+        project: str,
+        transcript: str,
+        kind: str = "session",
+        repo: str | None = None,
+        branch: str | None = None,
+        commit: str | None = None,
+    ) -> str:
+        """Submit a full conversation transcript OR a memory dump for the KB to
+        learn from. It is scrubbed and stored NOW (no GPU); the grounded 14B
+        extraction runs in the nightly window and results land as unverified items
+        you can review. kind is 'session' (a .jsonl or plain transcript) or
+        'memory' (a free-text memory dump). Pass repo/branch/commit to anchor the
+        knowledge to code. Re-submitting identical content is a no-op."""
+        try:
+            queue_id = ingest_queue.enqueue(
+                project, transcript, kind=kind, repo=repo, branch=branch, commit=commit
+            )
+            if queue_id is None:
+                return "duplicate — already queued"
+            return f"queued for nightly extraction (id {queue_id})"
+        except (KBError, ValueError) as e:
             raise _wrap(e) from e

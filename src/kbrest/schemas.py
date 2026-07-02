@@ -36,3 +36,12 @@ class LinkRequest(BaseModel):
 class ReviewResolveRequest(BaseModel):
     action: str  # promote | reject | supersede
     new_item_id: int | None = None
+
+
+class IngestSessionRequest(BaseModel):
+    project: str
+    transcript: str
+    kind: str = "session"  # session | memory
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None

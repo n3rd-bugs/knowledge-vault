@@ -77,6 +77,39 @@ def assemble_transcript(data: bytes) -> str:
     return "\n\n".join(out)
 
 
+def _mostly_jsonl(text: str) -> bool:
+    """True if the majority of non-empty lines parse as JSON — i.e. a real
+    transcript, not prose that merely contains a stray JSON line."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    parsed = 0
+    for ln in lines:
+        try:
+            json.loads(ln)
+            parsed += 1
+        except (ValueError, TypeError):
+            pass
+    return parsed >= max(1, (len(lines) + 1) // 2)
+
+
+def assemble_text(data: bytes | str, kind: str = "session") -> str:
+    """Text to extract from, for either a JSONL transcript OR a plain blob.
+
+    ``kind='memory'`` is always treated as plain text. ``kind='session'`` uses
+    JSONL assembly ONLY when the blob is actually mostly JSON lines — otherwise a
+    prose 'session' (or a memory dump misrouted here) that happens to contain one
+    message-shaped JSON line would collapse to that single line, silently
+    dropping the rest (review finding).
+    """
+    plain = (data if isinstance(data, str) else data.decode("utf-8", errors="replace")).strip()
+    if kind == "memory" or not _mostly_jsonl(plain):
+        return plain
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    assembled = assemble_transcript(raw)
+    return assembled if assembled.strip() else plain
+
+
 def _code_ref(project: str, repo: str | None, commit: str | None) -> dict[str, str] | None:
     """Stamp a code anchor from the session's git context (§7.2, DATA-9).
 
@@ -130,6 +163,70 @@ def _ingest_and_queue(
     return item_id
 
 
+def extract_and_ingest(
+    text: str,
+    project: str,
+    uri: str,
+    code_ref: dict[str, str] | None = None,
+    branch: str | None = None,
+    extractor=None,
+    extra_detail: dict[str, Any] | None = None,
+) -> tuple[int, int]:
+    """Extract → quote-validate → ingest, the core shared by file + queue paths.
+
+    Runs ``extractor`` (the 14B) on ``text``, keeps only items whose ``quote`` is
+    a verbatim substring (SEC-3/ARCH-2), and ingests survivors as unverified
+    ``session`` items with a scrubbed ``meta.quote`` and a review-queue row.
+    Returns ``(saved, rejected)``. The extractor defaults to ``llm.extract_items``
+    resolved at CALL time (so tests can monkeypatch it), and is a parameter so
+    callers own when the GPU runs — enqueue never calls it, only the nightly drain.
+    """
+    if extractor is None:
+        extractor = llm.extract_items
+    raw_items = extractor(text)
+    survivors: list[dict[str, Any]] = []
+    rejected = 0
+    for it in raw_items:
+        quote = it.get("quote")
+        if isinstance(quote, str) and quote and quote in text:
+            survivors.append(it)
+        else:
+            rejected += 1  # SEC-3: ungrounded item dropped
+
+    raw = text.encode("utf-8")
+    detail = {"rejected_count": rejected, **(extra_detail or {})}
+    saved = 0
+    for it in survivors:
+        type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
+        title = (it.get("title") or "").strip() or "session note"
+        body = (it.get("body") or "").strip()
+        if not body:
+            continue
+        tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
+        # Scrub the quote before storing it in meta: a secret in the source must
+        # not become searchable via meta.quote (SEC-2). Grounding above already
+        # validated the pre-scrub quote against the text.
+        scrubbed_quote, _ = scrub(it["quote"])
+        meta: dict[str, Any] = {"quote": scrubbed_quote, "extractor": settings.kb_extract_model}
+        if branch:
+            meta["branch"] = branch
+        item_id = _ingest_and_queue(
+            project=project,
+            type_=type_,
+            title=title,
+            body=body,
+            uri=uri,
+            tags=tags,
+            meta=meta,
+            code_ref=code_ref,
+            raw=raw,
+            detail=detail,
+        )
+        if item_id is not None:
+            saved += 1
+    return saved, rejected
+
+
 def ingest_session(
     path: str | Path,
     project: str,
@@ -179,55 +276,17 @@ def ingest_session(
             set_checkpoint(key, new_offset)
             return SessionSummary(path=str(path), project=project, offset=new_offset)
 
-        raw_items = llm.extract_items(transcript_text)
-
-        survivors: list[dict[str, Any]] = []
-        rejected = 0
-        for it in raw_items:
-            quote = it.get("quote")
-            if isinstance(quote, str) and quote and quote in transcript_text:
-                survivors.append(it)
-            else:
-                rejected += 1  # SEC-3: ungrounded item dropped
-
-        code_ref = _code_ref(project, repo, commit)
         # uri keyed by the canonical abs_path + consumed range so a relative and
         # an absolute invocation (or a retry) produce identical dedupe keys.
         uri = f"{key}:{offset}-{new_offset}"
-        detail = {"rejected_count": rejected, "offset_range": f"{offset}-{new_offset}"}
-        saved = 0
-        for it in survivors:
-            type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
-            title = (it.get("title") or "").strip() or "session note"
-            body = (it.get("body") or "").strip()
-            if not body:
-                continue
-            tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
-            # Scrub the quote before storing it in meta: a secret pasted in chat
-            # must not become searchable via meta.quote (SEC-2). Grounding above
-            # already validated the pre-scrub quote against the transcript.
-            scrubbed_quote, _ = scrub(it["quote"])
-            meta: dict[str, Any] = {
-                "quote": scrubbed_quote,
-                "extractor": settings.kb_extract_model,
-            }
-            if branch:
-                meta["branch"] = branch
-            item_id = _ingest_and_queue(
-                project=project,
-                type_=type_,
-                title=title,
-                body=body,
-                uri=uri,
-                tags=tags,
-                meta=meta,
-                code_ref=code_ref,
-                raw=chunk,
-                detail=detail,
-            )
-            if item_id is not None:
-                saved += 1
-
+        saved, rejected = extract_and_ingest(
+            transcript_text,
+            project,
+            uri,
+            code_ref=_code_ref(project, repo, commit),
+            branch=branch,
+            extra_detail={"offset_range": f"{offset}-{new_offset}"},
+        )
         set_checkpoint(key, new_offset)
         return SessionSummary(
             path=str(path), project=project, saved=saved, rejected=rejected, offset=new_offset

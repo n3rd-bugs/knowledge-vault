@@ -15,16 +15,18 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from kbcore import consolidation, llm
+from kbcore import consolidation, ingest_queue, llm
 from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
 from kbcore.ingest import ingest
+from kbworker import sessions
 
 logger = logging.getLogger("kbworker.consolidate")
 
 ADVISORY_KEY = 42
 CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
+QUEUE_BATCH = 200  # max ingest_queue rows drained per nightly run
 
 
 def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
@@ -47,6 +49,37 @@ def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
     for node in parent:
         clusters.setdefault(find(node), set()).add(node)
     return [c for c in clusters.values() if len(c) > 1]
+
+
+def _drain_ingest_queue() -> tuple[int, int]:
+    """Step 0: extract queued remote submissions — the ONLY place the 14B runs on
+    remote content (Invariant 8). Per-row isolation: one bad row logs + continues.
+
+    Returns ``(rows_drained, items_saved)``.
+    """
+    drained = 0
+    saved_total = 0
+    for row in ingest_queue.pending(limit=QUEUE_BATCH):
+        try:
+            text = sessions.assemble_text(row["content"], row["kind"])
+            meta = row["meta"] or {}
+            code_ref = sessions._code_ref(row["project"], meta.get("repo"), meta.get("commit"))
+            uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
+            saved, rejected = sessions.extract_and_ingest(
+                text,
+                row["project"],
+                uri,
+                code_ref=code_ref,
+                branch=meta.get("branch"),
+                extra_detail={"ingest_queue_id": row["id"], "source": row["kind"]},
+            )
+            ingest_queue.mark_extracted(row["id"], saved, rejected)
+            drained += 1
+            saved_total += saved
+        except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
+            logger.exception("draining ingest_queue row %s failed", row["id"])
+            ingest_queue.mark_failed(row["id"], f"{type(e).__name__}: {e}")
+    return drained, saved_total
 
 
 def _dedupe(project: str) -> int:
@@ -136,8 +169,9 @@ def main() -> dict[str, Any]:
             return {"skipped": True}
 
         since = consolidation.last_consolidation_at()
-        projects = consolidation.active_projects()
         counts: dict[str, Any] = {
+            "queued_drained": 0,
+            "queued_items_saved": 0,
             "duplicates_marked": 0,
             "summaries_written": 0,
             "contradictions_queued": 0,
@@ -145,6 +179,17 @@ def main() -> dict[str, Any]:
             "reembedded": 0,
         }
 
+        # Step 0: extract remote submissions BEFORE dedupe so the new items take
+        # part in this run's dedupe/summary/contradiction passes.
+        def _drain() -> int:
+            drained, saved = _drain_ingest_queue()
+            counts["queued_items_saved"] = saved
+            return drained
+
+        _run_step(counts, "queued_drained", _drain)
+
+        # active_projects AFTER the drain so freshly-ingested submissions count.
+        projects = consolidation.active_projects()
         _run_step(counts, "duplicates_marked", lambda: sum(_dedupe(p) for p in projects))
         _run_step(counts, "summaries_written", lambda: _summaries(since))
         _run_step(
@@ -160,6 +205,7 @@ def main() -> dict[str, Any]:
         _run_step(counts, "reembedded", reembed_mod.reembed)
 
         counts["review_queue_open"] = consolidation.open_review_count()
+        counts["ingest_queue_pending"] = ingest_queue.queue_depth()
         counts["disk_pct"] = _disk_pct()
         counts["extraction_rejection_rate"] = _rejection_rate()
 

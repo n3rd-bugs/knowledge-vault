@@ -15,7 +15,7 @@ import logging
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
-from kbcore import graph, ingest, items, review, search, stats, supersede
+from kbcore import graph, ingest, ingest_queue, items, review, search, stats, supersede
 from kbcore.config import settings
 from kbcore.errors import (
     DuplicateContent,
@@ -27,7 +27,13 @@ from kbcore.errors import (
 )
 from kbcore.models import ItemDetail, ProjectInfo, ReviewEntry, SearchHit, SimilarHit
 from kbmcp.server import BearerAuthMiddleware, _validate_runtime_config
-from kbrest.schemas import ItemCreate, LinkRequest, ReviewResolveRequest, SupersedeRequest
+from kbrest.schemas import (
+    IngestSessionRequest,
+    ItemCreate,
+    LinkRequest,
+    ReviewResolveRequest,
+    SupersedeRequest,
+)
 
 log = logging.getLogger("kbrest")
 
@@ -110,6 +116,19 @@ def _register_read(app: FastAPI) -> None:
 
 
 def _register_write(app: FastAPI) -> None:
+    @app.post("/api/ingest-session", status_code=202)
+    def api_ingest_session(payload: IngestSessionRequest) -> dict:
+        # Scrub + store NOW (no GPU); the 14B extracts in the nightly drain.
+        queue_id = ingest_queue.enqueue(
+            payload.project,
+            payload.transcript,
+            kind=payload.kind,
+            repo=payload.repo,
+            branch=payload.branch,
+            commit=payload.commit,
+        )
+        return {"queue_id": queue_id, "duplicate": queue_id is None}
+
     @app.post("/api/items", status_code=201)
     def api_create_item(payload: ItemCreate) -> dict:
         code_ref = payload.code_ref.model_dump(exclude_none=True) if payload.code_ref else None

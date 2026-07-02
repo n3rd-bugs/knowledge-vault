@@ -75,7 +75,8 @@ def kb(kb_schema):
         conn.execute(
             """
             TRUNCATE access_log, review_queue, relations, entities, chunks, items,
-                     sources, projects, session_checkpoints RESTART IDENTITY CASCADE
+                     sources, projects, session_checkpoints, ingest_queue
+                     RESTART IDENTITY CASCADE
             """
         )
     yield

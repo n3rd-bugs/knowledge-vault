@@ -135,7 +135,9 @@ def render_stats(s: dict[str, Any]) -> str:
     lines = [
         f"items: {s['items_total']}   chunks: {s['chunks']}   "
         f"entities: {s['entities']}   relations: {s['relations']}",
-        f"review queue open: {s['review_queue_open']}   embed_model: {s['embed_model']}",
+        f"review queue open: {s['review_queue_open']}   "
+        f"ingest queue pending: {s.get('ingest_queue_pending', 0)}   "
+        f"embed_model: {s['embed_model']}",
         f"last consolidation: {s['last_consolidation'] or 'never'}",
         f"by status: {_fmt_counts(s['by_status'])}",
         f"by trust:  {_fmt_counts(s['by_trust'])}",

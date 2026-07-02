@@ -242,4 +242,24 @@ def test_phase5_tools_roundtrip(mcp_server):
             review_text = (await client.call_tool("kb_review_list", {})).content[0].text
             assert "review queue is empty" in review_text or "[" in review_text
 
+            # kb_ingest_session enqueues (no GPU at submit); re-submit is a no-op
+            sub = await client.call_tool(
+                "kb_ingest_session",
+                {
+                    "project": "kb-test",
+                    "transcript": "a memory dump to learn from",
+                    "kind": "memory",
+                },
+            )
+            assert "queued for nightly extraction" in sub.content[0].text
+            dup = await client.call_tool(
+                "kb_ingest_session",
+                {
+                    "project": "kb-test",
+                    "transcript": "a memory dump to learn from",
+                    "kind": "memory",
+                },
+            )
+            assert "duplicate" in dup.content[0].text
+
     asyncio.run(roundtrip())

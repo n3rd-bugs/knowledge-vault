@@ -1,0 +1,11 @@
+# kb-consolidate.timer — fire the nightly consolidation at 03:30 (PLAN.md §9)
+[Unit]
+Description=Nightly Knowledge Vault consolidation at 03:30
+
+[Timer]
+OnCalendar=*-*-* 03:30
+Persistent=true
+Unit=kb-consolidate.service
+
+[Install]
+WantedBy=timers.target

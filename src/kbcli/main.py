@@ -12,7 +12,7 @@ import sys
 
 import typer
 
-from kbcli import render, seeds
+from kbcli import render, review_cmds, seeds
 from kbcore import graph, items, search
 from kbcore import ingest as ingest_mod
 from kbcore import migrate as migrate_mod
@@ -23,6 +23,7 @@ from kbcore.errors import KBError
 app = typer.Typer(help="Knowledge Vault CLI", no_args_is_help=True)
 project_app = typer.Typer(help="Project registry commands")
 app.add_typer(project_app, name="project")
+app.add_typer(review_cmds.review_app, name="review")
 
 TAGS_HELP = "Namespaced tags, repeatable: lang:c hw:tps55288 protocol:spi tool:systemd …"
 

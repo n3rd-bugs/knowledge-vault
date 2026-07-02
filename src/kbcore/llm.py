@@ -85,3 +85,92 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
         # Coerce to empty rather than letting a TypeError escape (review finding).
         return []
     return [it for it in items if isinstance(it, dict)]
+
+
+def _chat(messages: list[dict[str, str]], *, json_format: bool) -> str:
+    """POST /api/chat with keep_alive=0 (Invariant 8); return the message content."""
+    payload: dict[str, Any] = {
+        "model": settings.kb_extract_model,
+        "keep_alive": KEEP_ALIVE,
+        "stream": False,
+        "messages": messages,
+    }
+    if json_format:
+        payload["format"] = "json"
+    try:
+        resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()["message"]["content"]
+    except httpx.HTTPError as e:
+        raise ExtractorUnavailable(
+            f"extraction call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
+        ) from e
+    except (KeyError, ValueError, TypeError) as e:
+        raise ExtractorUnavailable(
+            f"extractor returned unusable output: {e.__class__.__name__}: {e}"
+        ) from e
+
+
+_SUMMARIZE_SYSTEM = (
+    "You write a concise, factual summary of what a project knows about one topic, "
+    "grounded ONLY in the items provided. Preserve specific identifiers, values, part "
+    "numbers, and decisions verbatim; do not speculate or add outside facts. One or two "
+    "short paragraphs, no preamble."
+)
+
+
+def summarize_items(topic: str, items: list[dict[str, Any]]) -> str:
+    """Grounded synthesis of a topic's source items into a summary body (§7.3 step 2)."""
+    if not items:
+        return ""
+    corpus = "\n\n".join(f"### {it.get('title', '')}\n{it.get('body', '')}".strip() for it in items)
+    content = _chat(
+        [
+            {"role": "system", "content": _SUMMARIZE_SYSTEM},
+            {
+                "role": "user",
+                "content": f"Topic: {topic}\n\nItems:\n{corpus}\n\nWrite the summary.",
+            },
+        ],
+        json_format=False,
+    )
+    return content.strip()
+
+
+_CONTRADICT_SYSTEM = (
+    "You compare two knowledge items and decide whether they factually CONTRADICT — "
+    "state incompatible facts or decisions about the same thing (not merely different "
+    'topics). Answer STRICT JSON only: {"contradict": true} or {"contradict": false}. '
+    "If you are unsure, answer false."
+)
+
+
+def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bool:
+    """True iff the extractor judges the two items to conflict (§7.3 step 3).
+
+    Never raises on an ambiguous/unparseable answer — defaults to False. Genuine
+    network failures still surface as :class:`ExtractorUnavailable` (via ``_chat``)
+    so the consolidation step logs and continues.
+    """
+    content = _chat(
+        [
+            {"role": "system", "content": _CONTRADICT_SYSTEM},
+            {
+                "role": "user",
+                "content": f"Item A: {a_title}\n{a_body}\n\nItem B: {b_title}\n{b_body}",
+            },
+        ],
+        json_format=True,
+    )
+    try:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    val = data.get("contradict")
+    # Some models emit a stringified bool under format=json; bool("false") is
+    # True, so coerce strings explicitly instead of trusting bool() on them.
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "yes", "1")
+    return bool(val)

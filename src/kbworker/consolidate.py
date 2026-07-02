@@ -1,11 +1,174 @@
-"""kbworker.consolidate — nightly dedupe/summarize/archive, advisory-locked (Phase 4, §7.3)."""
+"""kbworker.consolidate — nightly dedupe/summarize/archive, advisory-locked (§7.3).
+
+Takes ``pg_advisory_lock(42)`` for the whole run (ARCH-5); if another run holds
+it, logs and exits without work. Runs the six §7.3 steps in order, each isolated
+so one failure logs and the rest proceed. Only kbcore service functions touch the
+DB (Invariant 2). The 14B extractor is invoked ONLY here, keep_alive=0 (Invariant
+8). Run: ``python -m kbworker.consolidate`` (make consolidate).
+"""
 
 from __future__ import annotations
 
+import logging
+import shutil
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
 
-def main() -> None:
-    raise SystemExit("kb-consolidate is not implemented yet (see PLAN.md §11).")
+from kbcore import consolidation, llm
+from kbcore import reembed as reembed_mod
+from kbcore.config import settings
+from kbcore.db import advisory_lock
+from kbcore.ingest import ingest
+
+logger = logging.getLogger("kbworker.consolidate")
+
+ADVISORY_KEY = 42
+CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
+
+
+def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
+    """Union-find the dedupe pairs into clusters of mutually-similar items."""
+    parent: dict[int, int] = {}
+
+    def find(x: int) -> int:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        parent[find(a)] = find(b)
+
+    for a, b, _ in pairs:
+        union(a, b)
+    clusters: dict[int, set[int]] = {}
+    for node in parent:
+        clusters.setdefault(find(node), set()).add(node)
+    return [c for c in clusters.values() if len(c) > 1]
+
+
+def _dedupe(project: str) -> int:
+    """Step 1: collapse near-dupes to one canonical (oldest verified, else oldest)."""
+    pairs = consolidation.duplicate_pairs(project, settings.kb_dup_threshold)
+    marked = 0
+    for cluster in _canonical_clusters(pairs):
+        ranks = consolidation.item_ranks(list(cluster))
+        canonical = min(cluster, key=lambda i: ranks[i])
+        for dup in cluster:
+            if dup != canonical and consolidation.mark_duplicate(dup, canonical):
+                marked += 1
+    return marked
+
+
+def _summaries(since: datetime | None) -> int:
+    """Step 2: (re)write topic summaries for tags with >=3 new items since last run."""
+    written = 0
+    for project, tag, _new in consolidation.tags_needing_summary(since):
+        sources = consolidation.active_items_with_tag(project, tag)
+        if len(sources) < 3:
+            continue
+        body = llm.summarize_items(tag, sources)
+        if not body.strip():
+            continue
+        consolidation.create_summary(project, tag, body, [s["id"] for s in sources])
+        written += 1
+    return written
+
+
+def _contradictions(project: str) -> int:
+    """Step 3: judge near-but-not-dup pairs; queue confirmed conflicts (never auto-supersede)."""
+    queued = 0
+    for a_id, b_id, _sim in consolidation.contradiction_pairs(project, CONTRA_LOW, CONTRA_HIGH):
+        (a_title, a_body), (b_title, b_body) = consolidation.item_pair_texts(a_id, b_id)
+        if llm.items_contradict(
+            a_title, a_body, b_title, b_body
+        ) and consolidation.record_contradiction(a_id, b_id):
+            queued += 1
+    return queued
+
+
+def _disk_pct() -> float:
+    """Percent used on the filesystem holding KB_RAW."""
+    p = settings.raw
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    usage = shutil.disk_usage(p if p.exists() else Path("/"))
+    return round(usage.used / usage.total * 100, 1)
+
+
+def _rejection_rate() -> float | None:
+    rejected, saved = consolidation.extraction_stats()
+    total = rejected + saved
+    return round(rejected / total, 3) if total else None
+
+
+def _run_step(counts: dict[str, Any], key: str, fn) -> None:
+    """Run one step, isolating failure: log and leave the count at 0."""
+    try:
+        counts[key] = fn()
+    except Exception:  # noqa: BLE001 — one step must not abort the pass
+        logger.exception("consolidation step %r failed", key)
+
+
+def _write_report(counts: dict[str, Any]) -> int:
+    ts = datetime.now(UTC)
+    body = "Nightly consolidation report\n\n" + "\n".join(f"- {k}: {v}" for k, v in counts.items())
+    return ingest(
+        "kb-system",
+        "report",
+        f"Consolidation report {ts.date().isoformat()}",
+        body,
+        kind="chat",
+        uri=f"report:{ts.isoformat()}",
+        trust="verified",
+        meta={"consolidation": True, **counts},
+    )
+
+
+def main() -> dict[str, Any]:
+    """Run the consolidation pass under the advisory lock. Returns a summary dict."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    with advisory_lock(ADVISORY_KEY) as acquired:
+        if not acquired:
+            logger.info("another consolidation holds lock %d; skipping this run", ADVISORY_KEY)
+            return {"skipped": True}
+
+        since = consolidation.last_consolidation_at()
+        projects = consolidation.active_projects()
+        counts: dict[str, Any] = {
+            "duplicates_marked": 0,
+            "summaries_written": 0,
+            "contradictions_queued": 0,
+            "archived": 0,
+            "reembedded": 0,
+        }
+
+        _run_step(counts, "duplicates_marked", lambda: sum(_dedupe(p) for p in projects))
+        _run_step(counts, "summaries_written", lambda: _summaries(since))
+        _run_step(
+            counts, "contradictions_queued", lambda: sum(_contradictions(p) for p in projects)
+        )
+        _run_step(
+            counts,
+            "archived",
+            lambda: consolidation.archive_stale(
+                datetime.now(UTC) - timedelta(days=settings.kb_archive_after_days)
+            ),
+        )
+        _run_step(counts, "reembedded", reembed_mod.reembed)
+
+        counts["review_queue_open"] = consolidation.open_review_count()
+        counts["disk_pct"] = _disk_pct()
+        counts["extraction_rejection_rate"] = _rejection_rate()
+
+        report_id = _write_report(counts)
+        counts["report_item_id"] = report_id
+        counts["skipped"] = False
+        logger.info("consolidation done: %s", counts)
+        return counts
 
 
 if __name__ == "__main__":
-    main()
+    print(main())

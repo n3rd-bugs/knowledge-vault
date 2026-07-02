@@ -1,0 +1,18 @@
+# kb-consolidate — Knowledge Vault nightly refinement pass (PLAN.md §7.3/§9)
+# Install: bash scripts/install_systemd.sh   (systemd user unit; triggered by the timer)
+[Unit]
+Description=Knowledge Vault nightly consolidation (dedupe/summarize/archive) + backup
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+# The 14B extractor loads here (Invariant 8) — do NOT cap memory at 1G.
+MemoryMax=16G
+ExecStart=%h/kb/repo/.venv/bin/python -m kbworker.consolidate
+ExecStartPost=%h/kb/repo/scripts/backup.sh
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -43,3 +43,25 @@ def ping() -> bool:
     """Return True if the database answers ``SELECT 1``. Used by health checks/tests."""
     with connect() as conn:
         return conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+@contextmanager
+def advisory_lock(key: int) -> Iterator[bool]:
+    """Hold a session-level ``pg_advisory_lock`` for the block (ARCH-5).
+
+    Yields whether the lock was acquired. Uses its OWN autocommit connection so
+    the lock survives the whole ``with`` regardless of the transaction()
+    connections the work opens (each opens/closes its own), and is released when
+    this connection closes. Non-blocking: a second holder yields ``False`` so the
+    caller can skip rather than queue.
+    """
+    conn = connect()
+    conn.autocommit = True
+    acquired = False
+    try:
+        acquired = bool(conn.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()[0])
+        yield acquired
+    finally:
+        if acquired:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
+        conn.close()

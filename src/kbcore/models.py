@@ -119,6 +119,18 @@ class ProjectInfo(BaseModel):
     last_activity: datetime | None = None
 
 
+class ReviewEntry(BaseModel):
+    """One open review-queue row for `kb review list` (PLAN.md §7.4)."""
+
+    queue_id: int
+    reason: str
+    item_id: int | None = None
+    title: str | None = None
+    status: str | None = None
+    trust: str | None = None
+    detail: dict = Field(default_factory=dict)
+
+
 class SessionSummary(BaseModel):
     """Result of ingesting a session transcript window (PLAN.md §7.2)."""
 

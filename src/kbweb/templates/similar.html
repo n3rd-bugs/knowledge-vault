@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Similar to {{ item_id }} · Knowledge Vault{% endblock %}
+{% block content %}
+<p><a href="/item/{{ item_id }}">← item {{ item_id }}</a></p>
+<h3>similar items</h3>
+{% if not hits %}<p>No similar items.</p>{% endif %}
+<ol>
+  {% for h in hits %}
+  <li>
+    <a href="/item/{{ h.item_id }}">{{ h.type }} · {{ h.title }}</a>
+    <span class="prov">({{ h.project }}, cosine {{ '%.3f'|format(h.score) }})</span>
+  </li>
+  {% endfor %}
+</ol>
+{% endblock %}

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Knowledge Vault{% endblock %}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 15px/1.5 system-ui, sans-serif; max-width: 60rem; margin: 1.5rem auto;
+           padding: 0 1rem; }
+    header { border-bottom: 1px solid #8884; padding-bottom: .5rem; margin-bottom: 1rem; }
+    header a { margin-right: .75rem; text-decoration: none; }
+    input[type=text], input[type=search], input[name=q], input[name=project],
+    input[type=password] { padding: .4rem .5rem; width: 60%; }
+    button { padding: .4rem .8rem; }
+    .hit { border-bottom: 1px solid #8883; padding: .6rem 0; }
+    .prov { font-size: .78rem; opacity: .7; }
+    .badge { font-size: .72rem; padding: .05rem .4rem; border-radius: .6rem; border: 1px solid #8886; }
+    .badge.unverified { color: #b26b00; border-color: #b26b0088; }
+    .badge.verified { color: #2a7; border-color: #2a78; }
+    .anchor { font-family: ui-monospace, monospace; font-size: .82rem; opacity: .85; }
+    .tag { font-size: .74rem; background: #8882; padding: .05rem .35rem; border-radius: .5rem; }
+    .snippet { margin: .35rem 0 0; }
+    .status { color: #b26b00; font-size: .82rem; }
+    pre { background: #8881; padding: .8rem; overflow-x: auto; border-radius: .3rem;
+          white-space: pre-wrap; word-break: break-word; }
+    .error { color: #c33; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/">search</a><a href="/timeline">timeline</a><a href="/stats">stats</a>
+    <span style="float:right; opacity:.6; font-size:.8rem">Knowledge Vault (read-only)</span>
+  </header>
+  <main>{% block content %}{% endblock %}</main>
+</body>
+</html>

@@ -1,0 +1,65 @@
+# Traefik dynamic config — routing + middlewares (file provider; no docker socket).
+http:
+  routers:
+    # Longest PathPrefix wins by Traefik's default priority, so /mcp and /api
+    # take precedence over the /-catch-all web UI. TLS + cert come from the
+    # websecure entrypoint (Let's Encrypt via Namecheap DNS-01).
+    kbmcp:
+      rule: "Host(`www.n3rd-bugs.dev`) && PathPrefix(`/mcp`)"
+      entryPoints: [websecure]
+      service: kbmcp
+      middlewares: [kb-public]
+    kbrest:
+      rule: "Host(`www.n3rd-bugs.dev`) && PathPrefix(`/api`)"
+      entryPoints: [websecure]
+      service: kbrest
+      middlewares: [kb-public]
+    kbweb:
+      rule: "Host(`www.n3rd-bugs.dev`) && PathPrefix(`/`)"
+      entryPoints: [websecure]
+      service: kbweb
+      middlewares: [kb-public]
+
+  services:
+    kbmcp:
+      loadBalancer:
+        servers:
+          - url: "http://kb-mcp:8321"
+    kbrest:
+      loadBalancer:
+        servers:
+          - url: "http://kb-rest:8322"
+    kbweb:
+      loadBalancer:
+        servers:
+          - url: "http://kb-web:8323"
+
+  middlewares:
+    # Blunt brute-force / scraping of the public bearer endpoint. Per source-IP.
+    kb-ratelimit:
+      rateLimit:
+        average: 20
+        burst: 40
+
+    # Baseline security headers (mainly for the web UI).
+    kb-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: false
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "no-referrer"
+
+    # Applied to every public router: rate-limit + headers.
+    kb-public:
+      chain:
+        middlewares:
+          - kb-ratelimit
+          - kb-headers
+
+tls:
+  options:
+    default:
+      minVersion: "VersionTLS12"

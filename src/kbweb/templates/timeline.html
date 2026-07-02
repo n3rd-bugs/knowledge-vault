@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Timeline · Knowledge Vault{% endblock %}
+{% block content %}
+<form method="get" action="/timeline">
+  <input type="text" name="project" value="{{ project }}" placeholder="project name" list="projects">
+  <datalist id="projects">
+    {% for p in projects %}<option value="{{ p.name }}">{% endfor %}
+  </datalist>
+  <button type="submit">Show</button>
+</form>
+{% if project and not entries %}<p>No items in "{{ project }}".</p>{% endif %}
+{% for e in entries %}
+<div class="tl">
+  {{ e.created_at.date().isoformat() }} ·
+  <a href="/item/{{ e.item_id }}">id {{ e.item_id }}</a> ·
+  {{ e.type }}{% if e.status != 'active' %} [{{ e.status }}]{% endif %} · {{ e.title }}
+</div>
+{% endfor %}
+{% endblock %}

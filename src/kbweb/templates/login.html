@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Sign in</h2>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="/login">
+  <input type="password" name="token" placeholder="bearer token" autofocus>
+  <button type="submit">Sign in</button>
+</form>
+<p class="prov">Read-only access. The token is your KB_TOKEN.</p>
+{% endblock %}

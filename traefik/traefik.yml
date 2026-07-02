@@ -1,0 +1,49 @@
+# Traefik v3 static config — the ONLY public listener (host :8803, TLS).
+# Routing is by docker labels (see docker-compose.yml); middlewares in dynamic.yml.
+global:
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+# Single public entrypoint: TLS on 8803 (the only forwarded port). All routers
+# on it get a Let's Encrypt cert for the domain via the ACME resolver below.
+entryPoints:
+  websecure:
+    address: ":8803"
+    http:
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "www.n3rd-bugs.dev"
+    transport:
+      respondingTimeouts:
+        readTimeout: "120s"    # MCP streamable HTTP holds connections
+        idleTimeout: "180s"
+
+# Dashboard/API disabled: it's attack surface on a public-facing proxy and we
+# don't route it. Re-enable behind a loopback-only router if ever needed.
+api:
+  dashboard: false
+  insecure: false
+
+# File provider only — routers/services point at the app containers by name
+# (resolved via docker's embedded DNS on kbnet). No docker socket needed, so
+# Traefik holds no docker API access — smaller blast radius on a public proxy.
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+# Let's Encrypt via DNS-01 (Namecheap) — the only viable challenge since ports
+# 80/443 are not forwarded (only 8803). Creds come from traefik.env (NAMECHEAP_*).
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "mirzaon@gmail.com"
+      storage: "/acme/acme.json"
+      dnsChallenge:
+        provider: namecheap
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"

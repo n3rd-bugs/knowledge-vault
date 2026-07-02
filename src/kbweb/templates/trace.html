@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Trace {{ node_id }} · Knowledge Vault{% endblock %}
+{% block content %}
+<p><a href="/item/{{ node_id }}">← item {{ node_id }}</a></p>
+<h3>trace (depth 2)</h3>
+<pre class="trace">{{ trace_text }}</pre>
+{% endblock %}

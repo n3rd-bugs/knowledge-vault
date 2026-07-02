@@ -9,6 +9,79 @@ services:
     ports: ["127.0.0.1:5433:5432"]
     volumes: [kbdata:/var/lib/postgresql/data]
     restart: unless-stopped
-    healthcheck: {test: ["CMD-SHELL","pg_isready -U kb"], interval: 5s, retries: 20}
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U kb"], interval: 5s, retries: 20}
+    networks: [kbnet]
+
+  # --- Phase 6: containerized HTTP services on kbnet, fronted by Traefik ---
+  # They reach the (unchanged) db and host Ollama over host.docker.internal, so
+  # kb-db is not recreated and the host systemd worker/consolidator are undisturbed.
+  # KB_DB_URL/OLLAMA_URL/binds are overridden here; the rest comes from .env.
+  kb-mcp:
+    build: .
+    image: kb-app:latest
+    container_name: kb-mcp
+    command: ["python", "-m", "kbmcp.server"]
+    env_file: [.env]
+    environment:
+      KB_DB_URL: postgresql://kb@db:5432/kb
+      OLLAMA_URL: http://host.docker.internal:11434
+      KB_BIND: 0.0.0.0
+      KB_PORT: "8321"
+      KB_ALLOW_ANY_BIND: "true"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:8321:8321"]   # keep the existing local Claude Code registration working
+    networks: [kbnet]
+    restart: unless-stopped
+
+  kb-rest:
+    image: kb-app:latest
+    container_name: kb-rest
+    command: ["python", "-m", "kbrest.server"]
+    env_file: [.env]
+    environment:
+      KB_DB_URL: postgresql://kb@db:5432/kb
+      OLLAMA_URL: http://host.docker.internal:11434
+      KB_BIND: 0.0.0.0
+      KB_REST_PORT: "8322"
+      KB_ALLOW_ANY_BIND: "true"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    networks: [kbnet]
+    restart: unless-stopped
+    depends_on: [kb-mcp]   # reuse the built image
+
+  kb-web:
+    image: kb-app:latest
+    container_name: kb-web
+    command: ["python", "-m", "kbweb.server"]
+    env_file: [.env]
+    environment:
+      KB_DB_URL: postgresql://kb@db:5432/kb
+      OLLAMA_URL: http://host.docker.internal:11434
+      KB_BIND: 0.0.0.0
+      KB_WEB_PORT: "8323"
+      KB_ALLOW_ANY_BIND: "true"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    networks: [kbnet]
+    restart: unless-stopped
+    depends_on: [kb-mcp]
+
+  kb-traefik:
+    image: traefik:v3.2
+    container_name: kb-traefik
+    env_file: [traefik.env]   # NAMECHEAP_API_USER / NAMECHEAP_API_KEY (gitignored)
+    dns: ["1.1.1.1", "8.8.8.8"]   # containers lack working external DNS; ACME needs it
+    ports: ["8803:8803"]      # the ONLY public port (forwarded on the router)
+    volumes:
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - ./traefik/acme.json:/acme/acme.json
+    networks: [kbnet]
+    restart: unless-stopped
+    depends_on: [kb-mcp, kb-rest, kb-web]
+
 volumes:
   kbdata:
+
+networks:
+  kbnet:
+    name: kbnet

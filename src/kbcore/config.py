@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     kb_token: str = "change-me-long-random"
     kb_bind: str = "127.0.0.1"
     kb_port: int = 8321
+    kb_rest_port: int = 8322
+    kb_web_port: int = 8323
+    # Containerized runs bind 0.0.0.0 (container-private, fronted by Traefik/TLS);
+    # set true only there. The default still refuses accidental host-public binds.
+    kb_allow_any_bind: bool = False
     ollama_url: str = "http://127.0.0.1:11434"
     kb_embed_model: str = "bge-m3"
     kb_embed_dim: int = 1024

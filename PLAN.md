@@ -404,7 +404,7 @@ systemd user units: `kb-mcp.service`, `kb-worker.service` (both `Restart=on-fail
 
 ## 10. Access model (SEC-1/SEC-5 summary)
 
-Default: loopback + Tailscale only, bearer token. Clients: Claude Code (server + laptop), Claude Desktop, any MCP-capable agent on the tailnet. **Phase 6 (optional, off by default):** REST facade for non-MCP agents; public HTTPS via Cloudflare Tunnel + OAuth if claude.ai-web access is ever truly needed; minimal read-only web UI.
+Phases 0–5 default: **loopback + bearer**, local/server use (a Tailscale IP remains a valid `KB_BIND` if a private mesh is ever wanted — this deployment does not use one). **Phase 6 (this deployment):** the KB is **deliberately exposed on public HTTPS** at `https://www.n3rd-bugs.dev:8803` via Traefik + Let's Encrypt (Namecheap DNS-01), serving MCP (`/mcp`) + REST (`/api`) + a read-only web UI (`/`) behind the bearer; laptop/remote clients use the public URL — no Tailscale. Kill switch: `docker compose stop kb-traefik`. Residual risk (all NDA data behind one static token) accepted by the owner; the `projects.public` allow-list is the recommended fast-follow.
 
 ---
 
@@ -452,8 +452,84 @@ hits from ≥2 different bootstrapped projects; `make eval` stays ≥ 0.7 with t
 **Tasks:** entity extraction on ingest (grounded, unverified) populating `entities`/`relations` — chips, protocols, libraries, tools as entities; `kb_trace`, `kb_similar`, `kb_review_*`, `kb_stats` MCP tools; `trace` output as indented tree with ids/dates/status; `restore_test.sh` + monthly timer; grow golden set to 25 with real queries; tune RRF/decay if gate fails.
 **AC:** trace a seeded 3-hop chain (decision → supersedes → old-decision → derived_from → source) rendered correctly; `kb_similar` on the seeded bug returns its fix in top-3; `make eval` hit@5 ≥ 0.8 **including code queries**; `restore_test.sh` prints PASS; review workflow round-trips over MCP.
 
-### Phase 6 — Optional (defer until felt need)
-REST facade over kbcore for non-MCP agents · read-only web UI (search + item view + timeline) · rclone encrypted offsite · Cloudflare Tunnel + OAuth for claude.ai-web · tree-sitter chunking if eval demands (V8).
+### Phase 6 — Public access & resilience (planned 2026-07-02; public exposure chosen deliberately)
+
+Change of posture (owner decision, own NDA data): the KB is **deliberately exposed on public
+HTTPS** at `https://www.n3rd-bugs.dev:8803` — the SEC-5 scenario the design kept off by default —
+serving the **whole KB incl. client/NDA projects** behind the bearer. **Tailscale is not used**: a
+public TLS endpoint supersedes a private mesh for laptop/remote reach, so the §13 "registered on
+laptop" item is met by the public URL. **Tree-sitter chunking stays deferred** (V8 — Phase 5 hit@5
+= 1.00 *including* code queries).
+
+**Residual risk (accepted):** one leaked/guessed token = full read (plus REST write) of client
+knowledge. Mitigations built in: a fresh dedicated 256-bit bearer (old local token rotated out);
+Traefik rate-limiting; TLS 1.2+ (Let's Encrypt); `access_log` audit of every query; a one-command
+**kill switch** `docker compose stop kb-traefik` that removes all public exposure with zero data
+change. Strongly recommended fast-follow: the `projects.public` allow-list (a per-project flag,
+default false) so NDA projects can be withheld from the *public* surface while local/REST access
+still sees everything.
+
+**Phase-6 discipline** (extends PLAN §1): the ONLY public listener is the Traefik TLS endpoint on
+`:8803`; every app service binds a container-private network and requires the bearer (**Inv. 10** —
+no unauthenticated surface; the deliberate container `0.0.0.0` bind is gated behind an explicit
+`KB_ALLOW_ANY_BIND`, the default still refuses accidental host-public binds). The **web UI stays
+read-only** — it imports zero write functions (**Inv. 11**); the REST facade is a write surface
+with the identical bearer. Offsite copies are **encrypted at rest** and the age key never sits
+beside the ciphertext or in git (**Inv. 12**).
+
+**6a — REST facade (~1-2 h)** — ARCH-4; JSON API for non-MCP consumers and the backing of the
+public endpoint. Tasks: `src/kbrest/server.py` — FastAPI over **kbcore only** (no SQL), reusing
+kb-mcp's pure-ASGI `BearerAuthMiddleware` and startup guards. Full MCP parity behind the identical
+bearer: read `GET /api/search /items/{id} /projects /timeline /similar/{id} /trace /stats`; write
+`POST /api/items /items/{id}/supersede /links /review/{id}/resolve`. JSON shapes reuse the existing
+pydantic models (`SearchHit`, `ItemDetail`, …). Port `KB_REST_PORT=8322`; OpenAPI at `/docs`;
+smoke test.
+AC: `curl` without token → 401; `GET /api/search?q=SPI+polarity` returns JSON hits incl. `code_ref`
++ trust; `GET /api/items/<id>` matches `kb_get`; a `POST /api/items` save then a search finds it;
+unsupported verbs → 405.
+
+**6b — Read-only web UI (~2-3 h)** — browse the KB outside Claude; strictly read-only (Inv. 11).
+Tasks: `src/kbweb/server.py` — server-rendered app (Starlette + Jinja, **no build step**) over
+**kbcore read functions only**; port `KB_WEB_PORT=8323`. Views: **search** (hits with the SEC-3
+provenance header, trust badge, code-anchor line, tags), **item** (`get_item`: body + relations +
+supersession chain), **timeline**, **trace** tree, **stats** dashboard. Auth: a login form setting
+a signed session cookie — no anonymous access. The DOM carries **no** write control; the app imports
+zero write functions. Reuse `kbcore.render` so UI and CLI/MCP render identically.
+AC: unauthenticated request → 401/redirect; authenticated search for "TPS55288" renders the decision
+with its anchor; the item view shows the UART bug's `fixes` relation; `bridge-security` timeline
+renders chronologically; a route dump proves **no** mutating route exists.
+
+**6c — Public HTTPS endpoint via Traefik + Let's Encrypt (~2-3 h)** — the deliberate exposure.
+Tasks: containerize kb-mcp/kb-rest/kb-web (one uv-based `Dockerfile`, `command` selects the module)
+onto a docker network `kbnet` with the existing kb-db; they reach Ollama on the host via
+`host.docker.internal` (`extra_hosts: host-gateway`). Add **Traefik** to compose binding host
+`:8803` (the only forwarded port) as a TLS `websecure` entrypoint, routing by
+`Host(www.n3rd-bugs.dev) + PathPrefix`: `/mcp`→kb-mcp:8321, `/api`→kb-rest:8322, `/`→kb-web:8323.
+TLS via **Let's Encrypt DNS-01 with the Namecheap provider** (`NAMECHEAP_API_USER/KEY` in a
+gitignored `traefik.env`; DNS-01 is the only option since 80/443 aren't forwarded — verified the
+Namecheap API works). Traefik `ratelimit` + security-headers middleware; dashboard loopback-only;
+`acme.json` chmod 600, gitignored. Mint a fresh `KB_TOKEN`, re-register local Claude Code. Stop the
+systemd `kb-mcp` (docker takes that role); `kb-worker`/`kb-consolidate` stay systemd (host FS/GPU).
+AC: `https://www.n3rd-bugs.dev:8803/api/stats` from off-box → 401 without token, JSON with it, and a
+**valid Let's Encrypt cert** (no `-k`, issuer Let's Encrypt, `CN=www.n3rd-bugs.dev`); the `/mcp`
+handshake works with the bearer from Claude Code on another machine; an unauthenticated burst → 429;
+`docker compose stop kb-traefik` makes the public URL unreachable while local `127.0.0.1:8321/mcp`
+still works. **claude.ai connector** attempted at hookup and reported (it may require OAuth rather
+than a static bearer — an OAuth shim is a separate follow-up; REST + web UI work with the bearer
+regardless).
+
+**6d — Encrypted offsite backups (~1-2 h)** — closes residual risk #4 (backups on the same disk as
+the DB). Tasks: install rclone + age; age keypair, private key at `~/.config/kb/age.key` (600) and
+*(user step: store a copy off-box)*; `KB_AGE_RECIPIENT` + `KB_RCLONE_REMOTE` in `.env`; *(user step:
+`rclone config` the Drive remote)*; extend `backup.sh`: after the local dump, cross-disk copy to
+`/backup/disk2/kb-backups/`, then `age -r $KB_AGE_RECIPIENT | rclone rcat …` (no plaintext byte
+leaves the box); prune remote to 14 daily + 8 weekly; offsite failures never break the local backup.
+AC: encrypted object visible via `rclone lsl`; `restore_test.sh --offsite` pulls the newest remote
+object, decrypts with the local key, restores into the throwaway container, counts within 1%;
+decrypt with a wrong key fails; grep proves no plaintext dump in the remote.
+
+**Tree-sitter chunking (V8):** stays deferred — gated on eval evidence of code-chunk misses, and the
+Phase 5 gate passed at hit@5 = 1.00 *including* code/identifier queries.
 
 ---
 

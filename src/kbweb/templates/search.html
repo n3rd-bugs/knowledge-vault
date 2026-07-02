@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Search · Knowledge Vault{% endblock %}
+{% block content %}
+<form method="get" action="/">
+  <input type="search" name="q" value="{{ q }}" placeholder="search the knowledge base" autofocus>
+  <button type="submit">Search</button>
+</form>
+{% if q and not hits %}<p>No results for "{{ q }}".</p>{% endif %}
+{% for hit in hits %}
+<article class="hit">
+  <div class="prov">{{ hit.provenance_header() }}</div>
+  <h3 style="margin:.2rem 0">
+    <a href="/item/{{ hit.item_id }}">{{ hit.type }} · {{ hit.title }}</a>
+    <span class="badge {{ hit.trust }}">{{ hit.trust }}</span>
+  </h3>
+  {% if hit.status != 'active' %}
+    <div class="status">⚠ status={{ hit.status }}{% if hit.superseded_by %}
+      → superseded by id {{ hit.superseded_by }}{% endif %}</div>
+  {% endif %}
+  {% if hit.code_ref %}<div class="anchor">{{ hit.code_ref.render() }}</div>{% endif %}
+  {% if hit.tags %}<div>{% for t in hit.tags %}<span class="tag">{{ t }}</span> {% endfor %}</div>{% endif %}
+  <p class="snippet">{{ hit.snippet }}</p>
+</article>
+{% endfor %}
+{% endblock %}

@@ -311,10 +311,13 @@ def _validate_runtime_config() -> None:
             "refusing to start: KB_TOKEN is unset, default, or too short — "
             "set a real secret in .env (openssl rand -hex 32)"
         )
-    if settings.kb_bind.strip() in _FORBIDDEN_BINDS:
+    # The bind guard is skipped only when KB_ALLOW_ANY_BIND is set (containerized,
+    # container-private runs fronted by Traefik/TLS). Token checks always apply.
+    if not settings.kb_allow_any_bind and settings.kb_bind.strip() in _FORBIDDEN_BINDS:
         raise SystemExit(
             f"refusing to start: KB_BIND={settings.kb_bind!r} binds all interfaces — "
-            "use 127.0.0.1 or a specific Tailscale IP (SEC-1)"
+            "use 127.0.0.1 or a specific Tailscale IP (SEC-1), or set KB_ALLOW_ANY_BIND=true "
+            "for a container-private bind"
         )
 
 

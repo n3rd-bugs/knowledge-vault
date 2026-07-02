@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{{ item.title }} · Knowledge Vault{% endblock %}
+{% block content %}
+<p>
+  <a href="/">← search</a> ·
+  <a href="/similar/{{ item.item_id }}">similar</a> ·
+  <a href="/trace/{{ item.item_id }}">trace</a>
+</p>
+<pre class="item">{{ item_text }}</pre>
+{% if item.relations %}
+<h4>relations</h4>
+<ul>
+  {% for r in item.relations %}
+  <li>
+    {{ r.src_id }} -{{ r.rel }}-&gt; {{ r.dst_id }} ({{ r.direction }})
+    {% if r.direction == 'out' %}<a href="/item/{{ r.dst_id }}">↗</a>
+    {% else %}<a href="/item/{{ r.src_id }}">↗</a>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

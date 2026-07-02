@@ -4,6 +4,10 @@
 *.env
 !.env.example
 
+# Phase 6 infra secrets (managed outside this repo)
+traefik.env
+traefik/acme.json
+
 # KB data dirs (if ever created inside the repo) and backups/dumps
 raw/
 backups/

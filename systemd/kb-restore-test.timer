@@ -1,0 +1,11 @@
+# kb-restore-test.timer — run the restore drill monthly (PLAN.md §9)
+[Unit]
+Description=Monthly Knowledge Vault restore drill
+
+[Timer]
+OnCalendar=*-*-01 04:30
+Persistent=true
+Unit=kb-restore-test.service
+
+[Install]
+WantedBy=timers.target

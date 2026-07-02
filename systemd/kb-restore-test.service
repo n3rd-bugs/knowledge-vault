@@ -1,0 +1,16 @@
+# kb-restore-test — monthly backup restore drill (PLAN.md §9, OPS-2)
+# Install: bash scripts/install_systemd.sh (the .timer is installed but NOT enabled;
+# enable manually with: systemctl --user enable --now kb-restore-test.timer)
+[Unit]
+Description=Knowledge Vault monthly restore drill (backup verification)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+ExecStart=%h/kb/repo/scripts/restore_test.sh
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

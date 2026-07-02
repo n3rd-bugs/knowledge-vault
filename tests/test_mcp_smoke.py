@@ -182,3 +182,64 @@ def test_save_search_get_roundtrip_with_code_ref(mcp_server):
             assert "sky-color calibration constant" in tl.content[0].text
 
     asyncio.run(roundtrip())
+
+
+def test_phase5_tools_roundtrip(mcp_server):
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+
+    async def roundtrip():
+        transport = StreamableHttpTransport(
+            mcp_server, headers={"Authorization": f"Bearer {TEST_TOKEN}"}
+        )
+        async with Client(transport) as client:
+            tools = {t.name for t in await client.list_tools()}
+            assert {
+                "kb_trace",
+                "kb_similar",
+                "kb_review_list",
+                "kb_review_resolve",
+                "kb_stats",
+            } <= tools
+
+            bug = await client.call_tool(
+                "kb_save",
+                {
+                    "project": "kb-test",
+                    "type": "bug",
+                    "title": "widget crash on cold boot",
+                    "body": "The widget crashes on cold boot below 0C.",
+                    "tags": ["hw:tps55288"],
+                    "code_ref": {"repo": "kb-test", "path": "boot.c"},
+                },
+            )
+            bug_id = int(bug.content[0].text.rsplit(" ", 1)[1])
+            fix = await client.call_tool(
+                "kb_save",
+                {
+                    "project": "kb-test",
+                    "type": "note",
+                    "title": "widget cold-boot fix",
+                    "body": "Delay 50ms before enabling the widget rail.",
+                    "links": [{"rel": "fixes", "item_id": bug_id}],
+                },
+            )
+            fix_id = int(fix.content[0].text.rsplit(" ", 1)[1])
+
+            # kb_trace: fix -fixes-> bug -mentions-> entity(tps55288)
+            trace = await client.call_tool("kb_trace", {"node_id": fix_id})
+            ttext = trace.content[0].text
+            assert "-fixes->" in ttext and f"bug {bug_id}" in ttext
+            assert "-mentions->" in ttext, "entity mention appears through the bug"
+
+            # kb_similar returns text (a ranked list or 'no similar items')
+            sim = await client.call_tool("kb_similar", {"item_id": bug_id})
+            assert isinstance(sim.content[0].text, str)
+
+            stats_text = (await client.call_tool("kb_stats", {})).content[0].text
+            assert "items:" in stats_text and "entities:" in stats_text
+
+            review_text = (await client.call_tool("kb_review_list", {})).content[0].text
+            assert "review queue is empty" in review_text or "[" in review_text
+
+    asyncio.run(roundtrip())

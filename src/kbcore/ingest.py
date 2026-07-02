@@ -17,6 +17,7 @@ from psycopg.types.json import Jsonb
 
 from kbcore import chunk as chunk_mod
 from kbcore import embed as embed_mod
+from kbcore import entities as entities_mod
 from kbcore.config import settings
 from kbcore.db import transaction
 from kbcore.models import ITEM_TYPES, SOURCE_KINDS, CodeRef
@@ -148,6 +149,11 @@ def ingest_in(
     chunks = chunk_mod.chunk_text(title, body, is_source=is_source)
     if chunks:
         _insert_chunks(conn, item_id, chunks)
+
+    # Derive entities from the (verbatim) tags + code_ref — GPU-free, so it runs
+    # synchronously in-transaction without touching the 14B extractor (Phase 5,
+    # Invariant 8). Same connection ⇒ commits atomically with the item.
+    entities_mod.extract_entities_in(conn, item_id, project, tags or [], code_ref)
     return item_id
 
 

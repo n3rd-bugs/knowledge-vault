@@ -119,6 +119,16 @@ class ProjectInfo(BaseModel):
     last_activity: datetime | None = None
 
 
+class SimilarHit(BaseModel):
+    """One nearest-neighbour item from kb_similar (PLAN.md §5.5, DATA-10)."""
+
+    item_id: int
+    title: str
+    type: str
+    project: str
+    score: float
+
+
 class ReviewEntry(BaseModel):
     """One open review-queue row for `kb review list` (PLAN.md §7.4)."""
 

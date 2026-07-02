@@ -258,6 +258,15 @@ def kb_projects() -> str:
     return render.render_projects(items.list_projects())
 
 
+# Register the Phase 5 tools (kb_trace/kb_similar/kb_review_*/kb_stats) on THIS
+# module's `mcp`. register() takes the instance as an arg so `python -m
+# kbmcp.server` (module run as __main__) registers on the served instance, not a
+# second copy imported under the name kbmcp.server.
+from kbmcp import tools_phase5  # noqa: E402
+
+tools_phase5.register(mcp)
+
+
 class BearerAuthMiddleware:
     """Pure-ASGI bearer check on every request (SEC-1). No streaming buffering."""
 

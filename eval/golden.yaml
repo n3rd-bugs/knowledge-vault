@@ -39,3 +39,21 @@
   expect_substr: ["OBD"]
 - q: "modbus register map irrigation controller"        # aquamonix, paraphrase
   expect_substr: ["modbus", "Modbus"]
+
+# --- Phase 5: exact-symbol / code-identifier retrieval (≥4 code queries) ---
+- q: "drv_spi_write"                                     # bare exact symbol → must be #1-ish
+  expect_substr: ["DRV8706", "drv_spi_write"]
+- q: "TPS55288 datasheet buck-boost part selection"      # exact part number + extra words
+  expect_substr: ["TPS55288"]
+- q: "PageNumber CURRENT field node docx footer"         # exact API symbol + context
+  expect_substr: ["PageNumber", "Footer"]
+- q: "add a footer with the page number in a Word document programmatically"  # paraphrase
+  expect_substr: ["Footer", "docx"]
+- q: "UART RX ring buffer ISR overrun fix"               # bug→fix recall, identifiers
+  expect_substr: ["ring buffer"]
+- q: "restart a crashed systemd user unit and read its logs"
+  expect_substr: ["journalctl"]
+- q: "aquamonix DNP3 outstation register poll"           # cross-project, identifier
+  expect_substr: ["DNP3"]
+- q: "blacksigma cb212 OBD-II telematics server endpoints"  # identifier + project
+  expect_substr: ["OBD"]

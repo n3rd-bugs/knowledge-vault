@@ -10,6 +10,7 @@ equal score.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from kbcore import embed as embed_mod
@@ -20,7 +21,37 @@ from kbcore.models import CodeRef, SearchHit
 RRF_K = 60
 CANDIDATES = 40
 BOOST = 0.05
+# Exact-identifier bonus (§5.4 tuning): when the query carries an identifier
+# token (see _is_identifier — a digit, an underscore, an all-caps acronym, or an
+# internal capital: drv_spi_write, TPS55288, SPI, PageNumber) that appears as a
+# WHOLE WORD in a candidate's title or body, add this. It rescues exact-symbol
+# lookups whose extra common word ("drv_spi_write gotcha") dilutes the vector
+# match under RRF and AND-fails the keyword leg. Principled: helps every
+# exact-symbol query, and is a genuine no-op for plain-word searches — a
+# sentence-initial capital ("How", "Postgres") is NOT treated as an identifier.
+EXACT_ID_BONUS = 0.05
 SNIPPET_CHARS = 300
+
+_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_identifier(t: str) -> bool:
+    """True for real code identifiers, not ordinary capitalized words.
+
+    Qualifies: a digit or underscore anywhere; an all-caps acronym (len ≥ 2,
+    e.g. SPI, OBD); an internal capital (camelCase/PascalCase, e.g. PageNumber).
+    Excludes sentence-initial capitals and single letters (How, Postgres, A, I).
+    """
+    if any(c.isdigit() for c in t) or "_" in t:
+        return True
+    if len(t) >= 2 and t.isupper():
+        return True
+    return any(c.isupper() for c in t[1:])  # capital after the first char
+
+
+def _identifier_tokens(query: str) -> list[str]:
+    """Identifier-like query tokens (deduped, order-preserving)."""
+    return list(dict.fromkeys(t for t in _WORD_RE.findall(query) if _is_identifier(t)))
 
 
 def _filters(
@@ -75,7 +106,7 @@ def search(
         vec_rows = _vector_leg(conn, query, where, params)
         kw_rows = _keyword_leg(conn, query, where, params)
 
-    fused = _rrf_fuse(vec_rows, kw_rows, boost_project)
+    fused = _rrf_fuse(vec_rows, kw_rows, boost_project, query)
     # Materialize ALL fused candidates before truncating: the verified ≥
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
@@ -123,6 +154,7 @@ def _rrf_fuse(
     vec_rows: list[tuple[int, str]],
     kw_rows: list[tuple[int, str]],
     boost_project: str | None,
+    query: str,
 ) -> list[tuple[int, float, str]]:
     """RRF over both legs, collapsed to items (best/earliest chunk is the snippet)."""
     scores: dict[int, float] = {}
@@ -135,16 +167,40 @@ def _rrf_fuse(
             seen.add(item_id)
             scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (RRF_K + rank)
             snippets.setdefault(item_id, text)
-    if boost_project and scores:
-        with connect() as conn:
-            rows = conn.execute(
-                "SELECT id FROM items WHERE id = ANY(%s) AND project = %s",
-                (list(scores), boost_project),
-            ).fetchall()
-        for (item_id,) in rows:
-            scores[item_id] += BOOST
+    if scores:
+        _apply_bonuses(scores, boost_project, query)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [(item_id, score, snippets[item_id]) for item_id, score in ranked]
+
+
+def _apply_bonuses(scores: dict[int, float], boost_project: str | None, query: str) -> None:
+    """Add the project boost and the exact-identifier bonus to the fused scores."""
+    ids = list(scores)
+    tokens = _identifier_tokens(query)
+    if not boost_project and not tokens:
+        return
+    with connect() as conn:
+        if boost_project:
+            for (item_id,) in conn.execute(
+                "SELECT id FROM items WHERE id = ANY(%s) AND project = %s",
+                (ids, boost_project),
+            ).fetchall():
+                scores[item_id] += BOOST
+        for token in tokens:
+            # \m..\M are Postgres word boundaries; identifier tokens are
+            # [A-Za-z0-9_] so no regex metachar escaping is needed.
+            pattern = rf"\m{token}\M"
+            for (item_id,) in conn.execute(
+                """
+                SELECT i.id FROM items i
+                WHERE i.id = ANY(%(ids)s) AND (
+                    i.title ~* %(pat)s
+                    OR EXISTS (SELECT 1 FROM chunks c WHERE c.item_id = i.id AND c.text ~* %(pat)s)
+                )
+                """,
+                {"ids": ids, "pat": pattern},
+            ).fetchall():
+                scores[item_id] += EXACT_ID_BONUS
 
 
 def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:

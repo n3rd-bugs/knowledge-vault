@@ -93,7 +93,7 @@ KB_EXTRACT_MODEL=qwen2.5:14b-instruct-q4_K_M
 KB_INBOX=~/kb/inbox
 KB_RAW=~/kb/raw
 KB_BACKUPS=~/kb/backups
-KB_GIT_REPOS=                              # colon-separated repo paths for docs scanner, e.g. ~/work/motor-ctl:~/work/docx-tools
+KB_GIT_REPOS=                              # colon-separated ACTIVE repo paths for the daily docs scan (§7.6), e.g. ~/UpWork/BridgeSecuritySolution/bss-git/bss-backend:~/UpWork/Aquamonix/docker-mount/rm3 — stale/backup repos are one-time `kb ingest-repo` runs instead
 KB_ARCHIVE_AFTER_DAYS=180
 KB_DUP_THRESHOLD=0.97
 ```
@@ -320,6 +320,67 @@ Take `pg_advisory_lock(42)` (ARCH-5), then:
 ### 7.5 Repo docs scanner (`kbworker/reposcan.py`) — Invariant 9 boundary
 `kb ingest-repo <path>` + daily worker pass over `KB_GIT_REPOS`: for each repo, scan **git-tracked** files matching `README*`, `CHANGELOG*`, `docs/**/*.md`, `adr/**`, `design/**/*.md`, root `*.md` — **never** source files. Ingest kind=`git`, uri=`<repo-name>:<relpath>`, trust=`verified`, project = registry mapping via `projects.repos` (fallback: repo dir name), `meta.code_ref={repo, path, commit}`. Content-hash dedupe makes daily re-runs no-ops (DATA-1); changed docs ingest as new items (old remain, consolidation dedupes/timeline shows evolution).
 
+### 7.6 Corpus bootstrap — seeding from the existing local project roots (Phase 3.5)
+
+The KB runs on the same server that already holds the full consulting history, so the real
+corpus is seeded from disk (surveyed 2026-07-02). **Invariant 9 applies unchanged**: bootstrap
+uses only the two sanctioned ingestion paths — `kb ingest-repo` for git-tracked docs in
+client-owned repos, and curated `~/kb/inbox/<project>/` drops for loose documents. No blanket
+recursive ingest of any root, ever.
+
+**Source roots & precedence** (live wins; backups only contribute what is absent live):
+
+| Priority | Root | Role |
+|---|---|---|
+| 1 | `/home/usama/UpWork` | Live checkouts — canonical for every project present here |
+| 2 | `/backup/disk2/UpWork-Backup` | Only projects absent live: IMS, KVM, Sheetak, SmartAccess, CCAthletics, ICS, AquamonixHART, AquamonixQuantum, BlackSigma2026 (docs), Presale, Archive/* |
+| 3 | `/backup/disk2/UpWork-Ubuntu-Backup` | Stale snapshot of root 1 — skip, except unique `UnlimitedIRL` (opcm4 image repo) |
+| 4 | `/backup/disk2/gdrive-Backup` | Real files only. Most "docs" are 172-byte `.gdoc/.gsheet` pointers with **no local content — cannot be ingested**. Real: SmartAccess (~34 docs), PunchRescue (~15), Pakal KiCad PDFs, ICS crash-timeline md, LeeMandel SOWs |
+
+**Project registry mapping** (canonical name ← sources; `kb project set <name> --domain … --repo …`):
+
+| project | domain | repos (client-owned only) | curated inbox drops |
+|---|---|---|---|
+| bridge-security | mixed | live `bss-git/{bss-backend,bss-frontend,bss-lib,infrastructure,rpi-firmware}` | root planning MDs (CLAUDE/IMPLEMENTATION_PLAN/STATUS/DEPLOYMENT_TOPOLOGY/NEXT_FEATURES_PLAN/RECORDING_TEST_PLAN/WIREGUARD_SUPPORT), notes/hls/ffmpeg txt |
+| aquamonix | embedded | live `docker-mount/{rm3,rm3-config-server,rm3-simulation,mp-grouping}` | TODO.md, register-map *.txt |
+| aquamonix-hart / aquamonix-quantum | embedded | backup `AquamonixHART`/`AquamonixQuantum` firmware repos | KiCad-adjacent docs |
+| blacksigma | web | live `git/cb212` | cb212 docs/ (backend_api.md, OBD rev4.47 pdf), BlackSigma2026 pdf set |
+| nesr | embedded | backup NESR DAQ repos (ESP32-CAN mcp251863, STM32CubeU5, Radxa logger, Qt host) + live `docker-mount/srsran-image` | file-structure.txt, links.txt |
+| clairways | mixed | live `git/Connect{Client,Admin,Base}` + backup Artemis/STM32 audio-wearable repos | — |
+| intensivate | embedded | live `git/{i-firemarshal,i-benchmarks}` | selected experiment summaries (not the ~380 raw logs) |
+| pakal | embedded | live `git/{pakal-ovenrtd,pakal-ovenctrl,thermalfixture}` | gdrive KiCad PDFs |
+| phyllome | embedded | live `git/{pycam,eo-camera-image}` | — |
+| punchtech | embedded | live `git/repeater` | notion-export ~25 docx |
+| unlimitedirl | devops | ubuntu-backup opcm4 image repo | — |
+| ims | mixed | backup IMS repo (rich md specs) | — |
+| kvm | embedded | backup KVM repo | — |
+| sheetak | embedded | backup Sheetak repos + `docs/` md specs | — |
+| smartaccess | embedded | backup smartaccess repo (one canonical of the 5 clones) | gdrive real docs (~34) |
+| ccathletics | embedded | backup force-plate repos | — |
+| ics | embedded | — | gdrive NUC crash-timeline md, backup capture notes |
+| punchrescue | embedded | — | gdrive docs (~15; NDA — stays local, like everything else) |
+| Archive/* (31+ past clients) | — | **deferred** — optional later pass, one project per subdir, after the named set proves the pipeline | — |
+
+**Hard exclusions** (never ingested; enforce in reposcan/watcher tests where mechanical):
+- **Credentials/secrets**: `*.pem`, `*.key`, `*.csr`, `*.pfx`, `*.ovpn`, `secrets.json`,
+  `server.env`, `.secrets/`, `accounts.csv`, `github-recovery-codes.txt`, `SoftwareKeys/`,
+  BitLocker/recovery material. (Scrubber is the last line of defense, not the plan.)
+- **Vendor/upstream clones** (not client IP): gstreamer, gst-plugins-rs, poky, meta-tegra,
+  buildroot, esp-idf/esp SDKs, uzlib, Particle device-os, flipperzero, ENNOID-BMS, CMSIS,
+  Arduino libs, firesim-linux, `mp-grouping-old`, `cb212-c1005_server` (dup of blacksigma repo).
+- **Personal data**: `report/` (medical DICOM disc), gdrive `Private/`, `Javaria*`, `School/`,
+  `Trips/`, `Interview/`, root tax/identity PDFs.
+- **Data/artifacts, not knowledge**: build trees (yocto sstate, `linux-<sha>` dirs), media dumps
+  (`.jp2` frames, wav/opus/flac samples, mp4, DCIM), pcaps, `.img`/`.swu`/firmware `.bin`/`.deb`,
+  gerber zips/step files, `devices.db`, logs, `_sf`/trash dirs, `.tmp.driveupload`,
+  `.history` editor pseudo-repos, `.gdoc/.gsheet` pointer files.
+- The ~380 Intensivate experiment `.txt` logs are measurement data; if their debugging story is
+  worth keeping, it enters as hand-curated summary notes, not raw ingestion.
+
+**`KB_GIT_REPOS` (continuous daily scan) carries only the ACTIVE live repos** — currently
+bridge-security, aquamonix, nesr, blacksigma sets. Everything else is a one-time
+`kb ingest-repo` at bootstrap; stale/backup repos don't need a daily pass.
+
 ## 8. Eval harness — DATA-5
 
 `eval/golden.yaml` — development-centric, seeded with 12 in Phase 1 (≥2 code/identifier queries, ≥2 cross-project gotcha phrasings, ≥1 Urdu to hold the multilingual guarantee), grown continuously:
@@ -368,6 +429,21 @@ Default: loopback + Tailscale only, bearer token. Clients: Claude Code (server +
 **Tasks:** watcher (§7.1) incl. PDF/DOCX/source parse + zstd archival; `sessions.py` with grounded extraction, checkpoints, git-context stamping (§7.2); `session_hook.sh` opt-in installer; `reposcan.py` + `kb ingest-repo` + daily worker pass over `KB_GIT_REPOS` (§7.5); `kb-worker.service`; tests: drop→searchable, re-drop→no dupes, hallucinated-quote rejected (mock LLM), checkpoint resumes mid-file, **reposcan on a fixture repo ingests README/docs and zero `.c/.py` source files** (Invariant 9), reposcan re-run adds 0 items.
 **AC:** drop a real PDF into `inbox/<project>/` → searchable < 60 s, original in `~/kb/raw`; second drop adds 0 items; `kb ingest-session` on one real transcript → items appear `unverified` with valid quotes and stamped `code_ref`; `kb ingest-repo` on the current firmware repo ingests only doc files (show the ingested-path list as proof); hook installed in one test project fires on session Stop.
 
+### Phase 3.5 — Corpus bootstrap from local roots (~2 h, after Phase 3 AC is green)
+**Tasks:** execute §7.6: `kb project set` for every project in the mapping table (domain + repos);
+`kb ingest-repo` across all mapped client-owned repos (backup-root repos included, live wins on
+overlap); stage curated inbox drops per the table (BSS planning MDs, punchtech notion-export,
+smartaccess gdrive docs, blacksigma cb212+2026 docs, pakal KiCad PDFs, ICS timeline, punchrescue
+set) into `~/kb/inbox/<project>/`; set `KB_GIT_REPOS` to the active-repo list only; grow
+`eval/golden.yaml` with ≥5 queries answerable only from the bootstrapped corpus (e.g. a DNP3/
+modbus register question, an ESP32 OTA/MQTT gotcha, a BSS deployment-topology question).
+**AC:** registry shows ≥15 projects with domain+repos; ingested-path list contains **zero
+source files and zero excluded paths** (paste proof greps: no `.pem/.ovpn/secrets/Private/`
+uris in `sources`); re-running the full bootstrap adds 0 items; one cross-project query returns
+hits from ≥2 different bootstrapped projects; `make eval` stays ≥ 0.7 with the grown golden set.
+**Note:** NDA material stays on this machine — the KB binds loopback/Tailscale with bearer auth
+(SEC-1) and backups stay local (`chmod 600`); nothing changes about exposure.
+
 ### Phase 4 — Refinement (~2 h)
 **Tasks:** `consolidate.py` steps 1–6 (§7.3) with advisory lock; `kb review` + `kb reembed`; `backup.sh`; `kb-consolidate.{service,timer}` enabled; tests: synthetic near-dupes collapse to one canonical, summaries link `derived_from` to all sources, raw bodies byte-identical before/after run, second consolidate run is a no-op.
 **AC:** seeded dupes → exactly one `active`; report item written with correct counts; contradiction pair lands in queue and `kb review` promotes/rejects it; `systemctl --user list-timers` shows next run; backup file exists, `600`, non-empty.
@@ -393,7 +469,10 @@ claude   # then paste the Phase 0 prompt from §11
 
 - [ ] Phase 0–5 AC all green, committed per phase
 - [ ] KB registered in Claude Code on server and laptop
-- [ ] Two real projects from **different domains** fully seeded (e.g., the current firmware job + the Node.js docx tooling): past decisions saved via `kb adr`, docs via inbox/reposcan, hook installed
+- [ ] Corpus bootstrap (§7.6/Phase 3.5) done: ≥15 real client projects registered and seeded
+      from the local roots (live UpWork + backups + gdrive real files), zero source files and
+      zero excluded/secret paths ingested; session hook installed in the active projects
+      (bridge-security, aquamonix, nesr, blacksigma)
 - [ ] One cross-project query answered correctly in live use ("have we handled X anywhere?")
 - [ ] One week of daily use → first consolidation report reviewed → golden set at 25+ → eval ≥ 0.8
 - [ ] Restore drill passed once manually

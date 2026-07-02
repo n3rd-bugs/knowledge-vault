@@ -1,0 +1,24 @@
+# Secrets & runtime — never commit (CLAUDE.md §Secrets)
+.env
+.env.*
+*.env
+!.env.example
+
+# KB data dirs (if ever created inside the repo) and backups/dumps
+raw/
+backups/
+*.sql.zst
+*.dump
+
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Editor / OS
+.DS_Store

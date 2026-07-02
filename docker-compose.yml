@@ -1,0 +1,14 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: kb-db
+    environment:
+      POSTGRES_DB: kb
+      POSTGRES_USER: kb
+      POSTGRES_PASSWORD: ${KB_DB_PASSWORD}
+    ports: ["127.0.0.1:5433:5432"]
+    volumes: [kbdata:/var/lib/postgresql/data]
+    restart: unless-stopped
+    healthcheck: {test: ["CMD-SHELL","pg_isready -U kb"], interval: 5s, retries: 20}
+volumes:
+  kbdata:

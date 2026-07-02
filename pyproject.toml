@@ -1,0 +1,46 @@
+[project]
+name = "knowledge-vault"
+version = "0.1.0"
+description = "Local, model-agnostic knowledge library for multidomain software development (Knowledge Vault)."
+readme = "PLAN.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastmcp>=2.0",
+  "psycopg[binary]>=3.2",
+  "pgvector>=0.3",
+  "httpx>=0.27",
+  "pydantic-settings>=2.4",
+  "watchdog>=4.0",
+  "pypdf>=4.0",
+  "python-docx>=1.1",
+  "tiktoken>=0.7",
+  "zstandard>=0.22",
+  "pyyaml>=6.0",
+  "typer>=0.12",
+]
+
+[project.scripts]
+kb = "kbcli.main:app"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kbcore", "src/kbmcp", "src/kbworker", "src/kbcli"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests", "eval"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]

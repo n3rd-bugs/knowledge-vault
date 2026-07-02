@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from kbcore.db import connect, transaction
-from kbcore.errors import NotFound
+from kbcore.errors import InvalidOperation, NotFound
 from kbcore.models import CodeRef, ItemDetail, ProjectInfo, Relation
 
 
@@ -71,6 +73,90 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
         created_at=created,
         relations=relations,
     )
+
+
+MAX_TIMELINE_LIMIT = 500
+
+
+def _parse_day(value: str, param: str) -> date:
+    """Strict YYYY-MM-DD validation so garbage input raises a domain error,
+    not a raw psycopg error escaping to MCP clients (review finding)."""
+    try:
+        return date.fromisoformat(value)
+    except ValueError as e:
+        raise InvalidOperation(f"{param} must be YYYY-MM-DD, got {value!r}") from e
+
+
+def timeline(
+    project: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    limit: int = 50,
+) -> list[ItemDetail]:
+    """Chronological items for a project, superseded/archived included (kb_timeline).
+
+    Dates are whole days, both ends inclusive (to_date=today includes today —
+    review finding: `<= 'YYYY-MM-DD'` casts to midnight and dropped the day).
+    When more than `limit` items match, the MOST RECENT `limit` are returned,
+    still in ascending order — recent evolution must not be invisible.
+    """
+    limit = max(1, min(int(limit), MAX_TIMELINE_LIMIT))
+    where = ["i.project = %s"]
+    params: list = [project]
+    if from_date:
+        where.append("i.created_at >= %s")
+        params.append(_parse_day(from_date, "from_date"))
+    if to_date:
+        where.append("i.created_at < %s")
+        params.append(_parse_day(to_date, "to_date") + timedelta(days=1))
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT * FROM (
+                SELECT i.id, i.project, i.type, i.title, i.body, i.tags, i.status,
+                       s.trust, i.superseded_by, i.supersede_reason, i.meta,
+                       s.uri, i.created_at
+                FROM items i LEFT JOIN sources s ON s.id = i.source_id
+                WHERE {" AND ".join(where)}
+                ORDER BY i.created_at DESC, i.id DESC
+                LIMIT %s
+            ) recent ORDER BY created_at ASC, id ASC
+            """,  # noqa: S608 — WHERE fragments above are constant literals
+            params,
+        ).fetchall()
+    out = []
+    for id_, proj, type_, title, body, tags, status, trust, sup, reason, meta, uri, created in rows:
+        meta = meta if isinstance(meta, dict) else {}
+        code_ref = CodeRef(**meta["code_ref"]) if meta.get("code_ref") else None
+        out.append(
+            ItemDetail(
+                item_id=id_,
+                project=proj,
+                type=type_,
+                title=title,
+                body=body,
+                tags=tags or [],
+                status=status,
+                trust=trust or "verified",
+                superseded_by=sup,
+                supersede_reason=reason,
+                code_ref=code_ref,
+                meta=meta,
+                source_uri=uri or None,
+                created_at=created,
+            )
+        )
+    return out
+
+
+def log_access(item_id: int, tool: str, query: str | None = None) -> None:
+    """Record a direct item access (kb_get / kb get) for staleness scoring."""
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO access_log (item_id, tool, query) VALUES (%s, %s, %s)",
+            (item_id, tool, query),
+        )
 
 
 def find_by_title(title: str) -> int | None:

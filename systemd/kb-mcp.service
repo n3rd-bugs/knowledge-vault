@@ -1,0 +1,22 @@
+# kb-mcp — Knowledge Vault MCP server (PLAN.md §9)
+# Install: bash scripts/install_systemd.sh   (systemd user unit)
+[Unit]
+Description=Knowledge Vault MCP server (FastMCP, streamable HTTP)
+After=network.target
+# Stop retrying after 5 failed starts in 60s instead of crash-looping forever
+# (RestartSec=3 outpaces the user manager's default 5-in-10s window).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+ExecStart=%h/kb/repo/.venv/bin/python -m kbmcp.server
+Restart=on-failure
+RestartSec=3
+MemoryMax=1G
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

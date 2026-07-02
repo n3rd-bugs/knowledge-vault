@@ -151,6 +151,30 @@ def ingest_in(
     return item_id
 
 
+def find_duplicate(title: str, body: str, *, kind: str = "chat", uri: str = "") -> int | None:
+    """Item id whose source matches this content's dedupe key, or None.
+
+    Lets callers (MCP kb_save) point at the existing item when ingest reports
+    a duplicate, instead of a dead-end 'nothing ingested'.
+    """
+    from kbcore.db import connect
+
+    title_n, _ = scrub(normalize_title(title))
+    body_n, _ = scrub(normalize(body))
+    chash = content_hash(title_n, body_n)
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT i.id FROM items i
+            JOIN sources s ON s.id = i.source_id
+            WHERE s.kind = %s AND s.uri = %s AND s.content_hash = %s
+            ORDER BY i.id LIMIT 1
+            """,
+            (kind, uri, chash),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def _insert_chunks(conn: psycopg.Connection, item_id: int, chunks: list[str]) -> None:
     """Embed and insert chunks, reusing embeddings for identical text (DATA-1)."""
     hashes = [hashlib.sha256(c.encode()).hexdigest() for c in chunks]

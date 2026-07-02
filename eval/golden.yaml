@@ -27,3 +27,15 @@
   expect_substr: ["keep_alive"]
 - q: "add page numbers to a Word document footer"      # semantic paraphrase, no identifiers
   expect_substr: ["Footer", "docx"]
+
+# --- Phase 3.5 corpus-bootstrap queries (answerable only from the real client repos) ---
+- q: "DNP3 outstation poll interval register map"       # aquamonix irrigation SCADA
+  expect_substr: ["DNP3"]
+- q: "WireGuard tunnel deployment topology"             # bridge-security curated planning doc
+  expect_substr: ["WireGuard"]
+- q: "LoRa repeater firmware over the air update"       # punchtech
+  expect_substr: ["LoRa"]
+- q: "OBD-II telematics device server"                  # blacksigma cb212
+  expect_substr: ["OBD"]
+- q: "modbus register map irrigation controller"        # aquamonix, paraphrase
+  expect_substr: ["modbus", "Modbus"]

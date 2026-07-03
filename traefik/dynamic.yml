@@ -4,8 +4,13 @@ http:
     # Longest PathPrefix wins by Traefik's default priority, so /mcp and /api
     # take precedence over the /-catch-all web UI. TLS + cert come from the
     # websecure entrypoint (Let's Encrypt via Namecheap DNS-01).
+    # /mcp plus the OAuth discovery + flow endpoints FastMCP mounts for claude.ai
+    # (metadata, authorize, token, dynamic client registration, consent, Google
+    # callback). All go to the OAuth-enabled public MCP instance. The compound
+    # rule is long, so Traefik's length-based priority keeps it above the /
+    # web-UI catch-all for these paths.
     kbmcp:
-      rule: "Host(`www.n3rd-bugs.dev`) && PathPrefix(`/mcp`)"
+      rule: "Host(`www.n3rd-bugs.dev`) && (PathPrefix(`/mcp`) || PathPrefix(`/.well-known`) || PathPrefix(`/authorize`) || PathPrefix(`/token`) || PathPrefix(`/register`) || PathPrefix(`/consent`) || PathPrefix(`/auth`))"
       entryPoints: [websecure]
       service: kbmcp
       middlewares: [kb-public]
@@ -24,7 +29,7 @@ http:
     kbmcp:
       loadBalancer:
         servers:
-          - url: "http://kb-mcp:8321"
+          - url: "http://kb-mcp-public:8321"
     kbrest:
       loadBalancer:
         servers:

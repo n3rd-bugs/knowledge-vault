@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # Public/cloud instance gate: when true, reads see only projects flagged
     # public and writes to non-public projects are rejected (no existence leak).
     kb_public_only: bool = False
+    # OAuth (for claude.ai web/mobile connectors). When enabled the public MCP
+    # instance accepts BOTH Google OAuth and the static bearer (MultiAuth).
+    kb_oauth_enabled: bool = False
+    kb_public_url: str = "https://www.n3rd-bugs.dev:8803"  # base URL for OAuth metadata/redirects
+    google_client_id: str = ""
+    google_client_secret: str = ""
     ollama_url: str = "http://127.0.0.1:11434"
     kb_embed_model: str = "bge-m3"
     kb_embed_dim: int = 1024

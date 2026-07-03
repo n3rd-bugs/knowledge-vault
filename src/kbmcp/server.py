@@ -30,8 +30,44 @@ _MIN_TOKEN_LEN = 16
 # INADDR_ANY-style binds violate "loopback/Tailscale only" (Invariant 6).
 _FORBIDDEN_BINDS = {"", "0.0.0.0", "::", "*"}  # noqa: S104 — the denylist itself
 
+
+def _build_auth():
+    """Google OAuth + static-bearer (MultiAuth) for the public instance, else None.
+
+    When KB_OAUTH_ENABLED, the public MCP accepts BOTH a claude.ai OAuth session
+    (Google, restricted to the consent screen's test users) AND the static bearer
+    (Claude Code / scripts). When off, auth is the pure-ASGI BearerAuthMiddleware
+    (below). Google's OAuth app in Testing mode limits login to its test users.
+    """
+    if not settings.kb_oauth_enabled:
+        return None
+    from fastmcp.server.auth import MultiAuth, StaticTokenVerifier
+    from fastmcp.server.auth.providers.google import GoogleProvider
+
+    google = GoogleProvider(
+        client_id=settings.google_client_id,
+        client_secret=settings.google_client_secret,
+        base_url=settings.kb_public_url,
+        redirect_path="/auth/callback",
+        required_scopes=["openid", "email"],
+    )
+    verifiers = []
+    if settings.kb_token and len(settings.kb_token) >= _MIN_TOKEN_LEN:
+        # The static token must carry the SAME scopes the resource enforces, or
+        # MultiAuth rejects the bearer path with insufficient_scope. Read them off
+        # the provider rather than hardcoding — GoogleProvider normalizes "email"
+        # to "https://www.googleapis.com/auth/userinfo.email", so a literal list
+        # would silently drift out of match.
+        required = list(getattr(google, "required_scopes", None) or ["openid", "email"])
+        verifiers.append(
+            StaticTokenVerifier({settings.kb_token: {"client_id": "bearer", "scopes": required}})
+        )
+    return MultiAuth(server=google, verifiers=verifiers, base_url=settings.kb_public_url)
+
+
 mcp = FastMCP(
     name="kb",
+    auth=_build_auth(),
     # Hide non-ToolError exception details from clients (e.g. raw psycopg
     # messages when the DB is down); full traces still go to journald.
     mask_error_details=True,
@@ -311,6 +347,12 @@ def _validate_runtime_config() -> None:
             "refusing to start: KB_TOKEN is unset, default, or too short — "
             "set a real secret in .env (openssl rand -hex 32)"
         )
+    if settings.kb_oauth_enabled and not (
+        settings.google_client_id and settings.google_client_secret
+    ):
+        raise SystemExit(
+            "refusing to start: KB_OAUTH_ENABLED but GOOGLE_CLIENT_ID/SECRET are unset"
+        )
     # The bind guard is skipped only when KB_ALLOW_ANY_BIND is set (containerized,
     # container-private runs fronted by Traefik/TLS). Token checks always apply.
     if not settings.kb_allow_any_bind and settings.kb_bind.strip() in _FORBIDDEN_BINDS:
@@ -324,6 +366,12 @@ def _validate_runtime_config() -> None:
 def build_app():
     _validate_runtime_config()
     app = mcp.http_app(path="/mcp")
+    # With OAuth on, FastMCP's own auth middleware (MultiAuth: Google + bearer)
+    # handles every request — do NOT also wrap with the pure-ASGI bearer check,
+    # which would 401 the OAuth discovery/callback paths. Otherwise the bearer
+    # middleware is the sole gate.
+    if settings.kb_oauth_enabled:
+        return app
     return BearerAuthMiddleware(app)
 
 

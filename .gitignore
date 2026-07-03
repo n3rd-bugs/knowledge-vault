@@ -26,3 +26,13 @@ build/
 
 # Editor / OS
 .DS_Store
+
+# OAuth secrets (Phase 6e)
+google.txt
+oauth.env
+
+# TLS / DNS provider credentials (Namecheap API user+key for ACME DNS-01)
+namecheap.txt
+
+# Claude Code local session/agent state
+.claude/

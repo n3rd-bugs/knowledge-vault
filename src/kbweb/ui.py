@@ -8,6 +8,7 @@ stays plain-text so CLI/MCP output is unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import html
 from functools import lru_cache
 from pathlib import Path
@@ -70,10 +71,29 @@ def code_css() -> str:
     return f"{light}\n{dark_scoped}\n@media (prefers-color-scheme: dark) {{\n{dark_media}\n}}\n"
 
 
+def _asset_version() -> str:
+    """Content hash of the static assets, used as a ?v= cache-buster.
+
+    The public site sits behind Cloudflare, which edge-caches CSS/JS for hours;
+    a content-derived version in the URL makes every deploy a cache MISS without
+    manual purges. Computed once at import (assets are baked into the image).
+    """
+    h = hashlib.sha1()  # noqa: S324 — cache key, not security
+    for name in ("app.css", "app.js"):
+        p = STATIC_DIR / name
+        if p.exists():
+            h.update(p.read_bytes())
+    return h.hexdigest()[:8]
+
+
+ASSET_V = _asset_version()
+
+
 def create_templates() -> Jinja2Templates:
     """The app-wide template environment; filters/globals are registered here."""
     t = Jinja2Templates(directory=str(_TEMPLATE_DIR))
     t.env.filters["markdown"] = render_markdown
+    t.env.globals["asset_v"] = ASSET_V
     return t
 
 

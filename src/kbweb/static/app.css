@@ -196,8 +196,9 @@ blockquote.quote { border-left: 3px solid var(--accent); margin: .3rem 0; paddin
 .bar-row { display: grid; grid-template-columns: 11rem minmax(0,1fr) 3.5rem;
            align-items: center; gap: .6rem; padding: .22rem 0; font-size: .88rem; }
 .bar-row .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.bar-row .track { background: var(--surface-2); border-radius: 4px; height: .8rem; }
-.bar-row .fill { background: var(--viz-bar); border-radius: 4px; height: 100%; }
+.bar-row .track { display: block; background: var(--surface-2); border-radius: 4px; height: .8rem; }
+/* display:block — an inline span ignores width/height, so the fill never paints */
+.bar-row .fill { display: block; background: var(--viz-bar); border-radius: 4px; height: 100%; }
 .bar-row .n { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
 .stack-bar { display: flex; gap: 2px; height: 1rem; border-radius: 5px; overflow: hidden;
              margin: .35rem 0 .2rem; }

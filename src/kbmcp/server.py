@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import time
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -30,6 +31,44 @@ _FORBIDDEN_TOKENS = {"", "change-me-long-random"}
 _MIN_TOKEN_LEN = 16
 # INADDR_ANY-style binds violate "loopback/Tailscale only" (Invariant 6).
 _FORBIDDEN_BINDS = {"", "0.0.0.0", "::", "*"}  # noqa: S104 — the denylist itself
+
+
+def _install_verify_cache(provider, ttl_seconds: int = 300) -> None:
+    """Cache Google access-token verification on ``provider`` (in place).
+
+    FastMCP's GoogleTokenVerifier calls Google's tokeninfo+userinfo on EVERY MCP
+    request with no caching. Google's tokeninfo is rate-limited and not meant for
+    per-request production use; under claude.ai's concurrent burst (tools+prompts+
+    resources at once) the ~1-2s round-trips stall requests past Anthropic's
+    mcp-proxy timeout, which then reports a 502 "incomplete response". Cache the
+    verified AccessToken per opaque token for a short TTL (never past the token's
+    own expiry) so repeat/concurrent calls skip the network. Best-effort: silently
+    no-ops if FastMCP's internals change.
+    """
+    verifier = getattr(provider, "_token_validator", None)
+    if verifier is None or not hasattr(verifier, "verify_token"):
+        log.warning("token-verify cache not installed: verifier shape changed")
+        return
+    original = verifier.verify_token
+    cache: dict[str, tuple] = {}
+
+    async def cached_verify(token: str):
+        now = time.monotonic()
+        entry = cache.get(token)
+        if entry is not None and entry[1] > now:
+            return entry[0]
+        result = await original(token)
+        if result is not None:
+            expiry = now + ttl_seconds
+            tok_exp = getattr(result, "expires_at", None)
+            if tok_exp:  # never serve a cached grant past the token's real expiry
+                expiry = min(expiry, now + max(0, int(tok_exp) - int(time.time())))
+            for stale in [k for k, v in cache.items() if v[1] <= now]:
+                del cache[stale]  # bound the dict; tokens rotate hourly anyway
+            cache[token] = (result, expiry)
+        return result
+
+    verifier.verify_token = cached_verify
 
 
 def _build_auth():
@@ -58,6 +97,9 @@ def _build_auth():
         # hits /register. Forcing DCR-only makes claude.ai register normally.
         enable_cimd=False,
     )
+    # Cache token verification so we don't hit Google's rate-limited tokeninfo on
+    # every request (the source of the intermittent 502s under claude.ai's bursts).
+    _install_verify_cache(google)
     verifiers = []
     if settings.kb_token and len(settings.kb_token) >= _MIN_TOKEN_LEN:
         # The static token must carry the SAME scopes the resource enforces, or

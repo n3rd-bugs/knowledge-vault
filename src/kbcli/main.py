@@ -235,16 +235,24 @@ def ingest_session_cmd(
     repo: str | None = typer.Option(None, "--repo", help="git worktree root (for code_ref)"),
     branch: str | None = typer.Option(None, "--branch"),
     commit: str | None = typer.Option(None, "--commit", help="short commit for code_ref"),
+    queue: bool = typer.Option(
+        False,
+        "--queue",
+        help="enqueue the delta for the nightly drain (GPU-free) instead of extracting now",
+    ),
 ) -> None:
     """Extract unverified knowledge from a session transcript (§7.2, opt-in)."""
     from kbworker.sessions import ingest_session
 
     try:
-        summary = ingest_session(path, project, repo=repo, branch=branch, commit=commit)
+        summary = ingest_session(
+            path, project, repo=repo, branch=branch, commit=commit, queue=queue
+        )
     except KBError as e:
         _fail(e)
+    verb = "queued" if queue else "saved (unverified)"
     typer.echo(
-        f"session {summary.path}: {summary.saved} saved (unverified), "
+        f"session {summary.path}: {summary.saved} {verb}, "
         f"{summary.rejected} rejected, offset {summary.offset}"
     )
 

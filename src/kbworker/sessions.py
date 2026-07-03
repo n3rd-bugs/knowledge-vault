@@ -233,6 +233,7 @@ def ingest_session(
     repo: str | None = None,
     branch: str | None = None,
     commit: str | None = None,
+    queue: bool = False,
 ) -> SessionSummary:
     """Extract and ingest new knowledge from a transcript window. Idempotent.
 
@@ -240,6 +241,11 @@ def ingest_session(
     offset up to the last COMPLETE line, validates quote-grounding, ingests
     survivors as unverified session items (each atomically queued for review),
     and advances the checkpoint only after successful processing.
+
+    With ``queue=True`` the transcript window is instead ENQUEUED for the nightly
+    drain (no GPU / 14B at call time) — the courtesy path for a PreCompact hook
+    that must return instantly (Invariant 8). The checkpoint still advances, so
+    each compaction enqueues only its new delta.
     """
     abs_path = Path(path).expanduser().resolve()
     key = str(abs_path)
@@ -279,6 +285,32 @@ def ingest_session(
         # uri keyed by the canonical abs_path + consumed range so a relative and
         # an absolute invocation (or a retry) produce identical dedupe keys.
         uri = f"{key}:{offset}-{new_offset}"
+
+        # Courtesy path: enqueue the delta for the nightly drain instead of running
+        # the 14B now. Advance the checkpoint on success so the next call resumes
+        # after this window. Oversized/rejected submissions raise (caller logs).
+        if queue:
+            from kbcore import ingest_queue
+
+            qid = ingest_queue.enqueue(
+                project,
+                transcript_text,
+                kind="session",
+                repo=repo,
+                branch=branch,
+                commit=commit,
+                source_uri=uri,
+                allow_reserved=True,  # trusted local flush may target kb-system
+            )
+            set_checkpoint(key, new_offset)
+            return SessionSummary(
+                path=str(path),
+                project=project,
+                saved=1 if qid is not None else 0,
+                rejected=0,
+                offset=new_offset,
+            )
+
         saved, rejected = extract_and_ingest(
             transcript_text,
             project,

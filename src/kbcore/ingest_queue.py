@@ -34,18 +34,21 @@ def enqueue(
     branch: str | None = None,
     commit: str | None = None,
     source_uri: str | None = None,
+    allow_reserved: bool = False,
 ) -> int | None:
     """Scrub and enqueue a submission. Returns the row id, or None if a duplicate.
 
     Rejects unknown kinds, empty content, and oversized content (domain errors).
     The content is SCRUBBED before storage and the dedupe hash is over the
-    scrubbed text, so re-submitting identical content is a no-op.
+    scrubbed text, so re-submitting identical content is a no-op. ``allow_reserved``
+    is set only by trusted LOCAL callers (the CLI session flush) so a PreCompact
+    hook may file into kb-system; the public REST/MCP path always leaves it false.
     """
     if kind not in QUEUE_KINDS:
         raise InvalidOperation(f"unknown ingest kind {kind!r}; one of {', '.join(QUEUE_KINDS)}")
     if not project or not project.strip():
         raise InvalidOperation("project is required")
-    if project.strip() in RESERVED_PROJECTS:
+    if not allow_reserved and project.strip() in RESERVED_PROJECTS:
         raise InvalidOperation(f"project {project!r} is reserved and cannot be targeted remotely")
     # Public-only instance: only public projects accept submissions.
     scope.assert_writable(project)

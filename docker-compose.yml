@@ -58,6 +58,11 @@ services:
       # kb.n3rd-bugs.dev; cloudflared (host systemd) forwards to the published port
       # below. Every issuer/PRM/redirect URL therefore renders as https://kb...dev.
       KB_PUBLIC_URL: "https://kb.n3rd-bugs.dev"
+    # This IS the OAuth server: it calls Google server-side (OIDC discovery, JWKS,
+    # and the auth-code -> token exchange at the callback). kbnet's embedded
+    # resolver can't reach the internet, so give it public DNS (same as
+    # kb-cloudflared/kb-traefik/kb-web) or the OAuth flow fails at the Google hop.
+    dns: ["1.1.1.1", "8.8.8.8"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     networks: [kbnet]
     restart: unless-stopped

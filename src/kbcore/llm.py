@@ -10,12 +10,48 @@ immediately after use — GPU is a guest and the extractor must not sit resident
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import httpx
 
 from kbcore.config import settings
 from kbcore.errors import ExtractorUnavailable
+
+# Reasoning models (deepseek-r1, qwen3 with thinking on, ...) may wrap or prefix
+# the answer with a <think>...</think> block, and some models fence the JSON in
+# markdown despite format="json". Strip/recover instead of failing the batch.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
+
+
+def parse_model_json(content: str) -> Any:
+    """Parse model output into JSON, tolerating reasoning-model wrappers.
+
+    Order: strip <think> blocks → direct parse → fenced ```json``` block →
+    outermost {...} span. Raises ``ValueError`` if no JSON object can be
+    recovered (callers map that to their own failure mode).
+    """
+    text = _THINK_RE.sub("", content).strip()
+    # An UNCLOSED <think> means the model hit its token budget mid-reasoning;
+    # anything after it is reasoning, not an answer — do not mine JSON from it.
+    if text.lstrip().lower().startswith("<think>"):
+        raise ValueError("extractor output is an unterminated <think> block")
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    fence = _FENCE_RE.search(text)
+    if fence:
+        try:
+            return json.loads(fence.group(1))
+        except ValueError:
+            pass
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start : end + 1])  # ValueError propagates
+    raise ValueError("no JSON object found in extractor output")
+
 
 # The 14B can take a while on first-token; generous read timeout, tight connect.
 _TIMEOUT = httpx.Timeout(600.0, connect=10.0)
@@ -73,7 +109,7 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
 
     try:
         content = resp.json()["message"]["content"]
-        data = json.loads(content)
+        data = parse_model_json(content)
     except (KeyError, ValueError, TypeError) as e:
         raise ExtractorUnavailable(
             f"extractor returned unparseable output: {e.__class__.__name__}: {e}"
@@ -163,7 +199,7 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
         json_format=True,
     )
     try:
-        data = json.loads(content)
+        data = parse_model_json(content)
     except (ValueError, TypeError):
         return False
     if not isinstance(data, dict):

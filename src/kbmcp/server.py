@@ -51,6 +51,12 @@ def _build_auth():
         base_url=settings.kb_public_url,
         redirect_path="/auth/callback",
         required_scopes=["openid", "email"],
+        # Advertise ONLY standard Dynamic Client Registration. With CIMD on, the
+        # metadata carries client_id_metadata_document_supported=true, and
+        # claude.ai's connector tries the CIMD flow instead of POST /register —
+        # which fails ("Couldn't register with the sign-in service") and never
+        # hits /register. Forcing DCR-only makes claude.ai register normally.
+        enable_cimd=False,
     )
     verifiers = []
     if settings.kb_token and len(settings.kb_token) >= _MIN_TOKEN_LEN:

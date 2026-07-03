@@ -111,6 +111,11 @@ services:
       # allowlist; the KB_TOKEN form login remains as an owner fallback.
       KB_WEB_PUBLIC_URL: "https://web.n3rd-bugs.dev"
       KB_WEB_ALLOWED_EMAILS: "mirzaon@gmail.com"
+    # Google sign-in makes outbound calls to oauth2.googleapis.com; kbnet's
+    # embedded resolver can't reach the internet, so give it public DNS (same as
+    # kb-cloudflared/kb-traefik). Without this the code exchange fails with
+    # "Temporary failure in name resolution" -> "Google sign-in was not accepted".
+    dns: ["1.1.1.1", "8.8.8.8"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     networks: [kbnet]
     restart: unless-stopped

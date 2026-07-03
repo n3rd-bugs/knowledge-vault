@@ -1,7 +1,26 @@
 {% extends "base.html" %}
+{% from "partials/_trace_node.html" import tnode %}
 {% block title %}Trace {{ node_id }} · Knowledge Vault{% endblock %}
 {% block content %}
-<p><a href="/item/{{ node_id }}">← item {{ node_id }}</a></p>
-<h3>trace (depth 2)</h3>
-<pre class="trace">{{ trace_text }}</pre>
+{% if kind == 'item' %}<p class="prov"><a href="/item/{{ node_id }}">← item {{ node_id }}</a></p>{% endif %}
+<h3>relation trace</h3>
+<form method="get" action="/trace/{{ node_id }}" class="bar">
+  <input type="hidden" name="kind" value="{{ kind }}">
+  <label class="f">depth
+    <select name="depth">
+      {% for d in [1, 2, 3, 4] %}
+      <option value="{{ d }}" {% if d == depth %}selected{% endif %}>{{ d }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="f">direction
+    <select name="direction">
+      {% for dirn in ['both', 'out', 'in'] %}
+      <option value="{{ dirn }}" {% if dirn == direction %}selected{% endif %}>{{ dirn }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Trace</button>
+</form>
+<div class="card trace-tree">{{ tnode(tree) }}</div>
 {% endblock %}

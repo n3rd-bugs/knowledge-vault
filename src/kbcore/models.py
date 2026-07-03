@@ -130,6 +130,15 @@ class SimilarHit(BaseModel):
     score: float
 
 
+class ItemRef(BaseModel):
+    """Light item reference for browse lists / relation labels (kbcore.browse)."""
+
+    item_id: int
+    title: str
+    type: str
+    status: str
+
+
 class ReviewEntry(BaseModel):
     """One open review-queue row for `kb review list` (PLAN.md §7.4)."""
 

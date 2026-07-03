@@ -23,7 +23,7 @@ from kbcore.config import settings
 from kbcore.errors import KBError, NotFound
 from kbmcp.server import _validate_runtime_config
 from kbweb import auth, views_items, views_meta, views_search
-from kbweb.ui import STATIC_DIR, templates
+from kbweb.ui import STATIC_DIR, code_css, templates
 
 log = logging.getLogger("kbweb")
 
@@ -107,10 +107,17 @@ def _bad_request(request, exc) -> Response:
     return HTMLResponse(f"<h1>400 — {exc}</h1><p><a href='/'>search</a></p>", status_code=400)
 
 
+def code_css_view(request) -> Response:  # GET /static/code.css
+    """Pygments token styles, generated from the installed lib (see ui.code_css)."""
+    return Response(code_css(), media_type="text/css", headers={"Cache-Control": "max-age=86400"})
+
+
 ROUTES = [
     Route("/login", login, methods=["GET", "POST"]),
     Route("/auth/google/login", google_login),
     Route("/auth/google/callback", google_callback),
+    # Declared before the Mount so it wins over the on-disk static lookup.
+    Route("/static/code.css", code_css_view),
     Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
     *views_search.ROUTES,
     *views_items.ROUTES,

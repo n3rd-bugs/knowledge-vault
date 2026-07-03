@@ -197,6 +197,15 @@ blockquote.quote { border-left: 3px solid var(--accent); margin: .3rem 0; paddin
 .dot { display: inline-block; width: .65rem; height: .65rem; border-radius: 3px;
        margin-right: .3rem; vertical-align: baseline; }
 
+/* --- trace tree --------------------------------------------------------------- */
+.trace-tree summary { cursor: pointer; padding: .15rem 0; }
+.trace-tree ul.trace-kids { list-style: none; margin: .15rem 0 .15rem .45rem;
+                            padding-left: .9rem; border-left: 1px solid var(--border); }
+.trace-tree li { padding: .12rem 0; }
+.rel-lbl { font-size: .74rem; color: var(--accent); font-family: ui-monospace, monospace;
+           margin-right: .25rem; white-space: nowrap; }
+.trace-leaf { display: inline; }
+
 /* --- misc -------------------------------------------------------------------- */
 .error { color: var(--bad); }
 .grid-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr)); gap: .7rem; }

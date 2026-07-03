@@ -1,25 +1,80 @@
-"""kbweb.ui — shared template environment and request-param helpers (Inv. 11).
+"""kbweb.ui — shared template environment, markdown pipeline, param helpers (Inv. 11).
 
 Owns the Jinja2Templates instance so view modules never import from server
-(no circular imports) and presentation concerns stay in one place. The
-markdown/pygments pipeline (phase web-2) also lives here — kbcore.render stays
-plain-text for CLI/MCP parity.
+(no circular imports) and presentation concerns stay in one place. HTML
+rendering (markdown + pygments) lives HERE, not in kbcore — kbcore.render
+stays plain-text so CLI/MCP output is unchanged.
 """
 
 from __future__ import annotations
 
+import html
+from functools import lru_cache
 from pathlib import Path
 
+from markdown_it import MarkdownIt
+from markupsafe import Markup
+from pygments import highlight as _pyg_highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import get_lexer_by_name
+from pygments.util import ClassNotFound
 from starlette.requests import Request
 from starlette.templating import Jinja2Templates
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Above this, a single fenced block is served escaped-but-unhighlighted:
+# pygments on pathological fences is the only real CPU risk on this page.
+_MAX_HL_CHARS = 20_000
+_FORMATTER = HtmlFormatter(nowrap=True)
+
+
+def _highlight(code: str, lang: str, attrs: str) -> str:
+    """Fenced-code renderer for markdown-it: pygments or escaped fallback."""
+    if lang and len(code) <= _MAX_HL_CHARS:
+        try:
+            lexer = get_lexer_by_name(lang)
+            return f'<pre class="hl"><code>{_pyg_highlight(code, lexer, _FORMATTER)}</code></pre>'
+        except ClassNotFound:
+            pass
+    return f'<pre class="hl"><code>{html.escape(code)}</code></pre>'
+
+
+# html=False ESCAPES raw HTML in bodies — the XSS defense for stored content
+# (SEC-3 spirit: item bodies are data, never markup). markdown-it's built-in
+# link validator additionally refuses javascript:/vbscript:/data: hrefs.
+_MD = MarkdownIt("commonmark", {"html": False, "highlight": _highlight})
+_MD.enable("table")
+_MD.enable("strikethrough")
+
+
+@lru_cache(maxsize=256)  # bodies are immutable (Invariant 1) — cache by content
+def render_markdown(body: str) -> Markup:
+    """Item body → safe HTML (raw HTML escaped, fences highlighted)."""
+    return Markup(_MD.render(body))  # noqa: S704 — html=False escapes raw HTML above
+
+
+@lru_cache(maxsize=1)
+def code_css() -> str:
+    """Pygments token styles for both themes, generated from the installed lib.
+
+    Light: ``default`` style; dark: ``lightbulb`` under the same [data-theme] /
+    prefers-color-scheme conditions app.css uses. Served at /static/code.css —
+    never committed, never drifts from the pygments version.
+    """
+    light = HtmlFormatter(style="default").get_style_defs(".hl")
+    dark = HtmlFormatter(style="lightbulb").get_style_defs(".hl")
+    dark_scoped = dark.replace(".hl", ':root[data-theme="dark"] .hl')
+    dark_media = dark.replace(".hl", ':root:not([data-theme="light"]) .hl')
+    return f"{light}\n{dark_scoped}\n@media (prefers-color-scheme: dark) {{\n{dark_media}\n}}\n"
+
 
 def create_templates() -> Jinja2Templates:
     """The app-wide template environment; filters/globals are registered here."""
-    return Jinja2Templates(directory=str(_TEMPLATE_DIR))
+    t = Jinja2Templates(directory=str(_TEMPLATE_DIR))
+    t.env.filters["markdown"] = render_markdown
+    return t
 
 
 templates = create_templates()

@@ -1,0 +1,30 @@
+{# Recursive trace-tree macros. Node dicts come from kbcore.graph.trace():
+   {id, kind, type, title, status?, date, project, edges: [{rel, direction, node}]} #}
+
+{% macro tlabel(n) %}
+  {% if n.kind == 'item' %}
+    <a href="/item/{{ n.id }}">{{ n.type }} · {{ n.title }}</a>
+  {% else %}
+    <a href="/trace/{{ n.id }}?kind=entity">entity:{{ n.type }} · {{ n.title }}</a>
+  {% endif %}
+  {% if n.status and n.status != 'active' %}<span class="badge {{ n.status }}">{{ n.status }}</span>{% endif %}
+  <span class="prov">{{ n.project }} · {{ n.date }} · id {{ n.id }}</span>
+{% endmacro %}
+
+{% macro tnode(n) %}
+  {% if n.edges %}
+    <details open>
+      <summary>{{ tlabel(n) }}</summary>
+      <ul class="trace-kids">
+        {% for e in n.edges %}
+        <li>
+          <span class="rel-lbl">{% if e.direction == 'out' %}−{{ e.rel }}→{% else %}←{{ e.rel }}−{% endif %}</span>
+          {{ tnode(e.node) }}
+        </li>
+        {% endfor %}
+      </ul>
+    </details>
+  {% else %}
+    <div class="trace-leaf">{{ tlabel(n) }}</div>
+  {% endif %}
+{% endmacro %}

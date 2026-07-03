@@ -52,11 +52,32 @@ services:
       # (OAuth app in Testing mode → only the owner's Gmail can log in; the static
       # bearer is the owner's). Flip to "true" to re-enable the NDA allow-list.
       KB_OAUTH_ENABLED: "true"
-      KB_PUBLIC_URL: "https://www.n3rd-bugs.dev:8803"
+      # Advertised OAuth issuer/endpoints MUST equal the public URL claude.ai uses.
+      # claude.ai's broker refuses the non-standard :8803 port (ISP blocks inbound
+      # 443), so the public front door is a Cloudflare Tunnel terminating at 443 on
+      # kb.n3rd-bugs.dev; cloudflared (host systemd) forwards to the published port
+      # below. Every issuer/PRM/redirect URL therefore renders as https://kb...dev.
+      KB_PUBLIC_URL: "https://kb.n3rd-bugs.dev"
     extra_hosts: ["host.docker.internal:host-gateway"]
     networks: [kbnet]
     restart: unless-stopped
     depends_on: [kb-mcp]   # reuse the built image
+
+  # Cloudflare Tunnel = the public 443 front door for claude.ai. The ISP blocks
+  # inbound 443 and claude.ai's connector broker refuses the non-standard :8803,
+  # so cloudflared dials OUT to Cloudflare's edge, which serves
+  # https://kb.n3rd-bugs.dev (edge TLS) and forwards to kb-mcp-public over kbnet
+  # (tunnel ingress: kb.n3rd-bugs.dev -> http://kb-mcp-public:8321). No inbound
+  # port, no Traefik in this path. TUNNEL_TOKEN (connector token) is gitignored.
+  kb-cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: kb-cloudflared
+    command: ["tunnel", "--no-autoupdate", "run"]
+    env_file: [cloudflared.env]
+    dns: ["1.1.1.1", "8.8.8.8"]   # kbnet's embedded resolver can't reach argotunnel.com (same as kb-traefik)
+    networks: [kbnet]
+    restart: unless-stopped
+    depends_on: [kb-mcp-public]
 
   kb-rest:
     image: kb-app:latest

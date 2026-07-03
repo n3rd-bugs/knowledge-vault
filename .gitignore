@@ -34,5 +34,9 @@ oauth.env
 # TLS / DNS provider credentials (Namecheap API user+key for ACME DNS-01)
 namecheap.txt
 
+# Cloudflare Tunnel token (grants running the named tunnel for the account)
+cloudflare.txt
+cloudflared.env
+
 # Claude Code local session/agent state
 .claude/

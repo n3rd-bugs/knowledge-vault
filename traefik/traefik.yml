@@ -6,6 +6,16 @@ global:
 log:
   level: INFO
 
+# Access log to stdout (docker logs kb-traefik). Temporarily enabled to capture
+# the claude.ai connector's exact request sequence (path/status/User-Agent) so we
+# can see where its OAuth handshake breaks. Safe to remove once diagnosed.
+accessLog:
+  format: common
+  fields:
+    headers:
+      names:
+        User-Agent: keep
+
 # Single public entrypoint: TLS on 8803 (the only forwarded port). All routers
 # on it get a Let's Encrypt cert for the domain via the ACME resolver below.
 entryPoints:

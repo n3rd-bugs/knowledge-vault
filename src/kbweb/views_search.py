@@ -18,7 +18,11 @@ from kbweb.ui import int_param, str_param, templates
 
 
 def index(request: Request) -> Response:  # GET /
-    q = (request.query_params.get("q") or "").strip()
+    q_raw = request.query_params.get("q")
+    q = (q_raw or "").strip()
+    # A submitted-but-blank phrase (q present, empty after strip) must not look
+    # like the fresh landing page — the user asked for something and got nothing.
+    submitted_empty = q_raw is not None and not q
     project = str_param(request, "project")
     domain = str_param(request, "domain")
     type_ = str_param(request, "type", tuple(ITEM_TYPES))
@@ -49,6 +53,9 @@ def index(request: Request) -> Response:  # GET /
         {
             "q": q,
             "hits": hits,
+            "submitted_empty": submitted_empty,
+            # Landing state: offer top tags as starting points instead of a blank page.
+            "top_tags": list_tags(limit=24) if not q else [],
             "projects": projects,
             "domains": sorted({p.domain for p in projects if p.domain}),
             "item_types": ITEM_TYPES,

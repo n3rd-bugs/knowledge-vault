@@ -160,6 +160,24 @@ def test_search_filters_round_trip(client):
     assert client.get("/", params={"q": "widget", "k": "9999"}).status_code == 200
 
 
+def test_empty_query_submit_shows_hint_not_blank_page(client):
+    ingest("emptyq", "note", "landing tag item", "b", tags=["lang:zig"])
+    # submitted empty (q present but blank) → hint, not a silent blank page
+    for qval in ["", "   "]:
+        r = client.get("/", params={"q": qval})
+        assert r.status_code == 200
+        assert "Enter a search phrase" in r.text
+    # fresh landing (no q param at all) → no hint, but tag starting points
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Enter a search phrase" not in r.text
+    assert "browse by tag" in r.text and "lang:zig" in r.text
+    # a real query shows neither landing artifact
+    r = client.get("/", params={"q": "landing tag item"})
+    assert "Enter a search phrase" not in r.text
+    assert "browse by tag" not in r.text
+
+
 def test_tag_page_lists_items(client):
     a = ingest("tagp", "note", "tagged one", "b1", tags=["proto:zeta"])
     ingest("tagp", "note", "untagged", "b2")

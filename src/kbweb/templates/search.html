@@ -53,7 +53,17 @@
   </details>
 </form>
 
+{% if submitted_empty %}
+<p class="status">Enter a search phrase — or browse by
+  <a href="/projects">project</a>, <a href="/timeline">timeline</a>, or a tag below.</p>
+{% endif %}
 {% if q and not hits %}<p>No results for "{{ q }}".</p>{% endif %}
+{% if not q and top_tags %}
+<h4>browse by tag</h4>
+<p class="tag-cloud">
+  {% for t, n in top_tags %}<a class="tag" href="/tags/{{ t }}">{{ t }} ({{ n }})</a>{% endfor %}
+</p>
+{% endif %}
 {% for hit in hits %}
 <article class="hit">
   <div class="prov">{{ hit.provenance_header() }}</div>

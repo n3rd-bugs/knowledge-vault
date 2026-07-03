@@ -5,7 +5,7 @@ gotchas, snippets, specs, runbooks, and bug/fix pairs, serves recall over MCP + 
 with hybrid semantic+keyword search, refines itself nightly, and never loses history (supersede,
 don't delete). Design and rationale live in [PLAN.md](PLAN.md) and [ADVERSARIAL_REVIEW.md](ADVERSARIAL_REVIEW.md).
 
-- **Public HTTPS:** `https://www.n3rd-bugs.dev:8803` — `/mcp` (MCP), `/api` (REST), `/` (web UI)
+- **Public HTTPS (Cloudflare Tunnel, standard 443):** `https://kb.n3rd-bugs.dev/mcp` (MCP, OAuth+bearer) · `https://api.n3rd-bugs.dev/api` (REST) · `https://web.n3rd-bugs.dev` (web UI)
 - **Local (server):** `http://127.0.0.1:8321/mcp`
 - **Auth:** a single bearer token, `KB_TOKEN` in `.env`. Required on every request. Get it with:
   ```bash
@@ -15,7 +15,7 @@ don't delete). Design and rationale live in [PLAN.md](PLAN.md) and [ADVERSARIAL_
 
 > ⚠️ **The public endpoint serves the entire KB — including client/NDA projects — behind this one
 > token.** Anyone with the token has full access. Kill switch (removes all public exposure instantly,
-> data untouched): `docker compose stop kb-traefik`. Restore: `docker compose start kb-traefik`.
+> data untouched): `docker compose stop kb-cloudflared`. Restore: `docker compose start kb-cloudflared`.
 
 ---
 
@@ -31,7 +31,7 @@ claude mcp list          # kb: ... ✔ Connected
 
 **From another machine (laptop, etc.) over the public endpoint:**
 ```bash
-claude mcp add --transport http --scope user kb https://www.n3rd-bugs.dev:8803/mcp \
+claude mcp add --transport http --scope user kb https://kb.n3rd-bugs.dev/mcp \
   --header "Authorization: Bearer <KB_TOKEN>"
 ```
 Then in a session, ask things like *"search kb for SPI polarity"* or *"have we handled MQTT OTA
@@ -39,7 +39,7 @@ anywhere?"* — the model calls the `kb_*` tools. To remove: `claude mcp remove 
 
 ## 2. Add it to claude.ai (web / mobile) as a Custom Connector
 
-claude.ai → **Settings → Connectors → Add custom connector** → URL `https://www.n3rd-bugs.dev:8803/mcp`.
+claude.ai → **Settings → Connectors → Add custom connector** → URL `https://kb.n3rd-bugs.dev/mcp`.
 
 > **Caveat:** claude.ai's connector UI generally expects **OAuth 2.0**, not a static bearer header.
 > If it won't accept the header, the endpoint still works for Claude Code / curl / scripts today; a
@@ -68,16 +68,16 @@ stored data, not instructions.
 
 ## 4. REST API (for scripts, cron, non-MCP agents)
 
-Same bearer, JSON. Base `https://www.n3rd-bugs.dev:8803` (REST/web are reached through Traefik, not
+Same bearer, JSON. Base `https://api.n3rd-bugs.dev` (served through the Cloudflare Tunnel, not
 published to host ports; only `kb-mcp` is also on `127.0.0.1:8321` for local Claude Code).
 ```bash
 H='Authorization: Bearer <KB_TOKEN>'
-curl -H "$H" "https://www.n3rd-bugs.dev:8803/api/search?q=SPI+polarity"
-curl -H "$H" "https://www.n3rd-bugs.dev:8803/api/items/2"
-curl -H "$H" "https://www.n3rd-bugs.dev:8803/api/stats"
+curl -H "$H" "https://api.n3rd-bugs.dev/api/search?q=SPI+polarity"
+curl -H "$H" "https://api.n3rd-bugs.dev/api/items/2"
+curl -H "$H" "https://api.n3rd-bugs.dev/api/stats"
 # write (parity with MCP):
 curl -H "$H" -H 'Content-Type: application/json' -X POST \
-  "https://www.n3rd-bugs.dev:8803/api/items" \
+  "https://api.n3rd-bugs.dev/api/items" \
   -d '{"project":"scratch","type":"note","title":"t","body":"b","tags":["lang:python"]}'
 ```
 Read: `GET /api/{search,items/{id},projects,timeline,similar/{id},trace/{node_id},stats,review}`.
@@ -94,7 +94,7 @@ then the **nightly consolidation (03:30)** runs grounded 14B extraction — surv
 MCP: `kb_ingest_session(project="myproj", transcript="<conversation or memory text>", kind="session"|"memory", repo?, branch?, commit?)`
 ```bash
 curl -H "Authorization: Bearer <KB_TOKEN>" -H 'Content-Type: application/json' -X POST \
-  "https://www.n3rd-bugs.dev:8803/api/ingest-session" \
+  "https://api.n3rd-bugs.dev/api/ingest-session" \
   -d '{"project":"myproj","kind":"session","transcript":"User: ... Assistant: ..."}'
 # → 202 {"queue_id": N, "duplicate": false}
 ```
@@ -107,7 +107,7 @@ curl -H "Authorization: Bearer <KB_TOKEN>" -H 'Content-Type: application/json' -
 
 ## 6. Web UI (read-only)
 
-`https://www.n3rd-bugs.dev:8803/` → log in with the bearer token. Views: search, item (`/item/{id}`),
+`https://web.n3rd-bugs.dev/` → log in with the bearer token. Views: search, item (`/item/{id}`),
 timeline, `/trace/{id}`, `/similar/{id}`, `/stats`. Strictly read-only — no writes from the browser.
 
 ## 7. CLI (`kb`, on the server)
@@ -120,31 +120,31 @@ timeline, `/trace/{id}`, `/similar/{id}`, `/stats`. Strictly read-only — no wr
 
 **Services** — HTTP tier is Docker; workers are systemd:
 ```bash
-docker compose ps                      # kb-db, kb-mcp, kb-rest, kb-web, kb-traefik
+docker compose ps                      # kb-db, kb-mcp, kb-mcp-public, kb-rest, kb-web, kb-cloudflared
 systemctl --user status kb-worker      # inbox watcher + daily repo docs scan
 systemctl --user status kb-consolidate.timer   # nightly refine + backup at 03:30
 ```
 - **Rebuild/redeploy after a code change:** `docker compose build kb-mcp && docker compose up -d`
-- **Kill switch (public off):** `docker compose stop kb-traefik`
+- **Kill switch (public off):** `docker compose stop kb-cloudflared`
 - **Logs:** `docker logs kb-mcp` · `journalctl --user -u kb-consolidate -f`
 - **Backups:** `make backup` (pg_dump | zstd, `chmod 600`, under `~/kb/backups`, pruned 14 daily +
   8 weekly). Restore drill: `bash scripts/restore_test.sh` (restores newest dump into a throwaway
   container, asserts counts, PASS/FAIL).
 - **DB migrations:** `make migrate` (additive; runs `migrations/*.sql` in order).
-- **Config:** everything via `.env` (see `.env.example`). Never commit `.env`, `traefik.env`,
-  `traefik/acme.json`.
+- **Config:** everything via `.env` (see `.env.example`). Never commit `.env`, `oauth.env`, `cloudflared.env`,
+  `cloudflare.txt`, `google.txt`.
 
-**TLS:** Let's Encrypt via **DNS-01 (Namecheap provider)**, auto-renewed by Traefik. The cert lives
-in `traefik/acme.json`. Only port **8803** is public; 80/443 are not forwarded.
+**TLS:** terminated at the **Cloudflare edge**; `cloudflared` dials OUT to Cloudflare, so **no
+inbound port is forwarded at all** (the old `:8803`/Traefik/Let's Encrypt stack is retired).
 
 ## 9. Security model (summary)
 
-- One static bearer on every surface; loopback + the single Traefik TLS endpoint are the only
-  listeners (no service binds `0.0.0.0` except inside a container behind Traefik).
+- One static bearer on every surface (the public MCP also accepts Google OAuth); loopback + the
+  outbound Cloudflare Tunnel are the only paths in (no host port is exposed at all).
 - Secrets scrubbed on every ingest (AWS/GitHub/OpenAI keys, private keys, JWTs, `password=…`).
 - Automatic/remote extraction is `trust='unverified'`, quote-grounded, and review-gated — it can
   contribute knowledge but never poison the `verified` tier.
-- Nightly-only 14B extractor (GPU courtesy); Traefik rate-limits the public endpoint.
+- Nightly-only 14B extractor (GPU courtesy); Cloudflare's edge fronts the public hostnames.
 - **Recommended hardening:** a per-project `projects.public` allow-list so NDA/client projects can
   be withheld from the public surface while local/REST keeps full access (see PLAN.md §6e).
 

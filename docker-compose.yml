@@ -126,19 +126,11 @@ services:
     restart: unless-stopped
     depends_on: [kb-mcp]
 
-  kb-traefik:
-    image: traefik:v3.2
-    container_name: kb-traefik
-    env_file: [traefik.env]   # NAMECHEAP_API_USER / NAMECHEAP_API_KEY (gitignored)
-    dns: ["1.1.1.1", "8.8.8.8"]   # containers lack working external DNS; ACME needs it
-    ports: ["8803:8803"]      # the ONLY public port (forwarded on the router)
-    volumes:
-      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
-      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
-      - ./traefik/acme.json:/acme/acme.json
-    networks: [kbnet]
-    restart: unless-stopped
-    depends_on: [kb-mcp-public, kb-rest, kb-web]
+  # kb-traefik (the :8803 host listener) was RETIRED 2026-07: the Cloudflare
+  # Tunnel serves everything on standard 443 — kb.n3rd-bugs.dev (MCP),
+  # web.n3rd-bugs.dev (UI), api.n3rd-bugs.dev (REST) — with edge TLS, so no
+  # inbound port, no Let's Encrypt/Namecheap ACME to maintain. Kill switch is
+  # now `docker compose stop kb-cloudflared`.
 
 volumes:
   kbdata:

@@ -20,7 +20,7 @@ if [ ! -f "$CFG" ]; then
     MODE="LOCAL enqueue via $KB_DIR_GUESS"
   else
     { echo "# KB session-flush (REMOTE) — set KB_TOKEN and confirm the URL:"
-      echo "KB_REST_URL=https://www.n3rd-bugs.dev:8803"
+      echo "KB_REST_URL=https://api.n3rd-bugs.dev"
       echo "KB_TOKEN="; } >"$CFG"
     MODE="REMOTE — edit $CFG (set KB_TOKEN) then re-run"
   fi

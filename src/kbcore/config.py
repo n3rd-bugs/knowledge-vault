@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     # OAuth (for claude.ai web/mobile connectors). When enabled the public MCP
     # instance accepts BOTH Google OAuth and the static bearer (MultiAuth).
     kb_oauth_enabled: bool = False
-    kb_public_url: str = "https://www.n3rd-bugs.dev:8803"  # base URL for OAuth metadata/redirects
+    kb_public_url: str = "https://kb.n3rd-bugs.dev"  # base URL for OAuth metadata/redirects
     google_client_id: str = ""
     google_client_secret: str = ""
     ollama_url: str = "http://127.0.0.1:11434"

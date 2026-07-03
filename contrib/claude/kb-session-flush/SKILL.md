@@ -30,10 +30,10 @@ Two modes, auto-detected by `install.sh`:
 
 2. Read the printed `mode:` line.
    - If it says **REMOTE**, the KB isn't local. Ask the user for the KB REST base
-     URL (default `https://www.n3rd-bugs.dev:8803`) and a bearer token, then write
+     URL (default `https://api.n3rd-bugs.dev`) and a bearer token, then write
      them into `~/.claude/kb-flush.env` (`chmod 600`), e.g.:
      ```
-     KB_REST_URL=https://www.n3rd-bugs.dev:8803
+     KB_REST_URL=https://api.n3rd-bugs.dev
      KB_TOKEN=<the KB bearer token>
      ```
    - If **LOCAL**, nothing more to configure.

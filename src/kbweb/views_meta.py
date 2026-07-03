@@ -1,4 +1,4 @@
-"""kbweb.views_meta — projects, stats, review (read-only, Inv. 11).
+"""kbweb.views_meta — projects, dashboard, review viewer (read-only, Inv. 11).
 
 ``list_open_review`` is a pure read (the review WRITE functions — promote,
 reject, resolve_via_supersede — are never imported here; the per-module
@@ -14,9 +14,13 @@ from starlette.routing import Route
 from kbcore.browse import list_tags
 from kbcore.errors import NotFound
 from kbcore.items import list_projects, timeline
-from kbcore.render import render_stats
+from kbcore.review import list_open_review
 from kbcore.stats import stats
+from kbweb.charts import bar_rows, stacked_segments
 from kbweb.ui import templates
+
+_STATUS_ORDER = ("active", "superseded", "duplicate", "archived")
+_TRUST_ORDER = ("verified", "unverified")
 
 
 def projects_view(request: Request) -> Response:  # GET /projects
@@ -41,12 +45,28 @@ def project_view(request: Request) -> Response:  # GET /project/{name}
     )
 
 
-def stats_view(request: Request) -> Response:  # GET /stats
-    return templates.TemplateResponse(request, "stats.html", {"stats_text": render_stats(stats())})
+def stats_view(request: Request) -> Response:  # GET /stats — the dashboard
+    s = stats()
+    return templates.TemplateResponse(
+        request,
+        "stats.html",
+        {
+            "s": s,
+            "type_rows": bar_rows(s["by_type"]),
+            "project_rows": bar_rows(s["by_project"], href_fmt="/project/{}"),
+            "status_segs": stacked_segments(s["by_status"], _STATUS_ORDER),
+            "trust_segs": stacked_segments(s["by_trust"], _TRUST_ORDER),
+        },
+    )
+
+
+def review_view(request: Request) -> Response:  # GET /review — list only, no actions
+    return templates.TemplateResponse(request, "review.html", {"entries": list_open_review()})
 
 
 ROUTES = [
     Route("/projects", projects_view),
     Route("/project/{name}", project_view),
     Route("/stats", stats_view),
+    Route("/review", review_view),
 ]

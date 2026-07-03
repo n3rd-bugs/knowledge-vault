@@ -1,0 +1,23 @@
+{# Bar-chart macros — see kbweb.charts for the row builders. Labels and counts
+   are real text (table view for free); fills carry a native title tooltip. #}
+
+{% macro bar_list(rows) %}
+<div class="bars">
+  {% for r in rows %}
+  <div class="bar-row" title="{{ r.label }}: {{ r.count }}">
+    <span class="lbl">{% if r.href %}<a href="{{ r.href }}">{{ r.label }}</a>{% else %}{{ r.label }}{% endif %}</span>
+    <span class="track"><span class="fill" style="width: {{ r.pct }}%"></span></span>
+    <span class="n">{{ r.count }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro stacked(segs) %}
+<div class="stack-bar">
+  {% for s in segs %}<span class="seg {{ s.label }}" style="width: {{ s.pct }}%" title="{{ s.label }}: {{ s.count }}"></span>{% endfor %}
+</div>
+<div class="stack-legend">
+  {% for s in segs %}<span><span class="dot {{ s.label }}"></span>{{ s.label }} <b>{{ s.count }}</b></span>{% endfor %}
+</div>
+{% endmacro %}

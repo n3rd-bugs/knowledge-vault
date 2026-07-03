@@ -1,6 +1,44 @@
 {% extends "base.html" %}
-{% block title %}Stats · Knowledge Vault{% endblock %}
+{% from "partials/_bars.html" import bar_list, stacked %}
+{% block title %}Dashboard · Knowledge Vault{% endblock %}
 {% block content %}
-<h2>Corpus stats</h2>
-<pre class="stats">{{ stats_text }}</pre>
+<h2>Dashboard</h2>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="n">{{ s.items_total }}</div><div class="l">items</div></div>
+  <div class="kpi"><div class="n">{{ s.chunks }}</div><div class="l">chunks</div></div>
+  <div class="kpi"><div class="n">{{ s.entities }}</div><div class="l">entities</div></div>
+  <div class="kpi"><div class="n">{{ s.relations }}</div><div class="l">relations</div></div>
+  <a class="kpi" href="/review" style="text-decoration:none">
+    <div class="n">{{ s.review_queue_open }}</div><div class="l">review open →</div>
+  </a>
+  <div class="kpi"><div class="n">{{ s.ingest_queue_pending }}</div><div class="l">queue pending</div></div>
+</div>
+
+<div class="grid-cards">
+  <div class="card">
+    <h4 style="margin:.1rem 0 .4rem">by status</h4>
+    {{ stacked(status_segs) }}
+  </div>
+  <div class="card">
+    <h4 style="margin:.1rem 0 .4rem">by trust</h4>
+    {{ stacked(trust_segs) }}
+  </div>
+</div>
+
+<div class="card">
+  <h4 style="margin:.1rem 0 .4rem">items by type</h4>
+  {{ bar_list(type_rows) }}
+</div>
+
+<div class="card">
+  <h4 style="margin:.1rem 0 .4rem">items by project</h4>
+  {{ bar_list(project_rows) }}
+</div>
+
+<footer class="page">
+  embed model <span class="mono">{{ s.embed_model }}</span>
+  · last consolidation
+  {% if s.last_consolidation %}<time>{{ s.last_consolidation[:19] }}</time>{% else %}never{% endif %}
+</footer>
 {% endblock %}

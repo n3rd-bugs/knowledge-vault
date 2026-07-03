@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Review queue · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Review queue</h2>
+<p class="prov">Read-only view. Resolve entries with the <span class="mono">kb review</span> CLI
+  or the <span class="mono">kb_review_resolve</span> MCP tool.</p>
+
+{% if not entries %}<p>Nothing awaiting review. ✨</p>{% endif %}
+{% for e in entries %}
+<div class="card">
+  <div>
+    <span class="rel" style="border-color: var(--warn); color: var(--warn);
+                             font-size:.72rem; border:1px solid; border-radius:99px;
+                             padding:.02rem .5rem;">{{ e.reason }}</span>
+    {% if e.trust %}<span class="badge {{ e.trust }}">{{ e.trust }}</span>{% endif %}
+    {% if e.status and e.status != 'active' %}<span class="badge {{ e.status }}">{{ e.status }}</span>{% endif %}
+    <span class="prov">queue #{{ e.queue_id }}</span>
+  </div>
+  {% if e.item_id %}
+  <h3 style="margin:.3rem 0"><a href="/item/{{ e.item_id }}">{{ e.title or ('item ' ~ e.item_id) }}</a></h3>
+  {% elif e.title %}
+  <h3 style="margin:.3rem 0">{{ e.title }}</h3>
+  {% endif %}
+  {% if e.detail %}
+  <dl class="meta-grid">
+    {% for k, v in e.detail.items() %}
+    <dt>{{ k }}</dt><dd>{{ v }}</dd>
+    {% endfor %}
+  </dl>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

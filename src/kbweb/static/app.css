@@ -17,6 +17,13 @@
   --warn: #b26b00;
   --bad: #c0392b;
   --viz-bar: #2a78d6;
+  /* Status-segment fills — validated (dataviz six-checks) against the light
+     surface; the two grays are neutral-by-design (duplicate/archived) and are
+     always paired with a text legend + 2px gaps (identity never color-alone). */
+  --seg-active: #0d8a3f;
+  --seg-superseded: #b26b00;
+  --seg-duplicate: #5f6672;
+  --seg-archived: #8a92a0;
   --radius: 10px;
   --shadow: 0 1px 2px rgb(0 0 0 / 6%), 0 2px 8px rgb(0 0 0 / 4%);
 }
@@ -34,6 +41,10 @@
   --warn: #d99a3d;
   --bad: #e06c5b;
   --viz-bar: #3987e5;
+  --seg-active: #2fa35c;
+  --seg-superseded: #bd7c28;
+  --seg-duplicate: #8b95a5;
+  --seg-archived: #6b7280;
   --shadow: 0 1px 2px rgb(0 0 0 / 40%);
 }
 @media (prefers-color-scheme: dark) {
@@ -51,6 +62,10 @@
     --warn: #d99a3d;
     --bad: #e06c5b;
     --viz-bar: #3987e5;
+    --seg-active: #2fa35c;
+    --seg-superseded: #bd7c28;
+    --seg-duplicate: #8b95a5;
+    --seg-archived: #6b7280;
     --shadow: 0 1px 2px rgb(0 0 0 / 40%);
   }
 }
@@ -188,12 +203,12 @@ blockquote.quote { border-left: 3px solid var(--accent); margin: .3rem 0; paddin
              margin: .35rem 0 .2rem; }
 .stack-bar .seg { height: 100%; }
 .stack-legend { font-size: .8rem; color: var(--ink-2); display: flex; gap: 1rem; flex-wrap: wrap; }
-.seg.active, .dot.active { background: var(--good); }
-.seg.superseded, .dot.superseded { background: var(--warn); }
-.seg.duplicate, .dot.duplicate { background: var(--muted); }
-.seg.archived, .dot.archived { background: var(--border); }
-.seg.verified, .dot.verified { background: var(--good); }
-.seg.unverified, .dot.unverified { background: var(--warn); }
+.seg.active, .dot.active { background: var(--seg-active); }
+.seg.superseded, .dot.superseded { background: var(--seg-superseded); }
+.seg.duplicate, .dot.duplicate { background: var(--seg-duplicate); }
+.seg.archived, .dot.archived { background: var(--seg-archived); }
+.seg.verified, .dot.verified { background: var(--seg-active); }
+.seg.unverified, .dot.unverified { background: var(--seg-superseded); }
 .dot { display: inline-block; width: .65rem; height: .65rem; border-radius: 3px;
        margin-right: .3rem; vertical-align: baseline; }
 

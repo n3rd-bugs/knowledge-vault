@@ -197,3 +197,54 @@ def test_timeline_date_and_limit_controls(client):
     assert r.status_code == 200
     assert "timeline entry" in r.text
     assert 'value="50" selected' in r.text
+
+
+# --- web-4: dashboard + review viewer -----------------------------------------------
+
+
+def test_bar_rows_percentages_and_folding():
+    from kbweb.charts import bar_rows
+
+    rows = bar_rows({"a": 10, "b": 5, "c": 1})
+    assert rows[0].label == "a" and rows[0].pct == 100.0
+    assert rows[1].pct == 50.0
+    folded = bar_rows({f"p{i}": i + 1 for i in range(15)}, max_rows=12)
+    assert len(folded) == 13
+    assert folded[-1].label == "(3 more)" and folded[-1].href is None
+    assert folded[-1].count == 1 + 2 + 3
+    linked = bar_rows({"proj": 3}, href_fmt="/project/{}")
+    assert linked[0].href == "/project/proj"
+
+
+def test_stacked_segments_sum_and_order():
+    from kbweb.charts import stacked_segments
+
+    segs = stacked_segments(
+        {"superseded": 1, "active": 3, "weird": 1}, ("active", "superseded", "archived")
+    )
+    assert [s.label for s in segs] == ["active", "superseded", "weird"]  # order + unknown appended
+    assert abs(sum(s.pct for s in segs) - 100.0) < 0.5
+    assert stacked_segments({}, ("active",)) == []
+
+
+def test_stats_dashboard_smoke(client):
+    ingest("dashp", "gotcha", "dash item", "b")
+    r = client.get("/stats")
+    assert r.status_code == 200
+    assert "kpi-grid" in r.text and "bar-row" in r.text and "stack-bar" in r.text
+    assert 'href="/project/dashp"' in r.text  # project bars link through
+    assert "width:" in r.text.replace(" ", "")  # server-computed fill widths
+
+
+def test_review_page_lists_entries_and_has_no_forms(client):
+    from kbcore.review import queue_review
+
+    item = ingest("revweb", "note", "needs review title", "b", trust="unverified")
+    queue_review(item, "unverified_extraction", {"rejected_count": 2})
+    r = client.get("/review")
+    assert r.status_code == 200
+    assert "needs review title" in r.text
+    assert "unverified_extraction" in r.text
+    assert "rejected_count" in r.text
+    # Read-only viewer: no write controls of any kind.
+    assert "<form" not in r.text

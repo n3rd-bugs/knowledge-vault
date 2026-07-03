@@ -35,6 +35,10 @@ class Settings(BaseSettings):
     kb_port: int = 8321
     kb_rest_port: int = 8322
     kb_web_port: int = 8323
+    # Google sign-in for the read-only web UI (kbweb): comma-separated allowlist
+    # of emails and the public base URL used to build the OAuth redirect_uri.
+    kb_web_allowed_emails: str = ""
+    kb_web_public_url: str = "https://web.n3rd-bugs.dev"
     # Containerized runs bind 0.0.0.0 (container-private, fronted by Traefik/TLS);
     # set true only there. The default still refuses accidental host-public binds.
     kb_allow_any_bind: bool = False
@@ -96,6 +100,11 @@ class Settings(BaseSettings):
     def git_repos(self) -> list[Path]:
         """`KB_GIT_REPOS` parsed as a colon-separated list of repo paths."""
         return [Path(p.strip()).expanduser() for p in self.kb_git_repos.split(":") if p.strip()]
+
+    @property
+    def web_allowed_emails(self) -> list[str]:
+        """`KB_WEB_ALLOWED_EMAILS` parsed as a lowercased comma-separated list."""
+        return [e.strip().lower() for e in self.kb_web_allowed_emails.split(",") if e.strip()]
 
 
 @lru_cache

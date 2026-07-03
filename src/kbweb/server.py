@@ -10,6 +10,7 @@ cookie; unauthenticated requests are redirected to /login. Run:
 from __future__ import annotations
 
 import logging
+import secrets
 from pathlib import Path
 
 from starlette.applications import Starlette
@@ -34,11 +35,11 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 
 class SessionAuthMiddleware(BaseHTTPMiddleware):
-    """Redirect any unauthenticated request to /login (except /login and /static)."""
+    """Redirect unauthenticated requests to /login (except /login, /static, /auth/google)."""
 
     async def dispatch(self, request, call_next):
         path = request.url.path
-        if path == "/login" or path.startswith("/static"):
+        if path == "/login" or path.startswith("/static") or path.startswith("/auth/google"):
             return await call_next(request)
         if not auth.cookie_valid(request.cookies.get(auth.COOKIE)):
             return RedirectResponse("/login", status_code=302)
@@ -111,6 +112,48 @@ async def login(request):  # GET shows form, POST checks token
     return templates.TemplateResponse(request, "login.html", {"error": error}, status_code=status)
 
 
+def _issue_session(location: str) -> RedirectResponse:
+    """A redirect that also sets the signed session cookie (shared by both logins)."""
+    resp = RedirectResponse(location, status_code=303)
+    resp.set_cookie(
+        auth.COOKIE, auth.issue_cookie(), httponly=True, samesite="lax", max_age=auth.MAX_AGE
+    )
+    return resp
+
+
+async def google_login(request):  # GET /auth/google/login
+    # Random per-request state, signed into a short-lived cookie; the same value
+    # travels to Google in the URL and comes back in the callback (CSRF guard).
+    state = secrets.token_urlsafe(24)
+    resp = RedirectResponse(auth.google_login_url(state), status_code=302)
+    resp.set_cookie(
+        auth.STATE_COOKIE,
+        auth.issue_state(state),
+        httponly=True,
+        samesite="lax",
+        max_age=auth.STATE_MAX_AGE,
+    )
+    return resp
+
+
+async def google_callback(request):  # GET /auth/google/callback
+    state = request.query_params.get("state") or ""
+    code = request.query_params.get("code") or ""
+    if not code or not auth.state_ok(request.cookies.get(auth.STATE_COOKIE), state):
+        log.warning("google callback rejected: missing code or state mismatch")
+    else:
+        email = auth.exchange_google_code(code)
+        if email and auth.email_allowed(email):
+            resp = _issue_session("/")
+            resp.delete_cookie(auth.STATE_COOKIE)
+            return resp
+        log.warning("google callback rejected: email not allowed or exchange failed: %r", email)
+    # Never surface the email/token to the client — a generic message only.
+    return templates.TemplateResponse(
+        request, "login.html", {"error": "Google sign-in was not accepted."}, status_code=403
+    )
+
+
 def _not_found(request, exc) -> Response:
     return HTMLResponse("<h1>404 — not found</h1><p><a href='/'>search</a></p>", status_code=404)
 
@@ -122,6 +165,8 @@ def _bad_request(request, exc) -> Response:
 ROUTES = [
     Route("/", index),
     Route("/login", login, methods=["GET", "POST"]),
+    Route("/auth/google/login", google_login),
+    Route("/auth/google/callback", google_callback),
     Route("/item/{item_id:int}", item_view),
     Route("/timeline", timeline_view),
     Route("/trace/{node_id:int}", trace_view),

@@ -99,13 +99,18 @@ services:
     image: kb-app:latest
     container_name: kb-web
     command: ["python", "-m", "kbweb.server"]
-    env_file: [.env]
+    env_file: [.env, oauth.env]   # oauth.env: GOOGLE_CLIENT_ID/SECRET for web "Sign in with Google"
     environment:
       KB_DB_URL: postgresql://kb@db:5432/kb
       OLLAMA_URL: http://host.docker.internal:11434
       KB_BIND: 0.0.0.0
       KB_WEB_PORT: "8323"
       KB_ALLOW_ANY_BIND: "true"
+      # Public read-only UI, served on 443 via the Cloudflare Tunnel
+      # (web.n3rd-bugs.dev -> kb-web:8323). Google login is gated by this
+      # allowlist; the KB_TOKEN form login remains as an owner fallback.
+      KB_WEB_PUBLIC_URL: "https://web.n3rd-bugs.dev"
+      KB_WEB_ALLOWED_EMAILS: "mirzaon@gmail.com"
     extra_hosts: ["host.docker.internal:host-gateway"]
     networks: [kbnet]
     restart: unless-stopped

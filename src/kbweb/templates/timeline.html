@@ -6,6 +6,15 @@
   <datalist id="projects">
     {% for p in projects %}<option value="{{ p.name }}">{% endfor %}
   </datalist>
+  <label class="f">from <input type="date" name="from" value="{{ f_from or '' }}"></label>
+  <label class="f">to <input type="date" name="to" value="{{ f_to or '' }}"></label>
+  <label class="f">limit
+    <select name="limit">
+      {% for n in [50, 100, 200, 500] %}
+      <option value="{{ n }}" {% if f_limit == n %}selected{% endif %}>{{ n }}</option>
+      {% endfor %}
+    </select>
+  </label>
   <button type="submit">Show</button>
 </form>
 {% if project and not entries %}<p>No items in "{{ project }}".</p>{% endif %}

@@ -141,3 +141,59 @@ def test_item_refs_public_scope(kb, monkeypatch):
     refs = browse.item_refs([pub, priv])
     assert pub in refs
     assert priv not in refs, "withheld id must be absent (no existence leak)"
+
+
+# --- web-3: search filters, tags, projects ----------------------------------------
+
+
+def test_search_filters_round_trip(client):
+    ingest("filt-a", "gotcha", "shared phrase gotcha", "the widget needs SPI mode 1")
+    ingest("filt-b", "note", "shared phrase note", "the widget needs SPI mode 1 too")
+    r = client.get("/", params={"q": "widget SPI", "type": "gotcha", "k": 25})
+    assert r.status_code == 200
+    assert "shared phrase gotcha" in r.text
+    assert "shared phrase note" not in r.text, "type filter must narrow"
+    # selections re-render (shareable URL keeps its state)
+    assert 'value="gotcha" selected' in r.text
+    assert 'value="25" selected' in r.text
+    # out-of-range k clamps instead of erroring
+    assert client.get("/", params={"q": "widget", "k": "9999"}).status_code == 200
+
+
+def test_tag_page_lists_items(client):
+    a = ingest("tagp", "note", "tagged one", "b1", tags=["proto:zeta"])
+    ingest("tagp", "note", "untagged", "b2")
+    r = client.get("/tags/proto:zeta")
+    assert r.status_code == 200
+    assert "tagged one" in r.text and f"/item/{a}" in r.text
+    assert "untagged" not in r.text
+
+
+def test_tag_page_public_scope(client, monkeypatch):
+    set_project("tpub", public=True)
+    set_project("tpriv", public=False)
+    ingest("tpub", "note", "public tagged", "p", tags=["scope:tag"])
+    ingest("tpriv", "note", "NDA SECRET tagged", "s", tags=["scope:tag"])
+    monkeypatch.setattr(settings, "kb_public_only", True)
+    r = client.get("/tags/scope:tag")
+    assert "public tagged" in r.text
+    assert "NDA SECRET tagged" not in r.text
+
+
+def test_projects_and_project_pages(client):
+    ingest("projpage", "note", "proj item one", "b")
+    r = client.get("/projects")
+    assert r.status_code == 200
+    assert "projpage" in r.text
+    r = client.get("/project/projpage")
+    assert r.status_code == 200
+    assert "proj item one" in r.text  # recent timeline entry
+    assert client.get("/project/does-not-exist").status_code == 404
+
+
+def test_timeline_date_and_limit_controls(client):
+    ingest("tlweb", "note", "timeline entry", "b")
+    r = client.get("/timeline", params={"project": "tlweb", "limit": 50, "from": "2000-01-01"})
+    assert r.status_code == 200
+    assert "timeline entry" in r.text
+    assert 'value="50" selected' in r.text

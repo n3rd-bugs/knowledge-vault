@@ -20,13 +20,25 @@ def item_view(request: Request) -> Response:  # GET /item/{item_id}
     )
 
 
-def timeline_view(request: Request) -> Response:  # GET /timeline?project=
+def timeline_view(request: Request) -> Response:  # GET /timeline?project=&from=&to=&limit=
     project = (request.query_params.get("project") or "").strip()
-    entries = timeline(project, limit=100) if project else []
+    limit = int_param(request, "limit", 100, 1, 500)
+    from_date = str_param(request, "from")
+    to_date = str_param(request, "to")
+    entries = (
+        timeline(project, from_date=from_date, to_date=to_date, limit=limit) if project else []
+    )
     return templates.TemplateResponse(
         request,
         "timeline.html",
-        {"project": project, "entries": entries, "projects": list_projects()},
+        {
+            "project": project,
+            "entries": entries,
+            "projects": list_projects(),
+            "f_from": from_date or "",
+            "f_to": to_date or "",
+            "f_limit": limit,
+        },
     )
 
 

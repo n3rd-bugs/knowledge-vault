@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Projects · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Projects</h2>
+<div class="grid-cards">
+  {% for p in projects %}
+  <div class="card">
+    <h3 style="margin:.1rem 0 .3rem"><a href="/project/{{ p.name }}">{{ p.name }}</a></h3>
+    <div>
+      {% if p.domain %}<span class="tag">{{ p.domain }}</span>{% endif %}
+      {% if p.public %}<span class="badge verified">public</span>{% endif %}
+      {% if p.archived %}<span class="badge archived">archived</span>{% endif %}
+    </div>
+    {% if p.description %}<p class="snippet">{{ p.description }}</p>{% endif %}
+    <div class="prov">
+      {{ p.item_count }} item{{ 's' if p.item_count != 1 }}
+      {% if p.last_activity %} · last activity <time>{{ p.last_activity.date().isoformat() }}</time>{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

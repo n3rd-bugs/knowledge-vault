@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}{{ p.name }} · Knowledge Vault{% endblock %}
+{% block content %}
+<div class="card">
+  <h2 style="margin:.1rem 0 .3rem">{{ p.name }}</h2>
+  <div>
+    {% if p.domain %}<span class="tag">{{ p.domain }}</span>{% endif %}
+    {% if p.public %}<span class="badge verified">public</span>{% endif %}
+    {% if p.archived %}<span class="badge archived">archived</span>{% endif %}
+  </div>
+  {% if p.description %}<p class="snippet">{{ p.description }}</p>{% endif %}
+  <div class="prov">
+    {{ p.item_count }} item{{ 's' if p.item_count != 1 }}
+    {% if p.last_activity %} · last activity <time>{{ p.last_activity.date().isoformat() }}</time>{% endif %}
+  </div>
+  {% if p.repos %}
+  <div class="anchor">{% for r in p.repos %}{{ r }}{% if not loop.last %} · {% endif %}{% endfor %}</div>
+  {% endif %}
+</div>
+
+{% if tags %}
+<h4>tags</h4>
+<p class="tag-cloud">
+  {% for t, n in tags %}
+  <a class="tag" href="/tags/{{ t }}?project={{ p.name }}">{{ t }} ({{ n }})</a>
+  {% endfor %}
+</p>
+{% endif %}
+
+<h4>recent items</h4>
+{% for e in entries %}
+<div class="tl">
+  <time>{{ e.created_at.date().isoformat() }}</time>
+  <a href="/item/{{ e.item_id }}">id {{ e.item_id }}</a> ·
+  {{ e.type }}{% if e.status != 'active' %} <span class="badge {{ e.status }}">{{ e.status }}</span>{% endif %} · {{ e.title }}
+</div>
+{% endfor %}
+<p><a href="/timeline?project={{ p.name }}">full timeline →</a></p>
+{% endblock %}

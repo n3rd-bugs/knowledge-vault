@@ -1,10 +1,58 @@
 {% extends "base.html" %}
 {% block title %}Search · Knowledge Vault{% endblock %}
 {% block content %}
-<form method="get" action="/" class="bar">
-  <input type="search" name="q" value="{{ q }}" placeholder="search the knowledge base" autofocus>
-  <button type="submit">Search</button>
+<form method="get" action="/" class="bar" style="flex-direction: column; align-items: stretch;">
+  <div style="display:flex; gap:.5rem; align-items:center;">
+    <input type="search" name="q" value="{{ q }}" placeholder="search the knowledge base" autofocus>
+    <button type="submit">Search</button>
+  </div>
+  <details class="filters" {% if f_project or f_domain or f_type or f_tag or f_superseded or f_archived %}open{% endif %}>
+    <summary>Filters</summary>
+    <div class="grid">
+      <label class="f">project
+        <select name="project">
+          <option value="">all projects</option>
+          {% for p in projects %}
+          <option value="{{ p.name }}" {% if f_project == p.name %}selected{% endif %}>{{ p.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="f">domain
+        <select name="domain">
+          <option value="">all domains</option>
+          {% for d in domains %}
+          <option value="{{ d }}" {% if f_domain == d %}selected{% endif %}>{{ d }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="f">type
+        <select name="type">
+          <option value="">all types</option>
+          {% for t in item_types %}
+          <option value="{{ t }}" {% if f_type == t %}selected{% endif %}>{{ t }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="f">tag
+        <input type="text" name="tag" value="{{ f_tag or '' }}" placeholder="lang:python">
+      </label>
+      <label class="f">results
+        <select name="k">
+          {% for n in [10, 25, 50] %}
+          <option value="{{ n }}" {% if f_k == n %}selected{% endif %}>{{ n }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="f">include
+        <span>
+          <label><input type="checkbox" name="superseded" value="1" {% if f_superseded %}checked{% endif %}> superseded</label>
+          <label><input type="checkbox" name="archived" value="1" {% if f_archived %}checked{% endif %}> archived</label>
+        </span>
+      </label>
+    </div>
+  </details>
 </form>
+
 {% if q and not hits %}<p>No results for "{{ q }}".</p>{% endif %}
 {% for hit in hits %}
 <article class="hit">
@@ -18,7 +66,7 @@
       → superseded by id {{ hit.superseded_by }}{% endif %}</div>
   {% endif %}
   {% if hit.code_ref %}<div class="anchor">{{ hit.code_ref.render() }}</div>{% endif %}
-  {% if hit.tags %}<div>{% for t in hit.tags %}<span class="tag">{{ t }}</span> {% endfor %}</div>{% endif %}
+  {% if hit.tags %}<div>{% for t in hit.tags %}<a class="tag" href="/tags/{{ t }}">{{ t }}</a>{% endfor %}</div>{% endif %}
   <p class="snippet">{{ hit.snippet }}</p>
 </article>
 {% endfor %}

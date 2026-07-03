@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}#{{ tag }} · Knowledge Vault{% endblock %}
+{% block content %}
+<h2><span class="tag" style="font-size:1rem">{{ tag }}</span>{% if project %} in {{ project }}{% endif %}</h2>
+
+{% if not items %}<p>No items carry this tag.</p>{% endif %}
+{% for it in items %}
+<div class="rel-card">
+  <a href="/item/{{ it.item_id }}">{{ it.type }} · {{ it.title }}</a>
+  {% if it.status != 'active' %}<span class="badge {{ it.status }}">{{ it.status }}</span>{% endif %}
+  <span class="prov">id {{ it.item_id }}</span>
+</div>
+{% endfor %}
+
+{% if top_tags %}
+<h4>other tags</h4>
+<p class="tag-cloud">
+  {% for t, n in top_tags %}
+  <a class="tag" href="/tags/{{ t }}{% if project %}?project={{ project }}{% endif %}">{{ t }} ({{ n }})</a>
+  {% endfor %}
+</p>
+{% endif %}
+{% endblock %}

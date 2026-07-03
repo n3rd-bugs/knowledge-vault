@@ -55,7 +55,9 @@ class Settings(BaseSettings):
     kb_embed_model: str = "bge-m3"
     kb_embed_dim: int = 1024
     kb_embed_device: str = "auto"
-    kb_extract_model: str = "qwen2.5:14b-instruct-q4_K_M"
+    # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity,
+    # 100% verbatim grounding. gemma3:12b is the approved fast fallback.
+    kb_extract_model: str = "qwen3:14b"
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")

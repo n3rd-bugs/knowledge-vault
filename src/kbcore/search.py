@@ -14,6 +14,7 @@ import re
 from typing import Any
 
 from kbcore import embed as embed_mod
+from kbcore import scope
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.models import CodeRef, SearchHit
@@ -101,6 +102,9 @@ def search(
         statuses.append("archived")
 
     where, params = _filters(project, domain, type, tags, statuses)
+    # Public-only instance: both legs JOIN projects p, so restrict to public ones.
+    if scope.public_only():
+        where = f"{where} AND p.public IS TRUE"
 
     with connect() as conn:
         vec_rows = _vector_leg(conn, query, where, params)

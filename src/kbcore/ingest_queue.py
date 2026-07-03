@@ -13,6 +13,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.scrub import scrub
@@ -46,6 +47,8 @@ def enqueue(
         raise InvalidOperation("project is required")
     if project.strip() in RESERVED_PROJECTS:
         raise InvalidOperation(f"project {project!r} is reserved and cannot be targeted remotely")
+    # Public-only instance: only public projects accept submissions.
+    scope.assert_writable(project)
     if not content or not content.strip():
         raise InvalidOperation("content is empty")
     if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:

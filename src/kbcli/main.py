@@ -218,10 +218,14 @@ def project_set(
     domain: str | None = typer.Option(None, "--domain"),
     repos: list[str] = typer.Option([], "--repo", help="repeatable local repo path"),
     description: str | None = typer.Option(None, "--description"),
+    public: bool | None = typer.Option(None, "--public/--private", help="allow-list flag"),
 ) -> None:
-    """Create/update registry metadata for a project (DATA-8)."""
-    items.set_project(name, domain=domain, repos=list(repos) or None, description=description)
-    typer.echo(f"project {name} updated")
+    """Create/update registry metadata (DATA-8); --public/--private flips the allow-list flag."""
+    items.set_project(
+        name, domain=domain, repos=list(repos) or None, description=description, public=public
+    )
+    vis = "" if public is None else f" ({'public' if public else 'private'})"
+    typer.echo(f"project {name} updated{vis}")
 
 
 @app.command("ingest-session")

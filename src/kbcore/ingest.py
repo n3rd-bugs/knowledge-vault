@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 from kbcore import chunk as chunk_mod
 from kbcore import embed as embed_mod
 from kbcore import entities as entities_mod
+from kbcore import scope
 from kbcore.config import settings
 from kbcore.db import transaction
 from kbcore.models import ITEM_TYPES, SOURCE_KINDS, CodeRef
@@ -99,6 +100,9 @@ def ingest_in(
         raise ValueError(f"unknown item type {type!r}")
     if kind not in SOURCE_KINDS:
         raise ValueError(f"unknown source kind {kind!r}")
+    # Public-only instance: reject writes to non-public (or new, default-private)
+    # projects. No-op on a full-access instance. Covers ingest/kb_save/summary/etc.
+    scope.assert_writable(project)
 
     body = normalize(body)
     title = normalize_title(title)
@@ -163,19 +167,28 @@ def find_duplicate(title: str, body: str, *, kind: str = "chat", uri: str = "") 
     Lets callers (MCP kb_save) point at the existing item when ingest reports
     a duplicate, instead of a dead-end 'nothing ingested'.
     """
+    from kbcore import scope
     from kbcore.db import connect
 
     title_n, _ = scrub(normalize_title(title))
     body_n, _ = scrub(normalize(body))
     chash = content_hash(title_n, body_n)
+    # Public-only: never hand back a non-public item's id — kb_save's dup path
+    # would otherwise turn a content match into an id/existence oracle for
+    # private items (review finding). A non-public dup → return None.
+    gate = (
+        "AND i.project IN (SELECT name FROM projects WHERE public IS TRUE)"
+        if scope.public_only()
+        else ""
+    )
     with connect() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT i.id FROM items i
             JOIN sources s ON s.id = i.source_id
-            WHERE s.kind = %s AND s.uri = %s AND s.content_hash = %s
+            WHERE s.kind = %s AND s.uri = %s AND s.content_hash = %s {gate}
             ORDER BY i.id LIMIT 1
-            """,
+            """,  # noqa: S608 — gate is a constant fragment, no user data
             (kind, uri, chash),
         ).fetchone()
     return row[0] if row else None

@@ -115,6 +115,7 @@ class ProjectInfo(BaseModel):
     repos: list[str] = Field(default_factory=list)
     description: str | None = None
     archived: bool = False
+    public: bool = False
     item_count: int = 0
     last_activity: datetime | None = None
 

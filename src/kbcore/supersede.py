@@ -7,6 +7,7 @@ relation records the edge (Invariant 1/5).
 
 from __future__ import annotations
 
+from kbcore import scope
 from kbcore.db import transaction
 from kbcore.errors import DuplicateContent, InvalidOperation, NotFound
 from kbcore.ingest import ingest_in
@@ -30,6 +31,8 @@ def supersede(
         if row is None:
             raise NotFound(f"item {old_id} does not exist")
         project, type_, title, tags, status, old_meta = row
+        # Public-only instance: cannot supersede an item in a non-public project.
+        scope.assert_writable(project)
         if status == "superseded":
             raise InvalidOperation(f"item {old_id} is already superseded")
 
@@ -53,8 +56,13 @@ def supersede(
                     "replacement body duplicates existing content; pass new_item_id instead"
                 )
         else:
-            repl = conn.execute("SELECT status FROM items WHERE id = %s", (new_item_id,)).fetchone()
-            if repl is None:
+            repl = conn.execute(
+                "SELECT status, project FROM items WHERE id = %s", (new_item_id,)
+            ).fetchone()
+            # Public-only: a non-public replacement is indistinguishable from a
+            # missing one — no existence/status oracle, no private id written
+            # onto the public item's superseded_by (review finding).
+            if repl is None or (scope.public_only() and not scope.project_is_public(conn, repl[1])):
                 raise NotFound(f"replacement item {new_item_id} does not exist")
             if repl[0] != "active":
                 # Guards against supersession cycles and chains that end in a

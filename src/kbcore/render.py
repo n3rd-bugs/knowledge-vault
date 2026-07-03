@@ -62,10 +62,11 @@ def render_item(item: ItemDetail) -> str:
 
 
 def render_projects(projects: list[ProjectInfo]) -> str:
-    rows = [f"{'project':<16} {'domain':<10} {'items':>5}  last activity"]
+    rows = [f"{'project':<16} {'domain':<10} {'items':>5}  {'vis':<7} last activity"]
     for p in projects:
         last = p.last_activity.date().isoformat() if p.last_activity else "-"
-        rows.append(f"{p.name:<16} {p.domain or '-':<10} {p.item_count:>5}  {last}")
+        vis = "public" if p.public else "private"
+        rows.append(f"{p.name:<16} {p.domain or '-':<10} {p.item_count:>5}  {vis:<7} {last}")
     return "\n".join(rows)
 
 

@@ -12,6 +12,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
+from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
 from kbcore.models import REVIEW_REASONS, ReviewEntry
@@ -57,16 +58,24 @@ def queue_review(
 
 def list_open_review() -> list[ReviewEntry]:
     """Unresolved review-queue rows joined to their item (kb review list, §7.4)."""
+    # Public-only instance: never list rows for items in non-public projects
+    # (they leak private ids/titles/quotes). A NULL-item row → NULL IN (...) →
+    # not TRUE → dropped, matching stats.review_open (review finding).
+    gate = (
+        "AND i.project IN (SELECT name FROM projects WHERE public IS TRUE)"
+        if scope.public_only()
+        else ""
+    )
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT rq.id, rq.reason, rq.item_id, i.title, i.status, s.trust, rq.detail
             FROM review_queue rq
             LEFT JOIN items i ON i.id = rq.item_id
             LEFT JOIN sources s ON s.id = i.source_id
-            WHERE rq.resolved = false
+            WHERE rq.resolved = false {gate}
             ORDER BY rq.id
-            """
+            """  # noqa: S608 — gate is a constant fragment, no user data
         ).fetchall()
     return [
         ReviewEntry(
@@ -83,11 +92,20 @@ def list_open_review() -> list[ReviewEntry]:
 
 
 def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:
-    row = conn.execute("SELECT item_id FROM review_queue WHERE id = %s", (queue_id,)).fetchone()
+    row = conn.execute(
+        """
+        SELECT rq.item_id, i.project
+        FROM review_queue rq LEFT JOIN items i ON i.id = rq.item_id
+        WHERE rq.id = %s
+        """,
+        (queue_id,),
+    ).fetchone()
     if row is None:
         raise NotFound(f"review queue row {queue_id} does not exist")
     if row[0] is None:
         raise InvalidOperation(f"review queue row {queue_id} has no associated item")
+    # Public-only instance: cannot resolve a review for a non-public item.
+    scope.assert_writable(row[1])
     return row[0]
 
 

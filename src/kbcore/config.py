@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     # Containerized runs bind 0.0.0.0 (container-private, fronted by Traefik/TLS);
     # set true only there. The default still refuses accidental host-public binds.
     kb_allow_any_bind: bool = False
+    # Public/cloud instance gate: when true, reads see only projects flagged
+    # public and writes to non-public projects are rejected (no existence leak).
+    kb_public_only: bool = False
     ollama_url: str = "http://127.0.0.1:11434"
     kb_embed_model: str = "bge-m3"
     kb_embed_dim: int = 1024

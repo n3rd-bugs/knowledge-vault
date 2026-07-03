@@ -11,6 +11,7 @@ from typing import Any
 
 import psycopg
 
+from kbcore import scope
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
@@ -25,9 +26,20 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
         src = conn.execute("SELECT project FROM items WHERE id = %s", (src_item_id,)).fetchone()
         if src is None:
             raise NotFound(f"item {src_item_id} does not exist")
-        dst = conn.execute("SELECT 1 FROM items WHERE id = %s", (dst_item_id,)).fetchone()
-        if dst is None:
+        # Public-only instance: cannot write a relation from a non-public item.
+        scope.assert_writable(src[0])
+        dst = conn.execute("SELECT project FROM items WHERE id = %s", (dst_item_id,)).fetchone()
+        # A non-public dst is indistinguishable from a missing one (no id oracle).
+        if dst is None or (scope.public_only() and not scope.project_is_public(conn, dst[0])):
             raise NotFound(f"item {dst_item_id} does not exist")
+        # Same gate for evidence_item — else its FK to items() is an existence
+        # oracle for arbitrary (incl. private) ids (review finding).
+        if evidence_item is not None:
+            ev = conn.execute(
+                "SELECT project FROM items WHERE id = %s", (evidence_item,)
+            ).fetchone()
+            if ev is None or (scope.public_only() and not scope.project_is_public(conn, ev[0])):
+                raise NotFound(f"item {evidence_item} does not exist")
         row = conn.execute(
             """
             INSERT INTO relations (project, src_kind, src_id, rel, dst_kind, dst_id, evidence_item)
@@ -42,10 +54,10 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
 
 
 def _node_info(conn: psycopg.Connection, kind: str, node_id: int) -> dict[str, Any]:
-    """Label fields for a trace node (id/kind/title/type/status/date)."""
+    """Label fields for a trace node (id/kind/title/type/status/date/project)."""
     if kind == "item":
         row = conn.execute(
-            "SELECT type, title, status, created_at FROM items WHERE id = %s", (node_id,)
+            "SELECT type, title, status, created_at, project FROM items WHERE id = %s", (node_id,)
         ).fetchone()
         if row is None:
             return {"id": node_id, "kind": "item", "title": "(missing)", "missing": True}
@@ -56,9 +68,10 @@ def _node_info(conn: psycopg.Connection, kind: str, node_id: int) -> dict[str, A
             "title": row[1],
             "status": row[2],
             "date": row[3].date().isoformat(),
+            "project": row[4],
         }
     row = conn.execute(
-        "SELECT name, kind, updated_at FROM entities WHERE id = %s", (node_id,)
+        "SELECT name, kind, updated_at, project FROM entities WHERE id = %s", (node_id,)
     ).fetchone()
     if row is None:
         return {"id": node_id, "kind": "entity", "title": "(missing)", "missing": True}
@@ -68,6 +81,7 @@ def _node_info(conn: psycopg.Connection, kind: str, node_id: int) -> dict[str, A
         "type": row[1],
         "title": row[0],
         "date": row[2].date().isoformat(),
+        "project": row[3],
     }
 
 
@@ -107,24 +121,39 @@ def trace(node_kind: str, node_id: int, direction: str = "both", depth: int = 2)
     if node_kind not in ("item", "entity"):
         raise InvalidOperation(f"node_kind must be 'item' or 'entity', got {node_kind!r}")
     with connect() as conn:
-        if _node_info(conn, node_kind, node_id).get("missing"):
+        po = scope.public_only()
+        pub_cache: dict[str, bool] = {}
+
+        def is_public(project: str | None) -> bool:
+            if not project:
+                return False
+            if project not in pub_cache:
+                pub_cache[project] = scope.project_is_public(conn, project)
+            return pub_cache[project]
+
+        root = _node_info(conn, node_kind, node_id)
+        if root.get("missing") or (po and not is_public(root.get("project"))):
+            # Withheld (non-public) roots are indistinguishable from missing.
             raise NotFound(f"{node_kind} {node_id} does not exist")
         visited: set[tuple[str, int]] = set()
 
-        def build(kind: str, nid: int, remaining: int) -> dict[str, Any]:
-            node = _node_info(conn, kind, nid)
-            key = (kind, nid)
+        def build(node: dict[str, Any], remaining: int) -> dict[str, Any]:
+            key = (node["kind"], node["id"])
             if key in visited or remaining <= 0:
                 node["edges"] = []
                 return node
             visited.add(key)
-            node["edges"] = [
-                {"rel": rel, "direction": dirn, "node": build(nk, ni, remaining - 1)}
-                for rel, dirn, nk, ni in _neighbors(conn, kind, nid, direction)
-            ]
+            edges = []
+            for rel, dirn, nk, ni in _neighbors(conn, node["kind"], node["id"], direction):
+                child = _node_info(conn, nk, ni)
+                # Public-only: never traverse into or reveal a non-public node.
+                if child.get("missing") or (po and not is_public(child.get("project"))):
+                    continue
+                edges.append({"rel": rel, "direction": dirn, "node": build(child, remaining - 1)})
+            node["edges"] = edges
             return node
 
-        return build(node_kind, node_id, depth)
+        return build(root, depth)
 
 
 def similar(item_id: int, k: int = 5) -> list[SimilarHit]:
@@ -139,8 +168,11 @@ def similar(item_id: int, k: int = 5) -> list[SimilarHit]:
         # for every caller — otherwise the tool's later log_access() trips the
         # access_log FK with a raw psycopg error (review finding). An item that
         # exists but has no lead embedding legitimately returns [].
-        if conn.execute("SELECT 1 FROM items WHERE id = %s", (item_id,)).fetchone() is None:
+        anchor = conn.execute("SELECT project FROM items WHERE id = %s", (item_id,)).fetchone()
+        if anchor is None:
             raise NotFound(f"item {item_id} does not exist")
+        # Public-only: a withheld anchor is indistinguishable from missing.
+        scope.assert_readable(anchor[0], f"item {item_id} does not exist")
         base = conn.execute(
             "SELECT embedding::text FROM chunks "
             "WHERE item_id = %s AND ord = 0 AND embed_model = %s",
@@ -148,15 +180,18 @@ def similar(item_id: int, k: int = 5) -> list[SimilarHit]:
         ).fetchone()
         if base is None or base[0] is None:
             return []
+        # Public-only: JOIN projects so results never surface a non-public item.
+        public_join = "JOIN projects p ON p.name = i.project" if scope.public_only() else ""
+        public_where = "AND p.public IS TRUE" if scope.public_only() else ""
         rows = conn.execute(
-            """
+            f"""
             SELECT i.id, i.title, i.type, i.project, 1 - (c.embedding <=> %(v)s::vector) AS score
-            FROM chunks c JOIN items i ON i.id = c.item_id
+            FROM chunks c JOIN items i ON i.id = c.item_id {public_join}
             WHERE c.ord = 0 AND c.embed_model = %(model)s AND c.embedding IS NOT NULL
-              AND i.status = 'active' AND i.id <> %(self)s
+              AND i.status = 'active' AND i.id <> %(self)s {public_where}
             ORDER BY c.embedding <=> %(v)s::vector
             LIMIT %(k)s
-            """,
+            """,  # noqa: S608 — join/where fragments are constant literals
             {"v": base[0], "model": settings.kb_embed_model, "self": item_id, "k": k},
         ).fetchall()
     return [

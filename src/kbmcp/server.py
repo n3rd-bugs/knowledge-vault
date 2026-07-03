@@ -13,6 +13,7 @@ import secrets
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from starlette.middleware.cors import CORSMiddleware
 
 from kbcore import graph, items, render
 from kbcore import ingest as ingest_mod
@@ -370,9 +371,24 @@ def build_app():
     # handles every request — do NOT also wrap with the pure-ASGI bearer check,
     # which would 401 the OAuth discovery/callback paths. Otherwise the bearer
     # middleware is the sole gate.
-    if settings.kb_oauth_enabled:
-        return app
-    return BearerAuthMiddleware(app)
+    if not settings.kb_oauth_enabled:
+        app = BearerAuthMiddleware(app)
+    # CORS must be the OUTERMOST layer. claude.ai's web/desktop connector runs in
+    # a browser context and issues a cross-origin preflight (OPTIONS /mcp) that
+    # carries no auth; it must be answered with Access-Control-Allow-Origin BEFORE
+    # the auth/transport layers. FastMCP adds CORS only to its own OAuth routes,
+    # never to the /mcp Streamable-HTTP mount, so without this OPTIONS /mcp returns
+    # 405 with no ACAO and the browser aborts the connection before OAuth ever runs
+    # (root cause of claude.ai "Couldn't connect to the server"). Wrapping outside
+    # the auth layer also means the preflight is never rejected for missing bearer.
+    return CORSMiddleware(
+        app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["mcp-session-id", "mcp-protocol-version"],
+        max_age=86400,
+    )
 
 
 def main() -> None:

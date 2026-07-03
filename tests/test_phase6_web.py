@@ -99,18 +99,43 @@ def test_web_item_missing_is_404(client):
 def test_web_is_read_only(web_app):
     # (1) every route is GET-only except /login (which is GET+POST for auth,
     #     performs NO kbcore write); nothing anywhere allows PUT/DELETE/PATCH.
+    #     The /static Mount has no .methods attribute — StaticFiles serves
+    #     GET/HEAD only by construction.
     for route in web_app.routes:
-        methods = set(route.methods or ())
+        methods = set(getattr(route, "methods", None) or ())
         assert not (methods & {"PUT", "DELETE", "PATCH"}), f"{route.path} exposes a mutation verb"
         if route.path == "/login":
             assert methods <= {"GET", "POST", "HEAD"}
         else:
             assert methods <= {"GET", "HEAD"}, f"{route.path} is not GET-only: {methods}"
 
-    # (2) the web module imports zero KB-write functions (Invariant 11).
-    from kbweb import server as web
+    # (2) EVERY kbweb module imports zero KB-write functions (Invariant 11) —
+    #     not just server: the view split must not smuggle a write name in.
+    import importlib
+    import pkgutil
 
-    assert WRITE_NAMES.isdisjoint(dir(web)), "a write function leaked into the read-only UI"
+    import kbweb
+
+    for mod_info in pkgutil.iter_modules(kbweb.__path__):
+        mod = importlib.import_module(f"kbweb.{mod_info.name}")
+        leaked = WRITE_NAMES & set(dir(mod))
+        assert not leaked, f"write name(s) {leaked} leaked into kbweb.{mod_info.name}"
+
+
+def test_static_assets_served_without_auth(client):
+    # The design system must style the login page itself — pre-auth fetch.
+    r = client.get("/static/app.css")
+    assert r.status_code == 200
+    assert "text/css" in r.headers["content-type"]
+    assert "--viz-bar" in r.text  # design tokens present
+    assert client.get("/static/app.js").status_code == 200
+    # No directory listing / no escape. A plain ../ is normalized by the client
+    # off the /static prefix (auth bounces it); an encoded traversal reaches
+    # StaticFiles, which must reject it.
+    assert client.get("/static/").status_code == 404
+    r = client.get("/static/../.env", follow_redirects=False)
+    assert r.status_code in (302, 404)  # never a file body
+    assert client.get("/static/%2e%2e/.env").status_code == 404
 
 
 def test_bind_guard_override(monkeypatch):

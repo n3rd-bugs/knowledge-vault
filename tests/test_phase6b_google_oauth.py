@@ -168,7 +168,7 @@ def test_oauth_routes_are_get_only(app):
     paths = {r.path for r in app.routes}
     assert {"/auth/google/login", "/auth/google/callback"} <= paths
     for route in app.routes:
-        methods = set(route.methods or ())
+        methods = set(getattr(route, "methods", None) or ())  # Mount("/static") has no .methods
         if route.path.startswith("/auth/google"):
             assert methods <= {"GET", "HEAD"}, f"{route.path} is not GET-only: {methods}"
             assert not (methods & {"PUT", "POST", "DELETE", "PATCH"})

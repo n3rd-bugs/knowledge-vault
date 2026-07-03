@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Search · Knowledge Vault{% endblock %}
 {% block content %}
-<form method="get" action="/">
+<form method="get" action="/" class="bar">
   <input type="search" name="q" value="{{ q }}" placeholder="search the knowledge base" autofocus>
   <button type="submit">Search</button>
 </form>
@@ -9,7 +9,7 @@
 {% for hit in hits %}
 <article class="hit">
   <div class="prov">{{ hit.provenance_header() }}</div>
-  <h3 style="margin:.2rem 0">
+  <h3>
     <a href="/item/{{ hit.item_id }}">{{ hit.type }} · {{ hit.title }}</a>
     <span class="badge {{ hit.trust }}">{{ hit.trust }}</span>
   </h3>

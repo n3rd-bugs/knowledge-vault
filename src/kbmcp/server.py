@@ -372,7 +372,13 @@ def _validate_runtime_config() -> None:
 
 def build_app():
     _validate_runtime_config()
-    app = mcp.http_app(path="/mcp")
+    # json_response=True: POST /mcp returns a complete application/json body that
+    # closes immediately, instead of a text/event-stream that stays open. Anthropic's
+    # mcp-proxy cancels the open SSE stream ("canceled by remote", HTTP/2 code 0) and
+    # reports 502 "origin returned an incomplete response"; a non-streaming response
+    # avoids that. We are a request/response tool server — no server->client streaming
+    # is needed. (curl tolerates the open stream, so it only bites the proxied client.)
+    app = mcp.http_app(path="/mcp", json_response=True)
     # With OAuth on, FastMCP's own auth middleware (MultiAuth: Google + bearer)
     # handles every request — do NOT also wrap with the pure-ASGI bearer check,
     # which would 401 the OAuth discovery/callback paths. Otherwise the bearer

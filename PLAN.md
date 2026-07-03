@@ -498,6 +498,10 @@ zero write functions. Reuse `kbcore.render` so UI and CLI/MCP render identically
 AC: unauthenticated request → 401/redirect; authenticated search for "TPS55288" renders the decision
 with its anchor; the item view shows the UART bug's `fixes` relation; `bridge-security` timeline
 renders chronologically; a route dump proves **no** mutating route exists.
+*Modernized (phases web-1..web-4): markdown bodies + pygments, search filters, /tags, /projects,
+dashboard (CSS bars), read-only /review. kbcore.render still backs CLI/MCP; HTML rendering lives in
+kbweb.ui. **Deferred: an entity browser** (needs a scope-gated kbcore read over `entities`; trace
+already follows `kind=entity` nodes).*
 
 **6c — Public HTTPS endpoint via Traefik + Let's Encrypt (~2-3 h)** — the deliberate exposure.
 Tasks: containerize kb-mcp/kb-rest/kb-web (one uv-based `Dockerfile`, `command` selects the module)

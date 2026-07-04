@@ -58,6 +58,9 @@ class Settings(BaseSettings):
     # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity,
     # 100% verbatim grounding. gemma3:12b is the approved fast fallback.
     kb_extract_model: str = "qwen3:14b"
+    # Deep search (explicit user-invoked, local Ollama): empty -> extract model.
+    kb_deep_model: str = ""
+    kb_deep_max_items: int = 16
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")
@@ -85,6 +88,11 @@ class Settings(BaseSettings):
             netloc = f"{parts.username}:{quote(self.kb_db_password, safe='')}@{host}{port}"
             url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
         return url
+
+    @property
+    def deep_model(self) -> str:
+        """Model for deep search; falls back to the extractor model."""
+        return self.kb_deep_model or self.kb_extract_model
 
     @property
     def inbox(self) -> Path:

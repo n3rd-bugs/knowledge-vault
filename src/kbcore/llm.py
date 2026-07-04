@@ -123,11 +123,23 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
     return [it for it in items if isinstance(it, dict)]
 
 
-def _chat(messages: list[dict[str, str]], *, json_format: bool) -> str:
-    """POST /api/chat with keep_alive=0 (Invariant 8); return the message content."""
+def _chat(
+    messages: list[dict[str, str]],
+    *,
+    json_format: bool,
+    model: str | None = None,
+    keep_alive: int | str = KEEP_ALIVE,
+) -> str:
+    """POST /api/chat; return the message content.
+
+    ``keep_alive`` defaults to 0 (Invariant 8 — unload immediately). A bounded
+    positive value is permitted ONLY within one explicit multi-call run (deep
+    search) to avoid reloading the 14B between consecutive calls; such runs
+    MUST pass 0 on their final call so the model never outlives the run.
+    """
     payload: dict[str, Any] = {
-        "model": settings.kb_extract_model,
-        "keep_alive": KEEP_ALIVE,
+        "model": model or settings.kb_extract_model,
+        "keep_alive": keep_alive,
         "stream": False,
         "messages": messages,
     }
@@ -145,6 +157,17 @@ def _chat(messages: list[dict[str, str]], *, json_format: bool) -> str:
         raise ExtractorUnavailable(
             f"extractor returned unusable output: {e.__class__.__name__}: {e}"
         ) from e
+
+
+def chat(
+    messages: list[dict[str, str]],
+    *,
+    json_format: bool = False,
+    model: str | None = None,
+    keep_alive: int | str = KEEP_ALIVE,
+) -> str:
+    """Public single-shot chat (deep search). Same failure contract as ``_chat``."""
+    return _chat(messages, json_format=json_format, model=model, keep_alive=keep_alive)
 
 
 _SUMMARIZE_SYSTEM = (

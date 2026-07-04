@@ -164,3 +164,41 @@ def test_conflicts_passed_to_synthesize(corpus, monkeypatch):
     monkeypatch.setattr(deepsearch, "synthesize", spy_synth)
     deepsearch.deep_search("modbus", save=False)
     assert (corpus["a"], corpus["b"]) in captured["conflicts"]
+
+
+# --- surfaces: CLI + MCP -------------------------------------------------------------
+
+
+def test_cli_deep_search_smoke(corpus):
+    from typer.testing import CliRunner
+
+    from kbcli.main import app
+
+    result = CliRunner().invoke(app, ["deep-search", "modbus framing", "--no-save"])
+    assert result.exit_code == 0, result.output
+    assert "machine-synthesized from stored data" in result.output  # provenance header
+    assert "Answer citing" in result.output
+    assert "(not saved)" in result.output
+
+
+def test_mcp_kb_deep_search_registered(corpus):
+    import asyncio
+
+    from fastmcp import Client, FastMCP
+
+    from kbmcp import tools_deepsearch
+
+    mcp = FastMCP(name="kb-test")
+    tools_deepsearch.register(mcp)
+
+    async def run():
+        async with Client(mcp) as client:
+            tools = await client.list_tools()
+            assert any(t.name == "kb_deep_search" for t in tools)
+            res = await client.call_tool(
+                "kb_deep_search", {"question": "modbus framing", "save": False}
+            )
+            return res.content[0].text
+
+    text = asyncio.run(run())
+    assert "machine-synthesized" in text and "Answer citing" in text

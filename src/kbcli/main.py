@@ -12,7 +12,7 @@ import sys
 
 import typer
 
-from kbcli import graph_cmds, render, review_cmds, seeds
+from kbcli import deepsearch_cmd, graph_cmds, render, review_cmds, seeds
 from kbcore import graph, items, search
 from kbcore import ingest as ingest_mod
 from kbcore import migrate as migrate_mod
@@ -26,6 +26,7 @@ app.add_typer(project_app, name="project")
 app.add_typer(review_cmds.review_app, name="review")
 # Phase 5 top-level commands (bodies in kbcli.graph_cmds to keep this file small).
 app.command("stats")(graph_cmds.stats_cmd)
+app.command("deep-search")(deepsearch_cmd.deep_search_cmd)
 app.command("trace")(graph_cmds.trace_cmd)
 app.command("similar")(graph_cmds.similar_cmd)
 app.command("backfill-entities")(graph_cmds.backfill_cmd)

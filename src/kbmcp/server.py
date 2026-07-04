@@ -347,9 +347,10 @@ def kb_projects() -> str:
 # module's `mcp`. register() takes the instance as an arg so `python -m
 # kbmcp.server` (module run as __main__) registers on the served instance, not a
 # second copy imported under the name kbmcp.server.
-from kbmcp import tools_phase5  # noqa: E402
+from kbmcp import tools_deepsearch, tools_phase5  # noqa: E402
 
 tools_phase5.register(mcp)
+tools_deepsearch.register(mcp)
 
 
 class BearerAuthMiddleware:

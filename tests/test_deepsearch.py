@@ -47,3 +47,120 @@ def test_deep_model_falls_back_to_extract_model(monkeypatch):
     assert settings.deep_model == settings.kb_extract_model
     monkeypatch.setattr(settings, "kb_deep_model", "big:70b")
     assert settings.deep_model == "big:70b"
+
+
+# --- pipeline (plan/synthesize mocked; retrieval real over kb_test) -----------------
+
+
+import pytest  # noqa: E402
+
+from kbcore import db, deepsearch  # noqa: E402
+from kbcore.graph import link  # noqa: E402
+from kbcore.ingest import ingest  # noqa: E402
+
+
+@pytest.fixture()
+def corpus(kb, monkeypatch):
+    """Keyword-rich items so the keyword leg retrieves deterministically."""
+    a = ingest("dsproj", "spec", "modbus rtu framing", "modbus rtu uses crc16 framing", uri="a")
+    b = ingest("dsproj", "gotcha", "modbus timing gotcha", "modbus needs 3.5 char gaps", uri="b")
+    c = ingest("dsproj", "note", "unrelated cooking note", "how to bake bread", uri="c")
+    monkeypatch.setattr(
+        deepsearch, "plan_queries", lambda q: ["modbus rtu framing", "modbus timing"]
+    )
+    monkeypatch.setattr(
+        deepsearch,
+        "synthesize",
+        lambda q, docs, conflicts: f"Answer citing [item {docs[0]['id']}]. ({len(docs)} docs)",
+    )
+    return {"a": a, "b": b, "c": c}
+
+
+def test_deep_search_saves_report_with_sources(corpus):
+    res = deepsearch.deep_search("how does modbus framing work?")
+    assert corpus["a"] in res.sources and corpus["b"] in res.sources
+    # hybrid search returns k-best (the vector leg scores everything), so the
+    # off-topic item may appear — but never above the keyword-relevant ones.
+    if corpus["c"] in res.sources:
+        assert res.sources.index(corpus["c"]) > res.sources.index(corpus["a"])
+    assert res.item_id is not None
+    assert "Sources:" in res.report
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT i.type, i.project, i.title, i.meta, s.trust, s.uri "
+            "FROM items i JOIN sources s ON s.id = i.source_id WHERE i.id = %s",
+            (res.item_id,),
+        ).fetchone()
+    typ, project, title, meta, trust, uri = row
+    assert typ == "report" and project == "kb-system" and trust == "unverified"
+    assert uri.startswith("deepsearch:")
+    assert title == "Deep search: how does modbus framing work?"
+    assert meta["deep_search"] == "how does modbus framing work?"
+    assert set(meta["sources"]) == set(res.sources)
+    assert meta["model"] == settings.deep_model
+
+
+def test_retrieval_dedupes_and_excludes_reports(corpus, monkeypatch):
+    # the same item matches both sub-queries -> appears once
+    res = deepsearch.deep_search("modbus", save=False)
+    assert len(res.sources) == len(set(res.sources))
+    # a previous deep-search REPORT matching the query is never retrieved
+    rep = ingest(
+        "dsproj", "report", "old modbus report", "modbus rtu crc16 framing report", uri="r"
+    )
+    res2 = deepsearch.deep_search("modbus", save=False)
+    assert rep not in res2.sources, "type='report' excluded (echo chamber)"
+
+
+def test_context_caps_enforced_and_logged(corpus, monkeypatch, caplog):
+    captured: dict = {}
+
+    def spy_synth(q, docs, conflicts):
+        captured["docs"] = docs
+        return "ok"
+
+    monkeypatch.setattr(deepsearch, "synthesize", spy_synth)
+    monkeypatch.setattr(deepsearch, "BODY_CHAR_CAP", 10)
+    monkeypatch.setattr(deepsearch, "CONTEXT_CHAR_CAP", 40)
+    with caplog.at_level("INFO", logger="kbcore.deepsearch"):
+        deepsearch.deep_search("modbus", save=False)
+    for d in captured["docs"]:
+        assert len(d["body"]) <= 10 + len("\n[... truncated]")
+    assert any("truncated" in r.message or "dropped" in r.message for r in caplog.records)
+
+
+def test_plan_falls_back_to_question_on_bad_json(kb, monkeypatch):
+    monkeypatch.setattr(deepsearch.llm, "chat", lambda *a, **k: "not json at all")
+    assert deepsearch.plan_queries("my question") == ["my question"]
+
+
+def test_no_save_and_empty_retrieval(corpus, monkeypatch):
+    res = deepsearch.deep_search("modbus", save=False)
+    assert res.item_id is None
+    with db.connect() as conn:
+        n = conn.execute("SELECT count(*) FROM items WHERE type='report'").fetchone()[0]
+    assert n == 0, "no report row when save=False"
+    # empty retrieval: synthesize must never be called, nothing saved. The
+    # vector leg scores every item, so force the empty branch directly.
+    monkeypatch.setattr(deepsearch, "_retrieve", lambda *a: [])
+    monkeypatch.setattr(
+        deepsearch,
+        "synthesize",
+        lambda *a: (_ for _ in ()).throw(AssertionError("synthesize called on empty")),
+    )
+    res2 = deepsearch.deep_search("nothing matches this")
+    assert res2.item_id is None and res2.sources == []
+    assert "No KB items matched" in res2.report
+
+
+def test_conflicts_passed_to_synthesize(corpus, monkeypatch):
+    link(corpus["a"], "contradicts", corpus["b"])
+    captured: dict = {}
+
+    def spy_synth(q, docs, conflicts):
+        captured["conflicts"] = conflicts
+        return "ok"
+
+    monkeypatch.setattr(deepsearch, "synthesize", spy_synth)
+    deepsearch.deep_search("modbus", save=False)
+    assert (corpus["a"], corpus["b"]) in captured["conflicts"]

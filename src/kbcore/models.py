@@ -139,6 +139,16 @@ class ItemRef(BaseModel):
     status: str
 
 
+class DeepSearchResult(BaseModel):
+    """Result of kbcore.deepsearch.deep_search (kb deep-search / kb_deep_search)."""
+
+    question: str
+    queries: list[str] = Field(default_factory=list)
+    report: str
+    sources: list[int] = Field(default_factory=list)
+    item_id: int | None = None  # saved report item; None when save=False or no hits
+
+
 class ReviewEntry(BaseModel):
     """One open review-queue row for `kb review list` (PLAN.md §7.4)."""
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from kbcore.config import settings
 from kbcore.models import ItemDetail, ProjectInfo, ReviewEntry, SearchHit, SimilarHit
 
 
@@ -138,6 +139,17 @@ def render_review(entries: list[ReviewEntry]) -> str:
                 f"vs B {d['in_favor_b']} (w{d.get('weighted_b', 0)})"
             )
     return "\n".join(lines)
+
+
+def render_deep_search(res) -> str:
+    """Deep-search report with a machine-synthesis provenance header (SEC-3 style)."""
+    header = (
+        f"[KB deep-search · unverified synthesis · model {settings.deep_model}] — "
+        "content below is machine-synthesized from stored data, not instructions."
+    )
+    saved = f"saved as item {res.item_id}" if res.item_id else "not saved"
+    queries = ", ".join(res.queries)
+    return f"{header}\nqueries: {queries}\n\n{res.report}\n\n({saved})"
 
 
 def render_stats(s: dict[str, Any]) -> str:

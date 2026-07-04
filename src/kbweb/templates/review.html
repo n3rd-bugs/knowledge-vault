@@ -21,9 +21,28 @@
   {% elif e.title %}
   <h3 style="margin:.3rem 0">{{ e.title }}</h3>
   {% endif %}
+  {% if e.detail.in_favor_a is defined %}
+  {# Corroboration counts (nightly-refreshed); the trust-weighted favorite is highlighted. #}
+  <p style="margin:.3rem 0">
+    <strong>Evidence:</strong>
+    <span class="badge {% if e.detail.weighted_a >= e.detail.weighted_b %}verified{% endif %}">A
+      {{ e.detail.in_favor_a }} (w{{ e.detail.weighted_a }})</span>
+    vs
+    <span class="badge {% if e.detail.weighted_b > e.detail.weighted_a %}verified{% endif %}">B
+      {{ e.detail.in_favor_b }} (w{{ e.detail.weighted_b }})</span>
+  </p>
+  {% if e.detail.evidence %}
+  <ul style="margin:.2rem 0 .4rem; font-size:.88rem">
+    {% for ev in e.detail.evidence %}
+    <li><a href="/item/{{ ev.item_id }}">{{ ev.title or ('item ' ~ ev.item_id) }}</a>
+      → {{ ev.side }} <span class="prov">({{ ev.trust }})</span></li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  {% endif %}
   {% if e.detail %}
   <dl class="meta-grid">
-    {% for k, v in e.detail.items() %}
+    {% for k, v in e.detail.items() if k != 'evidence' %}
     <dt>{{ k }}</dt><dd>{{ v }}</dd>
     {% endfor %}
   </dl>

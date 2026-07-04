@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import typer
 
+from kbcore import render
 from kbcore import review as review_mod
 from kbcore.errors import KBError
 
@@ -23,13 +24,9 @@ def _fail(err: Exception) -> None:
 @review_app.command("list")
 def review_list() -> None:
     """List open review-queue entries (unverified extractions, contradictions)."""
-    entries = review_mod.list_open_review()
-    if not entries:
-        typer.echo("review queue is empty")
-        return
-    for e in entries:
-        title = e.title or "(no item)"
-        typer.echo(f"[{e.queue_id}] {e.reason} · item {e.item_id} · {e.trust or '-'} · {title}")
+    # Delegates to render_review so CLI/MCP output stays identical (incl. the
+    # contradiction evidence-count lines).
+    typer.echo(render.render_review(review_mod.list_open_review()))
 
 
 @review_app.command("promote")

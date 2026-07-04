@@ -129,6 +129,14 @@ def render_review(entries: list[ReviewEntry]) -> str:
     for e in entries:
         title = e.title or "(no item)"
         lines.append(f"[{e.queue_id}] {e.reason} · item {e.item_id} · {e.trust or '-'} · {title}")
+        d = e.detail
+        if "in_favor_a" in d:
+            # Corroboration counts for contradictions: raw + trust-weighted
+            # (verified=2, unverified=1), refreshed by the nightly pass.
+            lines.append(
+                f"    evidence: A {d['in_favor_a']} (w{d.get('weighted_a', 0)}) "
+                f"vs B {d['in_favor_b']} (w{d.get('weighted_b', 0)})"
+            )
     return "\n".join(lines)
 
 

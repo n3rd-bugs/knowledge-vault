@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from kbcore import consolidation, ingest_queue, llm
+from kbcore import consolidation, evidence, ingest_queue, llm
 from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
@@ -26,6 +26,7 @@ logger = logging.getLogger("kbworker.consolidate")
 
 ADVISORY_KEY = 42
 CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
+EVIDENCE_PAIR_CAP = 20  # max contradiction pairs evidence-judged per nightly run
 QUEUE_BATCH = 200  # max ingest_queue rows drained per nightly run
 
 
@@ -122,6 +123,31 @@ def _contradictions(project: str) -> int:
     return queued
 
 
+def _evidence() -> int:
+    """Step 3b: gather/refresh support evidence for open contradiction rows.
+
+    Counts accumulate night over night as repo seeds and session flushes add
+    corroborating items; never-enriched rows come first (evidence.py ordering)
+    so the cap can't starve brand-new contradictions. Per-pair isolation: one
+    bad pair logs and the rest proceed (drain-loop pattern).
+    """
+    rows = evidence.open_contradiction_rows()
+    refreshed = 0
+    for queue_id, a_id, b_id, _updated in rows[:EVIDENCE_PAIR_CAP]:
+        try:
+            if evidence.update_review_detail(queue_id, evidence.gather_evidence(a_id, b_id)):
+                refreshed += 1
+        except Exception:  # noqa: BLE001 — one bad pair must not abort the step
+            logger.exception("evidence refresh for queue row %s failed", queue_id)
+    if len(rows) > EVIDENCE_PAIR_CAP:
+        logger.info(
+            "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",
+            EVIDENCE_PAIR_CAP,
+            len(rows) - EVIDENCE_PAIR_CAP,
+        )
+    return refreshed
+
+
 def _disk_pct() -> float:
     """Percent used on the filesystem holding KB_RAW."""
     p = settings.raw
@@ -175,6 +201,7 @@ def main() -> dict[str, Any]:
             "duplicates_marked": 0,
             "summaries_written": 0,
             "contradictions_queued": 0,
+            "evidence_refreshed": 0,
             "archived": 0,
             "reembedded": 0,
         }
@@ -195,6 +222,9 @@ def main() -> dict[str, Any]:
         _run_step(
             counts, "contradictions_queued", lambda: sum(_contradictions(p) for p in projects)
         )
+        # Step 3b AFTER contradictions so rows queued seconds ago get evidence
+        # in the same run (open_contradiction_rows orders never-enriched first).
+        _run_step(counts, "evidence_refreshed", _evidence)
         _run_step(
             counts,
             "archived",

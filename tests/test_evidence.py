@@ -63,11 +63,13 @@ def contradiction_pair(kb):
     c_unv = ingest(
         "evother", "note", "session said mode 1", "we saw mode 1 work", uri="d", trust="unverified"
     )
-    # Cluster everything near the pair so similar() finds the candidates.
+    # Geometry matters: the pair must land in the CONTRADICTION band [0.80,
+    # 0.95) — not the dedupe range (>=0.97, which runs first and would flip one
+    # item to 'duplicate'). Same-project candidate pairs must stay < 0.97 too.
     _force_lead(a, _vec(1.0))
-    _force_lead(b, _vec(0.999, 0.0447))
-    _force_lead(c_ver, _vec(0.998, 0.0632))
-    _force_lead(c_unv, _vec(0.997, 0.0774))
+    _force_lead(b, _vec(0.88, 0.4749736))  # cos(a,b)=0.88 — in the band
+    _force_lead(c_ver, _vec(0.95, 0.312))  # cos(c_ver,c_unv)=0.82 — no dedupe
+    _force_lead(c_unv, _vec(0.6, 0.8))
     return {"a": a, "b": b, "c_ver": c_ver, "c_unv": c_unv}
 
 
@@ -112,6 +114,160 @@ def test_gather_excludes_summaries_and_caps_judge_calls(contradiction_pair, monk
     assert len(seen_titles) <= evidence.MAX_CANDIDATES
     assert "mode summary" not in seen_titles, "summary items are excluded from evidence"
     assert d["in_favor_a"] == 0 and d["weighted_a"] == 0
+
+
+# --- nightly step integration -----------------------------------------------------
+
+
+def _pinned_contradict(a_title: str) -> object:
+    """items_contradict mock pinned to the exact pair titles so filler/candidate
+    items can never accidentally trip the contradiction band."""
+
+    def judge(at, ab, bt, bb):
+        return {at, bt} == {"use mode 0", "use mode 1"}
+
+    return judge
+
+
+def test_new_contradiction_gets_evidence_same_night(contradiction_pair, monkeypatch):
+    from kbworker import consolidate
+
+    ids = contradiction_pair
+    monkeypatch.setattr(llm, "items_contradict", _pinned_contradict("use mode 0"))
+    monkeypatch.setattr(
+        llm,
+        "evidence_side",
+        lambda at, ab, bt, bb, ct, cb: {
+            "datasheet says mode 0": "a",
+            "session said mode 1": "b",
+        }.get(ct, "neither"),
+    )
+    monkeypatch.setattr(llm, "summarize_items", lambda topic, items: "")
+    result = consolidate.main()
+    assert result["contradictions_queued"] == 1
+    assert result["evidence_refreshed"] == 1
+    with db.connect() as conn:
+        detail = conn.execute(
+            "SELECT detail FROM review_queue WHERE reason='contradiction' AND resolved=false "
+            "AND (detail->>'a_id')::bigint = %s",
+            (ids["a"],),
+        ).fetchone()[0]
+    assert detail["in_favor_a"] == 1 and detail["weighted_a"] == 2
+    assert detail["in_favor_b"] == 1 and detail["weighted_b"] == 1
+    assert detail["evidence_updated"]
+    # the count lands in the nightly report meta
+    with db.connect() as conn:
+        meta = conn.execute(
+            "SELECT meta FROM items WHERE type='report' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert meta["evidence_refreshed"] == 1
+
+
+def test_refresh_grows_counts_on_next_run(contradiction_pair, monkeypatch):
+    from kbworker import consolidate
+
+    ids = contradiction_pair
+    monkeypatch.setattr(llm, "items_contradict", _pinned_contradict("use mode 0"))
+    monkeypatch.setattr(llm, "summarize_items", lambda topic, items: "")
+    sides = {"datasheet says mode 0": "a", "session said mode 1": "b"}
+    monkeypatch.setattr(
+        llm, "evidence_side", lambda at, ab, bt, bb, ct, cb: sides.get(ct, "neither")
+    )
+    consolidate.main()
+    # a new corroborating VERIFIED item lands (nightly seed / session flush) —
+    # in a THIRD project so it can't dedupe against the existing candidates.
+    extra = ingest("evthird", "note", "field report favors mode 0", "mode 0 confirmed", uri="x")
+    _force_lead(extra, _vec(0.7, 0.7141428))
+    sides["field report favors mode 0"] = "a"
+    result = consolidate.main()
+    assert result["evidence_refreshed"] == 1
+    with db.connect() as conn:
+        detail = conn.execute(
+            "SELECT detail FROM review_queue WHERE reason='contradiction' AND resolved=false "
+            "AND (detail->>'a_id')::bigint = %s",
+            (ids["a"],),
+        ).fetchone()[0]
+    assert detail["in_favor_a"] == 2 and detail["weighted_a"] == 4, "counts grew on refresh"
+
+
+def test_evidence_cap_defers_and_logs(contradiction_pair, monkeypatch, caplog):
+    from kbworker import consolidate
+
+    ids = contradiction_pair
+    # two open contradiction rows: the real pair + a synthetic one
+    from kbcore.consolidation import record_contradiction
+
+    record_contradiction(ids["a"], ids["b"])
+    record_contradiction(ids["c_ver"], ids["c_unv"])
+    monkeypatch.setattr(consolidate, "EVIDENCE_PAIR_CAP", 1)
+    monkeypatch.setattr(llm, "evidence_side", lambda *a: "neither")
+    with caplog.at_level("INFO", logger="kbworker.consolidate"):
+        refreshed = consolidate._evidence()
+    assert refreshed == 1, "cap limits the refresh to one pair"
+    assert any("capped" in r.message for r in caplog.records), "deferral is logged"
+
+
+def test_render_and_cli_show_evidence_counts(kb):
+    from typer.testing import CliRunner
+
+    from kbcli.main import app
+    from kbcore.models import ReviewEntry
+    from kbcore.render import render_review
+
+    e = ReviewEntry(
+        queue_id=7,
+        reason="contradiction",
+        item_id=1,
+        title="pair a",
+        status="active",
+        trust="verified",
+        detail={"in_favor_a": 3, "weighted_a": 5, "in_favor_b": 1, "weighted_b": 1},
+    )
+    out = render_review([e])
+    assert "evidence: A 3 (w5) vs B 1 (w1)" in out
+    # entries without counts render unchanged (single line)
+    plain = ReviewEntry(queue_id=8, reason="unverified_extraction", item_id=2, detail={})
+    assert "evidence:" not in render_review([plain])
+    # the CLI inherits via render_review
+    item = ingest("evcli", "note", "cli pair", "b", uri="cli", trust="unverified")
+    qid = queue_review(item, "contradiction", {"a_id": item, "b_id": item})
+    evidence.update_review_detail(
+        qid, {"in_favor_a": 2, "weighted_a": 4, "in_favor_b": 0, "weighted_b": 0}
+    )
+    result = CliRunner().invoke(app, ["review", "list"])
+    assert result.exit_code == 0
+    assert "evidence: A 2 (w4) vs B 0 (w0)" in result.output
+
+
+def test_web_review_shows_evidence_block(kb, monkeypatch):
+    from starlette.testclient import TestClient
+
+    from kbcore.config import settings as cfg
+
+    token = "kbtest-" + "0" * 32
+    monkeypatch.setattr(cfg, "kb_token", token)
+    monkeypatch.setattr(cfg, "kb_bind", "127.0.0.1")
+    item = ingest("evweb", "note", "web pair a", "b", uri="w", trust="unverified")
+    qid = queue_review(item, "contradiction", {"a_id": item, "b_id": item})
+    evidence.update_review_detail(
+        qid,
+        {
+            "in_favor_a": 2,
+            "weighted_a": 4,
+            "in_favor_b": 1,
+            "weighted_b": 1,
+            "evidence": [{"item_id": item, "side": "a", "trust": "verified", "title": "web ev"}],
+        },
+    )
+    from kbweb.server import build_app
+
+    client = TestClient(build_app())
+    client.post("/login", data={"token": token})
+    r = client.get("/review")
+    assert r.status_code == 200
+    assert "Evidence:" in r.text
+    assert "A\n      2 (w4)" in r.text or "2 (w4)" in r.text
+    assert "web ev" in r.text and f"/item/{item}" in r.text
 
 
 def test_update_review_detail_merges_open_rows_only(kb):

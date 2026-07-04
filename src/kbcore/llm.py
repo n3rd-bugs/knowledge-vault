@@ -173,6 +173,47 @@ def summarize_items(topic: str, items: list[dict[str, Any]]) -> str:
     return content.strip()
 
 
+_EVIDENCE_SYSTEM = (
+    "Two knowledge items (A and B) contradict each other. You are given a third "
+    "item as evidence. Decide which side the evidence supports. Answer STRICT "
+    'JSON only: {"side": "a"} or {"side": "b"} or {"side": "neither"}. '
+    'If the evidence is off-topic, ambiguous, or supports both, answer "neither".'
+)
+
+
+def evidence_side(
+    a_title: str, a_body: str, b_title: str, b_body: str, c_title: str, c_body: str
+) -> str:
+    """Which side of a contradiction the candidate item supports: 'a'|'b'|'neither'.
+
+    Mirrors :func:`items_contradict`: an unparseable or unexpected answer degrades
+    to 'neither' (never raises on ambiguity); genuine network failures surface as
+    :class:`ExtractorUnavailable` so the nightly step can log and continue.
+    """
+    content = _chat(
+        [
+            {"role": "system", "content": _EVIDENCE_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Item A: {a_title}\n{a_body}\n\n"
+                    f"Item B: {b_title}\n{b_body}\n\n"
+                    f"Evidence: {c_title}\n{c_body}"
+                ),
+            },
+        ],
+        json_format=True,
+    )
+    try:
+        data = parse_model_json(content)
+    except (ValueError, TypeError):
+        return "neither"
+    if not isinstance(data, dict):
+        return "neither"
+    side = str(data.get("side", "")).strip().lower()
+    return side if side in ("a", "b") else "neither"
+
+
 _CONTRADICT_SYSTEM = (
     "You compare two knowledge items and decide whether they factually CONTRADICT — "
     "state incompatible facts or decisions about the same thing (not merely different "

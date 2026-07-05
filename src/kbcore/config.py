@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # instance accepts BOTH Google OAuth and the static bearer (MultiAuth).
     kb_oauth_enabled: bool = False
     kb_public_url: str = "https://kb.n3rd-bugs.dev"  # base URL for OAuth metadata/redirects
+    # Lifetime of the FastMCP-issued access token. Decoupled from Google's ~1h
+    # upstream expiry so a client hiccup doesn't surface as an hourly logout;
+    # the proxy refreshes Google underneath (access_type=offline).
+    kb_oauth_token_ttl: int = 86_400
     google_client_id: str = ""
     google_client_secret: str = ""
     ollama_url: str = "http://127.0.0.1:11434"

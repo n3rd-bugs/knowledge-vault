@@ -58,6 +58,13 @@ services:
       # kb.n3rd-bugs.dev; cloudflared (host systemd) forwards to the published port
       # below. Every issuer/PRM/redirect URL therefore renders as https://kb...dev.
       KB_PUBLIC_URL: "https://kb.n3rd-bugs.dev"
+    # FastMCP keeps OAuth state (claude.ai's client registration, refresh tokens,
+    # upstream Google tokens) in an encrypted file store under this path. Without
+    # a volume it is wiped on every redeploy -> POST /token 401 -> everyone is
+    # logged out ("KB loses authentication quickly"). Encrypted at rest with a
+    # key derived from the Google client secret, so persisting it is safe.
+    volumes:
+      - fastmcp-oauth:/root/.local/share/fastmcp
     # This IS the OAuth server: it calls Google server-side (OIDC discovery, JWKS,
     # and the auth-code -> token exchange at the callback). kbnet's embedded
     # resolver can't reach the internet, so give it public DNS (same as
@@ -134,6 +141,7 @@ services:
 
 volumes:
   kbdata:
+  fastmcp-oauth:
 
 networks:
   kbnet:

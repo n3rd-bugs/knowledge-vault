@@ -96,6 +96,11 @@ def _build_auth():
         # which fails ("Couldn't register with the sign-in service") and never
         # hits /register. Forcing DCR-only makes claude.ai register normally.
         enable_cimd=False,
+        # Decouple our issued-token lifetime from Google's ~1h upstream expiry:
+        # without this, clients must refresh hourly and ANY refresh failure
+        # (e.g. OAuth state lost to a container restart — now persisted via the
+        # fastmcp-oauth volume) surfaces as a logout.
+        fastmcp_access_token_expiry_seconds=settings.kb_oauth_token_ttl,
     )
     # Cache token verification so we don't hit Google's rate-limited tokeninfo on
     # every request (the source of the intermittent 502s under claude.ai's bursts).

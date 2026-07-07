@@ -37,12 +37,18 @@ def decode_transcript_gz(transcript_gz: str) -> str:
     d = zlib.decompressobj(wbits=47)
     try:
         out = d.decompress(raw, MAX_DECOMPRESSED_BYTES + 1)
+        out += d.flush()
     except zlib.error as e:
         raise InvalidOperation(f"transcript_gz is not valid gzip: {e}") from e
     if len(out) > MAX_DECOMPRESSED_BYTES or d.unconsumed_tail:
         raise InvalidOperation(
             f"decompressed transcript exceeds the {MAX_DECOMPRESSED_BYTES}-byte row limit"
         )
+    # A truncated stream decodes partial output WITHOUT error — reject it so half
+    # a transcript is never stored as if whole (d.eof is only true at the gzip
+    # trailer). unused_data flags trailing garbage after a complete member.
+    if not d.eof or d.unused_data:
+        raise InvalidOperation("transcript_gz is truncated or has trailing data")
     return out.decode("utf-8", errors="replace")
 
 

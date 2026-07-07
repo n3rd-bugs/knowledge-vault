@@ -66,7 +66,7 @@ fi
 FLUSH_WARN=""
 FLOG="$HOME/.claude/hooks/flush-session.log"
 if [ -f "$FLOG" ]; then
-  RECENT_FAIL=$(tail -n 12 "$FLOG" | grep -E "FAILED|BUG:|err" | tail -1)
+  RECENT_FAIL=$(tail -n 12 "$FLOG" | grep -E "FAILED|BUG:|http=[45][0-9][0-9]" | tail -1)
   [ -n "$RECENT_FAIL" ] && FLUSH_WARN="⚠ KB session-flush reported a recent failure — capture may be
 incomplete until it succeeds (it retries each compaction). Last error:
   $RECENT_FAIL

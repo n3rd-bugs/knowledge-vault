@@ -31,9 +31,16 @@ fi
 RESP=$(curl -s --max-time 60 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
   -H "Mcp-Session-Id: $SID" --data @"$REQF")
 rm -f "$REQF"
-if printf '%s' "$RESP" | jq -e '.result' >/dev/null 2>&1; then
+if printf '%s' "$RESP" | jq -e '.result and (.result.isError | not)' >/dev/null 2>&1; then
   printf '%s' "$RESP" | jq -r '.result.content[]? | select(.type=="text") | .text'
   exit 0
+fi
+# isError:true is a tool rejection (queue full, bad project, oversize) surfaced
+# as an HTTP-200 JSON-RPC result — must fail so the caller does NOT advance the
+# offset and lose the chunk.
+if printf '%s' "$RESP" | jq -e '.result.isError == true' >/dev/null 2>&1; then
+  echo "mcp tool rejected: $(printf '%s' "$RESP" | jq -r '.result.content[]? | .text' 2>/dev/null | head -c 200)" >&2
+  exit 1
 fi
 echo "mcp error: $(printf '%s' "$RESP" | jq -r '.error.message // "unknown"' 2>/dev/null | head -c 200)" >&2
 exit 1

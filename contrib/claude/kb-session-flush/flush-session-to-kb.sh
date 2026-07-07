@@ -50,9 +50,9 @@ if [ -n "${KB_DIR:-}" ]; then
   UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
   export KB_DIR UV
   "$DETACH" bash -c '
-    cd "$KB_DIR" 2>/dev/null || exit 0
     echo "$(date -Is) local $PROJECT $T"
-    "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue
+    cd "$KB_DIR" 2>/dev/null || { echo "$(date -Is) local $PROJECT BUG: KB_DIR unreachable ($KB_DIR)"; exit 0; }
+    "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue       || echo "$(date -Is) local $PROJECT FAILED: kb ingest-session errored"
   ' </dev/null >>"$LOG" 2>&1 &
 elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TOKEN:-}" ]; then
   # MCP or REMOTE: submit the delta over the network, CHUNKED. Large sessions
@@ -66,27 +66,30 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   HELPER="$(dirname "$0")/kb-mcp-call.sh"
   export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER
   "$DETACH" bash -c '
-    CHUNK=900000; MAX_TOTAL=1073741824
+    CHUNK=900000; MAX_PER_FIRING=209715200   # 200 MB/firing; rest resumes next firing
+    _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
-    SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)
+    case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac   # empty/corrupt offset -> restart
+    SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
     [ "$SIZE" -le "$OFFSET" ] && exit 0
-    if [ $((SIZE - OFFSET)) -gt "$MAX_TOTAL" ]; then
-      echo "$(date -Is) flush $PROJECT SKIP delta > 1GB ($((SIZE-OFFSET)) bytes)"; exit 0
-    fi
     SENT=0
-    while [ "$OFFSET" -lt "$SIZE" ]; do
-      TMPC=$(mktemp)
+    while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$MAX_PER_FIRING" ]; do
+      TMPC=$(mktemp) || { echo "$(date -Is) flush $PROJECT BUG: mktemp failed"; break; }
       tail -c +$((OFFSET+1)) "$T" | head -c "$CHUNK" >"$TMPC"
-      BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")
+      BYTES=$(_fsize "$TMPC")
       [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
-      # Trim to the last complete line unless this window reaches EOF (a
-      # partial trailing line is re-read next firing, never lost).
-      if [ $((OFFSET + BYTES)) -lt "$SIZE" ] && [ "$(tail -c1 "$TMPC")" != "" ]; then
+      # ALWAYS cut on a line boundary: trim to the last newline unless the chunk
+      # already ends in one. Robust to the transcript growing after SIZE was read
+      # (an EOF-crossing window is still trimmed), so the offset never advances
+      # into the middle of a JSONL line and no straddled message is lost. Only a
+      # single line longer than CHUNK is sent unterminated (server tolerates it).
+      if [ "$(tail -c1 "$TMPC")" != "" ]; then
         PART=$(tail -n1 "$TMPC" | wc -c)
         KEEP=$((BYTES - PART))
-        [ "$KEEP" -gt 0 ] || KEEP=$BYTES   # one monster line: send as-is
-        head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"
-        BYTES=$KEEP
+        if [ "$KEEP" -gt 0 ]; then
+          head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"
+          BYTES=$KEEP
+        fi
       fi
       if [ -n "$KB_MCP_URL" ]; then
         # args go via FILE (@) — a ~900KB argv would hit the kernel arg limit.
@@ -134,7 +137,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
       fi
       rm -f "$TMPC"
       case "$CODE" in
-        2*|202) OFFSET=$((OFFSET + BYTES)); echo "$OFFSET" >"$OFFF"; SENT=$((SENT + BYTES)) ;;
+        2*|202) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
         *) echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume"; break ;;
       esac
     done
@@ -153,8 +156,10 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
   "$DETACH" bash -c '
     export KB_HOOK_GUARD=1   # children (claude -p) must not re-trigger KB hooks
+    _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
-    SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)
+    case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac
+    SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
     while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$KB_CONNECTOR_MAX" ]; do
@@ -170,8 +175,10 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       OUT=$("$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
       rm -f "$TMPC"
       case "$OUT" in
-        *[0-9]*) OFFSET=$((OFFSET + BYTES)); echo "$OFFSET" >"$OFFF"; SENT=$((SENT + BYTES)) ;;
-        *) echo "$(date -Is) connector $PROJECT chunk FAILED ($OUT) at offset $OFFSET — will resume"; break ;;
+        *[Ff][Aa][Ii][Ll]*|*[Ee]rror*|*NOTOOL*|*unavailable*)
+          echo "$(date -Is) connector $PROJECT chunk FAILED ($OUT) at offset $OFFSET — will resume"; break ;;
+        *[0-9]*) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
+        *) echo "$(date -Is) connector $PROJECT chunk FAILED (no id: $OUT) at offset $OFFSET — will resume"; break ;;
       esac
     done
     [ "$SENT" -gt 0 ] && echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"

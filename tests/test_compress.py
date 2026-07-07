@@ -127,3 +127,18 @@ def test_mcp_ingest_accepts_transcript_gz(kb):
             "SELECT content FROM ingest_queue WHERE project = 'gzmcp' ORDER BY id DESC LIMIT 1"
         ).fetchone()[0]
     assert "compressed MCP submission" in stored
+
+
+def test_rejects_truncated_gzip():
+    import gzip as _gz
+
+    full = _gz.compress(("line\n" * 5000).encode())
+    half = base64.b64encode(full[: len(full) // 2]).decode()
+    with pytest.raises(InvalidOperation, match="truncated"):
+        compress.decode_transcript_gz(half)
+
+
+def test_rejects_trailing_data_after_member():
+    payload = base64.b64encode(gzip.compress(b"ok\n") + b"garbage-after-trailer").decode()
+    with pytest.raises(InvalidOperation, match="truncated or has trailing"):
+        compress.decode_transcript_gz(payload)

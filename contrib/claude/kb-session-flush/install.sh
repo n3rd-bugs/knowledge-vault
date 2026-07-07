@@ -24,12 +24,12 @@ _discover_mcp() {
   local cj="$HOME/.claude.json"
   [ -f "$cj" ] || return 0
   jq -r '
-    (.mcpServers // {}) as $m
-    | ([$m.kb] + [$m[]])
-    | map(select(type == "object"
-        and ((.url // "") | endswith("/mcp"))
-        and ((.headers.Authorization // "") | test("Bearer"))))
-    | (.[0] // empty)
+    (.mcpServers // {}) | to_entries
+    | map(select((.key | test("kb|knowledge"; "i"))
+        and (.value | type == "object")
+        and ((.value.url // "") | endswith("/mcp"))
+        and ((.value.headers.Authorization // "") | test("Bearer"))))
+    | (.[0].value // empty)
     | [.url, (.headers.Authorization | sub("^Bearer +"; ""))] | @tsv
   ' "$cj" 2>/dev/null
 }

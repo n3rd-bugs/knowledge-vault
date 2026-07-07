@@ -49,6 +49,10 @@ class Settings(BaseSettings):
     # instance accepts BOTH Google OAuth and the static bearer (MultiAuth).
     kb_oauth_enabled: bool = False
     kb_public_url: str = "https://kb.n3rd-bugs.dev"  # base URL for OAuth metadata/redirects
+    # Public REST base (e.g. https://api.<host>), used by kb_setup to pre-fill the
+    # REMOTE session-hook config so a new machine needs only a token. Empty ->
+    # kb_setup emits a generic placeholder.
+    kb_public_rest_url: str = ""
     # Lifetime of the FastMCP-issued access token. Decoupled from Google's ~1h
     # upstream expiry so a client hiccup doesn't surface as an hourly logout;
     # the proxy refreshes Google underneath (access_type=offline).

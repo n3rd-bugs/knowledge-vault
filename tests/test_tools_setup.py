@@ -5,9 +5,20 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from kbmcp import tools_setup
 
 CONTRIB = Path(__file__).resolve().parents[1] / "contrib" / "claude" / "kb-session-flush"
+
+
+@pytest.fixture(autouse=True)
+def _no_configured_rest_url(monkeypatch):
+    """Hermetic default: ignore the machine's real .env KB_PUBLIC_REST_URL so
+    the placeholder-path tests are deterministic (the fallback test sets it)."""
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "")
 
 
 def test_setup_assets_match_contrib():
@@ -41,6 +52,24 @@ def test_guide_substitutes_rest_url():
     # (install.sh's own embedded REMOTE stub keeps its generic placeholder — the
     # guide tells users to write kb-flush.env first, which install.sh preserves.)
     assert "KB_REST_URL=https://api.myhost.internal" in guide
+
+
+def test_guide_falls_back_to_configured_public_rest_url(monkeypatch):
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "https://api.configured.host")
+    guide = tools_setup.build_setup_guide()  # no arg -> use the configured base
+    assert "KB_REST_URL=https://api.configured.host" in guide
+    assert "you only need to add" in guide  # "token only" hint when pre-filled
+    # explicit arg still overrides the configured default
+    g2 = tools_setup.build_setup_guide(rest_url="https://api.override.host")
+    assert "KB_REST_URL=https://api.override.host" in g2
+
+
+def test_guide_explains_oauth_only_dead_end():
+    guide = tools_setup.build_setup_guide()
+    assert "OAuth connector only" in guide
+    assert "not applicable" in guide
 
 
 def test_kb_setup_registered_and_callable():

@@ -15,6 +15,8 @@ from pathlib import Path
 
 from fastmcp.exceptions import ToolError
 
+from kbcore.config import settings
+
 log = logging.getLogger("kbmcp.setup")
 
 ASSETS_DIR = Path(__file__).parent / "setup_assets"
@@ -28,8 +30,24 @@ def _read(name: str) -> str:
 
 def build_setup_guide(rest_url: str | None = None) -> str:
     """Assemble the install guide + embedded scripts. Pure text, no I/O beyond
-    reading the packaged assets. ``rest_url`` fills the REMOTE config template."""
-    url = (rest_url or _PLACEHOLDER_URL).rstrip("/")
+    reading the packaged assets.
+
+    The REMOTE config's ``KB_REST_URL`` is filled from (in order) the ``rest_url``
+    argument, the server's configured ``kb_public_rest_url``, else a generic
+    placeholder; the token is always user-supplied (never emitted — SEC).
+    """
+    configured = (rest_url or settings.kb_public_rest_url or "").strip()
+    url = (configured or _PLACEHOLDER_URL).rstrip("/")
+    if configured:
+        remote_hint = (
+            "Your KB's REST endpoint is filled in below — you only need to add "
+            "`KB_TOKEN` (the same bearer you registered the MCP server with)."
+        )
+    else:
+        remote_hint = (
+            "Set `KB_REST_URL` to your KB's REST base (e.g. `https://api.<your-host>`) "
+            "and `KB_TOKEN` to a bearer token."
+        )
     scripts = {name: _read(name) for name in _SCRIPTS}
     files_block = "\n\n".join(
         f"### File: `~/.claude/kb-setup/{name}`\n\n```bash\n{body.rstrip()}\n```"
@@ -46,19 +64,26 @@ both directions:
   quick KB search — seeded by the repo's recent commit subjects — injected into
   Claude's starting context, so it begins aware of prior decisions and gotchas.
 
+## Which mode is this machine?
+
+- **KB host** (a local KB repo + `uv` are present): `install.sh` auto-detects
+  LOCAL mode and needs no token — skip step 3.
+- **Any other machine, self-hosted KB**: REMOTE mode — the hooks POST to your KB's
+  REST endpoint with a bearer token (step 3).
+- **claude.ai OAuth connector only** (no bearer token / no REST host of your own):
+  the session hooks are **not applicable** — they need a REST endpoint the shell
+  can authenticate to. Nothing to install; use the `kb_*` MCP tools directly.
+
 ## Steps (a Claude Code client can perform these directly)
 
 1. Check `jq` is installed: `command -v jq` (else `sudo apt install jq`).
 2. Write the three files below to `~/.claude/kb-setup/`.
-3. **Only on a machine that is NOT the KB host** (i.e. no local KB repo): create
-   `~/.claude/kb-flush.env` with the REST endpoint + a bearer token, then
-   `chmod 600` it:
+3. **REMOTE machines only** — create `~/.claude/kb-flush.env`, then `chmod 600` it.
+   {remote_hint}
    ```
    KB_REST_URL={url}
    KB_TOKEN=<your KB bearer token>
    ```
-   On the KB host itself, skip this — `install.sh` auto-detects LOCAL mode and
-   writes the config for you.
 4. Run the installer (idempotent; registers PreCompact + SessionEnd + Session
    Start in `~/.claude/settings.json`, preserving any other hooks):
    ```bash

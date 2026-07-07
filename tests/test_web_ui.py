@@ -254,6 +254,42 @@ def test_stats_dashboard_smoke(client):
     assert "width:" in r.text.replace(" ", "")  # server-computed fill widths
 
 
+def test_setup_page_shows_steps_and_token_for_authed(client, monkeypatch):
+    from kbcore.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "kb_public_url", "https://kb.demo.test")
+    monkeypatch.setattr(cfg, "kb_public_rest_url", "https://api.demo.test")
+    r = client.get("/setup")
+    assert r.status_code == 200
+    # correct MCP host in the register command (not the REST host)
+    assert "claude mcp add" in r.text
+    assert "https://kb.demo.test/mcp" in r.text
+    assert "https://api.demo.test/mcp" not in r.text  # must NOT use the REST host for MCP
+    assert "kb_setup" in r.text  # the hooks-install step
+    # the token is present for an authed session, behind a reveal control
+    assert TEST_TOKEN in r.text
+    assert 'id="token-reveal"' in r.text and "data-secret" in r.text
+
+
+def test_setup_page_never_leaks_token_unauthenticated(kb, monkeypatch):
+    """SECURITY: the bearer must never appear for an unauthenticated request."""
+    from starlette.testclient import TestClient
+
+    from kbcore.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "kb_token", TEST_TOKEN)
+    monkeypatch.setattr(cfg, "kb_bind", "127.0.0.1")
+    from kbweb.server import build_app
+
+    c = TestClient(build_app())  # no login
+    r = c.get("/setup", follow_redirects=False)
+    assert r.status_code == 302 and r.headers["location"] == "/login"
+    assert TEST_TOKEN not in r.text
+    # following the redirect to the login page must not carry the token either
+    r2 = c.get("/setup")
+    assert TEST_TOKEN not in r2.text
+
+
 def test_review_page_lists_entries_and_has_no_forms(client):
     from kbcore.review import queue_review
 

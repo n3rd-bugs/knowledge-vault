@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Connect a machine · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Connect a target machine</h2>
+
+<div class="card" style="border-color: var(--warn)">
+  <h4 style="margin:.1rem 0 .3rem">⚠ Bearer token — full read/write access</h4>
+  <p class="prov">This single token grants complete access to the entire KB
+    (including any private/NDA projects). Treat it like a password: don't paste it
+    into shared chats, commit it, or screenshot it. Rotate it in <span class="mono">.env</span>
+    if it ever leaks.</p>
+  <div class="token-box">
+    <code id="kb-token" class="mono" data-secret="{{ token }}">{{ '•' * 24 }}</code>
+    <button id="token-reveal" class="copy-btn" type="button">reveal</button>
+    <button id="token-copy" class="copy-btn" type="button">copy</button>
+  </div>
+</div>
+
+<h3>In Claude Code (CLI / IDE)</h3>
+<p>This gives that machine the <span class="mono">kb_*</span> tools <em>and</em>
+   lets the session hooks capture your work automatically.</p>
+<ol class="steps">
+  <li><strong>Register the connector</strong> (uses the bearer above — reveal &amp; paste it):
+    <pre class="hl">claude mcp add --transport http kb {{ mcp_url }} \
+  --header "Authorization: Bearer &lt;PASTE-TOKEN&gt;"</pre>
+    <span class="prov">Note the host is <span class="mono">{{ mcp_url }}</span> — the MCP
+      endpoint, not the REST host.</span>
+  </li>
+  <li><strong>Install the session hooks</strong> — simplest, just ask Claude Code:
+    <pre class="hl">run kb_setup and install the KB session hooks</pre>
+    With the registration above present, the installer auto-detects <em>MCP mode</em>
+    and needs no further token entry (flush-out on compaction + KB pre-brief on new
+    sessions).
+  </li>
+  <li><strong>Smoke-test</strong> the flush hook:
+    <pre class="hl">T=$(ls -t "$HOME"/.claude/projects/*/*.jsonl | head -1)
+printf '{"transcript_path":"%s","cwd":"%s","session_id":"smoke"}' "$T" "$PWD" \
+  | ~/.claude/hooks/flush-session-to-kb.sh
+sleep 2 &amp;&amp; tail -3 ~/.claude/hooks/flush-session.log   # expect: mcp … ok</pre>
+  </li>
+</ol>
+
+<h3>In claude.ai (web / mobile)</h3>
+<p>Settings → Connectors → <strong>Add custom connector</strong> → URL:</p>
+<pre class="hl">{{ mcp_url }}</pre>
+<p class="prov">Signs in with OAuth (no token needed there). Capture sessions
+   on-demand by asking Claude to <span class="mono">kb_ingest_session</span> /
+   <span class="mono">kb_save</span> — a headless hook can't drive OAuth, so the
+   automatic hooks above are for Claude Code machines with the bearer registration.</p>
+
+<h3>Endpoints</h3>
+<table class="endpoints">
+  <tr><td>MCP</td><td><span class="mono">{{ mcp_url }}</span></td></tr>
+  {% if rest_url %}<tr><td>REST</td><td><span class="mono">{{ rest_url }}</span></td></tr>{% endif %}
+  <tr><td>Web</td><td><span class="mono">{{ web_url }}</span></td></tr>
+</table>
+{% endblock %}

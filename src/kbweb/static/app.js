@@ -47,4 +47,25 @@
     });
     pre.appendChild(btn);
   });
+
+  /* 3. Setup page: reveal/hide + copy the bearer token (kept masked by default).
+     The value lives in data-secret so the plaintext only appears on demand. */
+  var tok = document.getElementById("kb-token");
+  if (tok) {
+    var secret = tok.getAttribute("data-secret") || "";
+    var masked = tok.textContent;
+    var reveal = document.getElementById("token-reveal");
+    var copy = document.getElementById("token-copy");
+    if (reveal) reveal.addEventListener("click", function () {
+      var shown = tok.textContent === secret;
+      tok.textContent = shown ? masked : secret;
+      reveal.textContent = shown ? "reveal" : "hide";
+    });
+    if (copy) copy.addEventListener("click", function () {
+      navigator.clipboard.writeText(secret).then(function () {
+        copy.textContent = "copied";
+        setTimeout(function () { copy.textContent = "copy"; }, 1200);
+      });
+    });
+  }
 })();

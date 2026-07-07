@@ -12,6 +12,7 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from kbcore.browse import list_tags
+from kbcore.config import settings
 from kbcore.errors import NotFound
 from kbcore.items import list_projects, timeline
 from kbcore.review import list_open_review
@@ -64,9 +65,31 @@ def review_view(request: Request) -> Response:  # GET /review — list only, no 
     return templates.TemplateResponse(request, "review.html", {"entries": list_open_review()})
 
 
+def setup_view(request: Request) -> Response:  # GET /setup — connect a target machine
+    """Target-machine setup: the connector token + copy-paste steps.
+
+    Auth-gated by SessionAuthMiddleware like the rest of the UI. The bearer is
+    rendered here at the owner's explicit request (it is masked + reveal-on-click
+    client-side); it is read from config at render time, never hardcoded. Still a
+    pure read — Invariant 11 (no write imports) holds.
+    """
+    base = settings.kb_public_url.rstrip("/")
+    return templates.TemplateResponse(
+        request,
+        "setup.html",
+        {
+            "token": settings.kb_token,
+            "mcp_url": f"{base}/mcp",
+            "rest_url": (settings.kb_public_rest_url or "").rstrip("/"),
+            "web_url": settings.kb_web_public_url.rstrip("/"),
+        },
+    )
+
+
 ROUTES = [
     Route("/projects", projects_view),
     Route("/project/{name}", project_view),
     Route("/stats", stats_view),
     Route("/review", review_view),
+    Route("/setup", setup_view),
 ]

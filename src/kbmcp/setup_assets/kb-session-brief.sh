@@ -38,6 +38,12 @@ if [ -n "${KB_DIR:-}" ]; then
   UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
   HITS=$(cd "$KB_DIR" 2>/dev/null && timeout 20 "$UV" run kb search "$QUERY" \
     -k 5 --boost-project "$PROJECT" 2>/dev/null) || HITS=""
+elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
+  # MCP: call kb_search over the connector endpoint (reuses the registration).
+  HELPER="$(dirname "$0")/kb-mcp-call.sh"
+  ARGS=$(jq -n --arg q "$QUERY" '{query:$q,k:5}')
+  HITS=$(KB_MCP_URL="$KB_MCP_URL" KB_TOKEN="$KB_TOKEN" \
+    timeout 25 bash "$HELPER" kb_search "$ARGS" 2>/dev/null) || HITS=""
 elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   ENC=$(printf '%s' "$QUERY" | jq -sRr @uri)
   HITS=$(curl -sS --max-time 10 "$KB_REST_URL/api/search?q=$ENC&k=5" \

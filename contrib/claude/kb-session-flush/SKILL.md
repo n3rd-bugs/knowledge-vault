@@ -19,13 +19,21 @@ This skill installs two hook sets:
    prior decisions and gotchas. Fails silently (a briefing must never break a
    session); set `KB_BRIEF_ON_RESUME=1` in kb-flush.env to brief resumes too.
 
-Two modes, auto-detected by `install.sh`:
+Three modes, auto-detected by `install.sh` (in priority order):
 - **LOCAL** (the KB host): the hook runs `kb ingest-session <transcript> --queue`
   (checkpointed, GPU-free enqueue). Config: `KB_DIR` in `~/.claude/kb-flush.env`.
-- **REMOTE** (any other machine): the hook POSTs the delta to the KB's
+- **MCP** (any machine already connected via `claude mcp`): **zero config** — the
+  installer auto-discovers the KB server's URL + bearer from `~/.claude.json` and
+  the hooks call `kb_ingest_session` / `kb_search` over that same MCP endpoint (a
+  tiny `kb-mcp-call.sh` helper speaks the streamable-HTTP protocol). Config keys
+  `KB_MCP_URL` + `KB_TOKEN` are written automatically.
+- **REMOTE** (a machine with no MCP registration): the hook POSTs the delta to
   `POST /api/ingest-session` over HTTPS with a bearer token, tracking a per-session
   byte offset so each compaction submits only the new window. Config:
   `KB_REST_URL` + `KB_TOKEN` in `~/.claude/kb-flush.env`.
+
+An OAuth-only claude.ai connector (no static bearer) can't drive the hooks — use
+the `kb_*` MCP tools directly there.
 
 ## Steps
 

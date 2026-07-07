@@ -30,20 +30,27 @@ def test_setup_assets_match_contrib():
         assert shipped == canonical, f"{name} drifted from contrib — re-copy it"
 
 
-def test_guide_embeds_all_three_scripts_and_steps():
+def test_guide_embeds_all_scripts_and_steps():
     guide = tools_setup.build_setup_guide()
     # both hook behaviors named
     assert "PreCompact" in guide and "SessionStart" in guide
-    # every script embedded (a distinctive line from each)
+    # every script embedded (a distinctive line from each of the four)
     assert "flush this session's NEW transcript" in guide  # flush hook
     assert "pre-brief a NEW session" in guide  # brief hook
-    assert "registers PreCompact + SessionEnd" in guide.replace("Session\nStart", "SessionStart")
+    assert "Minimal MCP streamable-HTTP client" in guide  # kb-mcp-call.sh helper
+    assert "reuses your 'claude mcp' KB registration" in guide  # install.sh MCP branch
     # actionable install + smoke test
     assert "bash ~/.claude/kb-setup/install.sh" in guide
     assert "flush-session.log" in guide
     # no site-specific host leaked; generic placeholder present
     assert "n3rd-bugs" not in guide
     assert "https://api.example.com" in guide
+
+
+def test_guide_explains_mcp_zero_config_mode():
+    guide = tools_setup.build_setup_guide()
+    assert "MCP mode" in guide and "zero config" in guide
+    assert "kb_ingest_session" in guide  # the tool the MCP-mode flush hook calls
 
 
 def test_guide_substitutes_rest_url():
@@ -69,7 +76,7 @@ def test_guide_falls_back_to_configured_public_rest_url(monkeypatch):
 def test_guide_explains_oauth_only_dead_end():
     guide = tools_setup.build_setup_guide()
     assert "OAuth connector only" in guide
-    assert "not applicable" in guide
+    assert "aren't applicable" in guide
 
 
 def test_kb_setup_registered_and_callable():

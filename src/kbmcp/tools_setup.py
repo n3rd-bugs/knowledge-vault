@@ -20,7 +20,12 @@ from kbcore.config import settings
 log = logging.getLogger("kbmcp.setup")
 
 ASSETS_DIR = Path(__file__).parent / "setup_assets"
-_SCRIPTS = ("flush-session-to-kb.sh", "kb-session-brief.sh", "install.sh")
+_SCRIPTS = (
+    "flush-session-to-kb.sh",
+    "kb-session-brief.sh",
+    "kb-mcp-call.sh",
+    "install.sh",
+)
 _PLACEHOLDER_URL = "https://api.example.com"
 
 
@@ -64,22 +69,25 @@ both directions:
   quick KB search — seeded by the repo's recent commit subjects — injected into
   Claude's starting context, so it begins aware of prior decisions and gotchas.
 
-## Which mode is this machine?
+## Which mode is this machine? (`install.sh` auto-detects)
 
-- **KB host** (a local KB repo + `uv` are present): `install.sh` auto-detects
-  LOCAL mode and needs no token — skip step 3.
-- **Any other machine, self-hosted KB**: REMOTE mode — the hooks POST to your KB's
-  REST endpoint with a bearer token (step 3).
-- **claude.ai OAuth connector only** (no bearer token / no REST host of your own):
-  the session hooks are **not applicable** — they need a REST endpoint the shell
-  can authenticate to. Nothing to install; use the `kb_*` MCP tools directly.
+- **KB host** (a local KB repo + `uv` present): LOCAL mode — no token needed.
+- **Already connected via `claude mcp`** (a bearer-registered KB server in
+  `~/.claude.json`): **MCP mode — zero config.** The installer reuses that
+  registration's URL + token, and the hooks call `kb_ingest_session` /
+  `kb_search` over the same MCP endpoint. Nothing to fill in.
+- **Otherwise, self-hosted KB**: REMOTE mode — the hooks POST to your KB's REST
+  endpoint with a bearer token (fill in step 3).
+- **claude.ai OAuth connector only** (no static bearer): the session hooks
+  aren't applicable — a headless shell hook can't do the OAuth refresh. Use the
+  `kb_*` MCP tools directly instead.
 
 ## Steps (a Claude Code client can perform these directly)
 
 1. Check `jq` is installed: `command -v jq` (else `sudo apt install jq`).
-2. Write the three files below to `~/.claude/kb-setup/`.
-3. **REMOTE machines only** — create `~/.claude/kb-flush.env`, then `chmod 600` it.
-   {remote_hint}
+2. Write the four files below to `~/.claude/kb-setup/`.
+3. **REMOTE machines only** (skip if `install.sh` reports LOCAL or MCP) — create
+   `~/.claude/kb-flush.env`, then `chmod 600` it. {remote_hint}
    ```
    KB_REST_URL={url}
    KB_TOKEN=<your KB bearer token>

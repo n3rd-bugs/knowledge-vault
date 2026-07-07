@@ -1,10 +1,11 @@
 """kbcore.llm — Ollama /api/chat extractor client (PLAN.md §7.2, Invariant 8).
 
 The nightly 14B extractor turns a session transcript into a list of grounded
-knowledge items. Every call sets ``keep_alive=0`` so the model unloads
-immediately after use — GPU is a guest and the extractor must not sit resident
-(Invariant 8 / OPS-1). Network/format failures become an
-:class:`ExtractorUnavailable` domain error; raw traces stay in the logs.
+knowledge items. ``keep_alive`` comes from ``settings.kb_llm_keep_alive``
+(owner decision 2026-07: default -1 = RESIDENT — idle residency is power-cheap
+and removes the per-call reload that dominated consolidation runtime; set 0 to
+restore unload-per-call and reclaim ~10GB VRAM). Network/format failures become
+an :class:`ExtractorUnavailable` domain error; raw traces stay in the logs.
 """
 
 from __future__ import annotations
@@ -55,8 +56,13 @@ def parse_model_json(content: str) -> Any:
 
 # The 14B can take a while on first-token; generous read timeout, tight connect.
 _TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+
+
 # Invariant 8: unload the extractor the instant the call returns.
-KEEP_ALIVE = 0
+def _keep_alive() -> int:
+    """Per-call keep_alive from config (read at call time so tests/env can flip)."""
+    return settings.kb_llm_keep_alive
+
 
 # The prompt demands the grounded schema from §7.2. Every item MUST carry a
 # ``quote`` that is a verbatim substring of the transcript — the caller
@@ -92,7 +98,7 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
     payload: dict[str, Any] = {
         "model": settings.kb_extract_model,
         "format": "json",
-        "keep_alive": KEEP_ALIVE,
+        "keep_alive": _keep_alive(),
         "stream": False,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -128,18 +134,17 @@ def _chat(
     *,
     json_format: bool,
     model: str | None = None,
-    keep_alive: int | str = KEEP_ALIVE,
+    keep_alive: int | str | None = None,
 ) -> str:
     """POST /api/chat; return the message content.
 
-    ``keep_alive`` defaults to 0 (Invariant 8 — unload immediately). A bounded
-    positive value is permitted ONLY within one explicit multi-call run (deep
-    search) to avoid reloading the 14B between consecutive calls; such runs
-    MUST pass 0 on their final call so the model never outlives the run.
+    ``keep_alive`` defaults to ``settings.kb_llm_keep_alive`` (None sentinel →
+    resolved at call time). Callers may override per call; with the default -1
+    the model stays resident between calls (owner decision, see config).
     """
     payload: dict[str, Any] = {
         "model": model or settings.kb_extract_model,
-        "keep_alive": keep_alive,
+        "keep_alive": _keep_alive() if keep_alive is None else keep_alive,
         "stream": False,
         "messages": messages,
     }
@@ -164,7 +169,7 @@ def chat(
     *,
     json_format: bool = False,
     model: str | None = None,
-    keep_alive: int | str = KEEP_ALIVE,
+    keep_alive: int | str | None = None,
 ) -> str:
     """Public single-shot chat (deep search). Same failure contract as ``_chat``."""
     return _chat(messages, json_format=json_format, model=model, keep_alive=keep_alive)

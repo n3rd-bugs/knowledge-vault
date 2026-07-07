@@ -30,9 +30,14 @@ def test_chat_keep_alive_and_model_passthrough(monkeypatch):
         return _FakeResp('{"ok": true}')
 
     monkeypatch.setattr(llm.httpx, "post", fake_post)
-    # defaults: extract model, keep_alive 0 (Invariant 8)
+    # defaults: extract model, keep_alive from config (owner residency decision)
+    monkeypatch.setattr(settings, "kb_llm_keep_alive", -1)
     llm.chat([{"role": "user", "content": "x"}], json_format=True)
     assert captured[-1]["model"] == settings.kb_extract_model
+    assert captured[-1]["keep_alive"] == -1
+    # config kill switch restores unload-per-call
+    monkeypatch.setattr(settings, "kb_llm_keep_alive", 0)
+    llm.chat([{"role": "user", "content": "x"}], json_format=True)
     assert captured[-1]["keep_alive"] == 0
     assert captured[-1]["format"] == "json"
     # overrides propagate

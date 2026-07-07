@@ -66,6 +66,12 @@ class Settings(BaseSettings):
     # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity,
     # 100% verbatim grounding. gemma3:12b is the approved fast fallback.
     kb_extract_model: str = "qwen3:14b"
+    # Extractor keep_alive (owner decision 2026-07): -1 keeps the model RESIDENT —
+    # idle residency draws single-digit watts (GPU idles down; VRAM refresh is on
+    # regardless), and it removes the ~20s reload per LLM call that dominated
+    # consolidation runtime. Cost: ~10GB VRAM stays occupied. Kill switch: set 0
+    # (unload per call) or a bounded value like 300 (seconds) to reclaim VRAM.
+    kb_llm_keep_alive: int = -1
     # Deep search (explicit user-invoked, local Ollama): empty -> extract model.
     kb_deep_model: str = ""
     kb_deep_max_items: int = 16

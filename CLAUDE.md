@@ -22,7 +22,7 @@ You are implementing the system specified in `PLAN.md` (v2.1 — primary use cas
 5. Automation never deletes rows; it flips `status`. Migrations after 001 are additive only.
 6. Network: bind `KB_BIND` only; bearer check on every MCP request; never disable auth "temporarily".
 7. `TIMESTAMPTZ`/UTC everywhere. `datetime.now(timezone.utc)`, never naive datetimes.
-8. GPU courtesy: embed calls set short keep-alive; the 14B extractor is invoked only from `consolidate.py` or explicit user-invoked runs (`kb ingest-session`, `kb deep-search`).
+8. GPU courtesy: embed calls set short keep-alive; the 14B extractor is invoked only from `consolidate.py` or explicit user-invoked runs (`kb ingest-session`, `kb deep-search`). Residency: `KB_LLM_KEEP_ALIVE=-1` keeps it loaded (owner decision 2026-07 — idle residency is power-cheap; set 0 to reclaim VRAM).
 9. **The KB is not a code index.** Never bulk-ingest source trees; the repo scanner reads docs/ADR/README files only. Knowledge about code carries a `code_ref` anchor ({repo, path, lines, commit, symbol}) instead of the code itself.
 
 ## Code style

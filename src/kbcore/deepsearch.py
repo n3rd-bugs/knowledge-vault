@@ -7,8 +7,8 @@ locally deployed Ollama model (deliberately slow-but-available; no cloud API).
 
 Invariant 8 note: like ``kb ingest-session``, this is an explicit user-invoked
 run, so the 14B may be used; intermediate calls hold the model for
-:data:`RUN_KEEP_ALIVE` seconds to avoid reload thrash, and the FINAL call
-passes ``keep_alive=0`` so nothing stays resident after the run. The report is
+``keep_alive`` follows ``settings.kb_llm_keep_alive`` (owner decision 2026-07:
+default -1 = resident, so runs skip reload thrash entirely). The report is
 saved BEFORE returning (type='report', trust='unverified' — hard rule 4: LLM
 synthesis is never auto-verified) so a timed-out MCP client can still fetch it.
 """
@@ -32,7 +32,6 @@ log = logging.getLogger("kbcore.deepsearch")
 MIN_QUERIES, MAX_QUERIES = 3, 6
 BODY_CHAR_CAP = 4_000  # per-item body budget in the synthesis context
 CONTEXT_CHAR_CAP = 28_000  # total synthesis context budget
-RUN_KEEP_ALIVE = 120  # seconds; intermediate calls only — the final call passes 0
 
 _PLAN_SYSTEM = (
     "You turn one engineering question into diverse search queries for a "
@@ -65,7 +64,6 @@ def plan_queries(question: str) -> list[str]:
             ],
             json_format=True,
             model=settings.deep_model,
-            keep_alive=RUN_KEEP_ALIVE,
         )
         data = llm.parse_model_json(content)
         raw = data.get("queries") if isinstance(data, dict) else None
@@ -165,7 +163,7 @@ def _contradiction_edges(ids: list[int]) -> list[tuple[int, int]]:
 
 
 def synthesize(question: str, docs: list[dict[str, Any]], conflicts: list[tuple[int, int]]) -> str:
-    """Grounded synthesis over the bounded docs. Final LLM call → keep_alive=0."""
+    """Grounded synthesis over the bounded docs (keep_alive from config)."""
     parts = []
     for d in docs:
         parts.append(
@@ -179,7 +177,6 @@ def synthesize(question: str, docs: list[dict[str, Any]], conflicts: list[tuple[
     return llm.chat(
         [{"role": "system", "content": _SYNTH_SYSTEM}, {"role": "user", "content": user}],
         model=settings.deep_model,
-        keep_alive=0,  # final call — the model must not outlive the run (Inv. 8)
     ).strip()
 
 

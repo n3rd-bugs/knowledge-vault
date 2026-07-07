@@ -39,6 +39,16 @@ def scrub(text: str) -> tuple[str, dict[str, int]]:
     Runs on every ingest path before anything is stored (SEC-2).
     """
     redactions: dict[str, int] = {}
+    # The KB's OWN bearer, wherever it appears (bare, in a config snippet, in a
+    # flushed transcript of a kb_setup conversation) — the generic token= pattern
+    # only catches prefixed forms. Exact match, no regex risk.
+    from kbcore.config import settings  # local import — scrub stays dependency-light
+
+    own = settings.kb_token
+    if own and len(own) >= 16 and own in text:
+        n = text.count(own)
+        text = text.replace(own, "[REDACTED:kb_token]")
+        redactions["kb_token"] = redactions.get("kb_token", 0) + n
     for label, pattern in SECRET_PATTERNS:
         text, n = pattern.subn(f"[REDACTED:{label}]", text)
         if n:

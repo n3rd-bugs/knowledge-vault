@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token
 
 from kbcore.config import settings
 
@@ -33,26 +34,59 @@ def _read(name: str) -> str:
     return (ASSETS_DIR / name).read_text()
 
 
-def build_setup_guide(rest_url: str | None = None) -> str:
+def _caller_holds_bearer() -> bool:
+    """True iff the CALLING client already possesses the static bearer.
+
+    Two cases: (a) the local kb-mcp instance — FastMCP auth is off there and the
+    ASGI middleware already validated the bearer, so get_access_token() is None;
+    (b) the public MultiAuth instance authenticated this request via the
+    StaticTokenVerifier (client_id == 'bearer'). An OAuth principal (Google)
+    returns False: echoing the bearer to an identity-authenticated session would
+    ESCALATE a revocable grant into the permanent master key.
+    """
+    try:
+        tok = get_access_token()
+    except Exception:  # outside a request context (tests calling directly)
+        return False
+    if tok is None:
+        return True
+    return getattr(tok, "client_id", "") == "bearer"
+
+
+def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> str:
     """Assemble the install guide + embedded scripts. Pure text, no I/O beyond
     reading the packaged assets.
 
     The REMOTE config's ``KB_REST_URL`` is filled from (in order) the ``rest_url``
     argument, the server's configured ``kb_public_rest_url``, else a generic
-    placeholder; the token is always user-supplied (never emitted — SEC).
+    placeholder. ``token`` is embedded ONLY when the tool layer verified the
+    caller already holds the bearer (see ``_caller_holds_bearer``); OAuth-authed
+    callers get an explanation + tokenless alternatives instead.
     """
     configured = (rest_url or settings.kb_public_rest_url or "").strip()
     url = (configured or _PLACEHOLDER_URL).rstrip("/")
-    if configured:
+    if token:
+        remote_hint = (
+            "Your bearer is embedded below (you authenticated this call with that "
+            "same token, so this discloses nothing new). Write the file EXACTLY as "
+            "shown and `chmod 600` it — do not echo the token elsewhere."
+        )
+        token_line = token
+    elif configured:
         remote_hint = (
             "Your KB's REST endpoint is filled in below — you only need to add "
-            "`KB_TOKEN` (the same bearer you registered the MCP server with)."
+            "`KB_TOKEN` (the same bearer you registered the MCP server with). "
+            "(Token not embedded: this call was authenticated via OAuth identity, "
+            "not the bearer — use the web UI /setup page to copy it, or skip "
+            "tokens entirely with CONNECTOR mode.)"
         )
+        token_line = "<your KB bearer token>"
     else:
         remote_hint = (
             "Set `KB_REST_URL` to your KB's REST base (e.g. `https://api.<your-host>`) "
             "and `KB_TOKEN` to a bearer token."
         )
+        token_line = "<your KB bearer token>"
     scripts = {name: _read(name) for name in _SCRIPTS}
     files_block = "\n\n".join(
         f"### File: `~/.claude/kb-setup/{name}`\n\n```bash\n{body.rstrip()}\n```"
@@ -93,7 +127,7 @@ both directions:
    `~/.claude/kb-flush.env`, then `chmod 600` it. {remote_hint}
    ```
    KB_REST_URL={url}
-   KB_TOKEN=<your KB bearer token>
+   KB_TOKEN={token_line}
    ```
 4. Run the installer (idempotent; registers PreCompact + SessionEnd + Session
    Start in `~/.claude/settings.json`, preserving any other hooks):
@@ -152,11 +186,14 @@ def register(mcp) -> None:
         before compaction) and a pre-brief hook (injects relevant KB knowledge
         into new sessions). On the KB host it installs in LOCAL mode; from any
         other machine pass rest_url (your KB REST base, e.g.
-        https://api.your-host) and set a KB_TOKEN. If you are running in Claude
-        Code, you can write the files and run install.sh yourself.
+        https://api.your-host). If this call is authenticated with the static
+        bearer, the token is embedded in the returned config automatically
+        (OAuth-authenticated calls never receive it). If you are running in
+        Claude Code, you can write the files and run install.sh yourself.
         """
         try:
-            return build_setup_guide(rest_url)
+            token = settings.kb_token if _caller_holds_bearer() else None
+            return build_setup_guide(rest_url, token=token)
         except OSError as e:  # packaged assets unreadable — surface cleanly
             log.exception("kb_setup asset read failed")
             raise ToolError(f"setup assets unavailable: {e}") from e

@@ -95,3 +95,70 @@ def test_kb_setup_registered_and_callable():
 
     text = asyncio.run(run())
     assert "install.sh" in text and "https://api.x.test" in text
+
+
+# --- auth-gated token embedding ------------------------------------------------------
+
+
+def test_guide_embeds_token_when_provided():
+    guide = tools_setup.build_setup_guide(token="kbtest-" + "9" * 32)
+    assert "KB_TOKEN=kbtest-" + "9" * 32 in guide
+    assert "discloses nothing new" in guide  # the rationale is stated
+    assert "<your KB bearer token>" not in guide
+
+
+def test_guide_withholds_token_by_default(monkeypatch):
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "https://api.demo.test")
+    guide = tools_setup.build_setup_guide()  # no token arg
+    assert "KB_TOKEN=<your KB bearer token>" in guide
+    assert "OAuth identity" in guide  # explains why + points at alternatives
+
+
+def test_kb_setup_gates_token_on_caller_principal(kb, monkeypatch):
+    """Bearer/local principals get the token; OAuth principals never do."""
+    import asyncio
+
+    from fastmcp import Client, FastMCP
+
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_token", "kbtest-" + "7" * 32)
+
+    class _Tok:
+        def __init__(self, cid):
+            self.client_id = cid
+
+    def run_with(principal):
+        monkeypatch.setattr(tools_setup, "get_access_token", lambda: principal)
+        mcp = FastMCP(name="kb-test")
+        tools_setup.register(mcp)
+
+        async def call():
+            async with Client(mcp) as c:
+                res = await c.call_tool("kb_setup", {})
+                return res.content[0].text
+
+        return asyncio.run(call())
+
+    # local instance (FastMCP auth off -> None) and static-bearer principal: embedded
+    assert "KB_TOKEN=kbtest-" + "7" * 32 in run_with(None)
+    assert "KB_TOKEN=kbtest-" + "7" * 32 in run_with(_Tok("bearer"))
+    # OAuth principal: withheld, with the explanation
+    oauth_guide = run_with(_Tok("google-oauth-client-abc"))
+    assert "kbtest-" + "7" * 32 not in oauth_guide
+    assert "OAuth" in oauth_guide
+
+
+def test_scrub_redacts_own_kb_token(kb, monkeypatch):
+    from kbcore.config import settings
+    from kbcore.scrub import scrub
+
+    monkeypatch.setattr(settings, "kb_token", "kbtest-" + "5" * 32)
+    clean, red = scrub(
+        f"the config was KB_TOKEN={settings.kb_token} and also bare "
+        f"{settings.kb_token} mid-sentence"
+    )
+    assert settings.kb_token not in clean
+    assert red.get("kb_token", 0) >= 2, "bare occurrences redacted too"

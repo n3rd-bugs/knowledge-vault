@@ -180,6 +180,7 @@ class RepoScanSummary(BaseModel):
     ingested: list[str] = Field(default_factory=list)
     skipped_dupes: int = 0
     errors: int = 0  # docs that failed to ingest (bad bytes etc.), logged + skipped
+    superseded: int = 0  # stale revisions auto-superseded by re-ingested docs
 
     @property
     def saved(self) -> int:

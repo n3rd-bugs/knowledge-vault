@@ -237,3 +237,82 @@ def test_reposcan_ingests_non_ascii_doc_name(tmp_path):
     summary = scan_repo(repo)
 
     assert any(u.endswith("résumé.md") for u in summary.ingested), "non-ASCII doc ingested"
+
+
+# --- doc-refresh auto-supersede (auto-resolution tier 1a) ----------------------------
+
+
+def _statuses_for_uri(uri: str) -> list[tuple[int, str, int | None]]:
+    with db.connect() as conn:
+        return conn.execute(
+            "SELECT i.id, i.status, i.superseded_by FROM items i "
+            "JOIN sources s ON s.id = i.source_id "
+            "WHERE s.kind='git' AND s.uri = %s ORDER BY i.id",
+            (uri,),
+        ).fetchall()
+
+
+def test_changed_doc_supersedes_previous_revision(kb, tmp_path):
+    repo = tmp_path / "refresh-repo"
+    _init_fixture_repo(repo)
+    first = scan_repo(repo)
+    assert first.saved == 2 and first.superseded == 0
+
+    (repo / "README.md").write_text("# Fixture\n\nThe frobnicator now uses I2C, not SPI.")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "update readme")
+    second = scan_repo(repo)
+    assert second.saved == 1, "only the changed doc re-ingests"
+    assert second.superseded == 1, "the stale revision was auto-superseded"
+
+    rows = _statuses_for_uri("refresh-repo:README.md")
+    assert len(rows) == 2
+    old, new = rows
+    assert old[1] == "superseded" and old[2] == new[0], "old -> superseded_by new"
+    assert new[1] == "active"
+    with db.connect() as conn:
+        reason = conn.execute(
+            "SELECT supersede_reason FROM items WHERE id = %s", (old[0],)
+        ).fetchone()[0]
+    assert "newer revision" in reason
+
+
+def test_doc_refresh_flag_off_leaves_both_active(kb, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "kb_auto_supersede_doc_refresh", False)
+    repo = tmp_path / "noflag-repo"
+    _init_fixture_repo(repo)
+    scan_repo(repo)
+    (repo / "README.md").write_text("# Fixture\n\nChanged content, flag off.")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "update")
+    second = scan_repo(repo)
+    assert second.superseded == 0
+    statuses = [r[1] for r in _statuses_for_uri("noflag-repo:README.md")]
+    assert statuses == ["active", "active"], "flag off preserves old behavior"
+
+
+def test_multiple_stale_revisions_all_superseded(kb, tmp_path):
+    repo = tmp_path / "multi-repo"
+    _init_fixture_repo(repo)
+    scan_repo(repo)
+    # two more revisions, the middle one scanned with the flag OFF to build backlog
+    from kbcore.config import settings as cfg
+
+    (repo / "README.md").write_text("rev 2")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "r2")
+    cfg_orig = cfg.kb_auto_supersede_doc_refresh
+    cfg.kb_auto_supersede_doc_refresh = False
+    try:
+        scan_repo(repo)  # rev2 ingests, rev1 stays active (backlog)
+    finally:
+        cfg.kb_auto_supersede_doc_refresh = cfg_orig
+    (repo / "README.md").write_text("rev 3")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "r3")
+    third = scan_repo(repo)
+    assert third.superseded == 2, "both stale revisions retire at once"
+    rows = _statuses_for_uri("multi-repo:README.md")
+    assert [r[1] for r in rows] == ["superseded", "superseded", "active"]
+    newest = rows[-1][0]
+    assert all(r[2] == newest for r in rows[:-1]), "all point at the newest revision"

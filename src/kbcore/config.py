@@ -65,6 +65,12 @@ class Settings(BaseSettings):
     # Deep search (explicit user-invoked, local Ollama): empty -> extract model.
     kb_deep_model: str = ""
     kb_deep_max_items: int = 16
+    # Auto-resolution (owner decision, 2026-07): a re-ingested newer revision of
+    # the SAME source doc supersedes its predecessor (git history IS the human
+    # decision), and lopsided-evidence contradictions auto-resolve after a
+    # 2-night stable margin (owner refinement of verdict V4). Kill switches:
+    kb_auto_supersede_doc_refresh: bool = True
+    kb_auto_resolve_evidence: bool = True
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")

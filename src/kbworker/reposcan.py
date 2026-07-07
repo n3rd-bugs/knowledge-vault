@@ -18,6 +18,7 @@ from kbcore.errors import KBError
 from kbcore.ingest import ingest
 from kbcore.items import project_for_repo
 from kbcore.models import RepoScanSummary
+from kbcore.supersede import supersede_doc_refresh
 
 logger = logging.getLogger("kbworker.reposcan")
 
@@ -196,6 +197,7 @@ def scan_repo(path: str | Path) -> RepoScanSummary:
     ingested: list[str] = []
     skipped = 0
     errors = 0
+    superseded = 0
     for rel in _tracked_files(repo):
         if not is_doc_path(rel):
             continue
@@ -215,6 +217,13 @@ def scan_repo(path: str | Path) -> RepoScanSummary:
                 code_ref={"repo": repo_name, "path": rel, "commit": commit},
                 raw_content=raw,
             )
+            # A changed doc = a NEWER REVISION of the same source uri: retire the
+            # stale predecessor(s) instead of letting old-vs-new coexist and get
+            # flagged as a contradiction later (owner decision — git history IS
+            # the human decision). Inside the per-doc guard: hook failures count
+            # as errors without aborting the scan.
+            if item_id is not None and settings.kb_auto_supersede_doc_refresh:
+                superseded += len(supersede_doc_refresh(item_id))
         except Exception:  # noqa: BLE001 — one bad doc must not abort the scan
             logger.exception("failed to ingest %s:%s", repo_name, rel)
             errors += 1
@@ -230,6 +239,7 @@ def scan_repo(path: str | Path) -> RepoScanSummary:
         ingested=ingested,
         skipped_dupes=skipped,
         errors=errors,
+        superseded=superseded,
     )
 
 

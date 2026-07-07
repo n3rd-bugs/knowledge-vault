@@ -7,10 +7,14 @@ relation records the edge (Invariant 1/5).
 
 from __future__ import annotations
 
+import logging
+
 from kbcore import scope
-from kbcore.db import transaction
+from kbcore.db import connect, transaction
 from kbcore.errors import DuplicateContent, InvalidOperation, NotFound
 from kbcore.ingest import ingest_in
+
+logger = logging.getLogger("kbcore.supersede")
 
 
 def supersede(
@@ -91,3 +95,46 @@ def supersede(
             (project, new_item_id, old_id),
         )
     return new_item_id
+
+
+def supersede_doc_refresh(new_item_id: int) -> list[int]:
+    """Supersede ALL prior ACTIVE items sharing the new item's source ``(kind, uri)``.
+
+    A re-ingested changed document (same source uri, new content hash) is a
+    NEWER REVISION, not competing knowledge — the repo owner already "disposed"
+    by committing the change, so mirroring git history here is V4-compatible
+    (owner decision, 2026-07). Returns the superseded ids ([] when the doc is
+    new or the predecessors are already non-active). Per-predecessor isolation:
+    one failure logs and the rest proceed.
+    """
+    with connect() as conn:
+        src = conn.execute(
+            """
+            SELECT i.project, s.kind, s.uri FROM items i
+            JOIN sources s ON s.id = i.source_id
+            WHERE i.id = %s
+            """,
+            (new_item_id,),
+        ).fetchone()
+        if src is None or not src[2]:
+            return []  # no source uri to key on (manual/chat items)
+        project, kind, uri = src
+        olds = conn.execute(
+            """
+            SELECT i.id FROM items i
+            JOIN sources s ON s.id = i.source_id
+            WHERE s.kind = %s AND s.uri = %s AND i.project = %s
+              AND i.status = 'active' AND i.id <> %s
+            ORDER BY i.id
+            """,
+            (kind, uri, project, new_item_id),
+        ).fetchall()
+
+    superseded: list[int] = []
+    for (old_id,) in olds:
+        try:
+            supersede(old_id, new_item_id=new_item_id, reason=f"auto: newer revision of {uri}")
+            superseded.append(old_id)
+        except (InvalidOperation, NotFound):  # raced/already superseded — fine
+            logger.info("doc-refresh: item %s already resolved; skipping", old_id)
+    return superseded

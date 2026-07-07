@@ -16,7 +16,18 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
-from kbcore import graph, ingest, ingest_queue, items, jobs, review, search, stats, supersede
+from kbcore import (
+    compress,
+    graph,
+    ingest,
+    ingest_queue,
+    items,
+    jobs,
+    review,
+    search,
+    stats,
+    supersede,
+)
 from kbcore.config import settings
 from kbcore.errors import (
     DuplicateContent,
@@ -122,7 +133,7 @@ def _register_write(app: FastAPI) -> None:
         # Scrub + store NOW (no GPU); the 14B extracts in the nightly drain.
         queue_id = ingest_queue.enqueue(
             payload.project,
-            payload.transcript,
+            compress.resolve_transcript(payload.transcript, payload.transcript_gz),
             kind=payload.kind,
             repo=payload.repo,
             branch=payload.branch,

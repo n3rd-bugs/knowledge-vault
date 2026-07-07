@@ -40,7 +40,11 @@ class ReviewResolveRequest(BaseModel):
 
 class IngestSessionRequest(BaseModel):
     project: str
-    transcript: str
+    transcript: str | None = None
+    # base64(gzip(transcript)) — for large-context submissions (~10x smaller on
+    # the wire); mutually exclusive with transcript. Decoded with zip-bomb
+    # guards in kbcore.compress.
+    transcript_gz: str | None = None
     kind: str = "session"  # session | memory
     repo: str | None = None
     branch: str | None = None

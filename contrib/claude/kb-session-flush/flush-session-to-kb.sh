@@ -75,16 +75,37 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         BYTES=$KEEP
       fi
       if [ -n "$KB_MCP_URL" ]; then
-        # args go via FILE (@) — a ~900KB argv would hit the kernel arg limit
-        jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
-          "{project:\$p,transcript:\$t,kind:\"session\"}" >"$TMPC.args"
+        # args go via FILE (@) — a ~900KB argv would hit the kernel arg limit.
+        # Chunks are gzip+base64 encoded when the tools exist (10x less wire);
+        # plaintext fallback keeps minimal systems working.
+        if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+          gzip -c "$TMPC" | base64 -w0 >"$TMPC.gz64"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" \
+            "{project:\$p,transcript_gz:\$t,kind:\"session\"}" >"$TMPC.args"
+          rm -f "$TMPC.gz64"
+        else
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
+            "{project:\$p,transcript:\$t,kind:\"session\"}" >"$TMPC.args"
+        fi
         bash "$HELPER" kb_ingest_session "@$TMPC.args" >/dev/null 2>>"$LOG" && CODE=202 || CODE=err
         rm -f "$TMPC.args"
       else
-        CODE=$(jq -n --arg p "$PROJECT" --rawfile t "$TMPC" "{project:\$p,kind:\"session\",transcript:\$t}" \
-          | curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
+        if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+          gzip -c "$TMPC" | base64 -w0 >"$TMPC.gz64"
+          BODYF="$TMPC.body"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" \
+            "{project:\$p,kind:\"session\",transcript_gz:\$t}" >"$BODYF"
+          rm -f "$TMPC.gz64"
+        else
+          BODYF="$TMPC.body"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
+            "{project:\$p,kind:\"session\",transcript:\$t}" >"$BODYF"
+        fi
+        CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
              -X POST "$KB_REST_URL/api/ingest-session" \
-             -H "Authorization: Bearer $KB_TOKEN" -H "Content-Type: application/json" --data @-)
+             -H "Authorization: Bearer $KB_TOKEN" -H "Content-Type: application/json" \
+             --data @"$BODYF")
+        rm -f "$BODYF"
       fi
       rm -f "$TMPC"
       case "$CODE" in

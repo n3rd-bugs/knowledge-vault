@@ -12,7 +12,7 @@ import logging
 
 from fastmcp.exceptions import ToolError
 
-from kbcore import graph, ingest_queue, items, render, stats
+from kbcore import compress, graph, ingest_queue, items, render, stats
 from kbcore import review as review_mod
 from kbcore.errors import KBError
 
@@ -94,7 +94,8 @@ def register(mcp) -> None:
     @mcp.tool
     def kb_ingest_session(
         project: str,
-        transcript: str,
+        transcript: str | None = None,
+        transcript_gz: str | None = None,
         kind: str = "session",
         repo: str | None = None,
         branch: str | None = None,
@@ -104,11 +105,14 @@ def register(mcp) -> None:
         learn from. It is scrubbed and stored NOW (no GPU); the grounded 14B
         extraction runs in the nightly window and results land as unverified items
         you can review. kind is 'session' (a .jsonl or plain transcript) or
-        'memory' (a free-text memory dump). Pass repo/branch/commit to anchor the
-        knowledge to code. Re-submitting identical content is a no-op."""
+        'memory' (a free-text memory dump). For LARGE transcripts pass
+        transcript_gz = base64(gzip(text)) instead of transcript (~10x smaller
+        on the wire). Pass repo/branch/commit to anchor the knowledge to code.
+        Re-submitting identical content is a no-op."""
         try:
+            text = compress.resolve_transcript(transcript, transcript_gz)
             queue_id = ingest_queue.enqueue(
-                project, transcript, kind=kind, repo=repo, branch=branch, commit=commit
+                project, text, kind=kind, repo=repo, branch=branch, commit=commit
             )
             if queue_id is None:
                 return "duplicate — already queued"

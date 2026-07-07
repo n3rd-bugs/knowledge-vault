@@ -213,6 +213,36 @@ def projects() -> None:
     typer.echo(render.render_projects(items.list_projects()))
 
 
+@app.command("consolidate-now")
+def consolidate_now() -> None:
+    """Request an on-demand consolidation run (the host worker executes it)."""
+    from kbcore import jobs
+
+    req_id, created = jobs.request_consolidation("cli")
+    typer.echo(
+        f"queued consolidation request {req_id}"
+        if created
+        else f"a run is already in progress (request {req_id})"
+    )
+    st = jobs.latest_consolidation_status()
+    if st:
+        typer.echo(f"status: {st['status']}")
+
+
+@app.command("consolidate-status")
+def consolidate_status() -> None:
+    """Show the latest on-demand consolidation request's status."""
+    from kbcore import jobs
+
+    st = jobs.latest_consolidation_status()
+    if not st:
+        typer.echo("no runs recorded yet")
+        return
+    typer.echo(f"#{st['id']} ({st['requested_by']}): {st['status']}")
+    if st.get("result"):
+        typer.echo(f"result: {st['result']}")
+
+
 @project_app.command("set")
 def project_set(
     name: str = typer.Argument(...),

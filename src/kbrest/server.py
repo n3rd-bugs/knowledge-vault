@@ -14,8 +14,9 @@ import logging
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 
-from kbcore import graph, ingest, ingest_queue, items, review, search, stats, supersede
+from kbcore import graph, ingest, ingest_queue, items, jobs, review, search, stats, supersede
 from kbcore.config import settings
 from kbcore.errors import (
     DuplicateContent,
@@ -167,6 +168,21 @@ def _register_write(app: FastAPI) -> None:
         )
         return {"relation_id": rel_id}
 
+    @app.post("/api/consolidate", status_code=202)
+    def api_consolidate() -> dict:
+        # Enqueue only — the host worker (GPU) runs it (Invariant 8). Deduped
+        # against an in-flight run so repeated clicks don't stack.
+        req_id, created = jobs.request_consolidation("rest")
+        return {
+            "request_id": req_id,
+            "created": created,
+            "status": jobs.latest_consolidation_status(),
+        }
+
+    @app.get("/api/consolidate")
+    def api_consolidate_status() -> dict:
+        return {"status": jobs.latest_consolidation_status()}
+
     @app.post("/api/review/{queue_id}/resolve")
     def api_review_resolve(queue_id: int, payload: ReviewResolveRequest) -> dict:
         action = payload.action
@@ -183,9 +199,25 @@ def _register_write(app: FastAPI) -> None:
 
 
 def build_app():
-    """FastAPI app wrapped in the bearer middleware, after the startup guard."""
+    """FastAPI app wrapped in the bearer middleware, after the startup guard.
+
+    CORS is layered OUTSIDE the bearer check so the read-only web UI (a different
+    origin) can call the write endpoints — notably POST /api/consolidate for the
+    "run now" button — with its bearer. Preflight OPTIONS carry no auth, so CORS
+    must answer them before the bearer middleware sees them. Origin is pinned to
+    the configured web UI host (never ``*``).
+    """
     _validate_runtime_config()
-    return BearerAuthMiddleware(create_app())
+    app = BearerAuthMiddleware(create_app())
+    origin = settings.kb_web_public_url.rstrip("/")
+    if origin:
+        app = CORSMiddleware(
+            app,
+            allow_origins=[origin],
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type"],
+        )
+    return app
 
 
 def main() -> None:

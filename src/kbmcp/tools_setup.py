@@ -109,8 +109,37 @@ delete `~/.claude/kb-flush.env` (the hooks no-op without config).
 """
 
 
+def _consolidation_status_line() -> str:
+    from kbcore import jobs
+
+    st = jobs.latest_consolidation_status()
+    if not st:
+        return "no runs recorded yet"
+    tail = f" — {st['result']}" if st.get("result") else ""
+    return f"latest run #{st['id']} ({st['requested_by']}): {st['status']}{tail}"
+
+
 def register(mcp) -> None:
-    """Register the kb_setup tool on the given FastMCP instance."""
+    """Register the control-plane tools (kb_setup, kb_consolidate)."""
+
+    @mcp.tool
+    def kb_consolidate() -> str:
+        """Request an on-demand nightly consolidation run (dedupe, summaries,
+        contradiction detection + evidence + auto-resolution, archive, re-embed).
+
+        The run executes on the host worker (GPU) and takes MINUTES; this only
+        enqueues it (deduped against an in-flight run) and returns the current
+        status. Poll kb_consolidate again — or kb_stats — for completion.
+        """
+        from kbcore import jobs
+
+        req_id, created = jobs.request_consolidation("mcp")
+        head = (
+            f"queued consolidation request #{req_id}"
+            if created
+            else f"a run is already in progress (request #{req_id})"
+        )
+        return f"{head}\n{_consolidation_status_line()}"
 
     @mcp.tool
     def kb_setup(rest_url: str | None = None) -> str:

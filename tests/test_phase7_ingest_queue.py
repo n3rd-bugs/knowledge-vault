@@ -247,3 +247,74 @@ def test_enqueue_rejects_when_backlog_full(kb, monkeypatch):
     ingest_queue.enqueue("p", "first submission text", kind="session")
     with pytest.raises(InvalidOperation, match="queue is full"):
         ingest_queue.enqueue("p", "second distinct submission text", kind="session")
+
+
+# --- large-session chunked flush (owner request: up to 1 GB) -------------------------
+
+
+def test_text_windows_line_boundaries_and_cap():
+    from kbworker.sessions import _text_windows
+
+    text = "".join(f"line {i} " + "x" * 90 + "\n" for i in range(50))  # ~5KB
+    wins = _text_windows(text, 1000)
+    assert len(wins) > 3
+    assert "".join(wins) == text, "windows reassemble losslessly"
+    for w in wins:
+        assert len(w.encode()) <= 1000
+        assert w.endswith("\n"), "windows cut on line boundaries"
+
+
+def test_text_windows_monster_line_hard_split():
+    from kbworker.sessions import _text_windows
+
+    text = "é" * 2000  # multibyte, single line, > cap
+    wins = _text_windows(text, 1000)
+    assert len(wins) >= 4
+    assert "".join(wins) == text, "hard split loses no characters"
+    for w in wins:
+        assert len(w.encode()) <= 1000
+
+
+def test_text_windows_total_cap(monkeypatch):
+    from kbworker import sessions
+
+    monkeypatch.setattr(sessions, "MAX_DELTA_BYTES", 5_000)
+    import pytest as _pytest
+
+    from kbcore.errors import InvalidOperation
+
+    with _pytest.raises(InvalidOperation):
+        sessions._text_windows("x" * 6_000, 1000)
+
+
+def test_local_queue_flush_chunks_large_delta(kb, tmp_path, monkeypatch):
+    """A >window transcript enqueues as MULTIPLE rows and advances the checkpoint
+    (previously it raised on the 1MB row cap and wedged forever)."""
+    import json as _json
+
+    from kbcore import db, ingest_queue
+    from kbworker import sessions
+
+    monkeypatch.setattr(sessions, "QUEUE_WINDOW_BYTES", 2_000)  # small for the test
+    t = tmp_path / "big.jsonl"
+    with t.open("w") as f:
+        for i in range(60):
+            f.write(
+                _json.dumps(
+                    {"type": "user", "message": {"role": "user", "content": f"m{i} " + "y" * 80}}
+                )
+                + "\n"
+            )
+    s = sessions.ingest_session(t, "bigflush", queue=True)
+    assert s.saved >= 2, "delta split into multiple queue rows"
+    assert s.offset == t.stat().st_size, "checkpoint advanced past the whole delta"
+    with db.connect() as conn:
+        parts = conn.execute(
+            "SELECT count(*) FROM ingest_queue WHERE project = 'bigflush' "
+            "AND meta->>'source_uri' LIKE '%#p%'"
+        ).fetchone()[0]
+    assert parts == s.saved, "each row carries its per-part uri (dedupe-safe)"
+    # re-run is a no-op (checkpoint advanced)
+    s2 = sessions.ingest_session(t, "bigflush", queue=True)
+    assert s2.saved == 0
+    assert ingest_queue.queue_depth() >= parts

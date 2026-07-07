@@ -20,6 +20,7 @@ from kbcore import llm
 from kbcore.checkpoints import get_checkpoint, set_checkpoint
 from kbcore.config import settings
 from kbcore.db import transaction
+from kbcore.errors import InvalidOperation
 from kbcore.ingest import ingest_in
 from kbcore.locks import session_lock
 from kbcore.models import ITEM_TYPES, SessionSummary
@@ -30,6 +31,61 @@ logger = logging.getLogger("kbworker.sessions")
 
 # Transcript roles we keep; tool machinery and system noise are skipped.
 _KEEP_ROLES = frozenset({"user", "assistant"})
+
+# Large-session flushing: per-queue-row window (under ingest_queue's 1 MB row
+# cap) and a total-delta ceiling. 1 GB ≈ 1,200 windows — drained at
+# QUEUE_BATCH/night by consolidation, a natural throttle on extraction cost.
+QUEUE_WINDOW_BYTES = 900_000
+MAX_DELTA_BYTES = 1_073_741_824  # 1 GB
+
+
+def _text_windows(text: str, max_bytes: int) -> list[str]:
+    """Split text into UTF-8 windows of at most ``max_bytes``, on line boundaries.
+
+    A single line longer than the window is emitted alone (mid-line split —
+    unavoidable, and the drain's line parser skips at most that one line).
+    Raises when the total exceeds :data:`MAX_DELTA_BYTES`.
+    """
+    if len(text.encode("utf-8")) > MAX_DELTA_BYTES:
+        raise InvalidOperation(f"session delta exceeds the {MAX_DELTA_BYTES}-byte (1 GB) limit")
+    windows: list[str] = []
+    current: list[str] = []
+    size = 0
+    for line in text.splitlines(keepends=True):
+        n = len(line.encode("utf-8"))
+        if n > max_bytes:
+            # A single monster line: flush what we have, then hard-split it on
+            # UTF-8-safe byte boundaries (a row must fit the queue's 1 MB cap).
+            if current:
+                windows.append("".join(current))
+                current, size = [], 0
+            windows.extend(_hard_split(line, max_bytes))
+            continue
+        if size + n > max_bytes and current:
+            windows.append("".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += n
+    if current:
+        windows.append("".join(current))
+    return windows or [""]
+
+
+def _hard_split(line: str, max_bytes: int) -> list[str]:
+    """Byte-cap a single oversized line, never cutting inside a UTF-8 sequence."""
+    data = line.encode("utf-8")
+    out: list[str] = []
+    i = 0
+    while i < len(data):
+        j = min(i + max_bytes, len(data))
+        while j > i:  # back off to a codepoint boundary (≤3 continuation bytes)
+            try:
+                out.append(data[i:j].decode("utf-8"))
+                break
+            except UnicodeDecodeError:
+                j -= 1
+        i = j
+    return out
 
 
 def _message_text(obj: dict[str, Any]) -> str:
@@ -287,26 +343,35 @@ def ingest_session(
         uri = f"{key}:{offset}-{new_offset}"
 
         # Courtesy path: enqueue the delta for the nightly drain instead of running
-        # the 14B now. Advance the checkpoint on success so the next call resumes
-        # after this window. Oversized/rejected submissions raise (caller logs).
+        # the 14B now. Large-session support (owner request, up to 1 GB): the delta
+        # is split into per-row windows under the queue's 1 MB cap — each window is
+        # its own queue row (extracted independently by the nightly drain), so big
+        # sessions no longer wedge the checkpoint on the cap. Advance the
+        # checkpoint only after ALL windows enqueued.
         if queue:
             from kbcore import ingest_queue
 
-            qid = ingest_queue.enqueue(
-                project,
-                transcript_text,
-                kind="session",
-                repo=repo,
-                branch=branch,
-                commit=commit,
-                source_uri=uri,
-                allow_reserved=True,  # trusted local flush may target kb-system
-            )
+            windows = _text_windows(transcript_text, QUEUE_WINDOW_BYTES)
+            saved = 0
+            for i, win in enumerate(windows):
+                part = f"#p{i}" if len(windows) > 1 else ""
+                qid = ingest_queue.enqueue(
+                    project,
+                    win,
+                    kind="session",
+                    repo=repo,
+                    branch=branch,
+                    commit=commit,
+                    source_uri=f"{uri}{part}",
+                    allow_reserved=True,  # trusted local flush may target kb-system
+                )
+                if qid is not None:
+                    saved += 1
             set_checkpoint(key, new_offset)
             return SessionSummary(
                 path=str(path),
                 project=project,
-                saved=1 if qid is not None else 0,
+                saved=saved,
                 rejected=0,
                 offset=new_offset,
             )

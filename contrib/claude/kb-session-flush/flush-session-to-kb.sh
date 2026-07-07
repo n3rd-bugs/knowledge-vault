@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Claude Code PreCompact/SessionEnd hook: flush this session's NEW transcript
-# delta into the Knowledge Vault before compaction. Detaches immediately so it
+# delta into the Knowledge Vault before compaction. Large sessions supported:
+# deltas are sent as sequential <=900KB line-boundary chunks (up to 1 GB total),
+# with the offset advancing per accepted chunk (mid-delta resume on failure). Detaches immediately so it
 # never blocks/stalls compaction. Config lives in ~/.claude/kb-flush.env:
 #   LOCAL  (KB host): KB_DIR=/path/to/kb-repo   [UV=/path/to/uv]
 #   MCP    (client) : KB_MCP_URL=https://host/mcp   KB_TOKEN=...  (reuses the
@@ -37,44 +39,59 @@ if [ -n "${KB_DIR:-}" ]; then
     echo "$(date -Is) local $PROJECT $T"
     "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue
   ' </dev/null >>"$LOG" 2>&1 &
-elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
-  # MCP: call kb_ingest_session over the same streamable-HTTP endpoint the
-  # `claude mcp` connector uses — reuses that registration (url + bearer), so a
-  # machine already connected to the KB needs no separate REST config. Same
-  # per-session byte offset as REMOTE so each compaction sends only the delta.
+elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TOKEN:-}" ]; then
+  # MCP or REMOTE: submit the delta over the network, CHUNKED. Large sessions
+  # (up to 1 GB) are sent as sequential ≤900 KB windows cut at line boundaries;
+  # the per-session byte offset advances after EACH accepted chunk, so a failure
+  # resumes mid-delta next firing. Chunks go via a temp file + jq --rawfile —
+  # passing the text as an argv (--arg) hits the kernel's ~128 KB per-argument
+  # limit long before 1 MB.
   STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
   OFFF="$STATE/${SID:-default}.offset"
   HELPER="$(dirname "$0")/kb-mcp-call.sh"
-  export KB_MCP_URL KB_TOKEN OFFF HELPER
+  export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER
   setsid bash -c '
+    CHUNK=900000; MAX_TOTAL=1073741824
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)
     [ "$SIZE" -le "$OFFSET" ] && exit 0
-    DELTA=$(tail -c +$((OFFSET+1)) "$T"); [ -n "$DELTA" ] || exit 0
-    ARGS=$(jq -n --arg p "$PROJECT" --arg t "$DELTA" "{project:\$p,transcript:\$t,kind:\"session\"}")
-    if bash "$HELPER" kb_ingest_session "$ARGS" >/dev/null 2>>"$LOG"; then
-      echo "$(date -Is) mcp $PROJECT ok bytes=$((SIZE-OFFSET))"; echo "$SIZE" >"$OFFF"
-    else
-      echo "$(date -Is) mcp $PROJECT err (see above)"
+    if [ $((SIZE - OFFSET)) -gt "$MAX_TOTAL" ]; then
+      echo "$(date -Is) flush $PROJECT SKIP delta > 1GB ($((SIZE-OFFSET)) bytes)"; exit 0
     fi
-  ' </dev/null >>"$LOG" 2>&1 &
-elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
-  # REMOTE: POST the delta over HTTPS. Per-session byte offset in a state file so
-  # each compaction submits only the new window (idempotent).
-  STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
-  OFFF="$STATE/${SID:-default}.offset"
-  export KB_REST_URL KB_TOKEN OFFF
-  setsid bash -c '
-    OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
-    SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)
-    [ "$SIZE" -le "$OFFSET" ] && exit 0
-    DELTA=$(tail -c +$((OFFSET+1)) "$T"); [ -n "$DELTA" ] || exit 0
-    BODY=$(jq -n --arg p "$PROJECT" --arg t "$DELTA" "{project:\$p,kind:\"session\",transcript:\$t}")
-    CODE=$(printf "%s" "$BODY" | curl -sS -o /dev/null -w "%{http_code}" --max-time 20 \
-       -X POST "$KB_REST_URL/api/ingest-session" \
-       -H "Authorization: Bearer $KB_TOKEN" -H "Content-Type: application/json" --data @-)
-    echo "$(date -Is) remote $PROJECT http=$CODE bytes=$((SIZE-OFFSET))"
-    case "$CODE" in 2*) echo "$SIZE" >"$OFFF";; esac
+    SENT=0
+    while [ "$OFFSET" -lt "$SIZE" ]; do
+      TMPC=$(mktemp)
+      tail -c +$((OFFSET+1)) "$T" | head -c "$CHUNK" >"$TMPC"
+      BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")
+      [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
+      # Trim to the last complete line unless this window reaches EOF (a
+      # partial trailing line is re-read next firing, never lost).
+      if [ $((OFFSET + BYTES)) -lt "$SIZE" ] && [ "$(tail -c1 "$TMPC")" != "" ]; then
+        PART=$(tail -n1 "$TMPC" | wc -c)
+        KEEP=$((BYTES - PART))
+        [ "$KEEP" -gt 0 ] || KEEP=$BYTES   # one monster line: send as-is
+        head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"
+        BYTES=$KEEP
+      fi
+      if [ -n "$KB_MCP_URL" ]; then
+        # args go via FILE (@) — a ~900KB argv would hit the kernel arg limit
+        jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
+          "{project:\$p,transcript:\$t,kind:\"session\"}" >"$TMPC.args"
+        bash "$HELPER" kb_ingest_session "@$TMPC.args" >/dev/null 2>>"$LOG" && CODE=202 || CODE=err
+        rm -f "$TMPC.args"
+      else
+        CODE=$(jq -n --arg p "$PROJECT" --rawfile t "$TMPC" "{project:\$p,kind:\"session\",transcript:\$t}" \
+          | curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
+             -X POST "$KB_REST_URL/api/ingest-session" \
+             -H "Authorization: Bearer $KB_TOKEN" -H "Content-Type: application/json" --data @-)
+      fi
+      rm -f "$TMPC"
+      case "$CODE" in
+        2*|202) OFFSET=$((OFFSET + BYTES)); echo "$OFFSET" >"$OFFF"; SENT=$((SENT + BYTES)) ;;
+        *) echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume"; break ;;
+      esac
+    done
+    [ "$SENT" -gt 0 ] && echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
   ' </dev/null >>"$LOG" 2>&1 &
 fi
 exit 0

@@ -40,3 +40,6 @@ cloudflared.env
 
 # Claude Code local session/agent state
 .claude/
+
+# Local logs may contain hostnames / pasted tokens — never commit
+logs/

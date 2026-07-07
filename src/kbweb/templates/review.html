@@ -40,9 +40,20 @@
   </ul>
   {% endif %}
   {% endif %}
+  {% if e.detail.suggested_resolution %}
+  {% set sg = e.detail.suggested_resolution %}
+  <p style="margin:.3rem 0">
+    <strong>Suggested:</strong>
+    keep <a href="/item/{{ sg.keep }}">item {{ sg.keep }}</a>,
+    retire <a href="/item/{{ sg.retire }}">item {{ sg.retire }}</a>
+    <span class="prov">({{ sg.rule }} · streak {{ e.detail.suggestion_streak or 1 }} —
+      auto-resolves after 2 stable nights, or apply now:
+      <span class="mono">kb review apply {{ e.queue_id }}</span>)</span>
+  </p>
+  {% endif %}
   {% if e.detail %}
   <dl class="meta-grid">
-    {% for k, v in e.detail.items() if k != 'evidence' %}
+    {% for k, v in e.detail.items() if k not in ('evidence', 'suggested_resolution') %}
     <dt>{{ k }}</dt><dd>{{ v }}</dd>
     {% endfor %}
   </dl>

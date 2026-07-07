@@ -20,7 +20,7 @@ from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
 from kbcore.ingest import ingest
-from kbcore.review import close_contradiction_rows_for
+from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
 from kbworker import sessions
 
@@ -145,20 +145,48 @@ def _doc_refresh(projects: list[str]) -> int:
     return resolved
 
 
-def _evidence() -> int:
-    """Step 3b: gather/refresh support evidence for open contradiction rows.
+def _evidence() -> tuple[int, int]:
+    """Step 3b: refresh evidence for open contradictions; auto-resolve stable ones.
 
     Counts accumulate night over night as repo seeds and session flushes add
     corroborating items; never-enriched rows come first (evidence.py ordering)
-    so the cap can't starve brand-new contradictions. Per-pair isolation: one
-    bad pair logs and the rest proceed (drain-loop pattern).
+    so the cap can't starve brand-new contradictions. A decisive suggestion
+    that holds for AUTO_RESOLVE_STREAK consecutive refreshes is executed
+    (owner V4 refinement; kill switch kb_auto_resolve_evidence). Per-pair
+    isolation. Returns ``(refreshed, auto_resolved)``.
     """
     rows = evidence.open_contradiction_rows()
     refreshed = 0
-    for queue_id, a_id, b_id, _updated in rows[:EVIDENCE_PAIR_CAP]:
+    auto_resolved = 0
+    for queue_id, a_id, b_id, prior in rows[:EVIDENCE_PAIR_CAP]:
         try:
-            if evidence.update_review_detail(queue_id, evidence.gather_evidence(a_id, b_id)):
+            detail = evidence.gather_evidence(a_id, b_id)
+            sugg = detail.get("suggested_resolution")
+            if sugg:
+                prior_sugg = prior.get("suggested_resolution") or {}
+                same = prior_sugg.get("keep") == sugg["keep"] and prior_sugg.get(
+                    "retire"
+                ) == sugg.get("retire")
+                detail["suggestion_streak"] = prior.get("suggestion_streak", 0) + 1 if same else 1
+            else:
+                detail["suggestion_streak"] = 0  # overwrite any stale streak
+            if evidence.update_review_detail(queue_id, detail):
                 refreshed += 1
+            if (
+                sugg
+                and settings.kb_auto_resolve_evidence
+                and detail["suggestion_streak"] >= evidence.AUTO_RESOLVE_STREAK
+            ):
+                auto_resolve_contradiction(queue_id, sugg["keep"], sugg["retire"])
+                auto_resolved += 1
+                logger.info(
+                    "auto-resolved contradiction row %s: keep %s, retire %s (%s, streak %d)",
+                    queue_id,
+                    sugg["keep"],
+                    sugg["retire"],
+                    sugg["rule"],
+                    detail["suggestion_streak"],
+                )
         except Exception:  # noqa: BLE001 — one bad pair must not abort the step
             logger.exception("evidence refresh for queue row %s failed", queue_id)
     if len(rows) > EVIDENCE_PAIR_CAP:
@@ -167,7 +195,7 @@ def _evidence() -> int:
             EVIDENCE_PAIR_CAP,
             len(rows) - EVIDENCE_PAIR_CAP,
         )
-    return refreshed
+    return refreshed, auto_resolved
 
 
 def _disk_pct() -> float:
@@ -225,6 +253,7 @@ def main() -> dict[str, Any]:
             "summaries_written": 0,
             "contradictions_queued": 0,
             "evidence_refreshed": 0,
+            "evidence_auto_resolved": 0,
             "archived": 0,
             "reembedded": 0,
         }
@@ -249,9 +278,15 @@ def main() -> dict[str, Any]:
         _run_step(
             counts, "contradictions_queued", lambda: sum(_contradictions(p) for p in projects)
         )
+
         # Step 3b AFTER contradictions so rows queued seconds ago get evidence
         # in the same run (open_contradiction_rows orders never-enriched first).
-        _run_step(counts, "evidence_refreshed", _evidence)
+        def _ev() -> int:
+            refreshed, auto_resolved = _evidence()
+            counts["evidence_auto_resolved"] = auto_resolved
+            return refreshed
+
+        _run_step(counts, "evidence_refreshed", _ev)
         _run_step(
             counts,
             "archived",

@@ -60,3 +60,27 @@ def review_supersede(
     except KBError as e:
         _fail(e)
     typer.echo(f"item {old_id} superseded by {new_item} (queue {queue_id} resolved)")
+
+
+@review_app.command("apply")
+def review_apply(
+    queue_id: int | None = typer.Argument(None, help="queue row whose suggestion to apply"),
+    apply_all: bool = typer.Option(False, "--all", help="apply every open suggestion"),
+) -> None:
+    """Apply the suggested resolution(s) computed by the nightly evidence pass."""
+    try:
+        if apply_all:
+            applied = 0
+            for e in review_mod.list_open_review():
+                if e.detail.get("suggested_resolution"):
+                    retired = review_mod.apply_suggestion(e.queue_id)
+                    typer.echo(f"[{e.queue_id}] applied: item {retired} superseded")
+                    applied += 1
+            typer.echo(f"applied {applied} suggestion(s)")
+        elif queue_id is not None:
+            retired = review_mod.apply_suggestion(queue_id)
+            typer.echo(f"applied: item {retired} superseded")
+        else:
+            _fail(KBError("pass a queue id or --all"))
+    except KBError as e:
+        _fail(e)

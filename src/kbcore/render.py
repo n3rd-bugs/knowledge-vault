@@ -138,6 +138,12 @@ def render_review(entries: list[ReviewEntry]) -> str:
                 f"    evidence: A {d['in_favor_a']} (w{d.get('weighted_a', 0)}) "
                 f"vs B {d['in_favor_b']} (w{d.get('weighted_b', 0)})"
             )
+        sugg = d.get("suggested_resolution")
+        if sugg:
+            lines.append(
+                f"    suggested: supersede item {sugg['retire']} → keep item {sugg['keep']} "
+                f"(streak {d.get('suggestion_streak', 1)}; apply: kb review apply {e.queue_id})"
+            )
     return "\n".join(lines)
 
 

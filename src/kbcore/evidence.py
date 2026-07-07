@@ -29,16 +29,24 @@ from kbcore.graph import similar
 TRUST_WEIGHTS = {"verified": 2, "unverified": 1}
 MAX_CANDIDATES = 8  # LLM judge calls per pair per night (cost bound)
 SIMILAR_K = 8  # nearest-neighbour fan per side
+# Suggestion / auto-resolve thresholds (owner V4 refinement, 2026-07): a side
+# must have >=2 supporters, weighted score >=4, and >=3x the other side's
+# weight to be SUGGESTED; the suggestion must then hold for 2 consecutive
+# nightly refreshes before the worker auto-resolves (kb_auto_resolve_evidence).
+SUGGEST_MIN_SUPPORTERS = 2
+SUGGEST_MIN_WEIGHT = 4
+SUGGEST_MARGIN = 3
+AUTO_RESOLVE_STREAK = 2
 
 
-def open_contradiction_rows() -> list[tuple[int, int, int, str | None]]:
+def open_contradiction_rows() -> list[tuple[int, int, int, dict[str, Any]]]:
     """Open contradiction rows whose BOTH items are still active.
 
-    Returns ``(queue_id, a_id, b_id, evidence_updated_iso_or_None)`` ordered so
-    never-enriched rows come first — new contradictions get evidence before
-    refreshes consume the nightly cap. Rows whose items were resolved away
-    (superseded/archived) are skipped: the conflict is moot, judging it would
-    waste GPU.
+    Returns ``(queue_id, a_id, b_id, prior_detail)`` ordered so never-enriched
+    rows come first — new contradictions get evidence before refreshes consume
+    the nightly cap. The prior detail carries last night's suggestion (for the
+    stability streak). Rows whose items were resolved away (superseded /
+    archived) are skipped: the conflict is moot, judging it would waste GPU.
     """
     with connect() as conn:
         rows = conn.execute(
@@ -46,7 +54,7 @@ def open_contradiction_rows() -> list[tuple[int, int, int, str | None]]:
             SELECT rq.id,
                    (rq.detail->>'a_id')::bigint,
                    (rq.detail->>'b_id')::bigint,
-                   rq.detail->>'evidence_updated'
+                   rq.detail
             FROM review_queue rq
             JOIN items ia ON ia.id = (rq.detail->>'a_id')::bigint AND ia.status = 'active'
             JOIN items ib ON ib.id = (rq.detail->>'b_id')::bigint AND ib.status = 'active'
@@ -54,7 +62,31 @@ def open_contradiction_rows() -> list[tuple[int, int, int, str | None]]:
             ORDER BY (rq.detail->>'evidence_updated') NULLS FIRST, rq.id
             """
         ).fetchall()
-    return [(r[0], r[1], r[2], r[3]) for r in rows]
+    return [(r[0], r[1], r[2], r[3] or {}) for r in rows]
+
+
+def suggestion_for(
+    a_id: int, b_id: int, in_favor: dict[str, int], weighted: dict[str, int]
+) -> dict[str, Any] | None:
+    """The suggested resolution when one side's evidence is decisively lopsided."""
+    for winner, loser in (("a", "b"), ("b", "a")):
+        if (
+            in_favor[winner] >= SUGGEST_MIN_SUPPORTERS
+            and weighted[winner] >= SUGGEST_MIN_WEIGHT
+            and weighted[winner] >= SUGGEST_MARGIN * weighted[loser]
+        ):
+            keep = a_id if winner == "a" else b_id
+            retire = b_id if winner == "a" else a_id
+            return {
+                "action": "supersede",
+                "keep": keep,
+                "retire": retire,
+                "rule": (
+                    f"evidence: {in_favor[winner]} supporters, "
+                    f"w{weighted[winner]} vs w{weighted[loser]}"
+                ),
+            }
+    return None
 
 
 def candidate_texts(item_ids: Sequence[int]) -> dict[int, tuple[str, str, str]]:
@@ -116,6 +148,10 @@ def gather_evidence(a_id: int, b_id: int) -> dict[str, Any]:
         "weighted_b": weighted["b"],
         "evidence": evidence,
         "evidence_updated": datetime.now(UTC).isoformat(),
+        # None (not absent) when no side dominates: the JSONB merge must
+        # OVERWRITE a stale suggestion from a previous night, or a later flip
+        # back could wrongly extend its streak.
+        "suggested_resolution": suggestion_for(a_id, b_id, in_favor, weighted),
     }
 
 

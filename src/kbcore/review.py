@@ -166,3 +166,48 @@ def close_contradiction_rows_for(a_id: int, b_id: int) -> int:
             (a_id, b_id, b_id, a_id),
         ).fetchall()
     return len(rows)
+
+
+def auto_resolve_contradiction(queue_id: int, keep: int, retire: int) -> int:
+    """Auto-resolve a contradiction whose evidence held for the stability streak.
+
+    Owner V4 refinement (2026-07): supersede the evidence-losing side with the
+    winner and close the row. Invoked ONLY by the nightly worker after the same
+    suggestion persisted for AUTO_RESOLVE_STREAK consecutive refreshes; fully
+    audited (supersede reason + relation + report count + log line) and
+    reversible (supersession is a status flip, never a delete).
+    """
+    supersede(
+        retire,
+        new_item_id=keep,
+        reason="auto: evidence margin stable across nightly refreshes",
+    )
+    with transaction() as conn:
+        conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
+    return retire
+
+
+def apply_suggestion(queue_id: int) -> int:
+    """Execute an open row's suggested resolution NOW (human-invoked early apply).
+
+    Returns the retired item id. Raises when the row is missing, already
+    resolved, or carries no suggestion.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT detail, resolved FROM review_queue WHERE id = %s", (queue_id,)
+        ).fetchone()
+    if row is None:
+        raise NotFound(f"review row {queue_id} does not exist")
+    detail, resolved = row
+    if resolved:
+        raise InvalidOperation(f"review row {queue_id} is already resolved")
+    sugg = (detail or {}).get("suggested_resolution")
+    if not sugg:
+        raise InvalidOperation(f"review row {queue_id} has no suggested resolution")
+    supersede(
+        sugg["retire"], new_item_id=sugg["keep"], reason="review: applied evidence suggestion"
+    )
+    with transaction() as conn:
+        conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
+    return sugg["retire"]

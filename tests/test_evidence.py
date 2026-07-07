@@ -285,3 +285,84 @@ def test_update_review_detail_merges_open_rows_only(kb):
     with db.connect() as conn:
         detail = conn.execute("SELECT detail FROM review_queue WHERE id = %s", (qid,)).fetchone()[0]
     assert detail["in_favor_a"] == 3
+
+
+# --- doc-refresh sweep (auto-resolution tier 1b) ------------------------------------
+
+
+def _mk_revisions(kb, uri="rm3:docs/X.md"):
+    """Two ACTIVE items for the same git-doc uri (backlog shape, hook bypassed)."""
+    old = ingest("sweep", "spec", "docs/X.md", "old revision content", kind="git", uri=uri)
+    new = ingest("sweep", "spec", "docs/X.md", "new revision content", kind="git", uri=uri)
+    return old, new
+
+
+def test_doc_refresh_sweep_resolves_backlog_and_closes_rows(kb, monkeypatch):
+    from kbcore.consolidation import record_contradiction
+    from kbworker import consolidate
+
+    monkeypatch.setattr(llm, "items_contradict", lambda *a: False)
+    monkeypatch.setattr(llm, "summarize_items", lambda *a: "")
+    old, new = _mk_revisions(kb)
+    record_contradiction(old, new)  # the moot row the sweep must close
+    result = consolidate.main()
+    assert result["doc_refresh_resolved"] == 1
+    with db.connect() as conn:
+        status, by = conn.execute(
+            "SELECT status, superseded_by FROM items WHERE id = %s", (old,)
+        ).fetchone()
+        assert status == "superseded" and by == new
+        open_rows = conn.execute(
+            "SELECT count(*) FROM review_queue WHERE reason='contradiction' AND resolved=false"
+        ).fetchone()[0]
+        assert open_rows == 0, "moot contradiction row auto-closed"
+        meta = conn.execute(
+            "SELECT meta FROM items WHERE type='report' ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+    assert meta["doc_refresh_resolved"] == 1
+
+
+def test_doc_refresh_closes_reversed_pair_row(kb, monkeypatch):
+    from kbcore.consolidation import record_contradiction
+    from kbworker import consolidate
+
+    monkeypatch.setattr(llm, "items_contradict", lambda *a: False)
+    monkeypatch.setattr(llm, "summarize_items", lambda *a: "")
+    old, new = _mk_revisions(kb, uri="rm3:docs/Y.md")
+    record_contradiction(new, old)  # reversed order in the detail
+    consolidate.main()
+    with db.connect() as conn:
+        open_rows = conn.execute(
+            "SELECT count(*) FROM review_queue WHERE reason='contradiction' AND resolved=false"
+        ).fetchone()[0]
+    assert open_rows == 0
+
+
+def test_doc_refresh_beats_dedupe(kb, monkeypatch):
+    """A revision pair at dup-range cosine must end 'superseded', never 'duplicate'."""
+    from kbworker import consolidate
+
+    monkeypatch.setattr(llm, "items_contradict", lambda *a: False)
+    monkeypatch.setattr(llm, "summarize_items", lambda *a: "")
+    old, new = _mk_revisions(kb, uri="rm3:docs/Z.md")
+    _force_lead(old, _vec(1.0))
+    _force_lead(new, _vec(1.0))  # cosine 1.0 — squarely in dedupe range
+    consolidate.main()
+    with db.connect() as conn:
+        status = conn.execute("SELECT status FROM items WHERE id = %s", (old,)).fetchone()[0]
+    assert status == "superseded", f"expected supersession semantics, got {status!r}"
+
+
+def test_doc_refresh_sweep_flag_off(kb, monkeypatch):
+    from kbworker import consolidate
+
+    monkeypatch.setattr(llm, "items_contradict", lambda *a: False)
+    monkeypatch.setattr(llm, "summarize_items", lambda *a: "")
+    monkeypatch.setattr(settings, "kb_auto_supersede_doc_refresh", False)
+    monkeypatch.setattr(settings, "kb_dup_threshold", 1.01)  # keep dedupe out of the way
+    old, new = _mk_revisions(kb, uri="rm3:docs/W.md")
+    result = consolidate.main()
+    assert result["doc_refresh_resolved"] == 0
+    with db.connect() as conn:
+        status = conn.execute("SELECT status FROM items WHERE id = %s", (old,)).fetchone()[0]
+    assert status == "active"

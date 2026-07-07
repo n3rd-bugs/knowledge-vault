@@ -20,6 +20,8 @@ from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
 from kbcore.ingest import ingest
+from kbcore.review import close_contradiction_rows_for
+from kbcore.supersede import same_uri_active_pairs, supersede
 from kbworker import sessions
 
 logger = logging.getLogger("kbworker.consolidate")
@@ -123,6 +125,26 @@ def _contradictions(project: str) -> int:
     return queued
 
 
+def _doc_refresh(projects: list[str]) -> int:
+    """Step 0b: retire stale doc revisions + close their moot contradiction rows.
+
+    Backlog counterpart of the scan-time hook (supersede_doc_refresh): any
+    same-uri active pairs that predate the hook get resolved here — BEFORE
+    dedupe (which would mislabel a revision pair 'duplicate') and before the
+    contradiction scan wastes LLM calls on them. Per-pair isolation.
+    """
+    resolved = 0
+    for project in projects:
+        for stale, newest in same_uri_active_pairs(project):
+            try:
+                supersede(stale, new_item_id=newest, reason="auto: newer revision of same document")
+                close_contradiction_rows_for(stale, newest)
+                resolved += 1
+            except Exception:  # noqa: BLE001 — one bad pair must not abort the sweep
+                logger.exception("doc-refresh sweep failed for %s -> %s", stale, newest)
+    return resolved
+
+
 def _evidence() -> int:
     """Step 3b: gather/refresh support evidence for open contradiction rows.
 
@@ -198,6 +220,7 @@ def main() -> dict[str, Any]:
         counts: dict[str, Any] = {
             "queued_drained": 0,
             "queued_items_saved": 0,
+            "doc_refresh_resolved": 0,
             "duplicates_marked": 0,
             "summaries_written": 0,
             "contradictions_queued": 0,
@@ -217,6 +240,10 @@ def main() -> dict[str, Any]:
 
         # active_projects AFTER the drain so freshly-ingested submissions count.
         projects = consolidation.active_projects()
+        # Step 0b BEFORE dedupe: retire stale doc revisions so the revision pair
+        # is superseded (correct semantic), never marked 'duplicate'.
+        if settings.kb_auto_supersede_doc_refresh:
+            _run_step(counts, "doc_refresh_resolved", lambda: _doc_refresh(projects))
         _run_step(counts, "duplicates_marked", lambda: sum(_dedupe(p) for p in projects))
         _run_step(counts, "summaries_written", lambda: _summaries(since))
         _run_step(

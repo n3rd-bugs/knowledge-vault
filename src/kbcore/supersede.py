@@ -138,3 +138,31 @@ def supersede_doc_refresh(new_item_id: int) -> list[int]:
         except (InvalidOperation, NotFound):  # raced/already superseded — fine
             logger.info("doc-refresh: item %s already resolved; skipping", old_id)
     return superseded
+
+
+def same_uri_active_pairs(project: str) -> list[tuple[int, int]]:
+    """(stale_id, newest_id) pairs of ACTIVE git-doc items sharing a source uri.
+
+    Backlog finder for the nightly doc-refresh sweep: any documents whose
+    revisions still coexist (scanned before the scan-time hook existed, or with
+    the flag off) — the newest item per (kind, uri) survives, every other
+    active revision pairs with it.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.uri, array_agg(i.id ORDER BY i.created_at, i.id) AS ids
+            FROM items i JOIN sources s ON s.id = i.source_id
+            WHERE i.project = %s AND i.status = 'active' AND s.kind = 'git'
+              AND s.uri <> ''
+            GROUP BY s.kind, s.uri
+            HAVING count(*) > 1
+            ORDER BY s.uri
+            """,
+            (project,),
+        ).fetchall()
+    pairs: list[tuple[int, int]] = []
+    for _uri, ids in rows:
+        newest = ids[-1]
+        pairs.extend((stale, newest) for stale in ids[:-1])
+    return pairs

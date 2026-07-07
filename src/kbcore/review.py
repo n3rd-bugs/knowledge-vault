@@ -146,3 +146,23 @@ def resolve_via_supersede(queue_id: int, new_item_id: int) -> int:
     with transaction() as conn:
         conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
     return item_id
+
+
+def close_contradiction_rows_for(a_id: int, b_id: int) -> int:
+    """Close open contradiction rows for a pair that auto-resolution settled.
+
+    Matches the {a_id, b_id} detail in either order. Closing (resolved=true) is
+    a status flip, not a delete (Invariant 5); the underlying items already
+    carry the supersession trail.
+    """
+    with transaction() as conn:
+        rows = conn.execute(
+            """
+            UPDATE review_queue SET resolved = true
+            WHERE resolved = false AND reason = 'contradiction'
+              AND ((detail->>'a_id')::bigint, (detail->>'b_id')::bigint) IN ((%s, %s), (%s, %s))
+            RETURNING id
+            """,
+            (a_id, b_id, b_id, a_id),
+        ).fetchall()
+    return len(rows)

@@ -18,9 +18,10 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
+from kbcore import jobs
 from kbcore.config import settings
 from kbcore.ingest import archive_raw, ingest
-from kbworker import reposcan
+from kbworker import consolidate, reposcan
 from kbworker.watcher_parsers import is_supported, parse
 
 logger = logging.getLogger("kbworker.watcher")
@@ -170,6 +171,7 @@ def main() -> None:
     try:
         while True:
             scan_inbox()
+            _drain_consolidation_requests()
             now = time.monotonic()
             if _reposcan_due(last_reposcan, now):
                 _run_reposcan()
@@ -180,6 +182,26 @@ def main() -> None:
     finally:
         observer.stop()
         observer.join()
+
+
+def _drain_consolidation_requests() -> None:
+    """Run any on-demand consolidation request enqueued via web/MCP/CLI.
+
+    This is the ONLY executor — the trigger surfaces just record intent; the
+    host worker (here) has the GPU. A 'skipped' result (another run holds the
+    advisory lock) is a success, not a failure — the intent is satisfied.
+    """
+    req_id = jobs.claim_pending_consolidation()
+    if req_id is None:
+        return
+    logger.info("on-demand consolidation requested (row %s) — running", req_id)
+    try:
+        result = consolidate.main()
+        jobs.finish_consolidation(req_id, result, ok=True)
+        logger.info("on-demand consolidation row %s done: %s", req_id, result)
+    except Exception as e:  # noqa: BLE001 — one bad run must not kill the watcher
+        logger.exception("on-demand consolidation row %s failed", req_id)
+        jobs.finish_consolidation(req_id, {"error": f"{type(e).__name__}: {e}"}, ok=False)
 
 
 def _reposcan_due(last: float | None, now: float) -> bool:

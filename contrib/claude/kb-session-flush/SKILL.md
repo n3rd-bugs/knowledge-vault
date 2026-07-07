@@ -1,15 +1,23 @@
 ---
 name: kb-session-flush
-description: Install a Claude Code hook that flushes each session's transcript into the Knowledge Vault (KB) before every compaction, so long-session context is captured before it is summarized away. Use when the user wants to auto-save Claude Code sessions to the KB, set up the pre-compact flush, or add that hook to another machine.
+description: Install Claude Code hooks that connect sessions to the Knowledge Vault (KB) - flush each session's transcript to the KB before every compaction, and pre-brief each NEW session with relevant KB knowledge at start. Use when the user wants to auto-save Claude Code sessions to the KB, get KB context injected on session start, or add these hooks to another machine.
 ---
 
-# Install the KB session-flush hook
+# Install the KB session hooks (flush + pre-brief)
 
-This skill installs a `PreCompact` + `SessionEnd` hook that flushes the current
-Claude Code session's new transcript delta into the Knowledge Vault. It never
-blocks compaction (the hook detaches immediately) and never uses the GPU at
-capture time — the delta is enqueued and the nightly `consolidate` pass runs the
-14B grounded extraction, landing unverified items in the review queue (§7.2).
+This skill installs two hook sets:
+
+1. **Flush** (`PreCompact` + `SessionEnd`): the session's new transcript delta is
+   flushed into the Knowledge Vault before every compaction. Never blocks
+   compaction (detaches immediately), never uses the GPU at capture time — the
+   delta is enqueued and the nightly `consolidate` pass runs the 14B grounded
+   extraction, landing unverified items in the review queue (§7.2).
+2. **Pre-brief** (`SessionStart`): when a NEW session starts (startup or /clear —
+   resume/compact are skipped), the hook runs a quick KB search seeded by the
+   repo's recent commit subjects + project name, and its stdout is INJECTED into
+   Claude's starting context — so Claude begins the activity already aware of
+   prior decisions and gotchas. Fails silently (a briefing must never break a
+   session); set `KB_BRIEF_ON_RESUME=1` in kb-flush.env to brief resumes too.
 
 Two modes, auto-detected by `install.sh`:
 - **LOCAL** (the KB host): the hook runs `kb ingest-session <transcript> --queue`

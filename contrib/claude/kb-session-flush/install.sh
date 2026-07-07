@@ -12,6 +12,8 @@ CFG="$HOME/.claude/kb-flush.env"
 SETTINGS="$HOME/.claude/settings.json"
 
 install -m 0755 "$SKILL_DIR/flush-session-to-kb.sh" "$HOOK"
+BRIEF="$HOOKS/kb-session-brief.sh"
+install -m 0755 "$SKILL_DIR/kb-session-brief.sh" "$BRIEF"
 
 if [ ! -f "$CFG" ]; then
   KB_DIR_GUESS="${KB_DIR:-$HOME/data-server}"
@@ -31,18 +33,22 @@ fi
 
 [ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
 entry=$(jq -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
+brief_entry=$(jq -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:30}]}')
 tmp=$(mktemp)
-# Append our entry to PreCompact + SessionEnd, removing any prior copy of it
-# (idempotent) while preserving any other hooks the user has.
-jq --argjson e "$entry" --arg c "$HOOK" '
+# Append our entries (idempotent: any prior copy removed first) while
+# preserving other hooks the user has. The brief hook self-filters
+# resume/compact sources, so its matcher stays empty.
+jq --argjson e "$entry" --argjson b "$brief_entry" --arg c "$HOOK" --arg bc "$BRIEF" '
   .hooks = (.hooks // {})
   | .hooks.PreCompact = (((.hooks.PreCompact // []) | map(select(.hooks[0].command != $c))) + [$e])
   | .hooks.SessionEnd = (((.hooks.SessionEnd // []) | map(select(.hooks[0].command != $c))) + [$e])
+  | .hooks.SessionStart = (((.hooks.SessionStart // []) | map(select(.hooks[0].command != $bc))) + [$b])
 ' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS"
 
 echo "hook:     $HOOK"
+echo "brief:    $BRIEF (SessionStart -> injects a KB pre-brief into new sessions)"
 echo "config:   $CFG  ($MODE)"
-echo "settings: $SETTINGS  (PreCompact + SessionEnd registered, matcher='' = all)"
+echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart registered)"
 echo
 echo "smoke test (feeds a fake PreCompact event to the hook):"
 echo "  T=\$(ls -t \"\$HOME\"/.claude/projects/*/*.jsonl | head -1)"

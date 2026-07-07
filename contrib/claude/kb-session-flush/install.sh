@@ -34,9 +34,21 @@ _discover_mcp() {
   ' "$cj" 2>/dev/null
 }
 
+# Locate a claude CLI for CONNECTOR mode (PATH, then common install spots,
+# then the VS Code extension bundle).
+_find_claude() {
+  command -v claude 2>/dev/null && return 0
+  for c in "$HOME/.local/bin/claude" "$HOME/.claude/local/claude"; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  ls -1t "$HOME"/.vscode-server/extensions/anthropic.claude-code-*/resources/native-binary/claude \
+    2>/dev/null | head -1
+}
+
 if [ ! -f "$CFG" ]; then
   KB_DIR_GUESS="${KB_DIR:-$HOME/data-server}"
   MCP_LINE="$(_discover_mcp || true)"
+  CLAUDE_BIN_FOUND="$(_find_claude || true)"
   if [ -f "$KB_DIR_GUESS/pyproject.toml" ] && command -v uv >/dev/null 2>&1; then
     { echo "# KB session-flush (LOCAL)"; echo "KB_DIR=$KB_DIR_GUESS"; echo "UV=$(command -v uv)"; } >"$CFG"
     MODE="LOCAL enqueue via $KB_DIR_GUESS"
@@ -46,6 +58,17 @@ if [ ! -f "$CFG" ]; then
     { echo "# KB session hooks (MCP) — reuses your 'claude mcp' KB registration"
       echo "KB_MCP_URL=$MURL"; echo "KB_TOKEN=$MTOK"; } >"$CFG"
     MODE="MCP via $MURL (auto-discovered from your claude mcp registration)"
+  elif [ -n "$CLAUDE_BIN_FOUND" ]; then
+    # Zero-config: the claude.ai KB connector bridged into Claude Code carries
+    # the auth (cloud-held OAuth). Hooks relay through headless `claude -p` —
+    # small chunks (the model is the data path) and each flush costs Claude
+    # usage; switch to MCP/REST modes for heavy sessions.
+    { echo "# KB session hooks (CONNECTOR) — via the claude.ai KB connector, no token"
+      echo "KB_CONNECTOR=1"
+      echo "CLAUDE_BIN=$CLAUDE_BIN_FOUND"
+      echo "# KB_CONNECTOR_CHUNK=24000   # bytes per relayed chunk"
+      echo "# KB_CONNECTOR_MAX=240000    # bytes per hook firing"; } >"$CFG"
+    MODE="CONNECTOR via $CLAUDE_BIN_FOUND (claude.ai KB connector; zero config)"
   else
     { echo "# KB session-flush (REMOTE) — set KB_TOKEN and confirm the URL:"
       echo "KB_REST_URL=https://api.example.com"

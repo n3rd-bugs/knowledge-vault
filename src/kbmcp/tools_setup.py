@@ -78,9 +78,12 @@ both directions:
   `kb_search` over the same MCP endpoint. Nothing to fill in.
 - **Otherwise, self-hosted KB**: REMOTE mode — the hooks POST to your KB's REST
   endpoint with a bearer token (fill in step 3).
-- **claude.ai OAuth connector only** (no static bearer): the session hooks
-  aren't applicable — a headless shell hook can't do the OAuth refresh. Use the
-  `kb_*` MCP tools directly instead.
+- **claude.ai OAuth connector only** (no static bearer): **CONNECTOR mode,
+  zero config.** claude.ai connectors bridge into Claude Code automatically, and
+  the hooks relay through a headless `claude -p` call using that cloud-held
+  auth. Caveats: the model is the data path (small ~24 KB chunks, capped per
+  firing) and each flush/brief spends Claude usage — bearer modes are the
+  efficient path for heavy sessions.
 
 ## Steps (a Claude Code client can perform these directly)
 

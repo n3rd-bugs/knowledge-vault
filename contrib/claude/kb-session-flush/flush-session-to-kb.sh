@@ -11,6 +11,7 @@
 # Installed by the `kb-session-flush` skill. See that skill's README for setup.
 set -uo pipefail
 
+[ -n "${KB_HOOK_GUARD:-}" ] && exit 0   # we were spawned by a KB hook — never recurse
 CFG="$HOME/.claude/kb-flush.env"
 [ -f "$CFG" ] || exit 0
 # shellcheck disable=SC1090
@@ -92,6 +93,43 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
       esac
     done
     [ "$SENT" -gt 0 ] && echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+  ' </dev/null >>"$LOG" 2>&1 &
+elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
+  # CONNECTOR: zero-config — uses the claude.ai KB connector bridged into
+  # Claude Code (cloud-held OAuth; nothing local). A headless `claude -p` call
+  # relays each chunk into kb_ingest_session. The MODEL is the data path, so
+  # chunks are small (~24 KB echo fidelity) and each flush costs Claude usage —
+  # bearer modes (MCP/REST) are the efficient path; this is the no-setup one.
+  STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
+  OFFF="$STATE/${SID:-default}.offset"
+  export CLAUDE_BIN OFFF
+  export KB_CONNECTOR_CHUNK="${KB_CONNECTOR_CHUNK:-24000}"
+  export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
+  setsid bash -c '
+    export KB_HOOK_GUARD=1   # children (claude -p) must not re-trigger KB hooks
+    OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
+    SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)
+    [ "$SIZE" -le "$OFFSET" ] && exit 0
+    SENT=0
+    while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$KB_CONNECTOR_MAX" ]; do
+      TMPC=$(mktemp)
+      tail -c +$((OFFSET+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" >"$TMPC"
+      BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")
+      [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
+      if [ $((OFFSET + BYTES)) -lt "$SIZE" ] && [ "$(tail -c1 "$TMPC")" != "" ]; then
+        PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
+        [ "$KEEP" -gt 0 ] || KEEP=$BYTES
+        head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
+      fi
+      OUT=$("$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
+      rm -f "$TMPC"
+      case "$OUT" in
+        *[0-9]*) OFFSET=$((OFFSET + BYTES)); echo "$OFFSET" >"$OFFF"; SENT=$((SENT + BYTES)) ;;
+        *) echo "$(date -Is) connector $PROJECT chunk FAILED ($OUT) at offset $OFFSET — will resume"; break ;;
+      esac
+    done
+    [ "$SENT" -gt 0 ] && echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+    [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -ge "$KB_CONNECTOR_MAX" ] &&       echo "$(date -Is) connector $PROJECT per-firing cap reached; $((SIZE-OFFSET)) bytes resume next firing"
   ' </dev/null >>"$LOG" 2>&1 &
 fi
 exit 0

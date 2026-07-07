@@ -73,10 +73,11 @@ def test_guide_falls_back_to_configured_public_rest_url(monkeypatch):
     assert "KB_REST_URL=https://api.override.host" in g2
 
 
-def test_guide_explains_oauth_only_dead_end():
+def test_guide_explains_oauth_only_connector_mode():
     guide = tools_setup.build_setup_guide()
     assert "OAuth connector only" in guide
-    assert "aren't applicable" in guide
+    assert "CONNECTOR mode" in guide and "zero config" in guide
+    assert "spends Claude usage" in guide  # the honest cost caveat
 
 
 def test_kb_setup_registered_and_callable():

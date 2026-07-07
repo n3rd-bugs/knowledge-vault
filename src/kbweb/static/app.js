@@ -68,4 +68,46 @@
       });
     });
   }
+
+  /* 4. Setup page: "run consolidation now" — POST to the write-capable REST API
+     (cross-origin, bearer from the token box), then poll status until terminal.
+     Keeps the web UI itself read-only: the write happens in the REST service. */
+  var cbtn = document.getElementById("consolidate-btn");
+  if (cbtn && tok) {
+    var restBase = cbtn.getAttribute("data-rest");
+    var statusEl = document.getElementById("consolidate-status");
+    var tokSecret = tok.getAttribute("data-secret") || "";
+    var timer = null;
+    function auth() { return { Authorization: "Bearer " + tokSecret }; }
+    function show(st) {
+      if (!st) { statusEl.textContent = "no run recorded"; return null; }
+      statusEl.textContent = "run #" + st.id + " (" + st.requested_by + "): " + st.status;
+      return st.status;
+    }
+    function poll() {
+      fetch(restBase + "/api/consolidate", { headers: auth() })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          var s = show(d.status);
+          if (s === "done" || s === "failed") {
+            clearInterval(timer); timer = null; cbtn.disabled = false;
+          }
+        })
+        .catch(function () { /* transient — keep polling */ });
+    }
+    cbtn.addEventListener("click", function () {
+      cbtn.disabled = true;
+      statusEl.textContent = "requesting…";
+      fetch(restBase + "/api/consolidate", { method: "POST", headers: auth() })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          show(d.status);
+          if (!timer) timer = setInterval(poll, 5000);
+        })
+        .catch(function (e) {
+          statusEl.textContent = "error: could not reach the REST API (" + e + ")";
+          cbtn.disabled = false;
+        });
+    });
+  }
 })();

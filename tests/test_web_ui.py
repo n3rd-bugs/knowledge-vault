@@ -271,6 +271,23 @@ def test_setup_page_shows_steps_and_token_for_authed(client, monkeypatch):
     assert 'id="token-reveal"' in r.text and "data-secret" in r.text
 
 
+def test_setup_page_has_consolidate_button_when_rest_configured(client, monkeypatch):
+    from kbcore.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "kb_public_rest_url", "https://api.demo.test")
+    r = client.get("/setup")
+    assert 'id="consolidate-btn"' in r.text
+    assert 'data-rest="https://api.demo.test"' in r.text  # posts to the REST host
+
+
+def test_setup_page_hides_consolidate_button_without_rest(client, monkeypatch):
+    from kbcore.config import settings as cfg
+
+    monkeypatch.setattr(cfg, "kb_public_rest_url", "")  # no REST endpoint to POST to
+    r = client.get("/setup")
+    assert 'id="consolidate-btn"' not in r.text
+
+
 def test_setup_page_never_leaks_token_unauthenticated(kb, monkeypatch):
     """SECURITY: the bearer must never appear for an unauthenticated request."""
     from starlette.testclient import TestClient

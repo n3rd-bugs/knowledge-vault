@@ -16,6 +16,18 @@
   </div>
 </div>
 
+{% if rest_url %}
+<div class="card">
+  <h4 style="margin:.1rem 0 .3rem">Run consolidation now</h4>
+  <p class="prov">Kicks the nightly refine pass (dedupe, summaries, contradiction
+    detection + evidence + auto-resolution, archive, re-embed) on demand. It runs
+    on the host worker and takes a few minutes; repeated clicks fold into the
+    in-flight run. Uses the bearer above to reach the REST API.</p>
+  <button id="consolidate-btn" class="copy-btn" type="button" data-rest="{{ rest_url }}">Run now</button>
+  <span id="consolidate-status" class="prov"></span>
+</div>
+{% endif %}
+
 <h3>In Claude Code (CLI / IDE)</h3>
 <p>This gives that machine the <span class="mono">kb_*</span> tools <em>and</em>
    lets the session hooks capture your work automatically.</p>

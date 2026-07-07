@@ -16,12 +16,26 @@ CFG="$HOME/.claude/kb-flush.env"
 [ -f "$CFG" ] || exit 0
 # shellcheck disable=SC1090
 . "$CFG"
+# Windows/Git Bash (KB item 496): a co-located jq (installer drops one next to
+# the hooks) must resolve even when Claude Code inherited a PATH without it.
+HOOKDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"; PATH="$HOOKDIR:$PATH"
 command -v jq >/dev/null 2>&1 || exit 0
+# setsid is absent on Git Bash — nohup is the detach fallback (item 496).
+DETACH="setsid"; command -v setsid >/dev/null 2>&1 || DETACH="nohup"
 
 INPUT=$(cat)
 T=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty')
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
 SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
+# Native Windows event paths (C:\... or C:/...) must be cygpath'ed — basename
+# on a backslash path yields the whole drive path (item 496; two-alternative
+# case pattern required, the single bracket-class form does not match).
+case "$T" in
+  [A-Za-z]:\\*|[A-Za-z]:/*) T=$(cygpath "$T" 2>/dev/null || printf '%s' "$T") ;;
+esac
+case "$CWD" in
+  [A-Za-z]:\\*|[A-Za-z]:/*) CWD=$(cygpath "$CWD" 2>/dev/null || printf '%s' "$CWD") ;;
+esac
 [ -n "$T" ] && [ -f "$T" ] || exit 0
 
 # Project = the working repo's dir name, slugified (falls back to "sessions").
@@ -35,7 +49,7 @@ if [ -n "${KB_DIR:-}" ]; then
   # LOCAL: trusted CLI enqueue — checkpointed, GPU-free (nightly drain extracts).
   UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
   export KB_DIR UV
-  setsid bash -c '
+  "$DETACH" bash -c '
     cd "$KB_DIR" 2>/dev/null || exit 0
     echo "$(date -Is) local $PROJECT $T"
     "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue
@@ -51,7 +65,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   OFFF="$STATE/${SID:-default}.offset"
   HELPER="$(dirname "$0")/kb-mcp-call.sh"
   export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER
-  setsid bash -c '
+  "$DETACH" bash -c '
     CHUNK=900000; MAX_TOTAL=1073741824
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)
@@ -87,6 +101,10 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
             "{project:\$p,transcript:\$t,kind:\"session\"}" >"$TMPC.args"
         fi
+        if [ ! -s "$TMPC.args" ] || ! jq -e . "$TMPC.args" >/dev/null 2>&1; then
+          echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
+          rm -f "$TMPC.args" "$TMPC"; break
+        fi
         bash "$HELPER" kb_ingest_session "@$TMPC.args" >/dev/null 2>>"$LOG" && CODE=202 || CODE=err
         rm -f "$TMPC.args"
       else
@@ -101,11 +119,18 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
             "{project:\$p,kind:\"session\",transcript:\$t}" >"$BODYF"
         fi
-        CODE=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 30 \
+        if [ ! -s "$BODYF" ] || ! jq -e . "$BODYF" >/dev/null 2>&1; then
+          echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
+          rm -f "$BODYF" "$TMPC"; break
+        fi
+        CODE=$(curl -sS -o "$TMPC.resp" -w "%{http_code}" --max-time 30 \
              -X POST "$KB_REST_URL/api/ingest-session" \
              -H "Authorization: Bearer $KB_TOKEN" -H "Content-Type: application/json" \
              --data @"$BODYF")
-        rm -f "$BODYF"
+        # A flaked response read (000) whose body still carries a queue id was
+        # ACCEPTED by the server (KB item 497) — count it as success.
+        case "$CODE" in 2*) : ;; *) grep -q "queue_id" "$TMPC.resp" 2>/dev/null && CODE=202 ;; esac
+        rm -f "$BODYF" "$TMPC.resp"
       fi
       rm -f "$TMPC"
       case "$CODE" in
@@ -126,7 +151,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   export CLAUDE_BIN OFFF
   export KB_CONNECTOR_CHUNK="${KB_CONNECTOR_CHUNK:-24000}"
   export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
-  setsid bash -c '
+  "$DETACH" bash -c '
     export KB_HOOK_GUARD=1   # children (claude -p) must not re-trigger KB hooks
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     SIZE=$(stat -c%s "$T" 2>/dev/null || echo 0)

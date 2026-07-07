@@ -81,17 +81,34 @@ else
 fi
 
 [ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
-entry=$(jq -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
-brief_entry=$(jq -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:30}]}')
+# Windows/Git Bash (KB item 496): Claude Code spawns hooks as exe+args, not via
+# a shell, so a bare .sh path never runs — register bash.exe as the command
+# with the script as its argument. Also co-locate jq next to the hooks (Claude
+# Code may have inherited a PATH from before jq was installed).
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    BASHW=$(cygpath -w "$(command -v bash)")
+    command -v jq >/dev/null 2>&1 && cp -f "$(command -v jq)" "$HOOKS/" 2>/dev/null || true
+    entry=$(jq -n --arg b "$BASHW" --arg c "$HOOK" \
+      '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
+    brief_entry=$(jq -n --arg b "$BASHW" --arg c "$BRIEF" \
+      '{matcher:"startup|clear",hooks:[{type:"command",command:$b,args:[$c],timeout:30}]}')
+    ;;
+  *)
+    entry=$(jq -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
+    brief_entry=$(jq -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:30}]}')
+    ;;
+esac
 tmp=$(mktemp)
 # Append our entries (idempotent: any prior copy removed first) while
 # preserving other hooks the user has. The brief hook self-filters
 # resume/compact sources, so its matcher stays empty.
 jq --argjson e "$entry" --argjson b "$brief_entry" --arg c "$HOOK" --arg bc "$BRIEF" '
+  def ours($p): (.hooks[0].command == $p) or ((.hooks[0].args[0]? // "") == $p);
   .hooks = (.hooks // {})
-  | .hooks.PreCompact = (((.hooks.PreCompact // []) | map(select(.hooks[0].command != $c))) + [$e])
-  | .hooks.SessionEnd = (((.hooks.SessionEnd // []) | map(select(.hooks[0].command != $c))) + [$e])
-  | .hooks.SessionStart = (((.hooks.SessionStart // []) | map(select(.hooks[0].command != $bc))) + [$b])
+  | .hooks.PreCompact = (((.hooks.PreCompact // []) | map(select(ours($c) | not))) + [$e])
+  | .hooks.SessionEnd = (((.hooks.SessionEnd // []) | map(select(ours($c) | not))) + [$e])
+  | .hooks.SessionStart = (((.hooks.SessionStart // []) | map(select(ours($bc) | not))) + [$b])
 ' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS"
 
 echo "hook:     $HOOK"

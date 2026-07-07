@@ -70,12 +70,31 @@ Copy this whole skill directory to `~/.claude/skills/kb-session-flush/` on the
 other machine and invoke it there (or run `install.sh` directly). On a non-KB
 host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
 
-## Notes / limits
+## Notes / limits (field-verified — KB items 495-498)
 
 - The hook returns instantly; extraction is deferred to the nightly drain.
-- REMOTE submissions are capped at ~1 MB per delta (the queue limit); an oversized
-  window logs a non-2xx and is retried next compaction. Very long turns between
-  compactions are the only case that can hit this.
-- `settings.json` merge is idempotent and preserves any other hooks you have.
-- To disable: remove the two entries from `~/.claude/settings.json` `hooks`, or
-  delete `~/.claude/kb-flush.env` (the hook no-ops without config).
+- **Chunking**: deltas are split into <=900 KB line-aligned chunks (server row cap
+  is 1 MB); up to 1 GB per session. Chunks travel gzip+base64 in `transcript_gz`
+  (~10x less wire). Do NOT use HTTP `Content-Encoding: gzip` — the origin does not
+  decode it (KB item 497).
+- **Edge limits** (when the KB is behind a CDN/proxy): keep requests small — a
+  single huge request can hit the edge's ~100 s origin window (524). The chunker
+  already guarantees this. A transient client status `000` whose body still
+  carries a `queue_id` WAS accepted — the hooks treat it as success (item 497).
+- **WAF caveat** (item 498): a managed WAF/OWASP ruleset in front of the KB API
+  can block PLAINTEXT bodies containing shell/code snippets with an opaque HTML
+  block page. The gzip path is immune (base64 body). For kb_save/plaintext
+  writes, add a WAF skip rule for the bearer-authed API routes.
+- **Windows / Git Bash** (item 496) — handled automatically by the installer and
+  hooks: `nohup` detach fallback (no `setsid`), hooks registered as
+  `bash.exe` + args (Claude Code on Windows spawns exe+args, not a shell), jq
+  co-located next to the hooks + PATH-prepended, and native `C:\...` event
+  paths converted with `cygpath` before use.
+- **Never-silent failures**: the flush hook refuses to POST an empty/invalid
+  body (logs `BUG: request body build failed`), and the SessionStart pre-brief
+  surfaces any recent flush failure INTO the next session's context so it is
+  seen, not buried in a log (item 495's sting was silent loss).
+- `settings.json` merge is idempotent (matches both command and args forms) and
+  preserves any other hooks you have.
+- To disable: remove the entries from `~/.claude/settings.json` `hooks`, or
+  delete `~/.claude/kb-flush.env` (the hooks no-op without config).

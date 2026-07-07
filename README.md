@@ -74,6 +74,7 @@ tokens are long-lived and refresh silently.
 | `kb_stats()` | Corpus snapshot (counts by type/project/trust, entities, queue depth) |
 | `kb_review_list()` / `kb_review_resolve(queue_id, action)` | Triage the unverified/contradiction queue |
 | `kb_ingest_session(project, transcript, kind?, repo?, branch?, commit?)` | **Submit a conversation or memory dump** (see §6) |
+| `kb_setup(rest_url?)` | Returns a ready-to-apply guide + scripts to install the Claude Code session hooks (see §6) |
 
 Item types: `note`, `decision`, `spec`, `snippet`, `bug`, `gotcha`, `pattern`, `runbook`, `qa`,
 `config` (plus machine-generated `summary` / `report`). Every search/get result carries a
@@ -131,8 +132,10 @@ curl -H "Authorization: Bearer <KB_TOKEN>" -H 'Content-Type: application/json' -
 
 ### Claude Code session hooks (both directions)
 
-An installable skill wires a machine's Claude Code sessions to the KB in **both directions** — run
-its `install.sh` (idempotent; auto-detects LOCAL vs REMOTE mode and writes `~/.claude/kb-flush.env`):
+The easiest install is to ask a connected Claude Code to run **`kb_setup`** — the MCP tool returns
+the scripts + an idempotent installer and can lay them down on whatever machine it's running on.
+Equivalently, an installable skill wires a machine's Claude Code sessions to the KB in **both
+directions** — run its `install.sh` (auto-detects LOCAL vs REMOTE mode and writes `~/.claude/kb-flush.env`):
 
 - **Flush out** (`PreCompact` + `SessionEnd`): the session's new transcript delta is enqueued to the
   KB before every compaction — never blocking, never using the GPU at capture time.

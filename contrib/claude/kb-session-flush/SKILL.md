@@ -5,7 +5,7 @@ description: Install Claude Code hooks that connect sessions to the Knowledge Va
 
 # Install the KB session hooks (flush + pre-brief)
 
-This skill installs two hook sets:
+This skill installs three hook behaviors (two scripts):
 
 1. **Flush** (`PreCompact` + `SessionEnd`): the session's new transcript delta is
    flushed into the Knowledge Vault before every compaction. Never blocks
@@ -13,11 +13,21 @@ This skill installs two hook sets:
    delta is enqueued and the nightly `consolidate` pass runs the 14B grounded
    extraction, landing unverified items in the review queue (§7.2).
 2. **Pre-brief** (`SessionStart`): when a NEW session starts (startup or /clear —
-   resume/compact are skipped), the hook runs a quick KB search seeded by the
-   repo's recent commit subjects + project name, and its stdout is INJECTED into
-   Claude's starting context — so Claude begins the activity already aware of
-   prior decisions and gotchas. Fails silently (a briefing must never break a
-   session); set `KB_BRIEF_ON_RESUME=1` in kb-flush.env to brief resumes too.
+   resume/compact are skipped), a quick KB search seeded by the repo's recent
+   commit subjects is INJECTED into Claude's starting context, so it begins the
+   activity aware of prior decisions and gotchas. `KB_BRIEF_ON_RESUME=1` briefs
+   resumes too.
+3. **Per-prompt recall** (`UserPromptSubmit`): on every substantive prompt, a KB
+   search seeded by THE PROMPT ITSELF is injected before Claude answers — so each
+   question is grounded in prior knowledge, not just the session opener. Trivial
+   prompts (acknowledgements, slash commands, <12 chars) are skipped; the search
+   stays well under the ~30s prompt cap. Disable with `KB_PROMPT_RECALL=0`.
+   CONNECTOR mode is skipped here by default (a headless `claude -p` per prompt
+   costs tokens + latency) — opt in with `KB_PROMPT_RECALL_CONNECTOR=1`. Both
+   pre-brief and recall are the same script (`kb-session-brief.sh`), branching on
+   the hook event.
+
+All hooks fail silently — recall/brief never break a prompt or session.
 
 Four modes, auto-detected by `install.sh` (in priority order):
 - **LOCAL** (the KB host): the hook runs `kb ingest-session <transcript> --queue`

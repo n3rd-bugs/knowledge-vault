@@ -36,7 +36,7 @@ def test_guide_embeds_all_scripts_and_steps():
     assert "PreCompact" in guide and "SessionStart" in guide
     # every script embedded (a distinctive line from each of the four)
     assert "flush this session's NEW transcript" in guide  # flush hook
-    assert "pre-brief a NEW session" in guide  # brief hook
+    assert "per-prompt recall" in guide  # brief/recall hook (SessionStart + UserPromptSubmit)
     assert "Minimal MCP streamable-HTTP client" in guide  # kb-mcp-call.sh helper
     assert "reuses your 'claude mcp' KB registration" in guide  # install.sh MCP branch
     # actionable install + smoke test

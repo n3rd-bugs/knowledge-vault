@@ -93,28 +93,33 @@ case "$(uname -s)" in
       '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
     brief_entry=$(jq -n --arg b "$BASHW" --arg c "$BRIEF" \
       '{matcher:"startup|clear",hooks:[{type:"command",command:$b,args:[$c],timeout:30}]}')
+    recall_entry=$(jq -n --arg b "$BASHW" --arg c "$BRIEF" \
+      '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
     ;;
   *)
     entry=$(jq -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
     brief_entry=$(jq -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:30}]}')
+    recall_entry=$(jq -n --arg c "$BRIEF" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
     ;;
 esac
 tmp=$(mktemp)
 # Append our entries (idempotent: any prior copy removed first) while
 # preserving other hooks the user has. The brief hook self-filters
 # resume/compact sources, so its matcher stays empty.
-jq --argjson e "$entry" --argjson b "$brief_entry" --arg c "$HOOK" --arg bc "$BRIEF" '
+jq --argjson e "$entry" --argjson b "$brief_entry" --argjson r "$recall_entry" \
+   --arg c "$HOOK" --arg bc "$BRIEF" '
   def ours($p): (.hooks[0].command == $p) or ((.hooks[0].args[0]? // "") == $p);
   .hooks = (.hooks // {})
   | .hooks.PreCompact = (((.hooks.PreCompact // []) | map(select(ours($c) | not))) + [$e])
   | .hooks.SessionEnd = (((.hooks.SessionEnd // []) | map(select(ours($c) | not))) + [$e])
   | .hooks.SessionStart = (((.hooks.SessionStart // []) | map(select(ours($bc) | not))) + [$b])
+  | .hooks.UserPromptSubmit = (((.hooks.UserPromptSubmit // []) | map(select(ours($bc) | not))) + [$r])
 ' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS"
 
 echo "hook:     $HOOK"
-echo "brief:    $BRIEF (SessionStart -> injects a KB pre-brief into new sessions)"
+echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-prompt KB recall)"
 echo "config:   $CFG  ($MODE)"
-echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart registered)"
+echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart + UserPromptSubmit registered)"
 echo
 echo "smoke test (feeds a fake PreCompact event to the hook):"
 echo "  T=\$(ls -t \"\$HOME\"/.claude/projects/*/*.jsonl | head -1)"

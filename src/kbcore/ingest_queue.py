@@ -21,6 +21,10 @@ from kbcore.scrub import scrub
 QUEUE_KINDS = ("session", "memory")
 MAX_CONTENT_BYTES = 1_000_000  # ~1 MB cap on a single submission
 MAX_PENDING = 5_000  # aggregate cap: refuse new submissions when the backlog is this deep
+# A failed row is re-drained until it has been tried this many times, then left
+# permanently 'failed'. Self-heals a transient DB/OOM failure without any
+# operator requeue tool; a genuinely-bad row stops after a bounded few attempts.
+MAX_ATTEMPTS = 3
 # Projects a public submission may never target (system/curated). Review findings:
 # a public caller must not inject items into kb-system or burn the nightly run on it.
 RESERVED_PROJECTS = frozenset({"kb-system"})
@@ -89,10 +93,12 @@ def enqueue(
 
 
 def pending(limit: int = 50) -> list[dict[str, Any]]:
-    """Claim up to ``limit`` pending rows for the drain (FOR UPDATE SKIP LOCKED).
+    """Claim up to ``limit`` drainable rows (FOR UPDATE SKIP LOCKED).
 
-    SKIP LOCKED means a concurrent/crashed drainer can never wedge the queue —
-    rows it holds are simply skipped; unprocessed rows stay 'pending' for retry.
+    Drainable = still 'pending', OR 'failed' but under :data:`MAX_ATTEMPTS` (the
+    self-heal set). Fresh pending rows sort first so a backlog of retryable
+    failures can never starve new content under the batch limit. SKIP LOCKED
+    means a concurrent/crashed drainer can never wedge the queue.
     """
     with connect() as conn:
         rows = conn.execute(
@@ -100,11 +106,12 @@ def pending(limit: int = 50) -> list[dict[str, Any]]:
             SELECT id, project, kind, content, meta
             FROM ingest_queue
             WHERE status = 'pending'
-            ORDER BY id
+               OR (status = 'failed' AND attempts < %s)
+            ORDER BY (status = 'failed'), id
             LIMIT %s
             FOR UPDATE SKIP LOCKED
             """,
-            (limit,),
+            (MAX_ATTEMPTS, limit),
         ).fetchall()
     return [
         {"id": r[0], "project": r[1], "kind": r[2], "content": r[3], "meta": r[4] or {}}
@@ -113,7 +120,7 @@ def pending(limit: int = 50) -> list[dict[str, Any]]:
 
 
 def mark_extracted(queue_id: int, saved: int, rejected: int) -> None:
-    """Record a successful drain of a row."""
+    """Record a successful drain — terminal, whether it took a retry or not."""
     with transaction() as conn:
         conn.execute(
             """
@@ -126,11 +133,15 @@ def mark_extracted(queue_id: int, saved: int, rejected: int) -> None:
 
 
 def mark_failed(queue_id: int, error: str) -> None:
-    """Record a failed drain (kept 'failed', not deleted — inspectable)."""
+    """Record a failed drain (kept 'failed', not deleted — inspectable + retried).
+
+    Increments ``attempts``; once it reaches :data:`MAX_ATTEMPTS` the row is no
+    longer selected by :func:`pending`, so a genuinely-bad row stops looping.
+    """
     with transaction() as conn:
         conn.execute(
-            "UPDATE ingest_queue SET status = 'failed', error = %s, processed_at = now() "
-            "WHERE id = %s",
+            "UPDATE ingest_queue SET status = 'failed', attempts = attempts + 1, "
+            "error = %s, processed_at = now() WHERE id = %s",
             (error[:2000], queue_id),
         )
 

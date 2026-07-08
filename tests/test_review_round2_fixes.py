@@ -68,3 +68,50 @@ def test_whitespace_only_window_skipped(kb, tmp_path, monkeypatch):
         rows = conn.execute("SELECT content FROM ingest_queue WHERE project = 'wsproj'").fetchall()
     assert all(c.strip() for (c,) in rows), "no whitespace-only rows enqueued"
     assert s.saved == len(rows)
+
+
+def test_failed_row_self_heals_on_retry(kb, monkeypatch):
+    """A failed row is re-drained and recovers when the cause clears — no
+    operator requeue needed (standalone self-heal)."""
+    from kbcore import ingest_queue
+    from kbworker import consolidate, sessions
+
+    qid = ingest_queue.enqueue("healproj", "User: a\nAssistant: b", kind="session")
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise ValueError("a transient db hiccup")
+        return (1, 0)
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", flaky)
+    consolidate._drain_ingest_queue()  # attempt 1 fails
+    with db.connect() as conn:
+        st, att = conn.execute(
+            "SELECT status, attempts FROM ingest_queue WHERE id = %s", (qid,)
+        ).fetchone()
+    assert st == "failed" and att == 1
+    consolidate._drain_ingest_queue()  # retried, now succeeds
+    with db.connect() as conn:
+        st = conn.execute("SELECT status FROM ingest_queue WHERE id = %s", (qid,)).fetchone()[0]
+    assert st == "extracted", "the failed row self-healed without any manual requeue"
+
+
+def test_failed_row_retries_are_bounded(kb, monkeypatch):
+    from kbcore import ingest_queue
+    from kbworker import consolidate, sessions
+
+    qid = ingest_queue.enqueue("healproj2", "User: a\nAssistant: b", kind="session")
+
+    def always_bad(*a, **k):
+        raise ValueError("genuinely malformed forever")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", always_bad)
+    for _ in range(6):
+        consolidate._drain_ingest_queue()
+    with db.connect() as conn:
+        st, att = conn.execute(
+            "SELECT status, attempts FROM ingest_queue WHERE id = %s", (qid,)
+        ).fetchone()
+    assert st == "failed" and att == ingest_queue.MAX_ATTEMPTS, "retries stop after MAX_ATTEMPTS"

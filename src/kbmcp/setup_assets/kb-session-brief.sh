@@ -53,7 +53,7 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
 elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # CONNECTOR: one small headless call through the claude.ai-bridged KB tool.
   export KB_HOOK_GUARD=1
-  HITS=$(timeout 90 "$CLAUDE_BIN" -p "Call the kb_search tool (mcp__claude_ai_Knowledge_Base__kb_search or any kb_search) with query: $QUERY and k=5. Print the tool result VERBATIM and nothing else; print nothing if the tool is unavailable."     --allowedTools "mcp__claude_ai_Knowledge_Base__kb_search,mcp__kb__kb_search"     2>/dev/null) || HITS=""
+  HITS=$(timeout 25 "$CLAUDE_BIN" -p "Call the kb_search tool (mcp__claude_ai_Knowledge_Base__kb_search or any kb_search) with query: $QUERY and k=5. Print the tool result VERBATIM and nothing else; print nothing if the tool is unavailable."     --allowedTools "mcp__claude_ai_Knowledge_Base__kb_search,mcp__kb__kb_search"     2>/dev/null) || HITS=""
   unset KB_HOOK_GUARD
 elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   ENC=$(printf '%s' "$QUERY" | jq -sRr @uri)

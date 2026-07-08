@@ -39,6 +39,13 @@ def scrub(text: str) -> tuple[str, dict[str, int]]:
     Runs on every ingest path before anything is stored (SEC-2).
     """
     redactions: dict[str, int] = {}
+    # Postgres TEXT cannot store NUL (\x00); a transcript message carrying a
+    # literal  (json.loads decodes it to a real NUL) would otherwise crash
+    # the enqueue INSERT and — on the LOCAL path — wedge behind an advanced
+    # checkpoint. Strip NUL before anything else. (Counted so it's visible.)
+    if "\x00" in text:
+        redactions["nul_stripped"] = text.count("\x00")
+        text = text.replace("\x00", "")
     # The KB's OWN bearer, wherever it appears (bare, in a config snippet, in a
     # flushed transcript of a kb_setup conversation) — the generic token= pattern
     # only catches prefixed forms. Exact match, no regex risk.

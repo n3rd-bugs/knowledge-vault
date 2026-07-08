@@ -193,8 +193,10 @@ def test_reposcan_skips_symlinked_docs(tmp_path):
 
 
 def test_reposcan_survives_a_bad_doc(tmp_path):
-    # Defect #2: one undecodable doc (NUL bytes → DB DataError) must not abort
-    # the whole scan; it is logged, counted, and skipped.
+    # Defect #2 (updated): a doc with NUL bytes must not abort the scan. Since
+    # scrub now strips \x00 (Postgres TEXT can't store it), the doc ingests
+    # cleanly — NUL-free — rather than erroring out; the scan completes either
+    # way. This is strictly better: the doc's content is no longer lost.
     repo = tmp_path / "repo2"
     _init_bare_git(repo)
     (repo / "README.md").write_text("# Good\n\nA good readme about the frobnicator.")
@@ -206,8 +208,14 @@ def test_reposcan_survives_a_bad_doc(tmp_path):
     summary = scan_repo(repo)
 
     assert "repo2:README.md" in summary.ingested
-    assert summary.errors == 1
-    assert _item_count() == 1, "good doc ingested, bad one skipped, scan completed"
+    assert summary.errors == 0, "the NUL doc no longer errors — scrub strips \\x00"
+    assert "repo2:docs/bad.md" in summary.ingested
+    with db.connect() as conn:
+        body = conn.execute(
+            "SELECT body FROM items i JOIN sources s ON s.id = i.source_id "
+            "WHERE s.uri = 'repo2:docs/bad.md'"
+        ).fetchone()[0]
+    assert "\x00" not in body and "embedded nul bytes" in body
 
 
 def test_git_absent_raises_kberror_not_traceback(tmp_path, monkeypatch):

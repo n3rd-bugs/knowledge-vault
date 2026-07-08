@@ -19,6 +19,7 @@ from kbcore import consolidation, evidence, ingest_queue, llm
 from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
+from kbcore.errors import EmbedderUnavailable, ExtractorUnavailable
 from kbcore.ingest import ingest
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
@@ -79,6 +80,13 @@ def _drain_ingest_queue() -> tuple[int, int]:
             ingest_queue.mark_extracted(row["id"], saved, rejected)
             drained += 1
             saved_total += saved
+        except (ExtractorUnavailable, EmbedderUnavailable) as e:
+            # TRANSIENT (Ollama down/restarting during the nightly window): do
+            # NOT mark_failed — a permanent 'failed' would strand this row
+            # forever (nothing re-drains failed rows, and the content-hash
+            # dedupe then silently swallows any re-submission). Leave it pending
+            # so the next run retries once the model is back.
+            logger.warning("row %s deferred (extractor/embedder unavailable): %s", row["id"], e)
         except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
             logger.exception("draining ingest_queue row %s failed", row["id"])
             ingest_queue.mark_failed(row["id"], f"{type(e).__name__}: {e}")

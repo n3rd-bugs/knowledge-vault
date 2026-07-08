@@ -354,6 +354,8 @@ def ingest_session(
             windows = _text_windows(transcript_text, QUEUE_WINDOW_BYTES)
             saved = 0
             for i, win in enumerate(windows):
+                if not win.strip():
+                    continue  # a whitespace-only window carries no knowledge
                 part = f"#p{i}" if len(windows) > 1 else ""
                 qid = ingest_queue.enqueue(
                     project,

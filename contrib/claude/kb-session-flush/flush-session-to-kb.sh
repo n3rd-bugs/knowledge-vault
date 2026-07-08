@@ -27,6 +27,7 @@ INPUT=$(cat)
 T=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty')
 CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
 SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
+EV=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // empty')
 # Native Windows event paths (C:\... or C:/...) must be cygpath'ed — basename
 # on a backslash path yields the whole drive path (item 496; two-alternative
 # case pattern required, the single bracket-class form does not match).
@@ -62,11 +63,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   # passing the text as an argv (--arg) hits the kernel's ~128 KB per-argument
   # limit long before 1 MB.
   STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
-  OFFF="$STATE/${SID:-default}.offset"
+  OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
+  OFFF="$STATE/${OKEY:-default}.offset"
   HELPER="$(dirname "$0")/kb-mcp-call.sh"
-  export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER
+  export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER EV
   "$DETACH" bash -c '
     CHUNK=900000; MAX_PER_FIRING=209715200   # 200 MB/firing; rest resumes next firing
+    [ "$EV" = "SessionEnd" ] && MAX_PER_FIRING=1099511627776   # terminal firing: drain all
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac   # empty/corrupt offset -> restart
@@ -95,12 +98,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         # args go via FILE (@) — a ~900KB argv would hit the kernel arg limit.
         # Chunks are gzip+base64 encoded when the tools exist (10x less wire);
         # plaintext fallback keeps minimal systems working.
-        if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
-          gzip -c "$TMPC" | base64 -w0 >"$TMPC.gz64"
+        if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
+           && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
           jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" \
             "{project:\$p,transcript_gz:\$t,kind:\"session\"}" >"$TMPC.args"
           rm -f "$TMPC.gz64"
         else
+          rm -f "$TMPC.gz64"
           jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
             "{project:\$p,transcript:\$t,kind:\"session\"}" >"$TMPC.args"
         fi
@@ -111,13 +115,14 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         bash "$HELPER" kb_ingest_session "@$TMPC.args" >/dev/null 2>>"$LOG" && CODE=202 || CODE=err
         rm -f "$TMPC.args"
       else
-        if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
-          gzip -c "$TMPC" | base64 -w0 >"$TMPC.gz64"
-          BODYF="$TMPC.body"
+        BODYF="$TMPC.body"
+        if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
+           && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
           jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" \
             "{project:\$p,kind:\"session\",transcript_gz:\$t}" >"$BODYF"
           rm -f "$TMPC.gz64"
         else
+          rm -f "$TMPC.gz64"
           BODYF="$TMPC.body"
           jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
             "{project:\$p,kind:\"session\",transcript:\$t}" >"$BODYF"
@@ -150,8 +155,9 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # chunks are small (~24 KB echo fidelity) and each flush costs Claude usage —
   # bearer modes (MCP/REST) are the efficient path; this is the no-setup one.
   STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
-  OFFF="$STATE/${SID:-default}.offset"
-  export CLAUDE_BIN OFFF
+  OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
+  OFFF="$STATE/${OKEY:-default}.offset"
+  export CLAUDE_BIN OFFF EV
   export KB_CONNECTOR_CHUNK="${KB_CONNECTOR_CHUNK:-24000}"
   export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
   "$DETACH" bash -c '
@@ -162,7 +168,8 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
-    while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$KB_CONNECTOR_MAX" ]; do
+    CAP="$KB_CONNECTOR_MAX"; [ "$EV" = "SessionEnd" ] && CAP=1099511627776   # drain all at end
+    while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$CAP" ]; do
       TMPC=$(mktemp)
       tail -c +$((OFFSET+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" >"$TMPC"
       BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")

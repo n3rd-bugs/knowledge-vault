@@ -19,9 +19,12 @@ This skill installs three hook behaviors (two scripts):
    resumes too.
 3. **Per-prompt recall** (`UserPromptSubmit`): on every substantive prompt, a KB
    search seeded by THE PROMPT ITSELF is injected before Claude answers — so each
-   question is grounded in prior knowledge, not just the session opener. Trivial
-   prompts (acknowledgements, slash commands, <12 chars) are skipped; the search
-   stays well under the ~30s prompt cap. Disable with `KB_PROMPT_RECALL=0`.
+   question is grounded in prior knowledge, not just the session opener. Noise
+   controls: slash commands and <12-char prompts skip; a CONTENT-WORD GATE skips
+   prompts made only of acknowledgements/stopwords/generic imperatives ("Yes
+   please review and update") — hybrid search would return k-best noise for
+   those; and a repeat of the same query within 10 min is suppressed (its hits
+   are already in context). Disable with `KB_PROMPT_RECALL=0`.
    CONNECTOR mode is skipped here by default (a headless `claude -p` per prompt
    costs tokens + latency) — opt in with `KB_PROMPT_RECALL_CONNECTOR=1`. Both
    pre-brief and recall are the same script (`kb-session-brief.sh`), branching on

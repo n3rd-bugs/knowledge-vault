@@ -42,12 +42,30 @@ if [ "$EV" = "UserPromptSubmit" ]; then
   # Skip trivial prompts (continuations, acknowledgements, slash commands) — no
   # point searching, and no context noise.
   case "$PROMPT" in /*) exit 0 ;; esac
-  NORM=$(printf '%s' "$PROMPT" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z')
-  case "$NORM" in
-    ''|continue|yes|yep|no|ok|okay|k|go|proceed|do|doit|sure|thanks|thankyou|please|y|n|next|stop|retry|again|fix|fixit|run) exit 0 ;;
-  esac
   [ "${#PROMPT}" -ge 12 ] || exit 0
+  # CONTENT-WORD GATE: a prompt made only of acknowledgements/stopwords/generic
+  # imperatives ("Yes please review and update") carries nothing searchable —
+  # hybrid search would return k-best NOISE and inject it. Require >=2 content
+  # words (identifiers, numbers, domain terms survive the stoplist).
+  COUNT=0
+  for W in $(printf '%s' "$PROMPT" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' ' '); do
+    case "$W" in
+      ''|a|an|and|or|but|is|are|was|were|be|been|do|does|did|to|of|in|on|for|with|at|by|from|as|it|its|the|this|that|these|those|i|we|you|they|them|my|our|your|me|us|so|if|then|else|when|what|which|who|how|why|where|can|could|should|would|will|shall|may|might|must|not|no|yes|yep|ok|okay|please|thanks|thank|just|now|also|too|very|more|less|some|any|all|both|each|most|other|same|only|again|once|here|there|about|into|over|out|up|down|off|review|update|check|look|see|make|let|lets|get|got|need|want|try|use|go|run|continue|proceed|done|sure|fine|right|good|nice|great)
+        ;;
+      *) COUNT=$((COUNT+1)) ;;
+    esac
+  done
+  [ "$COUNT" -ge 2 ] || exit 0
   QUERY=$(printf '%s' "$PROMPT" | tr '\n' ' ' | cut -c1-240)
+  # DUPLICATE SUPPRESSION: the same (normalized) query within 10 min already
+  # has its hits in context — re-injecting is pure noise.
+  RSTATE="$HOME/.claude/hooks/state"; mkdir -p "$RSTATE"
+  QH=$(printf '%s' "$QUERY" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cksum | cut -d" " -f1)
+  NOW=$(date +%s)
+  if [ -f "$RSTATE/recall.last" ]; then
+    read -r LH LT <"$RSTATE/recall.last" 2>/dev/null || LH=""
+    [ "$LH" = "$QH" ] && [ $((NOW - ${LT:-0})) -lt 600 ] && exit 0
+  fi
   K=3; ST=10; ALLOW_CONN="${KB_PROMPT_RECALL_CONNECTOR:-0}"; MODE=recall
 else
   # SessionStart: brief only genuinely NEW activity (startup / clear).
@@ -98,6 +116,9 @@ Tell the user; the smoke test in the kb-session-flush skill verifies the fix.
 fi
 
 { [ -n "$HITS" ] || [ -n "$FLUSH_WARN" ]; } || exit 0
+if [ "$MODE" = "recall" ] && [ -n "$HITS" ]; then
+  printf '%s %s\n' "$QH" "$NOW" >"$RSTATE/recall.last" 2>/dev/null || true
+fi
 if [ "$MODE" = "recall" ]; then
   HEAD="[KB recall · project ${PROJECT}] Knowledge-base matches for THIS prompt —"
 else

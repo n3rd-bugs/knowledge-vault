@@ -73,6 +73,12 @@ def add(
     file: typer.FileText | None = typer.Option(None, "--file"),
     tags: list[str] = typer.Option([], "--tag", help=TAGS_HELP),
     code_ref: str | None = typer.Option(None, "--code-ref", help="JSON code anchor"),
+    valid_from: str | None = typer.Option(
+        None, "--valid-from", help="ISO date/timestamp the fact became true (valid-time)"
+    ),
+    valid_to: str | None = typer.Option(
+        None, "--valid-to", help="ISO date/timestamp the fact stopped being true (exclusive)"
+    ),
 ) -> None:
     """Save a verified item (manual knowledge entry)."""
     try:
@@ -84,6 +90,8 @@ def add(
             kind="manual",
             tags=list(tags),
             code_ref=_parse_code_ref(code_ref),
+            valid_from=items._parse_instant(valid_from, "valid_from") if valid_from else None,
+            valid_to=items._parse_instant(valid_to, "valid_to") if valid_to else None,
         )
     except (KBError, ValueError) as e:
         _fail(e)
@@ -136,6 +144,9 @@ def search_cmd(
     boost_project: str | None = typer.Option(None, "--boost-project"),
     include_superseded: bool = typer.Option(False, "--include-superseded"),
     include_archived: bool = typer.Option(False, "--include-archived"),
+    as_of: str | None = typer.Option(
+        None, "--as-of", help="Valid-time filter: only facts true at this ISO date/timestamp"
+    ),
     k: int = typer.Option(8, "-k"),
 ) -> None:
     """Hybrid search across all projects (default) — cross-domain recall is the point."""
@@ -149,6 +160,7 @@ def search_cmd(
             boost_project=boost_project,
             include_superseded=include_superseded,
             include_archived=include_archived,
+            as_of=items._parse_instant(as_of, "as_of") if as_of else None,
             k=k,
             tool="cli.search",
         )

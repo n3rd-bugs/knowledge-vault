@@ -1,0 +1,117 @@
+"""WP1 — bitemporal VALID-TIME on items.
+
+Covers the interval round-trip through get_item, the search `as_of` valid-time
+filter (half-open, valid_to exclusive), and the shared instant parser. Real DB
+in kb_test; Ollama mocked by conftest (CLAUDE.md: real-DB tests, mock only
+Ollama). Hits are made deterministic with a shared keyword ("widgetflux") so the
+keyword leg matches every item regardless of the fake embedding vectors.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+
+from kbcore.errors import InvalidOperation
+from kbcore.ingest import ingest
+from kbcore.items import _parse_instant, get_item
+from kbcore.search import search
+
+pytestmark = pytest.mark.usefixtures("kb")
+
+T = datetime(2026, 6, 1, tzinfo=UTC)  # the as_of instant under test
+JAN = datetime(2026, 1, 1, tzinfo=UTC)
+DEC = datetime(2026, 12, 31, tzinfo=UTC)
+MAR = datetime(2026, 3, 1, tzinfo=UTC)
+SEP = datetime(2026, 9, 1, tzinfo=UTC)
+
+
+def _ingest(title: str, *, valid_from=None, valid_to=None) -> int:
+    """Ingest a note sharing the 'widgetflux' keyword; distinct title ⇒ no dedupe."""
+    item_id = ingest(
+        project="valid-time",
+        type="note",
+        title=title,
+        body=f"The widgetflux protocol note for the {title} case.",
+        valid_from=valid_from,
+        valid_to=valid_to,
+    )
+    assert item_id is not None
+    return item_id
+
+
+def _four() -> dict[str, int]:
+    return {
+        "covering": _ingest("covering", valid_from=JAN, valid_to=DEC),  # covers T
+        "ended": _ingest("ended", valid_to=MAR),  # valid_to <= T
+        "future": _ingest("future", valid_from=SEP),  # valid_from > T
+        "unbounded": _ingest("unbounded"),  # NULL/NULL — always
+    }
+
+
+# --- interval round-trip ------------------------------------------------------
+
+
+def test_interval_roundtrips_through_get_item():
+    item = get_item(_ingest("covering", valid_from=JAN, valid_to=DEC))
+    assert item.valid_from == JAN
+    assert item.valid_to == DEC
+
+
+def test_null_interval_is_the_default():
+    item = get_item(_ingest("open-ended"))
+    assert item.valid_from is None
+    assert item.valid_to is None
+
+
+# --- as_of search filter ------------------------------------------------------
+
+
+def test_as_of_keeps_only_facts_valid_at_the_instant():
+    ids = _four()
+    got = {h.item_id for h in search("widgetflux", as_of=T)}
+    assert ids["covering"] in got  # interval covers T
+    assert ids["unbounded"] in got  # NULL bounds are unbounded
+    assert ids["ended"] not in got  # ended before T (valid_to <= T)
+    assert ids["future"] not in got  # not yet valid at T (valid_from > T)
+
+
+def test_as_of_unset_applies_no_valid_time_filter():
+    ids = _four()
+    got = {h.item_id for h in search("widgetflux")}
+    assert got == set(ids.values())  # identical to pre-WP1 behaviour
+
+
+def test_valid_to_is_exclusive_and_valid_from_is_inclusive():
+    ends_at_t = _ingest("ends-at-t", valid_from=JAN, valid_to=T)
+    starts_at_t = _ingest("starts-at-t", valid_from=T)
+    got = {h.item_id for h in search("widgetflux", as_of=T)}
+    assert ends_at_t not in got  # half-open: valid_to == T is excluded
+    assert starts_at_t in got  # valid_from == T is included
+
+
+def test_search_hit_carries_the_interval():
+    item_id = _ingest("covering", valid_from=JAN, valid_to=DEC)
+    hit = next(h for h in search("widgetflux") if h.item_id == item_id)
+    assert hit.valid_from == JAN
+    assert hit.valid_to == DEC
+
+
+# --- the shared instant parser ------------------------------------------------
+
+
+def test_parse_instant_accepts_date_and_timestamp():
+    assert _parse_instant("2026-06-01", "as_of") == T
+    assert _parse_instant("2026-06-01T12:30:00+00:00", "as_of") == datetime(
+        2026, 6, 1, 12, 30, tzinfo=UTC
+    )
+    # A naive timestamp is assumed UTC (Invariant 7).
+    assert _parse_instant("2026-06-01T12:30:00", "as_of") == datetime(
+        2026, 6, 1, 12, 30, tzinfo=UTC
+    )
+
+
+def test_parse_instant_rejects_garbage():
+    with pytest.raises(InvalidOperation):
+        _parse_instant("not-a-date", "as_of")

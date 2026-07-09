@@ -50,6 +50,10 @@ def render_item(item: ItemDetail) -> str:
         lines.append(f"tags: {', '.join(item.tags)}")
     if item.code_ref:
         lines.append(item.code_ref.render())
+    if item.valid_from or item.valid_to:
+        frm = item.valid_from.isoformat() if item.valid_from else "…"
+        to = item.valid_to.isoformat() if item.valid_to else "…"
+        lines.append(f"valid: {frm} .. {to}")
     if item.meta.get("redactions"):
         lines.append(f"redactions: {item.meta['redactions']}")
     lines.append("")

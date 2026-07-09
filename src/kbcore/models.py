@@ -71,6 +71,8 @@ class SearchHit(BaseModel):
     source_uri: str | None = None
     code_ref: CodeRef | None = None
     superseded_by: int | None = None
+    valid_from: datetime | None = None  # valid-time interval (WP1); NULL = unbounded
+    valid_to: datetime | None = None  # NULL = still true (half-open, valid_to exclusive)
     score: float
 
     def provenance_header(self) -> str:
@@ -99,6 +101,8 @@ class ItemDetail(BaseModel):
     meta: dict = Field(default_factory=dict)
     source_uri: str | None = None
     created_at: datetime
+    valid_from: datetime | None = None  # valid-time interval (WP1); NULL = unbounded
+    valid_to: datetime | None = None  # NULL = still true (half-open, valid_to exclusive)
     relations: list[Relation] = Field(default_factory=list)
 
 

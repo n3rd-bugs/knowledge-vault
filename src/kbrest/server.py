@@ -87,10 +87,19 @@ def _register_read(app: FastAPI) -> None:
         domain: str | None = None,
         tags: list[str] | None = Query(None),
         type: str | None = None,
+        as_of: str | None = None,
         k: int = 8,
     ) -> list[SearchHit]:
+        as_of_dt = items._parse_instant(as_of, "as_of") if as_of else None
         return search.search(
-            q, project=project, domain=domain, type=type, tags=tags, k=k, tool="rest.search"
+            q,
+            project=project,
+            domain=domain,
+            type=type,
+            tags=tags,
+            as_of=as_of_dt,
+            k=k,
+            tool="rest.search",
         )
 
     @app.get("/api/items/{item_id}")
@@ -153,6 +162,8 @@ def _register_write(app: FastAPI) -> None:
             trust="verified",
             tags=payload.tags,
             code_ref=code_ref,
+            valid_from=payload.valid_from,
+            valid_to=payload.valid_to,
         )
         if item_id is None:  # content-hash duplicate — point at the existing item
             existing = ingest.find_duplicate(payload.title, payload.body)

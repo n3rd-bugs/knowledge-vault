@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from kbcore import embed as embed_mod
@@ -61,6 +62,7 @@ def _filters(
     type: str | None,
     tags: list[str] | None,
     statuses: list[str],
+    as_of: datetime | None = None,
 ) -> tuple[str, list[Any]]:
     # SAFETY: the returned `where` string is interpolated into SQL, so it must
     # only ever be assembled from the constant fragments below — every user
@@ -79,6 +81,15 @@ def _filters(
     if tags:
         where.append("i.tags @> %s")
         params.append(tags)
+    if as_of is not None:
+        # Valid-time as_of (WP1): keep only facts whose interval covers T.
+        # Half-open (valid_to exclusive); NULL bounds are unbounded. Both legs
+        # JOIN items i and inherit this, so vector + keyword stay consistent.
+        where.append(
+            "(i.valid_from IS NULL OR i.valid_from <= %s)"
+            " AND (i.valid_to IS NULL OR i.valid_to > %s)"
+        )
+        params.extend([as_of, as_of])
     return " AND ".join(where), params
 
 
@@ -91,17 +102,22 @@ def search(
     boost_project: str | None = None,
     include_superseded: bool = False,
     include_archived: bool = False,
+    as_of: datetime | None = None,
     k: int = 8,
     tool: str = "search",
 ) -> list[SearchHit]:
-    """Hybrid search over all projects by default (cross-domain reuse is the point)."""
+    """Hybrid search over all projects by default (cross-domain reuse is the point).
+
+    as_of (WP1 valid-time): when set, restrict to facts whose validity interval
+    covers that instant; unset (default) applies no valid-time filter.
+    """
     statuses = ["active"]
     if include_superseded:
         statuses.append("superseded")
     if include_archived:
         statuses.append("archived")
 
-    where, params = _filters(project, domain, type, tags, statuses)
+    where, params = _filters(project, domain, type, tags, statuses, as_of)
     # Public-only instance: both legs JOIN projects p, so restrict to public ones.
     if scope.public_only():
         where = f"{where} AND p.public IS TRUE"
@@ -215,7 +231,8 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
         rows = conn.execute(
             """
             SELECT i.id, i.title, i.type, i.project, p.domain, i.status,
-                   s.trust, i.tags, i.created_at, s.uri, i.meta, i.superseded_by
+                   s.trust, i.tags, i.created_at, s.uri, i.meta, i.superseded_by,
+                   i.valid_from, i.valid_to
             FROM items i
             LEFT JOIN projects p ON p.name = i.project
             LEFT JOIN sources s ON s.id = i.source_id
@@ -224,7 +241,22 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
             (list(by_id),),
         ).fetchall()
     hits = []
-    for id_, title, type_, proj, dom, status, trust, tags, created, uri, meta, sup_by in rows:
+    for (
+        id_,
+        title,
+        type_,
+        proj,
+        dom,
+        status,
+        trust,
+        tags,
+        created,
+        uri,
+        meta,
+        sup_by,
+        valid_from,
+        valid_to,
+    ) in rows:
         score, snippet = by_id[id_]
         code_ref = None
         if isinstance(meta, dict) and meta.get("code_ref"):
@@ -244,6 +276,8 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
                 source_uri=uri or None,
                 code_ref=code_ref,
                 superseded_by=sup_by,
+                valid_from=valid_from,
+                valid_to=valid_to,
                 score=score,
             )
         )

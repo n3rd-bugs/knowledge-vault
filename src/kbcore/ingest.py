@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
@@ -23,6 +24,17 @@ from kbcore.config import settings
 from kbcore.db import transaction
 from kbcore.models import ITEM_TYPES, SOURCE_KINDS, CodeRef
 from kbcore.scrub import scrub
+
+
+def _as_utc(dt: datetime | None) -> datetime | None:
+    """Invariant 7: a naive datetime is assumed UTC; an aware one passes through.
+
+    Centralizes the tz guarantee at the single write point, so a naive value from
+    any surface (e.g. a pydantic-parsed bare date) still lands tz-aware.
+    """
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
 
 
 def normalize(text: str) -> str:
@@ -59,6 +71,8 @@ def ingest(
     code_ref: CodeRef | dict | None = None,
     raw_content: bytes | None = None,
     is_source: bool = False,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
 ) -> int | None:
     """Ingest one item. Returns the new item id, or None if a content-hash duplicate."""
     with transaction() as conn:
@@ -76,6 +90,8 @@ def ingest(
             code_ref=code_ref,
             raw_content=raw_content,
             is_source=is_source,
+            valid_from=valid_from,
+            valid_to=valid_to,
         )
 
 
@@ -94,8 +110,18 @@ def ingest_in(
     code_ref: CodeRef | dict | None = None,
     raw_content: bytes | None = None,
     is_source: bool = False,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
 ) -> int | None:
-    """Ingest within the caller's transaction (composition point for supersede)."""
+    """Ingest within the caller's transaction (composition point for supersede).
+
+    valid_from/valid_to are the optional VALID-TIME interval (WP1): when the fact
+    was true in the world, orthogonal to created_at (when the KB learned it). Both
+    default NULL (unbounded / still true). Naive datetimes are coerced to UTC so
+    the TIMESTAMPTZ columns stay tz-aware (Invariant 7).
+    """
+    valid_from = _as_utc(valid_from)
+    valid_to = _as_utc(valid_to)
     if type not in ITEM_TYPES:
         raise ValueError(f"unknown item type {type!r}")
     if kind not in SOURCE_KINDS:
@@ -140,11 +166,12 @@ def ingest_in(
 
     item_id = conn.execute(
         """
-        INSERT INTO items (source_id, project, type, title, body, tags, meta)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO items (source_id, project, type, title, body, tags, meta,
+                           valid_from, valid_to)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (source_id, project, type, title, body, tags or [], Jsonb(full_meta)),
+        (source_id, project, type, title, body, tags or [], Jsonb(full_meta), valid_from, valid_to),
     ).fetchone()[0]
 
     # The source splitter is only for actual raw source files (inbox drops,

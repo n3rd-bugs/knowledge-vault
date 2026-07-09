@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from kbcore import scope
@@ -17,7 +17,8 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
         row = conn.execute(
             """
             SELECT i.id, i.project, i.type, i.title, i.body, i.tags, i.status,
-                   s.trust, i.superseded_by, i.supersede_reason, i.meta, s.uri, i.created_at
+                   s.trust, i.superseded_by, i.supersede_reason, i.meta, s.uri, i.created_at,
+                   i.valid_from, i.valid_to
             FROM items i LEFT JOIN sources s ON s.id = i.source_id
             WHERE i.id = %s
             """,
@@ -41,6 +42,8 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
             meta,
             uri,
             created,
+            valid_from,
+            valid_to,
         ) = row
         relations: list[Relation] = []
         if with_relations:
@@ -90,6 +93,8 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
         meta=meta,
         source_uri=uri or None,
         created_at=created,
+        valid_from=valid_from,
+        valid_to=valid_to,
         relations=relations,
     )
 
@@ -104,6 +109,25 @@ def _parse_day(value: str, param: str) -> date:
         return date.fromisoformat(value)
     except ValueError as e:
         raise InvalidOperation(f"{param} must be YYYY-MM-DD, got {value!r}") from e
+
+
+def _parse_instant(value: str, param: str) -> datetime:
+    """Parse a full ISO-8601 timestamp OR a bare date (→ midnight) into a tz-aware
+    UTC datetime — the valid-time as_of / valid_from / valid_to parser (WP1).
+
+    A bare date maps to that day at 00:00 UTC; a naive timestamp is assumed UTC
+    (Invariant 7). Garbage raises a domain error instead of letting a raw
+    ValueError/psycopg error escape to MCP clients (mirrors _parse_day)."""
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            dt = datetime.combine(date.fromisoformat(value), datetime.min.time())
+        except ValueError as e:
+            raise InvalidOperation(
+                f"{param} must be an ISO-8601 date or timestamp, got {value!r}"
+            ) from e
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
 
 
 def timeline(
@@ -137,7 +161,7 @@ def timeline(
             SELECT * FROM (
                 SELECT i.id, i.project, i.type, i.title, i.body, i.tags, i.status,
                        s.trust, i.superseded_by, i.supersede_reason, i.meta,
-                       s.uri, i.created_at
+                       s.uri, i.created_at, i.valid_from, i.valid_to
                 FROM items i LEFT JOIN sources s ON s.id = i.source_id
                 WHERE {" AND ".join(where)}
                 ORDER BY i.created_at DESC, i.id DESC
@@ -147,7 +171,23 @@ def timeline(
             params,
         ).fetchall()
     out = []
-    for id_, proj, type_, title, body, tags, status, trust, sup, reason, meta, uri, created in rows:
+    for (
+        id_,
+        proj,
+        type_,
+        title,
+        body,
+        tags,
+        status,
+        trust,
+        sup,
+        reason,
+        meta,
+        uri,
+        created,
+        valid_from,
+        valid_to,
+    ) in rows:
         meta = meta if isinstance(meta, dict) else {}
         code_ref = CodeRef(**meta["code_ref"]) if meta.get("code_ref") else None
         out.append(
@@ -166,6 +206,8 @@ def timeline(
                 meta=meta,
                 source_uri=uri or None,
                 created_at=created,
+                valid_from=valid_from,
+                valid_to=valid_to,
             )
         )
     return out

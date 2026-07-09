@@ -6,6 +6,8 @@ inputs need their own request models.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from kbcore.models import CodeRef
@@ -18,6 +20,10 @@ class ItemCreate(BaseModel):
     body: str
     tags: list[str] = Field(default_factory=list)
     code_ref: CodeRef | None = None
+    # Optional valid-time interval (WP1). ISO-8601 strings are coerced by
+    # pydantic; ingest() normalizes naive values to UTC (Invariant 7).
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
 
 
 class SupersedeRequest(BaseModel):

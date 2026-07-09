@@ -111,6 +111,40 @@ def _neighbors(
     return edges
 
 
+def expand_items(
+    conn: psycopg.Connection, seed_ids: list[int], hops: int, direction: str = "both"
+) -> dict[int, int]:
+    """BFS the ITEM↔ITEM relation graph from ``seed_ids`` out to ``hops`` edges.
+
+    Returns ``{neighbor_item_id: min_hop_distance}`` for every item reachable
+    within ``hops`` that is NOT itself a seed. Entity nodes are ignored (item
+    edges only — ``neighbor_kind == 'item'``). Cycle-safe via a visited set;
+    level-by-level so the recorded distance is the minimum. WP2 graph-traversal
+    retrieval expansion — the caller (search) re-checks scope/status/valid-time
+    on the survivors before surfacing them.
+    """
+    if hops <= 0 or not seed_ids:
+        return {}
+    visited: set[int] = set(seed_ids)
+    reached: dict[int, int] = {}
+    frontier: set[int] = set(seed_ids)
+    for dist in range(1, hops + 1):
+        nxt: set[int] = set()
+        for node_id in frontier:
+            for _rel, _dirn, neighbor_kind, neighbor_id in _neighbors(
+                conn, "item", node_id, direction
+            ):
+                if neighbor_kind != "item" or neighbor_id in visited:
+                    continue
+                visited.add(neighbor_id)  # first (=shortest) reach wins the distance
+                reached[neighbor_id] = dist
+                nxt.add(neighbor_id)
+        if not nxt:
+            break
+        frontier = nxt
+    return reached
+
+
 def trace(node_kind: str, node_id: int, direction: str = "both", depth: int = 2) -> dict[str, Any]:
     """BFS the relation graph (item↔item and item↔entity) out to ``depth`` hops.
 

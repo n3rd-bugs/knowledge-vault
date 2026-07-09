@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from kbcore import embed as embed_mod
-from kbcore import scope
+from kbcore import scope, search_expand
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.models import CodeRef, SearchHit
@@ -103,6 +103,7 @@ def search(
     include_superseded: bool = False,
     include_archived: bool = False,
     as_of: datetime | None = None,
+    hops: int = 0,
     k: int = 8,
     tool: str = "search",
 ) -> list[SearchHit]:
@@ -110,7 +111,16 @@ def search(
 
     as_of (WP1 valid-time): when set, restrict to facts whose validity interval
     covers that instant; unset (default) applies no valid-time filter.
+
+    hops (WP2 graph expansion): when > 0, also pull each strong hit's n-hop
+    relation-graph neighborhood into the results with a hop-decayed score. A
+    per-call hops>0 wins; otherwise KB_GRAPH_EXPAND_HOPS can turn it on globally.
+    hops<=0 (the default) is the exact pre-WP2 path — zero regression.
     """
+    # Resolve effective hops: the param takes precedence when >0, else the config
+    # default; capped so a misconfigured value can't explode the BFS.
+    hops = min(hops or settings.kb_graph_expand_hops, search_expand.GRAPH_MAX_HOPS)
+
     statuses = ["active"]
     if include_superseded:
         statuses.append("superseded")
@@ -125,8 +135,11 @@ def search(
     with connect() as conn:
         vec_rows = _vector_leg(conn, query, where, params)
         kw_rows = _keyword_leg(conn, query, where, params)
-
-    fused = _rrf_fuse(vec_rows, kw_rows, boost_project, query)
+        fused = _rrf_fuse(vec_rows, kw_rows, boost_project, query)
+        if hops > 0 and fused:
+            # Seed from the top hits; expand_fused re-checks the SAME where on
+            # every neighbor, so no scope/status/valid-time leak (search_expand).
+            fused = search_expand.expand_fused(conn, fused, hops, where, params, max(k, 10))
     # Materialize ALL fused candidates before truncating: the verified ≥
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
@@ -232,7 +245,7 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
             """
             SELECT i.id, i.title, i.type, i.project, p.domain, i.status,
                    s.trust, i.tags, i.created_at, s.uri, i.meta, i.superseded_by,
-                   i.valid_from, i.valid_to
+                   i.valid_from, i.valid_to, i.body
             FROM items i
             LEFT JOIN projects p ON p.name = i.project
             LEFT JOIN sources s ON s.id = i.source_id
@@ -256,8 +269,12 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
         sup_by,
         valid_from,
         valid_to,
+        body,
     ) in rows:
         score, snippet = by_id[id_]
+        # An expanded graph neighbor has no matching chunk (empty snippet); fall
+        # back to the item body prefix so it still renders a preview (WP2).
+        snippet = snippet or body or ""
         code_ref = None
         if isinstance(meta, dict) and meta.get("code_ref"):
             code_ref = CodeRef(**meta["code_ref"])

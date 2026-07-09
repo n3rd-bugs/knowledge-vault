@@ -88,8 +88,10 @@ def _register_read(app: FastAPI) -> None:
         tags: list[str] | None = Query(None),
         type: str | None = None,
         as_of: str | None = None,
+        expand: bool = False,
         k: int = 8,
     ) -> list[SearchHit]:
+        # expand=true also surfaces the top hits' directly-linked neighbors (WP2).
         as_of_dt = items._parse_instant(as_of, "as_of") if as_of else None
         return search.search(
             q,
@@ -98,6 +100,7 @@ def _register_read(app: FastAPI) -> None:
             type=type,
             tags=tags,
             as_of=as_of_dt,
+            hops=1 if expand else 0,
             k=k,
             tool="rest.search",
         )

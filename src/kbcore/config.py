@@ -75,6 +75,9 @@ class Settings(BaseSettings):
     # Deep search (explicit user-invoked, local Ollama): empty -> extract model.
     kb_deep_model: str = ""
     kb_deep_max_items: int = 16
+    # WP2 graph expansion: default n-hop neighbor pull-in in search (0=off). A
+    # per-call hops>0 overrides this; search caps the effective value to 3 hops.
+    kb_graph_expand_hops: int = 0
     # Auto-resolution (owner decision, 2026-07): a re-ingested newer revision of
     # the SAME source doc supersedes its predecessor (git history IS the human
     # decision), and lopsided-evidence contradictions auto-resolve after a

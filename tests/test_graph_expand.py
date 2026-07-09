@@ -17,10 +17,10 @@ from __future__ import annotations
 
 import pytest
 
-from kbcore import db, graph
+from kbcore import db, graph, search_expand
 from kbcore.config import settings
 from kbcore.ingest import ingest
-from kbcore.search import search
+from kbcore.search import _filters, search
 
 pytestmark = pytest.mark.usefixtures("kb")
 
@@ -160,6 +160,61 @@ def test_non_public_neighbor_withheld_under_public_only(monkeypatch):
     ids = [h.item_id for h in search("gearbox", hops=1)]
     assert bug in ids, "the public seed is found"
     assert fix not in ids, "a non-public neighbor is withheld by the public-only scope check"
+
+
+# --- live regression: a weak neighbor already present in fused ----------------
+
+
+def test_weak_neighbor_in_the_seed_window_is_still_boosted():
+    """A genuine neighbor of the top hit that is ALSO weakly present in fused.
+
+    The blinded-neighbor tests above never exercised this: with real embeddings
+    every item gets a small vector score, so a true neighbor of the top hit
+    lands in the weak tail — inside the old flat top-N seed window. Because
+    expand_items excludes seeds, the old code left that neighbor stuck at its
+    weak rank (this was the live symptom: hops=1 identical to hops=0). Seeds are
+    now the strong hits only, so the neighbor stays boost-eligible and receives
+    the ``best * DECAY`` floor. Driven through expand_fused directly with a
+    synthetic RRF list so it does not depend on the fake vector leg's ordering.
+    """
+    bug = ingest("p", "bug", "Gearbox stalls", "The gearbox stalls under load.")
+    fix = ingest("p", "note", "Coupling fix", "Replace the coupling.")
+    filler = ingest("p", "note", "Filler", "an unrelated weak tail hit")
+    graph.link(fix, "fixes", bug)  # fix is a true 1-hop neighbor of the bug
+    where, params = _filters(None, None, None, None, ["active"], None)
+    # Mimic real embeddings: bug strong; filler and the linked fix both in the
+    # weak tail (fix even weaker than the unrelated filler), both inside the
+    # top-10 the old code seeded from.
+    best = 0.0328
+    fused = [(bug, best, "gearbox"), (filler, 0.0161, "unrelated"), (fix, 0.0122, "coupling")]
+    with db.connect() as conn:
+        out = search_expand.expand_fused(conn, fused, 1, where, params, 10)
+    scores = {i: s for i, s, _ in out}
+    order = [i for i, _, _ in out]
+    # The fix is lifted to exactly the one-hop decay floor (never its weak raw).
+    assert scores[fix] == pytest.approx(best * search_expand.GRAPH_DECAY)
+    assert scores[fix] > scores[filler], "boosted above the unrelated tail hit"
+    assert order.index(bug) < order.index(fix) < order.index(filler)
+    # The unrelated filler (not a neighbor of any strong seed) is left untouched.
+    assert scores[filler] == pytest.approx(0.0161)
+
+
+def test_weak_tail_hit_does_not_expand_its_own_neighborhood():
+    """A barely-relevant tail hit must not drag in its neighbors as noise.
+
+    Only hits at/above best*DECAY seed expansion. An item sitting in the weak
+    tail is below that floor, so its private neighborhood stays out of results.
+    """
+    strong = ingest("p", "note", "Strong", "gearbox topic")
+    tail = ingest("p", "note", "Tail", "weak tail item")
+    tail_nbr = ingest("p", "note", "TailNeighbor", "only reachable via the tail")
+    graph.link(tail, "depends_on", tail_nbr)  # neighbor of the WEAK tail hit
+    where, params = _filters(None, None, None, None, ["active"], None)
+    best = 0.0328
+    fused = [(strong, best, "gearbox"), (tail, 0.0100, "weak")]  # tail << best*DECAY
+    with db.connect() as conn:
+        out = search_expand.expand_fused(conn, fused, 1, where, params, 10)
+    assert tail_nbr not in {i for i, _, _ in out}, "weak tail hit does not seed expansion"
 
 
 # --- effective-hops resolution: param precedence + cap -----------------------

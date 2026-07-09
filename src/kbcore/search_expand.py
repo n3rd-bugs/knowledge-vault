@@ -39,20 +39,32 @@ def expand_fused(
     """Merge scope-safe graph neighbors of the top hits into ``fused``.
 
     ``fused`` is the RRF output ``(item_id, score, snippet)``, already sorted
-    score-descending. Seeds from its top ``seed_cap`` ids; BFS out ``hops`` over
-    item↔item edges; keep only neighbors that still pass the search's ``where``;
-    add each survivor at ``best_seed_score * DECAY**hop`` (keeping the max for an
-    id already present, never demoting a direct hit). Survivors carry an empty
-    snippet — _to_hits fills it from the item body.
+    score-descending. Seeds from its STRONG hits (see below); BFS out ``hops``
+    over item↔item edges; keep only neighbors that still pass the search's
+    ``where``; add each survivor at ``best_seed_score * DECAY**hop`` (keeping the
+    max for an id already present, never demoting a direct hit). Survivors carry
+    an empty snippet — _to_hits fills it from the item body.
+
+    Seed selection is score-relative, not a flat top-N. A hit whose own score is
+    below ``best * DECAY`` can never outrank the floor a single hop from the top
+    hit would give it, so it belongs in the boost-eligible CANDIDATE pool, not
+    the seed pool. Seeding the weak tail instead (which a flat top-N does) was a
+    live-only regression: real embeddings give every item a small vector score,
+    so a genuine neighbor of the top hit lands in the tail, becomes a seed, and —
+    because expand_items excludes seeds — never receives the decay floor. It also
+    expanded the noisy neighborhoods of barely-relevant tail hits. Restricting
+    seeds to hits at/above ``best * DECAY`` keeps real neighbors boost-eligible
+    and confines expansion to hits confident enough to vouch for their graph.
     """
-    seeds = [item_id for item_id, _score, _snip in fused[:seed_cap]]
+    best = fused[0][1]  # strongest hit (fused is score-descending)
+    seed_floor = best * GRAPH_DECAY
+    seeds = [item_id for item_id, score, _snip in fused if score >= seed_floor][:seed_cap]
     reached = graph.expand_items(conn, seeds, hops)
     if not reached:
         return fused
     survivors = _scoped_ids(conn, list(reached), where, params)
     if not survivors:
         return fused
-    best = fused[0][1]  # strongest hit (fused is score-descending)
     index = {item_id: pos for pos, (item_id, _s, _n) in enumerate(fused)}
     out = list(fused)
     for nid in survivors:

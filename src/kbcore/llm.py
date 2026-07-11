@@ -10,6 +10,7 @@ an :class:`ExtractorUnavailable` domain error; raw traces stay in the logs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -19,12 +20,30 @@ import httpx
 from kbcore.config import settings
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 
-# Extractor sampling: pin temperature=0 and a fixed seed so a row re-drained after
-# partial progress (a crash mid-batch left N items committed) re-extracts the SAME
-# titles/bodies — content-hash dedupe then collapses the retry instead of minting
-# reworded near-duplicates (Invariant 3).
-EXTRACT_TEMPERATURE = 0
+# Extractor sampling: pin ONLY a fixed seed — determinism-for-retry comes from the
+# seed, not from greedy decoding. Ollama's seed makes sampling reproducible at
+# temperature > 0, so a row re-drained after partial progress (a crash mid-batch
+# left N items committed) re-extracts the SAME titles/bodies and content-hash
+# dedupe collapses the retry (Invariant 3). temperature=0 was DROPPED: the default
+# extractor qwen3:14b runs in thinking mode, whose model card forbids greedy
+# decoding (it degrades quality and can loop) — so we leave temperature at the
+# model-card default and rely on the seed alone (review finding; KB item 313 was
+# benchmarked at default sampling, which this restores).
 EXTRACT_SEED = 42
+
+
+def _draw_seed(*parts: str) -> int:
+    """Deterministic per-content sampling seed for the nightly judge paths.
+
+    The SAME inputs reproduce the SAME draw on every nightly re-judge, so a
+    compatible-but-similar pair judged 'false' stays false forever instead of
+    accumulating a per-night probability of a spurious 'true' (the one-way
+    contradiction ratchet — review finding); DIFFERENT pairs get different seeds
+    (no shared-RNG bias). Reproducible at temperature > 0 via Ollama's seed, so no
+    greedy decoding is needed.
+    """
+    digest = hashlib.sha256("\x00".join(parts).encode()).digest()
+    return EXTRACT_SEED + int.from_bytes(digest[:4], "big")
 
 
 def _classify_extractor_error(e: httpx.HTTPError) -> Exception:
@@ -130,7 +149,7 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
         "format": "json",
         "keep_alive": _keep_alive(),
         "stream": False,
-        "options": {"temperature": EXTRACT_TEMPERATURE, "seed": EXTRACT_SEED},
+        "options": {"seed": EXTRACT_SEED},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": transcript_text},
@@ -166,12 +185,17 @@ def _chat(
     json_format: bool,
     model: str | None = None,
     keep_alive: int | str | None = None,
+    seed: int | None = None,
 ) -> str:
     """POST /api/chat; return the message content.
 
     ``keep_alive`` defaults to ``settings.kb_llm_keep_alive`` (None sentinel →
     resolved at call time). Callers may override per call; with the default -1
     the model stays resident between calls (owner decision, see config).
+
+    ``seed`` (optional) pins Ollama sampling so a re-run reproduces the same draw —
+    the nightly judge paths pass a per-content seed so their verdicts stop drifting
+    night to night (review finding). None leaves sampling unseeded.
     """
     payload: dict[str, Any] = {
         "model": model or settings.kb_extract_model,
@@ -181,6 +205,8 @@ def _chat(
     }
     if json_format:
         payload["format"] = "json"
+    if seed is not None:
+        payload["options"] = {"seed": seed}
     try:
         resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
@@ -262,6 +288,7 @@ def evidence_side(
             },
         ],
         json_format=True,
+        seed=_draw_seed(a_title, a_body, b_title, b_body, c_title, c_body),
     )
     try:
         data = parse_model_json(content)
@@ -297,6 +324,7 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
             },
         ],
         json_format=True,
+        seed=_draw_seed(a_title, a_body, b_title, b_body),
     )
     try:
         data = parse_model_json(content)

@@ -83,9 +83,20 @@ def _drain_ingest_queue() -> tuple[int, int]:
         except (ExtractorUnavailable, EmbedderUnavailable) as e:
             # CONNECTIVITY (Ollama down/restarting/model-not-loaded during the
             # nightly window): do NOT mark_failed — leave the row 'pending' with
-            # attempts UNCHANGED so an outage never burns a row's retry budget;
-            # the next run retries once the model is back.
-            logger.warning("row %s deferred (extractor/embedder unavailable): %s", row["id"], e)
+            # attempts UNCHANGED so an outage never burns a row's retry budget; the
+            # next run retries once the model is back. mark_deferred bumps a bounded
+            # deferral counter and, if a "transient" failure never heals (a
+            # payload-deterministic 5xx / mid-response crash), escalates the row to
+            # 'failed' so it can't re-drain every night forever (review finding).
+            if ingest_queue.mark_deferred(row["id"], f"{type(e).__name__}: {e}"):
+                logger.error(
+                    "row %s escalated to failed after %d deferrals (transient never healed): %s",
+                    row["id"],
+                    ingest_queue.DEFERRAL_CAP,
+                    e,
+                )
+            else:
+                logger.warning("row %s deferred (extractor/embedder unavailable): %s", row["id"], e)
         except ExtractionFailed as e:
             # CONTENT-DETERMINISTIC (unparseable output, unterminated <think>, a
             # per-row read timeout, a 4xx): re-running the 14B on this exact row

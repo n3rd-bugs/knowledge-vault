@@ -116,6 +116,11 @@ def register(mcp) -> None:
             )
             if res.id is None:
                 return "duplicate — already queued"
+            if res.permanently_failed:
+                return (
+                    f"permanently failed after repeated retries — needs manual review "
+                    f"(id {res.id}); resubmitting identical content will not re-queue it"
+                )
             if res.requeued:
                 return f"re-queued after prior failure for nightly extraction (id {res.id})"
             return f"queued for nightly extraction (id {res.id})"

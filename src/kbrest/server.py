@@ -73,7 +73,13 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ValueError, lambda r, e: _err(400, str(e)))
     app.add_exception_handler(EmbedderUnavailable, lambda r, e: _err(503, str(e)))
     app.add_exception_handler(ExtractorUnavailable, lambda r, e: _err(503, str(e)))
-    app.add_exception_handler(ExtractionFailed, lambda r, e: _err(422, str(e)))
+    # ExtractionFailed → 503, NOT 422: on the REST facade this only ever comes from
+    # a synchronous embed under load (a busy-GPU read timeout on /api/search or
+    # /api/items) — a retryable server condition. 422 wrongly tells clients the
+    # request payload is invalid and not to retry. The attempts-cap "content
+    # failure" meaning of ExtractionFailed is a queue-DRAIN concept and never
+    # surfaces here — REST defers extraction to the nightly drain (finding).
+    app.add_exception_handler(ExtractionFailed, lambda r, e: _err(503, str(e)))
     app.add_exception_handler(KBError, lambda r, e: _err(500, str(e)))
     app.add_exception_handler(Exception, lambda r, e: _err(500, "internal server error"))
 
@@ -155,7 +161,12 @@ def _register_write(app: FastAPI) -> None:
             branch=payload.branch,
             commit=payload.commit,
         )
-        return {"queue_id": res.id, "duplicate": res.id is None, "requeued": res.requeued}
+        return {
+            "queue_id": res.id,
+            "duplicate": res.id is None,
+            "requeued": res.requeued,
+            "permanently_failed": res.permanently_failed,
+        }
 
     @app.post("/api/items", status_code=201)
     def api_create_item(payload: ItemCreate) -> dict:
@@ -252,6 +263,18 @@ def build_app():
             allow_origins=[origin],
             allow_methods=["GET", "POST", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type"],
+        )
+    elif settings.kb_public_only or settings.kb_oauth_enabled:
+        # kb-rest NEEDS this origin functionally (its only CORS pin), so an empty
+        # value on a public-facing instance silently drops the header and the web
+        # UI's cross-origin writes (POST /api/consolidate "run now") break with no
+        # server-side error. It cannot hard-fail (local no-web deploys legitimately
+        # leave it unset), so warn loudly instead (review finding).
+        log.warning(
+            "KB_WEB_PUBLIC_URL is empty on a public-facing kb-rest instance: no CORS "
+            "allow-origin will be sent, so the web UI's cross-origin writes "
+            "(e.g. POST /api/consolidate) will be blocked by the browser. "
+            "Set KB_WEB_PUBLIC_URL to the web UI's public origin."
         )
     return app
 

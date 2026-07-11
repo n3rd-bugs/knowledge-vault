@@ -71,6 +71,10 @@ def kb_schema():
     """Session-scoped isolated schema kb_test with the full migrated layout."""
     if not DB_UP:
         pytest.skip("compose Postgres not reachable")
+    # Create the schema through a PUBLIC-targeted connection: db.connect() now
+    # refuses a MISSING non-public schema (it would otherwise fall through to live
+    # public data), so kb_test must exist before any kb_test-targeted connect.
+    settings.kb_db_schema = "public"
     conn = db.connect()
     conn.autocommit = True
     conn.execute("DROP SCHEMA IF EXISTS kb_test CASCADE")

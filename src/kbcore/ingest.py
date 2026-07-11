@@ -63,16 +63,31 @@ def content_hash(
 
     In a bitemporal model identical text over a DIFFERENT validity interval is a
     DISTINCT assertion (a recurring outage, a config state that came back), so the
-    canonical-UTC interval is folded into the key WHEN either bound is set. Content
-    with no interval keeps the pre-WP1 hash exactly, so existing rows and ingest
-    idempotency are untouched (a re-save of interval-less content still dedupes).
+    canonical-UTC interval is folded into the key WHEN either bound is set.
+
+    The fold is INJECTIVE: the interval is combined with the sha256 DIGEST of the
+    base (a fixed 64-hex string), not appended as plaintext. Appending literal
+    ``\\n\\nvalid:<iso>..`` text let a crafted body ENDING in that string collide
+    with a genuine interval-bearing save (dedupe misdirection, review finding) —
+    the same aliasing class ``normalize_title`` closed for titles. Forging the key
+    now requires a sha256 preimage of the base, not a printable suffix.
+
+    Content with no interval keeps the pre-WP1 hash EXACTLY (``sha256(title\\n\\n
+    body)``), so existing interval-less rows and ingest idempotency are untouched
+    (Invariant 3). NOTE (transition window): interval-bearing rows written between
+    WP1 fb38f80 and the earlier plaintext-fold patch carry pre-interval hashes and,
+    like rows written under that intermediate fold, differ from this scheme — a
+    one-off operator backfill (recompute + UPDATE sources.content_hash for rows
+    with a non-NULL interval) reconciles them; there is no in-code migration since
+    the DB is not touched here.
     """
-    key = f"{title}\n\n{body}"
-    if valid_from is not None or valid_to is not None:
-        vf = valid_from.astimezone(UTC).isoformat() if valid_from else ""
-        vt = valid_to.astimezone(UTC).isoformat() if valid_to else ""
-        key = f"{key}\n\nvalid:{vf}..{vt}"
-    return hashlib.sha256(key.encode()).hexdigest()
+    base = f"{title}\n\n{body}"
+    if valid_from is None and valid_to is None:
+        return hashlib.sha256(base.encode()).hexdigest()
+    vf = valid_from.astimezone(UTC).isoformat() if valid_from else ""
+    vt = valid_to.astimezone(UTC).isoformat() if valid_to else ""
+    base_digest = hashlib.sha256(base.encode()).hexdigest()
+    return hashlib.sha256(f"{base_digest}\nvalid:{vf}..{vt}".encode()).hexdigest()
 
 
 def ingest(

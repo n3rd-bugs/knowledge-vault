@@ -194,7 +194,7 @@ def test_weak_neighbor_in_the_seed_window_is_still_boosted():
     best = 0.0328
     fused = [(bug, best, "gearbox"), (filler, 0.0161, "unrelated"), (fix, 0.0122, "coupling")]
     with db.connect() as conn:
-        out = search_expand.expand_fused(conn, fused, 1, where, params, 10)
+        out, origin = search_expand.expand_fused(conn, fused, 1, where, params, 10)
     scores = {i: s for i, s, _ in out}
     order = [i for i, _, _ in out]
     # The fix is lifted to exactly the one-hop decay floor (never its weak raw).
@@ -203,6 +203,9 @@ def test_weak_neighbor_in_the_seed_window_is_still_boosted():
     assert order.index(bug) < order.index(fix) < order.index(filler)
     # The unrelated filler (not a neighbor of any strong seed) is left untouched.
     assert scores[filler] == pytest.approx(0.0161)
+    # `fix` is a DIRECT hit here (present in fused), just boosted by expansion — so
+    # it is not "expansion-only" and carries no origin entry.
+    assert fix not in origin
 
 
 def test_weak_tail_hit_does_not_expand_its_own_neighborhood():
@@ -219,7 +222,7 @@ def test_weak_tail_hit_does_not_expand_its_own_neighborhood():
     best = 0.0328
     fused = [(strong, best, "gearbox"), (tail, 0.0100, "weak")]  # tail << best*DECAY
     with db.connect() as conn:
-        out = search_expand.expand_fused(conn, fused, 1, where, params, 10)
+        out, _origin = search_expand.expand_fused(conn, fused, 1, where, params, 10)
     assert tail_nbr not in {i for i, _, _ in out}, "weak tail hit does not seed expansion"
 
 
@@ -273,11 +276,12 @@ def test_neighbor_scores_off_its_own_seed_not_the_global_best():
     # seed; its neighbor must decay from IT, not from the global best.
     fused = [(top, best, "top"), (weak_seed, best * search_expand.GRAPH_DECAY, "weak")]
     with db.connect() as conn:
-        out = search_expand.expand_fused(conn, fused, 1, where, params, 10)
+        out, origin = search_expand.expand_fused(conn, fused, 1, where, params, 10)
     scores = {i: s for i, s, _ in out}
     d = search_expand.GRAPH_DECAY
     assert scores[nbr] == pytest.approx(best * d * d), "neighbor decays from the weak seed"
     assert scores[nbr] < scores[weak_seed], "neighbor ranks strictly below its vouching seed"
+    assert origin[nbr] == weak_seed, "vouching seed is the weak seed, not the global best"
 
 
 def test_unbonused_rank1_hit_can_still_seed_under_a_project_boost():

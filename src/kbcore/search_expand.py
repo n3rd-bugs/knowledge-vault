@@ -51,8 +51,13 @@ def expand_fused(
     where: str,
     params: list[Any],
     seed_cap: int,
-) -> list[tuple[int, float, str]]:
+) -> tuple[list[tuple[int, float, str]], dict[int, int]]:
     """Merge scope-safe graph neighbors of the top hits into ``fused``.
+
+    Returns ``(merged, expansion_origin)`` where ``expansion_origin`` maps each
+    PURE-neighbor id (surfaced only by expansion, not a direct hit) to the direct-hit
+    SEED that vouches for it — the caller uses it to clamp a bonused neighbor below
+    its seed (finding).
 
     ``fused`` is the RAW RRF output ``(item_id, score, snippet)`` (no bonuses yet),
     already sorted score-descending. Seeds are its STRONG hits (score at/above
@@ -79,25 +84,27 @@ def expand_fused(
     if seed_cap is not None and len(seeds) > seed_cap:
         seeds = dict(list(seeds.items())[:seed_cap])
     if not seeds:
-        return fused
+        return fused, {}
 
     def scope_ok(ids: list[int]) -> set[int]:
         return set(_scoped_ids(conn, ids, where, params))
 
     reached = graph.expand_items_scored(conn, seeds, hops, GRAPH_DECAY, scope_ok)
     if not reached:
-        return fused
+        return fused, {}
     index = {item_id: pos for pos, (item_id, _s, _n) in enumerate(fused)}
     out = list(fused)
-    for nid, decayed in reached.items():
-        if nid in index:  # already a direct hit — keep the higher score
+    expansion_origin: dict[int, int] = {}
+    for nid, (decayed, origin) in reached.items():
+        if nid in index:  # already a direct hit — keep the higher score, not pure
             item_id, score, snippet = out[index[nid]]
             if decayed > score:
                 out[index[nid]] = (item_id, decayed, snippet)
         else:
             out.append((nid, decayed, ""))
+            expansion_origin[nid] = origin  # pure neighbor → its vouching seed
     out.sort(key=lambda row: row[1], reverse=True)
-    return out
+    return out, expansion_origin
 
 
 def _scoped_ids(

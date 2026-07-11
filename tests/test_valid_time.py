@@ -214,3 +214,79 @@ def test_supersede_new_start_before_old_start_is_rejected():
     old = _ingest("started march", valid_from=MAR)  # open
     with pytest.raises(InvalidOperation, match="precedes"):
         supersede(old, new_body="started earlier?", reason="bad", valid_from=JAN)
+
+
+# --- supersede EQUAL-start same-window takeover (finding 0) --------------------
+
+
+def test_supersede_equal_start_new_body_is_a_same_window_takeover():
+    # Restating the UNCHANGED start is a same-window correction, NOT an error: the
+    # window is unchanged so no auto-close (equal start would be an empty interval).
+    old = _ingest("v1 same window", valid_from=JAN)  # open
+    new = supersede(old, new_body="v2 same window", reason="restated", valid_from=JAN)
+    assert get_item(old).valid_to is None, "equal start leaves the old window unchanged"
+    assert get_item(old).status == "superseded"
+    assert get_item(new).valid_from == JAN
+
+
+def test_supersede_equal_start_new_item_path_is_a_same_window_takeover():
+    # The dead-end from the finding: a pre-saved successor sharing the old fact's
+    # true start could not supersede an open predecessor. Equality now skips the
+    # auto-close instead of raising 'precedes'.
+    old = _ingest("running v1", valid_from=JAN)  # open
+    newer = _ingest("running v2", valid_from=JAN)  # same true start
+    supersede(old, new_item_id=newer, reason="corrected")
+    assert get_item(old).valid_to is None, "same-start successor leaves the window open"
+    assert get_item(old).status == "superseded"
+    assert get_item(old).superseded_by == newer
+
+
+# --- supersede valid_to-only closes the old open window (finding 1) ------------
+
+
+def test_supersede_valid_to_only_closes_the_old_open_window():
+    old = _ingest("service running", valid_from=JAN)  # open (valid_to NULL)
+    new = supersede(old, new_body="service stopped", reason="ended", valid_to=T)
+    assert get_item(old).valid_to == T, "valid_to-only closes the old open window at T"
+    repl = get_item(new)
+    assert repl.valid_from == JAN and repl.valid_to == T, "replacement carries [JAN, T)"
+
+
+def test_supersede_valid_to_only_fixes_inverted_visibility_past_the_end():
+    # Before the fix the old row stayed OPEN while the correction was closed, so an
+    # as_of past T returned the STALE superseded fact and dropped the correction.
+    old = _ingest("valid-to fact", valid_from=JAN)  # open, matches 'widgetflux'
+    supersede(old, new_body="ended fact", reason="ended", valid_to=T)
+    got = {h.item_id for h in search("widgetflux", as_of=SEP, include_superseded=True)}
+    assert old not in got, "the closed old window no longer reports as valid past its end"
+
+
+# --- content_hash: injective interval fold + interval-less stability ----------
+
+
+def test_interval_fold_is_not_delimiter_injectable():
+    iso = JAN.isoformat()
+    # A: a crafted body that ENDS with a plaintext 'valid:...' suffix, NO interval.
+    a = ingest("inject", "note", "proto", f"Widget uses proto v1.\n\nvalid:{iso}..")
+    # B: the plain body carrying a GENUINE interval.
+    b = ingest("inject", "note", "proto", "Widget uses proto v1.", valid_from=JAN)
+    assert a is not None and b is not None and a != b, "no collision — the fold is injective"
+
+
+def test_content_hash_interval_less_is_stable_and_unfolded():
+    import hashlib
+
+    from kbcore.ingest import content_hash
+
+    expected = hashlib.sha256(b"t\n\nb").hexdigest()
+    assert content_hash("t", "b") == expected, "interval-less hash unchanged (Invariant 3)"
+    assert content_hash("t", "b", valid_from=JAN) != expected, "an interval yields a distinct key"
+
+
+def test_supersede_twice_second_is_rejected():
+    # Exercises the FOR UPDATE re-read + status guard (finding 4): a second
+    # supersede of an already-superseded row is rejected, not a silent double-mint.
+    old = _ingest("lockme", valid_from=JAN)
+    supersede(old, new_body="first correction", reason="one")
+    with pytest.raises(InvalidOperation, match="already superseded"):
+        supersede(old, new_body="second correction", reason="two")

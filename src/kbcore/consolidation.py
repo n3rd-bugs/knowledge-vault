@@ -29,26 +29,36 @@ def last_consolidation_at() -> datetime | None:
     return row[0] if row and row[0] else None
 
 
-def previous_eval_metrics() -> dict[str, float] | None:
-    """Eval hit@5/MRR recorded in the most recent kb-system report's meta.
+EVAL_BASELINE_LOOKBACK = 30  # reports scanned back for the last completed eval
 
-    The search-quality sentinel compares each run against this — the metrics
-    live in the report item's ``meta`` (no new table). Returns None when no prior
-    report carries a completed eval (first run, or last run's eval was
-    skipped/errored), so the first successful eval just establishes a baseline.
+
+def previous_eval_metrics() -> dict[str, float] | None:
+    """Eval hit@5/MRR from the newest kb-system report that actually COMPLETED an
+    eval (``meta.eval_status == 'ok'``), scanning back a bounded window.
+
+    The search-quality sentinel compares each run against this. Reading only the
+    single newest report was fragile (review finding): one errored/skipped/disabled
+    night — or ANY interleaved ``type='report'`` item (a deep-search save, a manual
+    kb_save) — carries no ok metrics and used to wipe the baseline, blinding the
+    sentinel to a regression that merged that same day. We now walk back over
+    non-ok/foreign reports (up to :data:`EVAL_BASELINE_LOOKBACK`) to the last real
+    baseline. Returns None only when NO recent report carries a completed eval
+    (genuine first run), so the first successful eval just establishes a baseline.
     """
     with connect() as conn:
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT meta FROM items WHERE project = 'kb-system' AND type = 'report' "
-            "ORDER BY created_at DESC, id DESC LIMIT 1"
-        ).fetchone()
-    meta = row[0] if row else None
-    if not isinstance(meta, dict) or meta.get("eval_status") != "ok":
-        return None
-    try:
-        return {"hit_at_5": float(meta["eval_hit_at_5"]), "mrr": float(meta["eval_mrr"])}
-    except (KeyError, TypeError, ValueError):
-        return None
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (EVAL_BASELINE_LOOKBACK,),
+        ).fetchall()
+    for (meta,) in rows:
+        if not isinstance(meta, dict) or meta.get("eval_status") != "ok":
+            continue
+        try:
+            return {"hit_at_5": float(meta["eval_hit_at_5"]), "mrr": float(meta["eval_mrr"])}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return None
 
 
 def _lead_pairs(project: str, low: float, high: float) -> list[tuple[int, int, float]]:

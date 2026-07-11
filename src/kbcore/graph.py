@@ -117,6 +117,33 @@ def _neighbors(
     return edges
 
 
+def _neighbors_batch(
+    conn: psycopg.Connection, kind: str, node_ids: list[int], direction: str
+) -> dict[int, list[tuple[str, str, str, int]]]:
+    """Level-batched :func:`_neighbors`: ONE query per direction over the whole
+    frontier via ``= ANY(...)``, instead of two per node (finding — a BFS level of
+    N nodes issued 2N sequential edge queries). Returns ``{node_id: edges}``.
+    """
+    out: dict[int, list[tuple[str, str, str, int]]] = {nid: [] for nid in node_ids}
+    if not node_ids:
+        return out
+    if direction in ("both", "out"):
+        for src_id, rel, dk, di in conn.execute(
+            "SELECT src_id, rel, dst_kind, dst_id FROM relations "
+            "WHERE src_kind = %s AND src_id = ANY(%s) ORDER BY src_id, id",
+            (kind, node_ids),
+        ).fetchall():
+            out[src_id].append((rel, "out", dk, di))
+    if direction in ("both", "in"):
+        for dst_id, rel, sk, si in conn.execute(
+            "SELECT dst_id, rel, src_kind, src_id FROM relations "
+            "WHERE dst_kind = %s AND dst_id = ANY(%s) ORDER BY dst_id, id",
+            (kind, node_ids),
+        ).fetchall():
+            out[dst_id].append((rel, "in", sk, si))
+    return out
+
+
 def expand_items(
     conn: psycopg.Connection, seed_ids: list[int], hops: int, direction: str = "both"
 ) -> dict[int, int]:
@@ -159,51 +186,55 @@ def expand_items_scored(
     scope_ok: Callable[[list[int]], set[int]],
     direction: str = "both",
     max_visited: int = EXPAND_MAX_VISITED,
-) -> dict[int, float]:
-    """BFS the ITEM↔ITEM graph from scored ``seeds`` and return per-neighbor scores.
+) -> dict[int, tuple[float, int]]:
+    """BFS the ITEM↔ITEM graph from scored ``seeds``; return per-neighbor
+    ``(score, origin_seed_id)``.
 
     A neighbor's score is the MAX over the seeds reaching it of
     ``seed_score * decay**hop`` — so a neighbor is scored by the seed that actually
     vouches for it (not by the global best hit), and always ranks strictly below
-    that seed since ``decay < 1``. Seeds themselves are never returned.
+    that seed since ``decay < 1``. ``origin_seed_id`` is that vouching seed, threaded
+    out so the caller can re-impose the guarantee AFTER bonuses (finding). Seeds
+    themselves are never returned.
 
     ``scope_ok(ids)`` returns the subset passing the search scope; it is applied to
     EACH frontier level so a withheld (non-public / out-of-scope / superseded /
     as_of-invalid) node is neither surfaced NOR used as a relay hop — parity with
     :func:`trace`'s walling (a private item can no longer bridge two public ones).
     Cycle-safe (a node re-expands only when a better vouch reaches it, and
-    ``decay < 1`` makes that terminate); ``max_visited`` bounds total breadth.
+    ``decay < 1`` makes that terminate); ``max_visited`` bounds total breadth. Each
+    BFS level's edges are fetched in one batched query per direction (finding).
     """
     if hops <= 0 or not seeds:
         return {}
     seed_ids = set(seeds)
-    # vouch: best seed_score*decay**hop reaching each non-seed node discovered.
-    vouch: dict[int, float] = {}
-    frontier: dict[int, float] = dict(seeds)  # node -> vouch AT that node
+    # vouch: (best seed_score*decay**hop, vouching seed) reaching each non-seed node.
+    vouch: dict[int, tuple[float, int]] = {}
+    # node -> (vouch AT that node, origin seed); seeds vouch for themselves.
+    frontier: dict[int, tuple[float, int]] = {sid: (score, sid) for sid, score in seeds.items()}
     scoped: dict[int, bool] = {}  # scope-check cache (never re-query a known id)
     for _dist in range(hops):
-        cand: dict[int, float] = {}
-        for node_id, node_vouch in frontier.items():
-            for _rel, _dirn, neighbor_kind, neighbor_id in _neighbors(
-                conn, "item", node_id, direction
-            ):
+        cand: dict[int, tuple[float, int]] = {}
+        batch = _neighbors_batch(conn, "item", list(frontier), direction)
+        for node_id, (node_vouch, origin) in frontier.items():
+            for _rel, _dirn, neighbor_kind, neighbor_id in batch.get(node_id, ()):
                 if neighbor_kind != "item" or neighbor_id in seed_ids:
                     continue
                 c = node_vouch * decay
-                if c > cand.get(neighbor_id, 0.0):
-                    cand[neighbor_id] = c
+                if c > cand.get(neighbor_id, (0.0, 0))[0]:
+                    cand[neighbor_id] = (c, origin)  # inherit the vouching seed
         unknown = [nid for nid in cand if nid not in scoped]
         if unknown:
             ok = scope_ok(unknown)
             for nid in unknown:
                 scoped[nid] = nid in ok
-        next_frontier: dict[int, float] = {}
-        for nid, c in cand.items():
+        next_frontier: dict[int, tuple[float, int]] = {}
+        for nid, (c, origin) in cand.items():
             if not scoped.get(nid):  # withheld: never surfaced, never relayed
                 continue
-            if c > vouch.get(nid, 0.0):
-                vouch[nid] = c
-                next_frontier[nid] = c
+            if c > vouch.get(nid, (0.0, 0))[0]:
+                vouch[nid] = (c, origin)
+                next_frontier[nid] = (c, origin)
                 if len(vouch) >= max_visited:
                     return vouch
         if not next_frontier:

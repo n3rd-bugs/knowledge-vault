@@ -156,8 +156,11 @@ def render_review(entries: list[ReviewEntry]) -> str:
         item = e.item_id if e.item_id is not None else "—"
         lines.append(f"[{e.queue_id}] {e.reason} · item {item} · {e.trust or '-'} · {title}")
         d = e.detail
-        if e.reason == "search_regression" and "observed_hit_at_5" in d:
-            # Search-quality drop flagged by the nightly sentinel (§8).
+        _reg_keys = ("observed_hit_at_5", "observed_mrr", "baseline_hit_at_5", "baseline_mrr")
+        if e.reason == "search_regression" and all(k in d for k in _reg_keys):
+            # Search-quality drop flagged by the nightly sentinel (§8). Guard ALL
+            # four keys (not just observed_hit_at_5): a partially-populated detail
+            # must not KeyError and hide EVERY pending review row (finding).
             lines.append(
                 f"    hit@5 {d['observed_hit_at_5']:.2f} / MRR {d['observed_mrr']:.2f} "
                 f"(baseline {d['baseline_hit_at_5']:.2f} / {d['baseline_mrr']:.2f})"

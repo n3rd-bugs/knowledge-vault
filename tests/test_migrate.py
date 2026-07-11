@@ -24,14 +24,17 @@ def _db_up() -> bool:
 pytestmark = pytest.mark.skipif(not _db_up(), reason="compose Postgres not reachable")
 
 
-def test_migrate_persists_and_is_idempotent():
-    migrate()  # apply anything pending (no-op if AC already ran)
-
+def test_migrate_persists_and_is_idempotent(kb_schema):
+    # Run against the ISOLATED kb_test schema (the kb_schema fixture already
+    # created + migrated it). Asserting the layout in kb_test — not public — is
+    # required now that db.connect() refuses to fall through a missing schema to
+    # live public data (a test that touched public via that fallback is exactly
+    # the isolation hole this batch closed).
     with db.connect() as conn:
         tables = {
             r[0]
             for r in conn.execute(
-                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'kb_test'"
             ).fetchall()
         }
     expected = {

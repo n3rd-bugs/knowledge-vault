@@ -102,6 +102,9 @@ services:
       KB_BIND: 0.0.0.0
       KB_REST_PORT: "8322"
       KB_ALLOW_ANY_BIND: "true"
+      # CORS pin for the web UI's fetches: required here since the config default
+      # became "" (review finding — without it, web-UI writes break on recreate).
+      KB_WEB_PUBLIC_URL: "https://web.n3rd-bugs.dev"
     extra_hosts: ["host.docker.internal:host-gateway"]
     networks: [kbnet]
     restart: unless-stopped

@@ -5,17 +5,41 @@
 # and recreates the container so cloudflared security fixes land (PLAN.md §9, OPS).
 # Install: bash scripts/install_systemd.sh (the .timer is installed but NOT enabled;
 # enable manually with: systemctl --user enable --now kb-cloudflared-refresh.timer)
+#
+# KILL SWITCH: `docker compose stop kb-cloudflared` removes all public exposure.
+# The timer's Persistent=true catches up a run missed while the machine was off at
+# the NEXT boot/login — but the ExecCondition below means that catch-up only fires
+# when the edge is CURRENTLY RUNNING, so a deliberately-stopped tunnel is NEVER
+# silently revived (the monthly refresh must not reverse the kill switch).
+#
+# network-online.target is INTENTIONALLY NOT used: in a systemd --user manager it
+# has no wait-online provider and cannot order against docker.service, so it is a
+# no-op. Real readiness is gated by the ExecStartPre retry loop instead.
 [Unit]
 Description=Knowledge Vault monthly cloudflared edge refresh (re-pull + recreate)
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/kb/repo
 EnvironmentFile=%h/kb/repo/.env
+# Respect the kill switch: skip (do not fail) unless kb-cloudflared is RUNNING.
+# `docker inspect` prints "true"/"false" and exits 0 for any existing container, so
+# gate on the STRING — a stopped or absent edge yields non-"true" and the unit is
+# skipped, never restarted (an ExecCondition non-zero is a clean skip, not a fail).
+ExecCondition=/bin/sh -c '[ "$(docker inspect -f {{.State.Running}} kb-cloudflared 2>/dev/null)" = "true" ]'
+# User-scope has no network-online.target: wait for the docker daemon to be ready
+# (a boot-time Persistent catch-up can fire before it is), retrying instead of
+# failing the whole month on a cold start (review finding).
+ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5 6; do docker info >/dev/null 2>&1 && exit 0; sleep 10; done; exit 1'
 ExecStart=docker compose -f %h/kb/repo/docker-compose.yml pull kb-cloudflared
-ExecStart=docker compose -f %h/kb/repo/docker-compose.yml up -d kb-cloudflared
+# --no-deps: refresh ONLY the edge, never (re)start its depends_on chain
+# (kb-mcp-public → kb-mcp), so the refresh cannot bring public exposure back up
+# beyond the single already-running edge container (review finding).
+ExecStart=docker compose -f %h/kb/repo/docker-compose.yml up -d --no-deps kb-cloudflared
+# A transient pull failure retries a few times this boot rather than skipping a
+# whole month (permitted for Type=oneshot on current systemd).
+Restart=on-failure
+RestartSec=5min
 NoNewPrivileges=true
 
 [Install]

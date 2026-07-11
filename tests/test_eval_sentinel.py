@@ -107,6 +107,62 @@ def test_small_drop_within_epsilon_is_not_a_regression(kb, monkeypatch):
     assert _open_regression_rows() == []
 
 
+def test_baseline_walks_back_past_an_errored_night(kb, monkeypatch):
+    # HIGH-2: one errored night must NOT wipe the baseline. Night 3 is above the
+    # floor, so the ONLY way it can flag is a drop vs night 1 — which requires
+    # previous_eval_metrics() to walk back over night 2's non-ok report.
+    _stub_eval(monkeypatch, 0.95, 0.90)
+    consolidate.main()  # night 1: ok baseline
+
+    monkeypatch.setattr(
+        eval_harness, "load_golden", lambda golden_path=None: [{"q": "q", "expect_substr": ["x"]}]
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("embed backend down")
+
+    monkeypatch.setattr(eval_harness, "evaluate", _boom)
+    night2 = consolidate.main()  # night 2: eval errors → interleaved non-ok report
+    assert night2["eval_status"] == "error"
+
+    _stub_eval(monkeypatch, 0.85, 0.80)  # above floor, but 0.10 below night 1
+    third = consolidate.main()
+    assert third["eval_regression"] is True, "regression detected vs the last OK night"
+    rows = _open_regression_rows()
+    assert len(rows) == 1 and rows[0][2]["baseline_hit_at_5"] == 0.95
+
+
+def test_absolute_floor_flags_gradual_subepsilon_drift(kb, monkeypatch):
+    # The boiled-frog case: each step is under epsilon so the relative check never
+    # trips, but the metrics cross the anchored floor → flagged (finding).
+    _stub_eval(monkeypatch, 0.78, 0.78)
+    consolidate.main()  # above floor, no prior → not flagged
+    _stub_eval(monkeypatch, 0.74, 0.74)  # drop 0.04 < epsilon, but 0.74 < 0.75 floor
+    result = consolidate.main()
+    assert result["eval_regression"] is True, "below-floor drift is caught under epsilon"
+    assert len(_open_regression_rows()) == 1
+
+
+def test_partial_rebound_does_not_auto_resolve_or_ratchet(kb, monkeypatch):
+    # The flapping ratchet: a partial rebound (>= baseline − epsilon but < baseline)
+    # must NOT auto-resolve, and the recovery anchor must not drift down (finding).
+    _stub_eval(monkeypatch, 0.9, 0.9)
+    consolidate.main()  # baseline
+    _stub_eval(monkeypatch, 0.7, 0.7)  # regression; anchor pinned at 0.9
+    consolidate.main()
+    assert _open_regression_rows()[0][2]["baseline_hit_at_5"] == 0.9
+
+    _stub_eval(monkeypatch, 0.86, 0.86)  # >= 0.9 − 0.05 but < 0.9 → partial
+    consolidate.main()
+    rows = _open_regression_rows()
+    assert len(rows) == 1, "a partial rebound does not self-close the flag"
+    assert rows[0][2]["baseline_hit_at_5"] == 0.9, "the recovery anchor never ratchets down"
+
+    _stub_eval(monkeypatch, 0.9, 0.9)  # full recovery to the anchor
+    consolidate.main()
+    assert _open_regression_rows() == [], "full recovery to the anchor auto-resolves"
+
+
 def test_recovery_auto_resolves_open_flag(kb, monkeypatch):
     _stub_eval(monkeypatch, 0.9, 0.85)
     consolidate.main()  # baseline

@@ -355,6 +355,58 @@ def test_terminal_row_is_requeued_on_resubmit(kb, monkeypatch):
     assert _one_row("qrequeue") == ("pending", 0)
 
 
+def test_drain_deferral_cap_escalates_a_never_healing_transient(kb, monkeypatch):
+    # A payload-deterministic 5xx surfaces as ExtractorUnavailable (transient) and
+    # is DEFERRED forever with attempts untouched — until the deferral cap escalates
+    # it to a terminal 'failed' row so it can't re-drain every night (finding).
+    ingest_queue.enqueue("qdefer", "User: a\nAssistant: b", kind="session")
+
+    def down(*a, **k):
+        raise ExtractorUnavailable("deterministic 500 / runner crash")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", down)
+    for _ in range(ingest_queue.DEFERRAL_CAP + 2):
+        consolidate._drain_ingest_queue()
+    assert _one_row("qdefer") == ("failed", ingest_queue.MAX_ATTEMPTS), (
+        "a transient that never heals is escalated to terminal after the deferral cap"
+    )
+
+
+def test_deferred_row_sorts_after_fresh_pending(kb):
+    # The ordering amplifier: a stuck deferred low-id row must not sit at the HEAD
+    # of every batch. Sorting by deferrals before id drifts it behind fresh work.
+    old = ingest_queue.enqueue("qord", "User: old\nAssistant: x", kind="session").id
+    ingest_queue.mark_deferred(old, "transient blip")  # deferrals=1, still pending
+    new = ingest_queue.enqueue("qord", "User: new\nAssistant: y", kind="session").id
+    ids = [r["id"] for r in ingest_queue.pending(limit=50)]
+    assert ids.index(new) < ids.index(old), "fresh pending drains before a deferred low-id row"
+
+
+def test_requeue_is_bounded_then_permanently_failed(kb, monkeypatch):
+    # A recurring identical poison submission can re-arm a terminal row only
+    # MAX_REQUEUES times; past that it stays failed and reports permanently_failed
+    # (with the id) so the caller routes it to manual review (finding).
+    content = "User: poison\nAssistant: payload"
+    ingest_queue.enqueue("qpoison", content, kind="session")
+
+    def bad(*a, **k):
+        raise ExtractionFailed("deterministic poison")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    for _ in range(ingest_queue.MAX_REQUEUES):
+        for _ in range(5):  # drive the (re-opened) row back to terminal
+            consolidate._drain_ingest_queue()
+        r = ingest_queue.enqueue("qpoison", content, kind="session")
+        assert r.requeued is True and r.permanently_failed is False
+
+    for _ in range(5):
+        consolidate._drain_ingest_queue()
+    final = ingest_queue.enqueue("qpoison", content, kind="session")
+    assert final.permanently_failed is True and final.requeued is False
+    assert final.id is not None, "the terminal row id is returned for manual review"
+    assert _one_row("qpoison")[0] == "failed", "the row stays terminally failed, not re-armed"
+
+
 def test_pending_row_resubmit_is_a_noop_not_a_requeue(kb):
     content = "User: gamma\nAssistant: delta"
     first = ingest_queue.enqueue("qnoop", content, kind="session")
@@ -398,8 +450,7 @@ def test_extract_items_pins_deterministic_options(monkeypatch):
 
     monkeypatch.setattr(llm.httpx, "post", fake_post)
     llm.extract_items("some transcript text")
-    assert captured["options"] == {
-        "temperature": llm.EXTRACT_TEMPERATURE,
-        "seed": llm.EXTRACT_SEED,
-    }
-    assert captured["options"]["temperature"] == 0, "greedy decoding so retries dedupe by hash"
+    # Determinism-for-retry comes from the pinned SEED alone; temperature=0 (greedy
+    # decoding, forbidden on qwen3 thinking mode) was dropped (review finding).
+    assert captured["options"] == {"seed": llm.EXTRACT_SEED}
+    assert "temperature" not in captured["options"], "no greedy decoding; seed pins the retry"

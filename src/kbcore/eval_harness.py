@@ -45,7 +45,12 @@ def evaluate(
     results: list[tuple[str, int | None]] = []
     for case in cases:
         query, expected = case["q"], case["expect_substr"]
-        hits = search(query, k=K, tool="eval")
+        # tool=None → NO access_log write. The nightly eval replays 25 golden
+        # queries every consolidation; logging those synthetic reads used to stamp
+        # every top-5 golden-hit item 'recently used' one day before archive_stale's
+        # 180-day cutoff, permanently exempting it from archiving and growing
+        # access_log ~125 rows/night. Eval reads are not usage (review finding).
+        hits = search(query, k=K, tool=None)
         rank: int | None = None
         for i, hit in enumerate(hits, start=1):
             haystack = f"{hit.title}\n{hit.snippet}\n{get_item(hit.item_id).body}"

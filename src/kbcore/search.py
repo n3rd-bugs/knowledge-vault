@@ -10,6 +10,7 @@ equal score.
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime
 from typing import Any
@@ -33,6 +34,11 @@ BOOST = 0.05
 # exact-symbol query, and is a genuine no-op for plain-word searches — a
 # sentence-initial capital ("How", "Postgres") is NOT treated as an identifier.
 EXACT_ID_BONUS = 0.05
+# Cap identifier tokens scanned in _apply_bonuses: each is one unindexed word-regex
+# over the candidate items' chunks, and the id set now spans direct hits + expanded
+# neighbors — an unbounded token count (a 500-token query) amplifies into 500
+# chunk-scans per search. 8 matches the 'identifier rescue' intent (review finding).
+MAX_ID_TOKENS = 8
 SNIPPET_CHARS = 300
 
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -106,7 +112,7 @@ def search(
     as_of: datetime | None = None,
     hops: int | None = None,
     k: int = 8,
-    tool: str = "search",
+    tool: str | None = "search",
 ) -> list[SearchHit]:
     """Hybrid search over all projects by default (cross-domain reuse is the point).
 
@@ -140,19 +146,28 @@ def search(
         vec_rows = _vector_leg(conn, query, where, params)
         kw_rows = _keyword_leg(conn, query, where, params)
         fused = _rrf_fuse(vec_rows, kw_rows)  # RAW RRF, no bonuses yet
+        expansion_origin: dict[int, int] = {}
         if hops > 0 and fused:
             # expand_fused walls every neighbor against the SAME where per BFS
-            # level, so no scope/status/valid-time leak (search_expand).
-            fused = search_expand.expand_fused(conn, fused, hops, where, params, max(k, 10))
-    # Bonuses apply AFTER the merge so they lift any candidate (direct OR neighbor)
-    # and the seed_floor stays on raw scores (un-boosted rank-1 can seed; finding).
-    fused = _apply_bonuses(fused, boost_project, query)
+            # level, so no scope/status/valid-time leak (search_expand). It also
+            # returns each pure neighbor's vouching SEED so bonuses cannot lift a
+            # neighbor above that seed (clamp in _apply_bonuses).
+            fused, expansion_origin = search_expand.expand_fused(
+                conn, fused, hops, where, params, max(k, 10)
+            )
+        # Bonuses apply AFTER the merge so they lift any candidate (direct OR
+        # neighbor) and the seed_floor stays on raw scores (un-boosted rank-1 can
+        # seed; finding). Reuse the legs' connection — no extra connect (finding).
+        fused = _apply_bonuses(conn, fused, boost_project, query, expansion_origin)
     # Materialize ALL fused candidates before truncating: the verified ≥
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
     # to displace a verified one).
     hits = _to_hits(fused)[:k]
-    _log_access(hits, tool, query)
+    # tool=None → skip access logging (the eval harness replays golden queries and
+    # must not stamp items 'recently used', which would pin them against archiving).
+    if tool is not None:
+        _log_access(hits, tool, query)
     return hits
 
 
@@ -214,41 +229,58 @@ def _rrf_fuse(
 
 
 def _apply_bonuses(
-    fused: list[tuple[int, float, str]], boost_project: str | None, query: str
+    conn,
+    fused: list[tuple[int, float, str]],
+    boost_project: str | None,
+    query: str,
+    expansion_origin: dict[int, int],
 ) -> list[tuple[int, float, str]]:
     """Return ``fused`` re-scored with the project boost + exact-identifier bonus.
 
-    Applied to every candidate (direct hits AND expanded neighbors) after the merge.
+    Applied to every candidate (direct hits AND expanded neighbors) after the merge,
+    reusing the legs' ``conn`` (no extra connect — finding). A pure expansion
+    neighbor is then CLAMPED strictly below its vouching seed's POST-bonus score:
+    BOOST/EXACT_ID_BONUS (0.05) each exceed the max raw RRF (~0.0328), so an
+    un-clamped bonus on a query-blind neighbor could categorically outrank its own
+    seed and genuine direct hits, breaking the documented 'never outranks its seed'
+    guarantee (finding). ``expansion_origin`` maps each pure-neighbor id → the
+    direct-hit seed that vouches for it (threaded out of search_expand).
     """
     if not fused:
         return fused
     scores = {item_id: score for item_id, score, _snip in fused}
     ids = list(scores)
-    tokens = _identifier_tokens(query)
+    tokens = _identifier_tokens(query)[:MAX_ID_TOKENS]
     if not boost_project and not tokens:
         return fused
-    with connect() as conn:
-        if boost_project:
-            for (item_id,) in conn.execute(
-                "SELECT id FROM items WHERE id = ANY(%s) AND project = %s",
-                (ids, boost_project),
-            ).fetchall():
-                scores[item_id] += BOOST
-        for token in tokens:
-            # \m..\M are Postgres word boundaries; identifier tokens are
-            # [A-Za-z0-9_] so no regex metachar escaping is needed.
-            pattern = rf"\m{token}\M"
-            for (item_id,) in conn.execute(
-                """
-                SELECT i.id FROM items i
-                WHERE i.id = ANY(%(ids)s) AND (
-                    i.title ~* %(pat)s
-                    OR EXISTS (SELECT 1 FROM chunks c WHERE c.item_id = i.id AND c.text ~* %(pat)s)
-                )
-                """,
-                {"ids": ids, "pat": pattern},
-            ).fetchall():
-                scores[item_id] += EXACT_ID_BONUS
+    if boost_project:
+        for (item_id,) in conn.execute(
+            "SELECT id FROM items WHERE id = ANY(%s) AND project = %s",
+            (ids, boost_project),
+        ).fetchall():
+            scores[item_id] += BOOST
+    for token in tokens:
+        # \m..\M are Postgres word boundaries; identifier tokens are
+        # [A-Za-z0-9_] so no regex metachar escaping is needed.
+        pattern = rf"\m{token}\M"
+        for (item_id,) in conn.execute(
+            """
+            SELECT i.id FROM items i
+            WHERE i.id = ANY(%(ids)s) AND (
+                i.title ~* %(pat)s
+                OR EXISTS (SELECT 1 FROM chunks c WHERE c.item_id = i.id AND c.text ~* %(pat)s)
+            )
+            """,
+            {"ids": ids, "pat": pattern},
+        ).fetchall():
+            scores[item_id] += EXACT_ID_BONUS
+    # Restore the seed guarantee post-bonus: a neighbor surfaced ONLY by expansion
+    # (empty-snippet, query-blind) must rank strictly below the direct hit that
+    # vouched for it. The seed is always a direct hit, hence present in `scores`.
+    for nid, seed_id in expansion_origin.items():
+        seed_score = scores.get(seed_id)
+        if seed_score is not None and nid in scores and scores[nid] >= seed_score:
+            scores[nid] = math.nextafter(seed_score, float("-inf"))
     return [(item_id, scores[item_id], snippet) for item_id, _score, snippet in fused]
 
 

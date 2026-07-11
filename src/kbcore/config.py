@@ -94,6 +94,12 @@ class Settings(BaseSettings):
     # the golden retrieval eval and flags a hit@5/MRR drop vs the prior run. Set
     # False to skip the eval entirely (kill switch).
     kb_eval_in_consolidation: bool = True
+    # Anchored ABSOLUTE floor for the sentinel: flag whenever hit@5 / MRR fall below
+    # these regardless of the night-over-night trend, so a gradual sub-epsilon drift
+    # (invisible to the previous-run comparison) is still caught, and the
+    # auto-resolve target never ratchets below the floor (review finding).
+    kb_eval_min_hit5: float = 0.75
+    kb_eval_min_mrr: float = 0.5
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")

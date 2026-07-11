@@ -25,6 +25,17 @@ MAX_PENDING = 5_000  # aggregate cap: refuse new submissions when the backlog is
 # permanently 'failed'. Self-heals a transient DB/OOM failure without any
 # operator requeue tool; a genuinely-bad row stops after a bounded few attempts.
 MAX_ATTEMPTS = 3
+# A row DEFERRED for a "transient" extractor/embedder outage keeps attempts
+# untouched (an outage must not burn the content-failure budget). But a
+# payload-DETERMINISTIC 5xx / mid-response crash is misclassified as transient and
+# would re-drain every night forever. After this many consecutive deferrals — set
+# WELL ABOVE MAX_ATTEMPTS so a genuine multi-night outage still recovers — the row
+# is escalated to 'failed' so the attempts cap can retire it (review finding).
+DEFERRAL_CAP = 10
+# Times a TERMINALLY-failed row may be re-armed to 'pending' by an identical
+# resubmission before it stays permanently failed. Bounds a recurring poison
+# payload that would otherwise reset attempts=0 forever (review finding).
+MAX_REQUEUES = 3
 # Projects a public submission may never target (system/curated). Review findings:
 # a public caller must not inject items into kb-system or burn the nightly run on it.
 RESERVED_PROJECTS = frozenset({"kb-system"})
@@ -33,10 +44,14 @@ RESERVED_PROJECTS = frozenset({"kb-system"})
 class EnqueueResult(NamedTuple):
     """Outcome of an enqueue: ``id`` is the drainable row (None ⇒ live duplicate);
     ``requeued`` is True when a TERMINALLY-FAILED row was reset to 'pending' so
-    callers can distinguish "re-queued after failure" from "already queued"."""
+    callers can distinguish "re-queued after failure" from "already queued";
+    ``permanently_failed`` is True when the row is terminally failed AND has
+    exhausted its re-arm budget (:data:`MAX_REQUEUES`) — the id is returned but the
+    row was NOT re-opened, so callers report it as needing manual review."""
 
     id: int | None
     requeued: bool
+    permanently_failed: bool = False
 
 
 def enqueue(
@@ -62,7 +77,9 @@ def enqueue(
     returns its id with ``requeued=True`` — a status flip (Invariant 5), so a bug
     fixed after the cap was hit no longer strands the content behind the dedupe
     UNIQUE. A row that is still pending/in-flight/extracted/under-cap stays a no-op
-    (id=None) so a live submission is never disturbed.
+    (id=None) so a live submission is never disturbed. Re-arming is BOUNDED at
+    :data:`MAX_REQUEUES`: past that a recurring poison payload is left permanently
+    failed and its id is returned with ``permanently_failed=True`` (finding).
     """
     if kind not in QUEUE_KINDS:
         raise InvalidOperation(f"unknown ingest kind {kind!r}; one of {', '.join(QUEUE_KINDS)}")
@@ -96,34 +113,64 @@ def enqueue(
         meta["redactions"] = redactions
 
     with transaction() as conn:
-        # ON CONFLICT re-opens ONLY a terminally-failed row; other statuses fail the
-        # DO UPDATE ... WHERE, so RETURNING yields no row (id=None). The system
-        # column xmax is 0 on a fresh INSERT and non-zero on an UPDATE, which tells
-        # a re-queue apart from a brand-new enqueue.
+        # ON CONFLICT DO UPDATE fires for ANY terminally-failed row; other statuses
+        # fail the WHERE so RETURNING yields no row (id=None → live duplicate). For a
+        # terminal row we RE-OPEN it (status→'pending', attempts→0) only while it is
+        # still under the re-arm budget; once requeue_count hits MAX_REQUEUES we bump
+        # nothing and leave it 'failed', so a recurring poison payload can't reset
+        # attempts forever. xmax is 0 on a fresh INSERT and non-zero on an UPDATE, and
+        # the returned status tells a re-open apart from a permanent-failure touch.
         row = conn.execute(
             """
             INSERT INTO ingest_queue (project, kind, content, content_hash, meta)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES (%(project)s, %(kind)s, %(content)s, %(hash)s, %(meta)s)
             ON CONFLICT (kind, project, content_hash) DO UPDATE
-              SET status = 'pending', attempts = 0, error = NULL,
-                  meta = EXCLUDED.meta, processed_at = NULL
-              WHERE ingest_queue.status = 'failed' AND ingest_queue.attempts >= %s
-            RETURNING id, (xmax <> 0)
+              SET requeue_count = CASE WHEN ingest_queue.requeue_count < %(cap)s
+                                       THEN ingest_queue.requeue_count + 1
+                                       ELSE ingest_queue.requeue_count END,
+                  status = CASE WHEN ingest_queue.requeue_count < %(cap)s
+                                THEN 'pending' ELSE 'failed' END,
+                  attempts = CASE WHEN ingest_queue.requeue_count < %(cap)s
+                                  THEN 0 ELSE ingest_queue.attempts END,
+                  error = CASE WHEN ingest_queue.requeue_count < %(cap)s
+                               THEN NULL ELSE ingest_queue.error END,
+                  deferrals = CASE WHEN ingest_queue.requeue_count < %(cap)s
+                                   THEN 0 ELSE ingest_queue.deferrals END,
+                  meta = EXCLUDED.meta,
+                  processed_at = CASE WHEN ingest_queue.requeue_count < %(cap)s
+                                      THEN NULL ELSE ingest_queue.processed_at END
+              WHERE ingest_queue.status = 'failed' AND ingest_queue.attempts >= %(maxa)s
+            RETURNING id, (xmax <> 0), (status = 'pending')
             """,
-            (project, kind, clean, content_hash, Jsonb(meta), MAX_ATTEMPTS),
+            {
+                "project": project,
+                "kind": kind,
+                "content": clean,
+                "hash": content_hash,
+                "meta": Jsonb(meta),
+                "cap": MAX_REQUEUES,
+                "maxa": MAX_ATTEMPTS,
+            },
         ).fetchone()
     if row is None:
         return EnqueueResult(None, requeued=False)
-    return EnqueueResult(int(row[0]), requeued=bool(row[1]))
+    id_, was_update, reopened = int(row[0]), bool(row[1]), bool(row[2])
+    if was_update and not reopened:
+        # A terminal row over the re-arm budget: id returned, but NOT re-opened.
+        return EnqueueResult(id_, requeued=False, permanently_failed=True)
+    return EnqueueResult(id_, requeued=(was_update and reopened))
 
 
 def pending(limit: int = 50) -> list[dict[str, Any]]:
     """Claim up to ``limit`` drainable rows (FOR UPDATE SKIP LOCKED).
 
     Drainable = still 'pending', OR 'failed' but under :data:`MAX_ATTEMPTS` (the
-    self-heal set). Fresh pending rows sort first so a backlog of retryable
-    failures can never starve new content under the batch limit. SKIP LOCKED
-    means a concurrent/crashed drainer can never wedge the queue.
+    self-heal set). Ordering: fresh (never-deferred) pending rows first, THEN
+    already-deferred pending rows, then retryable failed rows. Sorting by
+    ``deferrals`` before ``id`` means a stuck low-id row that keeps hitting a
+    "transient" 5xx can no longer sit at the HEAD of every nightly batch and starve
+    new content — it drifts to the back as it accumulates deferrals (review finding).
+    SKIP LOCKED means a concurrent/crashed drainer can never wedge the queue.
     """
     with connect() as conn:
         rows = conn.execute(
@@ -132,7 +179,7 @@ def pending(limit: int = 50) -> list[dict[str, Any]]:
             FROM ingest_queue
             WHERE status = 'pending'
                OR (status = 'failed' AND attempts < %s)
-            ORDER BY (status = 'failed'), id
+            ORDER BY (status = 'failed'), deferrals, id
             LIMIT %s
             FOR UPDATE SKIP LOCKED
             """,
@@ -169,6 +216,32 @@ def mark_failed(queue_id: int, error: str) -> None:
             "error = %s, processed_at = now() WHERE id = %s",
             (error[:2000], queue_id),
         )
+
+
+def mark_deferred(queue_id: int, error: str) -> bool:
+    """Record a TRANSIENT defer (extractor/embedder unavailable): bump ``deferrals``,
+    leaving the row 'pending' with ``attempts`` UNCHANGED so an outage never burns
+    the content-failure budget. Once deferrals reach :data:`DEFERRAL_CAP` a
+    "transient" that never heals is treated as content-deterministic in practice and
+    ESCALATED to 'failed' (attempts pinned at the cap) so the attempts logic retires
+    it — a payload-deterministic 5xx / mid-response crash can no longer re-drain
+    every night forever (review finding). Returns True when the row was escalated.
+    """
+    with transaction() as conn:
+        row = conn.execute(
+            "UPDATE ingest_queue SET deferrals = deferrals + 1, error = %s "
+            "WHERE id = %s RETURNING deferrals",
+            (error[:2000], queue_id),
+        ).fetchone()
+        deferrals = int(row[0]) if row else 0
+        if deferrals >= DEFERRAL_CAP:
+            conn.execute(
+                "UPDATE ingest_queue SET status = 'failed', attempts = %s, "
+                "processed_at = now() WHERE id = %s",
+                (MAX_ATTEMPTS, queue_id),
+            )
+            return True
+    return False
 
 
 def queue_depth() -> int:

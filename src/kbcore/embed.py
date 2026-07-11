@@ -56,12 +56,23 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         # (CLAUDE.md §Code style). Connectivity → EmbedderUnavailable (defer);
         # content/timeout → ExtractionFailed (attempts-capped in the drain).
         raise _classify_embed_error(e) from e
-    vectors = resp.json()["embeddings"]
-    for v in vectors:
-        if len(v) != settings.kb_embed_dim:
-            raise ValueError(
-                f"embedding dim {len(v)} != configured KB_EMBED_DIM {settings.kb_embed_dim}"
-            )
+    # A 200 whose BODY is not the expected shape (Ollama emitting {"error":...}
+    # with 200 during a restart, a proxy error page, or wrong-length vectors) would
+    # otherwise escape as a raw KeyError/JSONDecodeError/TypeError and the drain
+    # would misfile a transient server hiccup as a content failure. Wrap it as
+    # EmbedderUnavailable — a garbage 200 is a server-side anomaly → defer/retry,
+    # matching the classification _classify_embed_error already claims (finding).
+    try:
+        vectors = resp.json()["embeddings"]
+        for v in vectors:
+            if len(v) != settings.kb_embed_dim:
+                raise ValueError(
+                    f"embedding dim {len(v)} != configured KB_EMBED_DIM {settings.kb_embed_dim}"
+                )
+    except (KeyError, ValueError, TypeError) as e:
+        raise EmbedderUnavailable(
+            f"embedder returned unusable output: {e.__class__.__name__}: {e}"
+        ) from e
     return vectors
 
 

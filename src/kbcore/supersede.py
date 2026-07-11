@@ -50,7 +50,9 @@ def supersede(
     with transaction() as conn:
         row = conn.execute(
             "SELECT project, type, title, tags, status, meta, valid_from, valid_to "
-            "FROM items WHERE id = %s",
+            "FROM items WHERE id = %s FOR UPDATE",  # lock the old row: serialize
+            # concurrent supersedes so two callers can't both see 'active', both
+            # mint a replacement, and split superseded_by/valid_to (review finding).
             (old_id,),
         ).fetchone()
         if row is None:
@@ -90,6 +92,14 @@ def supersede(
                 )
             if valid_from is not None:
                 close_from = _as_utc(valid_from)  # explicit new start → world changed
+            elif valid_to is not None:
+                # valid_to-only override records that the OLD fact stopped being
+                # true at T. Close the old open window there too — otherwise the
+                # old row stays open while the correction is closed, and an as_of>T
+                # query returns the STALE superseded text and drops the correction
+                # (inverted visibility; review finding). ingest_in already rejected
+                # a valid_to <= old_valid_from, so this close is > old_valid_from.
+                close_from = _as_utc(valid_to)
         else:
             repl = conn.execute(
                 "SELECT status, project, valid_from FROM items WHERE id = %s", (new_item_id,)
@@ -121,16 +131,23 @@ def supersede(
         # Auto-close the old validity window (world-changed semantics). Only when
         # the old fact was still open; a closed window is left as recorded.
         if close_from is not None and old_valid_to is None:
-            if old_valid_from is not None and close_from <= old_valid_from:
-                # Would collapse/invert the old interval — the replacement cannot
-                # start at/before the fact it supersedes began.
+            close_from = _as_utc(close_from)
+            if old_valid_from is not None and close_from < old_valid_from:
+                # Strictly earlier would invert the old interval — the replacement
+                # cannot start BEFORE the fact it supersedes began.
                 raise InvalidOperation(
                     "replacement valid_from precedes the superseded item's valid_from"
                 )
-            conn.execute(
-                "UPDATE items SET valid_to = %s, updated_at = now() WHERE id = %s",
-                (close_from, old_id),
-            )
+            if old_valid_from is None or close_from > old_valid_from:
+                # A strictly-later start SHRINKS the window: close the old row there.
+                # EQUAL start is a same-window takeover — the window is unchanged, so
+                # skip the close (closing AT the start would collapse it to an empty
+                # interval, which ingest forbids). This is the mandated same-window
+                # correction path (review finding); only strict inequality acts.
+                conn.execute(
+                    "UPDATE items SET valid_to = %s, updated_at = now() WHERE id = %s",
+                    (close_from, old_id),
+                )
         conn.execute(
             """
             INSERT INTO relations (project, src_kind, src_id, rel, dst_kind, dst_id)

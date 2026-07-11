@@ -123,6 +123,9 @@ def grant(name: str, project: str, *, rw: bool = False) -> None:
             """,
             (pid, project.strip(), rw),
         )
+    # Flush the positive token cache so a newly-granted project is visible on the
+    # next request instead of lagging up to the cache TTL (parity with revoke()).
+    _clear_cache()
 
 
 def ungrant(name: str, project: str) -> None:
@@ -135,6 +138,9 @@ def ungrant(name: str, project: str) -> None:
             "DELETE FROM principal_grants WHERE principal_id = %s AND project = %s",
             (pid, project.strip()),
         )
+    # Flush the positive token cache so a de-scoped project stops being readable on
+    # the next request instead of lingering up to the cache TTL (parity with revoke()).
+    _clear_cache()
 
 
 def revoke(name: str) -> None:

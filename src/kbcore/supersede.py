@@ -58,7 +58,14 @@ def supersede(
         if row is None:
             raise NotFound(f"item {old_id} does not exist")
         project, type_, title, tags, status, old_meta, old_valid_from, old_valid_to = row
-        # Public-only instance: cannot supersede an item in a non-public project.
+        # A withheld old item must be byte-identical to a missing one — gate readability
+        # BEFORE writability, else assert_writable would leak the withheld project's NAME
+        # (existence + project-name oracle over arbitrary old_ids). Mirrors the
+        # new_item_id wall below and get_item's assert_readable.
+        if not scope.project_readable(conn, project):
+            raise NotFound(f"item {old_id} does not exist")
+        # Readable now, so a write-rejection may safely name it (public-only instance:
+        # cannot supersede an item in a non-public project).
         scope.assert_writable(project)
         if status == "superseded":
             raise InvalidOperation(f"item {old_id} is already superseded")
@@ -157,6 +164,7 @@ def supersede(
             """,
             (project, new_item_id, old_id),
         )
+        scope.log_write(conn, old_id, "supersede")  # audit: attribute grantee writes
     return new_item_id
 
 

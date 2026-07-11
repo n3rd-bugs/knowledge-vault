@@ -226,6 +226,7 @@ def ingest_in(
     # synchronously in-transaction without touching the 14B extractor (Phase 5,
     # Invariant 8). Same connection ⇒ commits atomically with the item.
     entities_mod.extract_entities_in(conn, item_id, project, tags or [], code_ref)
+    scope.log_write(conn, item_id, "ingest")  # audit: attribute grantee writes
     return item_id
 
 

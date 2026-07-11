@@ -149,8 +149,11 @@ def test_public_only_writes_rejected_for_private_allowed_for_public(seeded, monk
     # a brand-new (default-private) project is also not writable
     with pytest.raises(InvalidOperation):
         ingest("brand-new", "note", "t", "b")
-    # link from a private src
-    with pytest.raises(InvalidOperation):
+    # link from a private src: on a public-only instance a private item is withheld,
+    # so its src is byte-identical to a missing one (NotFound) — never a project-naming
+    # InvalidOperation (no existence/project-name oracle; parity with the dst wall and
+    # the private trace-root / get_item cases above).
+    with pytest.raises(NotFound):
         graph.link(seeded["q"], "alternative_to", seeded["p"])
     # enqueue
     with pytest.raises(InvalidOperation):

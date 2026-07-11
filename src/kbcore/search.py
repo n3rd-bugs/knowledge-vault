@@ -306,6 +306,9 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
             """,
             (list(by_id),),
         ).fetchall()
+        # Batch-mask superseded_by pointers into withheld projects (one scoped lookup)
+        # — parity with get_item/timeline; owner sees everything. sup_by is column 11.
+        readable_sup = scope.readable_item_ids(conn, [r[11] for r in rows if r[11] is not None])
     hits = []
     for (
         id_,
@@ -325,6 +328,8 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
         body,
     ) in rows:
         score, snippet = by_id[id_]
+        if sup_by is not None and sup_by not in readable_sup:
+            sup_by = None  # withheld successor id must not leak via the hit scalar
         # An expanded graph neighbor has no matching chunk (empty snippet); fall
         # back to the item body prefix so it still renders a preview (WP2).
         snippet = snippet or body or ""

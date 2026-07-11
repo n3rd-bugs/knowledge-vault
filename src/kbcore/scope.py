@@ -13,8 +13,9 @@ A request-scoped :class:`contextvars.ContextVar` carries the resolved principal.
 Each surface's auth layer sets it (``use_principal``); kbcore reads it. No
 per-call flag is threaded — every read/write already funnels through this module.
 
-**Fail-closed (servers):** ``enter_server_mode()`` is called by each server at
-``build_app``. After that, a request that reaches kbcore WITHOUT a principal set
+**Fail-closed (servers):** ``enter_server_mode()`` is called by each server's
+``main()`` before it starts serving. After that, a request that reaches kbcore
+WITHOUT a principal set
 RAISES (→ masked 500, no data) instead of defaulting to OWNER — so a contextvar
 propagation gap fails loud, never silently as the owner. Non-server processes
 (CLI, worker, tests) leave server mode off and default to OWNER (they run locally
@@ -65,8 +66,9 @@ OWNER = Principal(name="owner", is_owner=True, kind="owner")
 _UNSET: Any = object()
 _PRINCIPAL: ContextVar[Any] = ContextVar("kb_principal", default=_UNSET)
 
-# Process-wide: flipped true by a server's build_app() so an unset principal on a
-# served request fails closed. Left false for CLI/worker/tests (implicit owner).
+# Process-wide: flipped true by a server's main() (before uvicorn serves) so an
+# unset principal on a served request fails closed. Left false for CLI/worker/tests
+# (implicit owner).
 _SERVER_MODE = False
 
 
@@ -206,6 +208,25 @@ def project_readable(conn: psycopg.Connection, project: str) -> bool:
     return True
 
 
+def readable_item_ids(conn: psycopg.Connection, item_ids: list[int]) -> set[int]:
+    """Subset of ``item_ids`` whose project the current request may READ.
+
+    ONE scoped SELECT reusing :func:`project_predicate`, so masking is byte-identical
+    to every other read wall (owner → all present ids; grantee/public-only → only the
+    visible ones). Used to null a denormalized cross-project pointer (superseded_by)
+    whose target lives in a withheld project — the batch form for a whole result set.
+    """
+    if not item_ids:
+        return set()
+    frag, params = project_predicate("project")
+    where = f" AND {frag}" if frag else ""
+    rows = conn.execute(
+        f"SELECT id FROM items WHERE id = ANY(%s){where}",  # noqa: S608 — frag is a constant fragment; values ride params
+        [list(item_ids), *params],
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
 def assert_readable(project: str, not_found_msg: str) -> None:
     """A project the request cannot read must look like it does not exist.
 
@@ -256,3 +277,20 @@ def require_owner(what: str = "this operation") -> None:
     """
     if not current().is_owner:
         raise InvalidOperation(f"{what} is available to the KB owner only")
+
+
+def log_write(conn: psycopg.Connection, item_id: int, tool: str) -> None:
+    """Attribute a grantee WRITE inside the caller's open transaction (audit).
+
+    Owner/local writes stay unattributed (no row — the read paths already stamp NULL
+    for the owner); only a NON-owner grantee's mutation records its principal name, so
+    a grantee's writes are attributable just like its reads. ``item_id`` must already
+    exist in this transaction (access_log FK) — true on every write path, where the
+    row was just inserted/locked. In-transaction with the write, parameterized."""
+    p = current()
+    if p.is_owner:
+        return
+    conn.execute(
+        "INSERT INTO access_log (item_id, tool, principal) VALUES (%s, %s, %s)",
+        (item_id, tool, p.name),
+    )

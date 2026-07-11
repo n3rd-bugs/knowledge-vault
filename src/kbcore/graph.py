@@ -30,9 +30,14 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
         raise InvalidOperation(f"unknown relation {rel!r}; one of {', '.join(RELATIONS)}")
     with transaction() as conn:
         src = conn.execute("SELECT project FROM items WHERE id = %s", (src_item_id,)).fetchone()
-        if src is None:
+        # A src the caller cannot READ must be byte-identical to a missing one — gate
+        # readability BEFORE writability, else assert_writable's message would name the
+        # withheld project (existence + project-name oracle over arbitrary src ids).
+        # Mirrors the dst/evidence walls below and get_item's assert_readable.
+        if src is None or not scope.project_readable(conn, src[0]):
             raise NotFound(f"item {src_item_id} does not exist")
-        # Public-only instance: cannot write a relation from a non-public item.
+        # Readable now, so a write-rejection may safely name the project (public-only:
+        # cannot write a relation from a non-public item).
         scope.assert_writable(src[0])
         dst = conn.execute("SELECT project FROM items WHERE id = %s", (dst_item_id,)).fetchone()
         # A dst the caller cannot read is indistinguishable from a missing one
@@ -57,6 +62,7 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
             """,
             (src[0], src_item_id, rel, dst_item_id, evidence_item),
         ).fetchone()
+        scope.log_write(conn, src_item_id, "link")  # audit: attribute grantee writes
     return row[0]
 
 

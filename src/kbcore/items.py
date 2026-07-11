@@ -78,6 +78,13 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
             relations = [
                 Relation(src_id=s, rel=r, dst_id=d, direction=direc) for s, r, d, direc in rel_rows
             ]
+        # Denormalized supersession pointer: if the successor lives in a project this
+        # request cannot read, NULL both the id AND the free-text reason — else the
+        # scalar leaks a withheld item's existence + owner text past the relations wall
+        # above (the reciprocal 'supersedes' edge is already hidden). Owner sees all.
+        if sup_by is not None and not scope.readable_item_ids(conn, [sup_by]):
+            sup_by = None
+            sup_reason = None
     meta = meta if isinstance(meta, dict) else {}
     code_ref = CodeRef(**meta["code_ref"]) if meta.get("code_ref") else None
     return ItemDetail(
@@ -177,6 +184,9 @@ def timeline(
             """,  # noqa: S608 — WHERE fragments above are constant literals
             params,
         ).fetchall()
+        # Batch-mask superseded_by pointers into withheld projects (one scoped lookup
+        # for the whole page) — same wall as get_item; owner sees everything.
+        readable_sup = scope.readable_item_ids(conn, [r[8] for r in rows if r[8] is not None])
     out = []
     for (
         id_,
@@ -197,6 +207,9 @@ def timeline(
     ) in rows:
         meta = meta if isinstance(meta, dict) else {}
         code_ref = CodeRef(**meta["code_ref"]) if meta.get("code_ref") else None
+        if sup is not None and sup not in readable_sup:
+            sup = None  # withheld successor: byte-identical to a non-superseded row
+            reason = None
         out.append(
             ItemDetail(
                 item_id=id_,

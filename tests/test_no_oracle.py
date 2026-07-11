@@ -273,6 +273,101 @@ def test_supersede_withheld_replacement_no_oracle(world):
             supersede(a_old, new_item_id=world["b"], reason="oracle attempt")
 
 
+def test_link_withheld_src_no_oracle(world):
+    """Linking FROM a withheld src must be byte-identical to a missing src id: the
+    SAME NotFound (type + message), hence the SAME REST 404 / MCP ToolError string —
+    never an InvalidOperation naming the withheld project. Read-only AND zero-grant
+    grantees both, since the src write-check must fire identically for either."""
+    for i, grants in enumerate(({"a": False}, {})):  # read-only on 'a', and no grants
+        g = _grantee(f"linksrc_{i}", grants)
+        with scope.use_principal(g), pytest.raises(NotFound) as missing:
+            graph.link(9_999_999, "mentions", world["a"])  # truly missing src
+        with scope.use_principal(g), pytest.raises(NotFound) as withheld:
+            graph.link(world["b"], "mentions", world["a"])  # existent, withheld project
+        assert str(withheld.value) == str(missing.value).replace("9999999", str(world["b"]))
+
+
+def test_supersede_withheld_old_id_no_oracle(world):
+    """Superseding a withheld old_id must be byte-identical to a missing old_id — same
+    NotFound type + message (same 404 / ToolError), never a project-naming
+    InvalidOperation. Read-only AND zero-grant grantees both."""
+    for i, grants in enumerate(({"a": False}, {})):
+        g = _grantee(f"supold_{i}", grants)
+        with scope.use_principal(g), pytest.raises(NotFound) as missing:
+            supersede(9_999_999, new_body="x", reason="y")  # truly missing old
+        with scope.use_principal(g), pytest.raises(NotFound) as withheld:
+            supersede(world["b"], new_body="x", reason="y")  # existent, withheld
+        assert str(withheld.value) == str(missing.value).replace("9999999", str(world["b"]))
+
+
+def test_superseded_by_masked_when_successor_withheld(world):
+    """A denormalized cross-project supersession pointer must not leak the withheld
+    successor's id or free-text reason through the scalar column (get_item AND search
+    AND timeline). The reciprocal relation edge is already hidden; the scalar must
+    match. Owner sees the real values."""
+    a_item = world["a"]
+    # Owner retires a shared 'a' item in favour of a withheld 'b' item.
+    supersede(a_item, new_item_id=world["b"], reason="secret cross-project reason STD-9")
+    g = _grantee("reader", {"a": False})
+    with scope.use_principal(g):
+        d = get_item(a_item)
+        assert d.superseded_by is None, "withheld successor id leaked via get_item scalar"
+        assert d.supersede_reason is None, "withheld supersede reason leaked via get_item"
+        tl = [it for it in timeline("a") if it.item_id == a_item]
+        assert tl, "superseded 'a' item should appear in its reader's timeline"
+        assert tl[0].superseded_by is None and tl[0].supersede_reason is None
+        h = next(
+            (
+                x
+                for x in search("alpha widget SPI", include_superseded=True, k=10)
+                if x.item_id == a_item
+            ),
+            None,
+        )
+        assert h is not None, "superseded 'a' item should still surface for its reader"
+        assert h.superseded_by is None, "withheld successor id leaked via search hit"
+    # Owner sees the true pointer + reason (no masking).
+    od = get_item(a_item)
+    assert od.superseded_by == world["b"]
+    assert od.supersede_reason == "secret cross-project reason STD-9"
+
+
+def test_ungrant_clears_principal_cache(world):
+    """A de-scoped project must stop being readable within the SAME process — ungrant()
+    flushes the positive token cache instead of lagging up to the cache TTL."""
+    _pid, token = principals.create_principal("cached", kind="token")
+    principals.grant("cached", "a", rw=False)
+    p1 = principals.resolve_token(token)  # positive resolution → cached WITH grant 'a'
+    assert p1 is not None and "a" in p1.read_projects
+    with scope.use_principal(p1):
+        assert get_item(world["a"]).project == "a"
+    principals.ungrant("cached", "a")
+    p2 = principals.resolve_token(token)  # cache flushed → reflects the removed grant
+    assert p2 is not None and "a" not in p2.read_projects
+    with scope.use_principal(p2), pytest.raises(NotFound):
+        get_item(world["a"])  # denied now, no TTL wait
+
+
+def test_grantee_write_is_audited(world):
+    """A grantee's writes are attributable: ingest and link stamp an access_log row
+    bearing the grantee's principal name (owner/local writes stay unattributed)."""
+    g = _grantee("auditor", {"a": True})
+    with scope.use_principal(g):
+        new_id = ingest("a", "note", "audited note", "written by grantee auditor", uri="aud")
+        link_src = ingest("a", "note", "audited link src", "grantee link source body", uri="ls")
+        graph.link(link_src, "mentions", world["a"])
+    with db.connect() as conn:
+        ingest_rows = conn.execute(
+            "SELECT principal, tool FROM access_log WHERE item_id = %s", (new_id,)
+        ).fetchall()
+        link_rows = conn.execute(
+            "SELECT principal, tool FROM access_log WHERE item_id = %s AND tool = 'link'",
+            (link_src,),
+        ).fetchall()
+    assert ("auditor", "ingest") in ingest_rows, "grantee ingest not attributed"
+    assert ("auditor", "link") in link_rows, "grantee link not attributed"
+
+
 def test_find_duplicate_and_kb_save_dup_no_oracle(world):
     # A grantee saving content that duplicates a WITHHELD item must not get its id.
     # Positive control: the OWNER genuinely matches it, so a None for the grantee is

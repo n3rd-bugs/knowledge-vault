@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# ============================================================================
+# DEPRECATED (2026-07) — superseded by contrib/claude/kb-session-flush/.
+#
+# This installs a per-project `Stop` hook running `kb ingest-session`. The
+# kb-session-flush skill now covers the same job better (PreCompact + SessionEnd
+# flush with checkpointing + scrubbing, plus SessionStart/UserPromptSubmit
+# pre-brief). Prefer:  bash contrib/claude/kb-session-flush/install.sh
+#
+# Do NOT run both on one machine: the two assembly paths produce differently
+# assembled text, defeating the content-hash dedupe in ingest_queue.enqueue, so
+# each session gets extracted by the 14B twice. Kept only for reference.
+# ============================================================================
 # session_hook.sh — opt-in Claude Code Stop hook installer (PLAN.md §7.2, Verdict V5).
 #
 # Run this INSIDE a target project's working tree. It merges a `Stop` hook into

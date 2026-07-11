@@ -46,6 +46,26 @@ def fake_embeddings(monkeypatch):
     monkeypatch.setattr(embed, "embed_texts", lambda texts: [fake_vector(t) for t in texts])
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _force_test_schema():
+    """Belt-and-suspenders isolation (autouse): point ``settings.kb_db_schema`` at
+    ``kb_test`` for the ENTIRE session, independent of any fixture request.
+
+    The kb/kb_schema fixtures below still create + migrate kb_test on demand, but
+    that flip only happened when a test asked for them. A DB-touching test that
+    forgot the fixture ran SQL against the live ``public`` schema — the exact
+    failure mode that once truncated live data (a sub-agent-written test). With
+    this autouse guard the pointer is NEVER ``public`` during tests: a stray
+    write hits a possibly-missing ``kb_test`` (loud error), never live data.
+    """
+    original = settings.kb_db_schema
+    settings.kb_db_schema = "kb_test"
+    try:
+        yield
+    finally:
+        settings.kb_db_schema = original
+
+
 @pytest.fixture(scope="session")
 def kb_schema():
     """Session-scoped isolated schema kb_test with the full migrated layout."""

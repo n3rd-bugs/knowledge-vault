@@ -72,7 +72,7 @@ Repo layout (created in Phase 0):
   src/kbworker/ watcher.py sessions.py reposcan.py consolidate.py
   src/kbcli/    main.py            # `kb` entrypoint
   eval/         golden.yaml run_eval.py
-  scripts/      backup.sh restore_test.sh install_systemd.sh session_hook.sh
+  scripts/      backup.sh restore_test.sh install_systemd.sh session_hook.sh  # (session_hook.sh deprecated 2026-07)
   systemd/      kb-mcp.service kb-worker.service kb-consolidate.service kb-consolidate.timer
   tests/
 ```
@@ -301,7 +301,7 @@ Watches `~/kb/inbox` (watchdog + 30 s poll fallback). Handles `.md .txt .pdf .do
 ```
 
 Validate `quote in transcript_text` else drop the item (SEC-3/ARCH-2). Ingest survivors: trust=`unverified`, kind=`session`, `meta.code_ref` stamped from `--repo/--branch/--commit` (DATA-9), queue `review_queue(unverified_extraction)`. Update checkpoint.
-Per-project opt-in hook (`scripts/session_hook.sh` installs into that project's `.claude/settings.json`): a `Stop` hook that runs, in the background:
+Per-project opt-in hook (`scripts/session_hook.sh` — **DEPRECATED 2026-07, superseded by `contrib/claude/kb-session-flush/install.sh`**; installs into that project's `.claude/settings.json`): a `Stop` hook that runs, in the background:
 `kb ingest-session "$CLAUDE_TRANSCRIPT_PATH" --project <name> --repo "$(git rev-parse --show-toplevel 2>/dev/null)" --branch "$(git branch --show-current 2>/dev/null)" --commit "$(git rev-parse --short HEAD 2>/dev/null)"`
 **Never** scan `~/.claude` globally.
 
@@ -404,7 +404,7 @@ systemd user units: `kb-mcp.service`, `kb-worker.service` (both `Restart=on-fail
 
 ## 10. Access model (SEC-1/SEC-5 summary)
 
-Phases 0–5 default: **loopback + bearer**, local/server use (a Tailscale IP remains a valid `KB_BIND` if a private mesh is ever wanted — this deployment does not use one). **Phase 6 (this deployment):** the KB is **deliberately exposed on public HTTPS** at `https://www.n3rd-bugs.dev:8803` via Traefik + Let's Encrypt (Namecheap DNS-01), serving MCP (`/mcp`) + REST (`/api`) + a read-only web UI (`/`) behind the bearer; laptop/remote clients use the public URL — no Tailscale. Kill switch: `docker compose stop kb-traefik`. Residual risk (all NDA data behind one static token) accepted by the owner; the `projects.public` allow-list is the recommended fast-follow.
+Phases 0–5 default: **loopback + bearer**, local/server use (a Tailscale IP remains a valid `KB_BIND` if a private mesh is ever wanted — this deployment does not use one). **Phase 6 (this deployment):** the KB is **deliberately exposed on public HTTPS** via a **Cloudflare Tunnel on 443** at `kb`/`api`/`web.<host>` (an outbound tunnel — no inbound port is forwarded), serving MCP (`kb.<host>/mcp`) + REST (`api.<host>/api`) + a read-only web UI (`web.<host>`) behind the bearer (the public MCP additionally speaks OAuth for the claude.ai connector); laptop/remote clients use the public URLs — no Tailscale. **Kill switch:** `docker compose stop kb-cloudflared` removes all public exposure with zero data change. *(The original Traefik + Let's Encrypt `:8803` listener was **retired 2026-07** — claude.ai's broker refuses the non-standard port and the ISP blocks inbound 443, so the outbound Cloudflare Tunnel replaced it.)* Residual risk (all NDA data behind one static token) accepted by the owner; the `projects.public` allow-list is the recommended fast-follow.
 
 ---
 
@@ -453,6 +453,14 @@ hits from ≥2 different bootstrapped projects; `make eval` stays ≥ 0.7 with t
 **AC:** trace a seeded 3-hop chain (decision → supersedes → old-decision → derived_from → source) rendered correctly; `kb_similar` on the seeded bug returns its fix in top-3; `make eval` hit@5 ≥ 0.8 **including code queries**; `restore_test.sh` prints PASS; review workflow round-trips over MCP.
 
 ### Phase 6 — Public access & resilience (planned 2026-07-02; public exposure chosen deliberately)
+
+> **RETIRED 2026-07 — topology superseded (kept below as design history).** The Traefik + Let's
+> Encrypt `:8803` listener described in this section was replaced by a **Cloudflare Tunnel on 443**
+> (`kb`/`api`/`web.<host>`, outbound tunnel, no inbound port): claude.ai's connector broker refuses
+> the non-standard `:8803` and the ISP blocks inbound 443. The **current kill switch is
+> `docker compose stop kb-cloudflared`** (the `kb-traefik` service no longer exists). Read the
+> `:8803`/Traefik/`kb-traefik` mentions below as the original plan, not the running system; see §10
+> and README for the live topology.
 
 Change of posture (owner decision, own NDA data): the KB is **deliberately exposed on public
 HTTPS** at `https://www.n3rd-bugs.dev:8803` — the SEC-5 scenario the design kept off by default —

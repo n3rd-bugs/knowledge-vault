@@ -38,7 +38,10 @@ class Settings(BaseSettings):
     # Google sign-in for the read-only web UI (kbweb): comma-separated allowlist
     # of emails and the public base URL used to build the OAuth redirect_uri.
     kb_web_allowed_emails: str = ""
-    kb_web_public_url: str = "https://web.n3rd-bugs.dev"
+    # No hardcoded hosts (CLAUDE.md): the real value is supplied via .env /
+    # docker-compose. Empty is safe-and-loud — servers that NEED it (Google
+    # sign-in) refuse to start without it; surfaces that only display it degrade.
+    kb_web_public_url: str = ""
     # Containerized runs bind 0.0.0.0 (container-private, fronted by Traefik/TLS);
     # set true only there. The default still refuses accidental host-public binds.
     kb_allow_any_bind: bool = False
@@ -48,7 +51,10 @@ class Settings(BaseSettings):
     # OAuth (for claude.ai web/mobile connectors). When enabled the public MCP
     # instance accepts BOTH Google OAuth and the static bearer (MultiAuth).
     kb_oauth_enabled: bool = False
-    kb_public_url: str = "https://kb.n3rd-bugs.dev"  # base URL for OAuth metadata/redirects
+    # base URL for OAuth metadata/redirects. No hardcoded hosts (CLAUDE.md): the
+    # real value comes from .env / docker-compose. Empty is safe-and-loud — the
+    # server refuses to start with KB_OAUTH_ENABLED and this unset.
+    kb_public_url: str = ""
     # Public REST base (e.g. https://api.<host>), used by kb_setup to pre-fill the
     # REMOTE session-hook config so a new machine needs only a token. Empty ->
     # kb_setup emits a generic placeholder.

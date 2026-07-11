@@ -127,6 +127,15 @@ ROUTES = [
 
 def build_app() -> Starlette:
     _validate_runtime_config()
+    # Google sign-in builds its redirect_uri from KB_WEB_PUBLIC_URL (auth._redirect_uri);
+    # an empty base yields a relative "/auth/google/callback" that Google rejects.
+    # Refuse to serve the OAuth path misconfigured (no hardcoded host, CLAUDE.md).
+    if settings.google_client_id and not settings.kb_web_public_url.strip():
+        raise SystemExit(
+            "refusing to start: Google sign-in is configured (GOOGLE_CLIENT_ID set) "
+            "but KB_WEB_PUBLIC_URL is empty — set the public web base URL "
+            "(e.g. https://web.example.com) in .env"
+        )
     return Starlette(
         routes=ROUTES,
         middleware=[Middleware(SessionAuthMiddleware)],

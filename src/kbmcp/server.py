@@ -81,6 +81,14 @@ def _build_auth():
     """
     if not settings.kb_oauth_enabled:
         return None
+    if not settings.kb_public_url.strip():
+        # OAuth metadata + the /auth/callback redirect are built from this base;
+        # an empty value yields broken discovery/redirect URIs. Fail loudly rather
+        # than advertise a malformed issuer (no hardcoded host fallback, CLAUDE.md).
+        raise SystemExit(
+            "refusing to start: KB_OAUTH_ENABLED but KB_PUBLIC_URL is empty — "
+            "set the public base URL (e.g. https://kb.example.com) in .env"
+        )
     from fastmcp.server.auth import MultiAuth, StaticTokenVerifier
     from fastmcp.server.auth.providers.google import GoogleProvider
 
@@ -435,6 +443,13 @@ def _validate_runtime_config() -> None:
     ):
         raise SystemExit(
             "refusing to start: KB_OAUTH_ENABLED but GOOGLE_CLIENT_ID/SECRET are unset"
+        )
+    if settings.kb_oauth_enabled and not settings.kb_public_url.strip():
+        # OAuth issuer metadata + the /auth/callback redirect are derived from
+        # KB_PUBLIC_URL; without it the connector gets malformed discovery URIs.
+        raise SystemExit(
+            "refusing to start: KB_OAUTH_ENABLED but KB_PUBLIC_URL is empty — "
+            "set the public base URL (e.g. https://kb.example.com) in .env"
         )
     # The bind guard is skipped only when KB_ALLOW_ANY_BIND is set (containerized,
     # container-private runs fronted by Traefik/TLS). Token checks always apply.

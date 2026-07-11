@@ -79,7 +79,9 @@ def setup_view(request: Request) -> Response:  # GET /setup — connect a target
         "setup.html",
         {
             "token": settings.kb_token,
-            "mcp_url": f"{base}/mcp",
+            # Empty base (KB_PUBLIC_URL unset) must not render a bare, misleading
+            # "/mcp" — leave it blank so the page degrades instead of lying.
+            "mcp_url": f"{base}/mcp" if base else "",
             "rest_url": (settings.kb_public_rest_url or "").rstrip("/"),
             "web_url": settings.kb_web_public_url.rstrip("/"),
         },

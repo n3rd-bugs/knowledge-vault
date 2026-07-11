@@ -1,0 +1,13 @@
+# kb-cloudflared-refresh.timer — re-pull the public edge container monthly (PLAN.md §9)
+[Unit]
+Description=Monthly Knowledge Vault cloudflared edge refresh
+
+[Timer]
+OnCalendar=*-*-01 05:30
+# Spread the pull off the exact minute (and avoid clashing with other monthly units).
+RandomizedDelaySec=6h
+Persistent=true
+Unit=kb-cloudflared-refresh.service
+
+[Install]
+WantedBy=timers.target

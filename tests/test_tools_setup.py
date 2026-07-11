@@ -22,12 +22,25 @@ def _no_configured_rest_url(monkeypatch):
 
 
 def test_setup_assets_match_contrib():
-    """The shipped package-data scripts must stay byte-identical to contrib —
-    the container ships src/ only, so the tool reads the packaged copies."""
-    for name in tools_setup._SCRIPTS:
+    """Single-source guard for the KB hook assets.
+
+    contrib/claude/kb-session-flush/ is CANONICAL; src/kbmcp/setup_assets/ is the
+    shipped package-data copy (the container ships src/ only, so kb_setup reads the
+    packaged copies). Keep them in lockstep with `make sync-assets` (copies contrib
+    -> setup_assets). This asserts the full FILE SET matches (so an added/removed
+    file is caught — SKILL.md is package data outside tools_setup._SCRIPTS and used
+    to escape this guard) AND every file is byte-identical.
+    """
+    contrib_files = sorted(p.name for p in CONTRIB.iterdir() if p.is_file())
+    shipped_files = sorted(p.name for p in tools_setup.ASSETS_DIR.iterdir() if p.is_file())
+    assert shipped_files == contrib_files, (
+        f"asset file set drifted (contrib={contrib_files} shipped={shipped_files}) "
+        "— run `make sync-assets`"
+    )
+    for name in contrib_files:
         shipped = (tools_setup.ASSETS_DIR / name).read_bytes()
         canonical = (CONTRIB / name).read_bytes()
-        assert shipped == canonical, f"{name} drifted from contrib — re-copy it"
+        assert shipped == canonical, f"{name} drifted from contrib — run `make sync-assets`"
 
 
 def test_guide_embeds_all_scripts_and_steps():

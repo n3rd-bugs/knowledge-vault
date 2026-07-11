@@ -1,0 +1,22 @@
+# kb-cloudflared-refresh — monthly re-pull of the public edge container
+# The sole public 443 ingress runs cloudflare/cloudflared:latest (compose sets
+# --no-autoupdate + restart:unless-stopped), so the binary only updates when
+# someone pulls — which otherwise never happens. This re-pulls the newest image
+# and recreates the container so cloudflared security fixes land (PLAN.md §9, OPS).
+# Install: bash scripts/install_systemd.sh (the .timer is installed but NOT enabled;
+# enable manually with: systemctl --user enable --now kb-cloudflared-refresh.timer)
+[Unit]
+Description=Knowledge Vault monthly cloudflared edge refresh (re-pull + recreate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+ExecStart=docker compose -f %h/kb/repo/docker-compose.yml pull kb-cloudflared
+ExecStart=docker compose -f %h/kb/repo/docker-compose.yml up -d kb-cloudflared
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

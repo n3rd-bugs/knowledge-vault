@@ -18,6 +18,8 @@ def test_build_auth_passes_token_ttl(monkeypatch):
     monkeypatch.setattr(settings, "google_client_id", "cid.apps.googleusercontent.com")
     monkeypatch.setattr(settings, "google_client_secret", "GOCSPX-" + "0" * 20)
     monkeypatch.setattr(settings, "kb_token", TEST_TOKEN)
+    # kb_public_url now defaults to "" (no hardcoded host); OAuth requires it set.
+    monkeypatch.setattr(settings, "kb_public_url", "https://kb.example.com")
     monkeypatch.setattr(settings, "kb_oauth_token_ttl", 12_345)
 
     from kbmcp.server import _build_auth

@@ -1,7 +1,7 @@
-.PHONY: up down migrate test lint eval mcp worker consolidate backup restore-test seed reembed help
+.PHONY: up down migrate test lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
 
 help:
-	@echo "targets: up down migrate test lint eval mcp worker consolidate backup restore-test seed reembed"
+	@echo "targets: up down migrate test lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
 
 up:
 	docker compose --env-file .env up -d
@@ -42,6 +42,12 @@ seed:
 
 reembed:
 	uv run kb reembed
+
+# Re-sync the shipped hook assets from their canonical home. contrib/ is the
+# source of truth; src/kbmcp/setup_assets/ is package data the container ships.
+# The test_setup_assets_match_contrib drift test is the tripwire.
+sync-assets:
+	cp contrib/claude/kb-session-flush/* src/kbmcp/setup_assets/
 
 backup:
 	bash scripts/backup.sh

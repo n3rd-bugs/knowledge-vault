@@ -25,7 +25,25 @@ command -v jq >/dev/null 2>&1 || exit 0
 # present, else a perl watchdog that forwards the child's stdout + exit code (macOS
 # always ships perl); if none exist it runs the command bare (curl/uv paths are
 # separately bounded and Claude Code time-caps the hook). Usage: kb_timeout <s> cmd…
-KB_TIMEOUT_BIN=$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)
+# A binary merely NAMED `timeout` is not enough: on Git Bash/Windows
+# `command -v timeout` resolves to C:\Windows\System32\timeout.exe — a WAIT
+# utility that cannot run commands and errors on redirected stdin — which would
+# make pre-brief + recall a silent no-op on the one platform these hooks
+# painstakingly support (KB item 496/525 Windows). Trust a candidate only if it
+# behaves like GNU/BSD timeout: a coreutils `--version`, or a self-test that
+# actually BOUNDS a command with stdin redirected (`<candidate> 1 true`, which the
+# Windows tool rejects with "Input redirection is not supported"). Otherwise fall
+# through to gtimeout / the perl watchdog (Git Bash ships perl). (MED-2)
+_kb_timeout_ok() {
+  [ -n "$1" ] || return 1
+  "$1" --version 2>/dev/null | grep -qi coreutils && return 0
+  "$1" 1 true </dev/null >/dev/null 2>&1
+}
+KB_TIMEOUT_BIN=""
+for _cand in "$(command -v timeout 2>/dev/null)" "$(command -v gtimeout 2>/dev/null)"; do
+  [ -n "$_cand" ] || continue
+  if _kb_timeout_ok "$_cand"; then KB_TIMEOUT_BIN="$_cand"; break; fi
+done
 kb_timeout() {
   local dur=$1; shift
   if [ -n "$KB_TIMEOUT_BIN" ]; then
@@ -34,7 +52,7 @@ kb_timeout() {
     perl -e '
       my $t = shift @ARGV;
       my $pid = fork();
-      if (!defined $pid) { exec @ARGV or exit 127; }
+      if (!defined $pid) { exit 127; }   # fork failed: bail, do NOT exec unbounded; caller || HITS= degrades (LOW-1)
       if ($pid == 0)     { exec @ARGV or exit 127; }
       my $to = 0;
       local $SIG{ALRM} = sub { $to = 1; kill "TERM", $pid; };
@@ -166,8 +184,19 @@ if [ "$MODE" = "brief" ]; then
     # later " ok bytes=" (the retry drained) means the failure is stale and must
     # not resurface as noise every session (regression the recall-noise fix hit).
     RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
-      /FAILED|BUG:|http=[45][0-9][0-9]/ { fail=$0; failn=NR }
-      / ok bytes=/                      { okn=NR }
+      /FAILED|BUG:|http=[45][0-9][0-9]/ { fail=$0; failn=NR; next }
+      / (ok|partial) bytes=/ {
+        # Belt and braces (HIGH-1): a summary whose (offset X/Y) shows X<Y is an
+        # INCOMPLETE drain — count it as a failure even if the matching FAILED line
+        # scrolled out of the tail window, or this was the terminal SessionEnd
+        # firing that strands the tail forever. Only a fully-drained X>=Y line
+        # (the LOCAL/network " ok bytes=" marker) clears a prior failure.
+        if (match($0, /offset [0-9]+\/[0-9]+/)) {
+          seg = substr($0, RSTART + 7, RLENGTH - 7)
+          if (split(seg, a, "/") == 2 && (a[1] + 0) < (a[2] + 0)) { fail=$0; failn=NR }
+          else { okn=NR }
+        } else { okn=NR }
+      }
       END { if (failn > 0 && failn > okn) print fail }')
     [ -n "$RECENT_FAIL" ] && FLUSH_WARN="⚠ KB session-flush reported a recent failure — capture may be
 incomplete until it succeeds (it retries each compaction). Last error:

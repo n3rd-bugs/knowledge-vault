@@ -46,6 +46,13 @@ _find_claude() {
 }
 
 if [ ! -f "$CFG" ]; then
+  # Create the config with owner-only perms BEFORE the bearer token is written.
+  # Under the default umask 022 a plain '>' redirect would create $CFG as 0644,
+  # leaving KB_TOKEN world-readable in the window before the chmod below — and
+  # permanently 0644 if the installer is interrupted between write and chmod.
+  # install(1) sets the mode atomically at creation; the '>' rewrites below keep
+  # it (redirection to an existing file does not change its mode). (LOW-3)
+  install -m 600 /dev/null "$CFG"
   KB_DIR_GUESS="${KB_DIR:-$HOME/data-server}"
   MCP_LINE="$(_discover_mcp || true)"
   CLAUDE_BIN_FOUND="$(_find_claude || true)"

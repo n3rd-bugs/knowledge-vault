@@ -106,12 +106,19 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   `bash.exe` + args (Claude Code on Windows spawns exe+args, not a shell), jq
   co-located next to the hooks + PATH-prepended, and native `C:\...` event
   paths converted with `cygpath` before use.
-- **macOS / BSD** — the brief+recall hook wraps every bounded search in a portable
-  `kb_timeout`: it uses GNU `timeout` when present (Linux — unchanged), else
-  `gtimeout` (Homebrew coreutils), else a built-in perl watchdog (perl always
-  ships on macOS) that forwards the child's stdout + exit code. Stock macOS has no
-  `timeout` binary, so without this the pre-brief and per-prompt recall were a
-  silent no-op there.
+- **macOS / BSD / Windows** — the brief+recall hook wraps every bounded search in a
+  portable `kb_timeout`: it uses GNU `timeout` when present (Linux — unchanged),
+  else `gtimeout` (Homebrew coreutils), else a built-in perl watchdog (perl ships
+  on macOS and Git Bash) that forwards the child's stdout + exit code. Stock macOS
+  has no `timeout` binary, so without this the pre-brief and per-prompt recall were
+  a silent no-op there. A resolved `timeout`/`gtimeout` is TRUSTED only after a
+  behaviour check (a coreutils `--version`, or a `<bin> 1 true` self-test with stdin
+  redirected): on Git Bash `command -v timeout` finds
+  `C:\Windows\System32\timeout.exe` — a wait utility that cannot run commands and
+  rejects redirected stdin — so the bare name is not enough; it is rejected and the
+  perl watchdog is used instead. If the perl `fork()` itself fails (heavy
+  fork/memory pressure) `kb_timeout` now bails with an error rather than running the
+  command unbounded, and the caller degrades to no recall for that firing.
 - **Reachability probe / no prompt stalls** — because `UserPromptSubmit` recall runs
   synchronously (15 s hook budget), a cheap reachability check runs first: a
   `curl --connect-timeout 2` connect to the KB (MCP/REMOTE) or a trivial local check
@@ -131,7 +138,15 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
 - **Never-silent failures**: the flush hook refuses to POST an empty/invalid
   body (logs `BUG: request body build failed`), and the SessionStart pre-brief
   surfaces any recent flush failure INTO the next session's context so it is
-  seen, not buried in a log (item 495's sting was silent loss).
+  seen, not buried in a log (item 495's sting was silent loss). A flush firing
+  logs `ok bytes=… (offset X/Y)` ONLY when fully drained (`X>=Y`); a firing that
+  broke early (a failed chunk, a held partial line, or the per-firing cap) logs a
+  truthful `partial bytes=… (offset X/Y) — will resume` instead. The pre-brief
+  reads any `partial` (offset `X<Y`) as an unresolved failure — so a partial drop
+  on the terminal `SessionEnd`, where there is no next firing, can no longer be
+  masked by an earlier chunk's success and vanish silently. LOCAL enqueue logs the
+  same `ok bytes=` marker on success, so a one-off transient failure self-clears at
+  the next successful firing instead of nagging every new session.
 - `settings.json` merge is idempotent (matches both command and args forms) and
   preserves any other hooks you have.
 - To disable: remove the entries from `~/.claude/settings.json` `hooks`, or

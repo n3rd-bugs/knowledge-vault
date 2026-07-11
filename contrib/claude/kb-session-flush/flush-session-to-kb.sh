@@ -67,7 +67,17 @@ if [ -n "${KB_DIR:-}" ]; then
   "$DETACH" bash -c '
     echo "$(date -Is) local $PROJECT $T"
     cd "$KB_DIR" 2>/dev/null || { echo "$(date -Is) local $PROJECT BUG: KB_DIR unreachable ($KB_DIR)"; exit 0; }
-    "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue       || echo "$(date -Is) local $PROJECT FAILED: kb ingest-session errored"
+    if "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue; then
+      # Log the same fully-drained success marker the network paths emit, so a
+      # prior stale FAILED self-clears in the pre-brief warn logic instead of
+      # resurfacing as noise for ~40 firings (LOCAL never chunks — a successful
+      # enqueue is always a full drain, hence offset SZ/SZ).
+      SZ=$(stat -c%s "$T" 2>/dev/null || stat -f%z "$T" 2>/dev/null || wc -c <"$T" | tr -d " ")
+      case "$SZ" in ""|*[!0-9]*) SZ=0 ;; esac
+      echo "$(date -Is) local $PROJECT ok bytes=$SZ (offset $SZ/$SZ)"
+    else
+      echo "$(date -Is) local $PROJECT FAILED: kb ingest-session errored"
+    fi
   ' </dev/null >>"$LOG" 2>&1 &
 elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TOKEN:-}" ]; then
   # MCP or REMOTE: submit the delta over the network, CHUNKED. Large sessions
@@ -172,7 +182,19 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         *) echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume"; break ;;
       esac
     done
-    [ "$SENT" -gt 0 ] && echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+    # Truthful summary: only a FULLY drained firing (OFFSET>=SIZE) logs the
+    # " ok bytes=" success line the pre-brief matches. A firing that broke early
+    # (chunk FAILED, held partial line, or per-firing cap) logs a "partial" line
+    # that does NOT match that pattern — so a failed chunk followed by earlier
+    # successes can no longer masquerade as success and strand the tail forever
+    # on the terminal SessionEnd firing (HIGH-1).
+    if [ "$SENT" -gt 0 ]; then
+      if [ "$OFFSET" -ge "$SIZE" ]; then
+        echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+      else
+        echo "$(date -Is) flush $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE) — will resume"
+      fi
+    fi
     # Terminal event, fully drained: drop this session'"'"'s offset file (else it is
     # dead weight forever). The 30-day sweep at hook start catches the rest.
     [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
@@ -220,14 +242,30 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       fi
       OUT=$("$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
       rm -f "$TMPC"
+      # OUT is untrusted model output: a headless claude -p run whose stdin is the
+      # raw transcript delta, so an adversarial tool-result/webpage seen during the
+      # session can steer it. Classify on the raw $OUT, but LOG a sanitized copy —
+      # the pre-brief later lifts FAILED lines verbatim into the next session
+      # context, so an un-truncated line is a prompt-injection + context-bloat
+      # vector (LOW-2). Strip control chars + backticks, cap at 200 chars.
+      OUTLOG=$(printf "%s" "$OUT" | tr -d "[:cntrl:]\140" | cut -c1-200)
       case "$OUT" in
         *[Ff][Aa][Ii][Ll]*|*[Ee]rror*|*NOTOOL*|*unavailable*)
-          echo "$(date -Is) connector $PROJECT chunk FAILED ($OUT) at offset $OFFSET — will resume"; break ;;
+          echo "$(date -Is) connector $PROJECT chunk FAILED ($OUTLOG) at offset $OFFSET — will resume"; break ;;
         *[0-9]*) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
-        *) echo "$(date -Is) connector $PROJECT chunk FAILED (no id: $OUT) at offset $OFFSET — will resume"; break ;;
+        *) echo "$(date -Is) connector $PROJECT chunk FAILED (no id: $OUTLOG) at offset $OFFSET — will resume"; break ;;
       esac
     done
-    [ "$SENT" -gt 0 ] && echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+    # Truthful summary (HIGH-1): only a fully-drained firing logs " ok bytes=";
+    # an early break (chunk FAILED / held partial line / per-firing cap) logs a
+    # "partial" line the pre-brief does not read as success.
+    if [ "$SENT" -gt 0 ]; then
+      if [ "$OFFSET" -ge "$SIZE" ]; then
+        echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+      else
+        echo "$(date -Is) connector $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE) — will resume"
+      fi
+    fi
     [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -ge "$KB_CONNECTOR_MAX" ] &&       echo "$(date -Is) connector $PROJECT per-firing cap reached; $((SIZE-OFFSET)) bytes resume next firing"
     # Terminal event, fully drained: drop this session'"'"'s offset file.
     [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null

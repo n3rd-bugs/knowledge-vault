@@ -13,11 +13,11 @@ case "$ARGS" in @*) ARGSFILE="${ARGS#@}";; esac
 command -v jq >/dev/null 2>&1 || { echo "need jq" >&2; exit 1; }
 AUTH="Authorization: Bearer $KB_TOKEN"; CT="Content-Type: application/json"
 AC="Accept: application/json, text/event-stream"
-SID=$(curl -s -D - -o /dev/null --max-time 20 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
+SID=$(curl -s -D - -o /dev/null --connect-timeout 3 --max-time 20 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"kb-hook","version":"1"}}}' \
   | awk 'tolower($1)=="mcp-session-id:"{print $2}' | tr -d '\r')
 [ -n "$SID" ] || { echo "no mcp session (auth/url?)" >&2; exit 1; }
-curl -s -o /dev/null --max-time 20 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
+curl -s -o /dev/null --connect-timeout 3 --max-time 20 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
   -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 # Build the request into a FILE (never argv) so chunk-sized payloads work.
 REQF=$(mktemp)
@@ -28,7 +28,7 @@ else
   jq -cn --arg n "$TOOL" --argjson a "$ARGS" \
     '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:$n,arguments:$a}}' >"$REQF"
 fi
-RESP=$(curl -s --max-time 60 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
+RESP=$(curl -s --connect-timeout 3 --max-time 60 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
   -H "Mcp-Session-Id: $SID" --data @"$REQF")
 rm -f "$REQF"
 if printf '%s' "$RESP" | jq -e '.result and (.result.isError | not)' >/dev/null 2>&1; then

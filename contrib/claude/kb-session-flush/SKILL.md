@@ -23,8 +23,11 @@ This skill installs three hook behaviors (two scripts):
    controls: slash commands and <12-char prompts skip; a CONTENT-WORD GATE skips
    prompts made only of acknowledgements/stopwords/generic imperatives ("Yes
    please review and update") — hybrid search would return k-best noise for
-   those; and a repeat of the same query within 10 min is suppressed (its hits
-   are already in context). Disable with `KB_PROMPT_RECALL=0`.
+   those; and a repeat of the same query within 10 min IN THE SAME SESSION is
+   suppressed (its hits are already in context). The suppression gate is keyed
+   per session (`session_id`) + project + query, in per-session state files, so a
+   different session, a different project, or `/clear` (a fresh session id) never
+   falsely suppresses recall. Disable with `KB_PROMPT_RECALL=0`.
    CONNECTOR mode is skipped here by default (a headless `claude -p` per prompt
    costs tokens + latency) — opt in with `KB_PROMPT_RECALL_CONNECTOR=1`. Both
    pre-brief and recall are the same script (`kb-session-brief.sh`), branching on
@@ -103,6 +106,28 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   `bash.exe` + args (Claude Code on Windows spawns exe+args, not a shell), jq
   co-located next to the hooks + PATH-prepended, and native `C:\...` event
   paths converted with `cygpath` before use.
+- **macOS / BSD** — the brief+recall hook wraps every bounded search in a portable
+  `kb_timeout`: it uses GNU `timeout` when present (Linux — unchanged), else
+  `gtimeout` (Homebrew coreutils), else a built-in perl watchdog (perl always
+  ships on macOS) that forwards the child's stdout + exit code. Stock macOS has no
+  `timeout` binary, so without this the pre-brief and per-prompt recall were a
+  silent no-op there.
+- **Reachability probe / no prompt stalls** — because `UserPromptSubmit` recall runs
+  synchronously (15 s hook budget), a cheap reachability check runs first: a
+  `curl --connect-timeout 2` connect to the KB (MCP/REMOTE) or a trivial local check
+  (LOCAL). A dead/blackholed KB skips recall in ~2 s instead of stalling the prompt
+  for the whole budget. All inner search timeouts are kept strictly under the hook
+  budget (recall ≤ ~8 s, connector recall ≤ 12 s), and `kb-mcp-call.sh` curls carry
+  `--connect-timeout 3`.
+- **Partial-line safety** — a flush window that ends in an unterminated JSONL line
+  is trimmed to the last complete line and the remainder is held for the next
+  firing (never advanced past mid-line, so no straddled message is lost); the
+  terminal `SessionEnd` firing sends the final line as-is so nothing is dropped.
+- **Bounded state** — the CONNECTOR/MCP/REMOTE `.offset` files are deleted on a
+  fully-drained `SessionEnd` and swept if older than 30 days; `flush-session.log`
+  is truncated to its last 500 lines once it exceeds 1 MB; per-session `recall-*`
+  state files older than 7 days are pruned. All housekeeping is confined to the
+  hooks' own `~/.claude/hooks` state/log dirs.
 - **Never-silent failures**: the flush hook refuses to POST an empty/invalid
   body (logs `BUG: request body build failed`), and the SessionStart pre-brief
   surfaces any recent flush failure INTO the next session's context so it is

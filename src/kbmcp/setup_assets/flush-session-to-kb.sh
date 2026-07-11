@@ -46,6 +46,20 @@ PROJECT=$(basename "${CWD:-sessions}" | tr '[:upper:]' '[:lower:]' \
 LOG="$HOME/.claude/hooks/flush-session.log"
 export T CWD SID PROJECT LOG
 
+# Opportunistic housekeeping — bound our OWN state/log growth so a daily-driver
+# machine doesn't accumulate thousands of dead .offset files and an unrotated
+# multi-MB log. Cheap (runs before the detach) and scoped strictly to the hooks'
+# own dirs; never touches anything else.
+STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE" 2>/dev/null || true
+find "$STATE" -name '*.offset' -mtime +30 -delete 2>/dev/null || true
+if [ -f "$LOG" ]; then
+  LSIZE=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || wc -c <"$LOG" | tr -d " ")
+  case "$LSIZE" in ""|*[!0-9]*) LSIZE=0 ;; esac
+  if [ "$LSIZE" -gt 1048576 ]; then
+    tail -n 500 "$LOG" >"$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG" 2>/dev/null || rm -f "$LOG.t" 2>/dev/null
+  fi
+fi
+
 if [ -n "${KB_DIR:-}" ]; then
   # LOCAL: trusted CLI enqueue — checkpointed, GPU-free (nightly drain extracts).
   UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
@@ -92,6 +106,18 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         if [ "$KEEP" -gt 0 ]; then
           head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"
           BYTES=$KEEP
+        elif [ "$BYTES" -lt "$CHUNK" ]; then
+          # No newline anywhere AND smaller than a full chunk => a single line still
+          # being written. HOLD it (break, no advance) so the COMPLETED line is picked
+          # up next firing, instead of shipping a half-line the drain drops as malformed
+          # JSON. EXCEPTION: the terminal SessionEnd firing at EOF has no next firing —
+          # send the final line as-is rather than lose it silently (the drain still
+          # drops it only if truly malformed, so sending never loses data).
+          if [ "$EV" = "SessionEnd" ] && [ $((OFFSET + BYTES)) -ge "$SIZE" ]; then
+            :
+          else
+            rm -f "$TMPC"; break
+          fi
         fi
       fi
       if [ -n "$KB_MCP_URL" ]; then
@@ -147,6 +173,9 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
       esac
     done
     [ "$SENT" -gt 0 ] && echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+    # Terminal event, fully drained: drop this session'"'"'s offset file (else it is
+    # dead weight forever). The 30-day sweep at hook start catches the rest.
+    [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
   ' </dev/null >>"$LOG" 2>&1 &
 elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # CONNECTOR: zero-config — uses the claude.ai KB connector bridged into
@@ -174,10 +203,20 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       tail -c +$((OFFSET+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" >"$TMPC"
       BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")
       [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
-      if [ $((OFFSET + BYTES)) -lt "$SIZE" ] && [ "$(tail -c1 "$TMPC")" != "" ]; then
+      if [ "$(tail -c1 "$TMPC")" != "" ]; then
         PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
-        [ "$KEEP" -gt 0 ] || KEEP=$BYTES
-        head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
+        if [ "$KEEP" -gt 0 ]; then
+          head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
+        elif [ "$BYTES" -lt "$KB_CONNECTOR_CHUNK" ]; then
+          # single still-being-written partial line: hold for the next firing rather
+          # than ship a half-line — UNLESS this is the terminal SessionEnd firing at
+          # EOF (no next firing), where we send the final line as-is to avoid losing it.
+          if [ "$EV" = "SessionEnd" ] && [ $((OFFSET + BYTES)) -ge "$SIZE" ]; then
+            :
+          else
+            rm -f "$TMPC"; break
+          fi
+        fi
       fi
       OUT=$("$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
       rm -f "$TMPC"
@@ -190,6 +229,8 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     done
     [ "$SENT" -gt 0 ] && echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
     [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -ge "$KB_CONNECTOR_MAX" ] &&       echo "$(date -Is) connector $PROJECT per-firing cap reached; $((SIZE-OFFSET)) bytes resume next firing"
+    # Terminal event, fully drained: drop this session'"'"'s offset file.
+    [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
   ' </dev/null >>"$LOG" 2>&1 &
 fi
 exit 0

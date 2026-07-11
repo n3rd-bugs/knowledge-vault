@@ -9,7 +9,7 @@ text is never persisted — only the scrubbed content is stored. All SQL lives h
 from __future__ import annotations
 
 import hashlib
-from typing import Any
+from typing import Any, NamedTuple
 
 from psycopg.types.json import Jsonb
 
@@ -30,6 +30,15 @@ MAX_ATTEMPTS = 3
 RESERVED_PROJECTS = frozenset({"kb-system"})
 
 
+class EnqueueResult(NamedTuple):
+    """Outcome of an enqueue: ``id`` is the drainable row (None ⇒ live duplicate);
+    ``requeued`` is True when a TERMINALLY-FAILED row was reset to 'pending' so
+    callers can distinguish "re-queued after failure" from "already queued"."""
+
+    id: int | None
+    requeued: bool
+
+
 def enqueue(
     project: str,
     content: str,
@@ -39,14 +48,21 @@ def enqueue(
     commit: str | None = None,
     source_uri: str | None = None,
     allow_reserved: bool = False,
-) -> int | None:
-    """Scrub and enqueue a submission. Returns the row id, or None if a duplicate.
+) -> EnqueueResult:
+    """Scrub and enqueue a submission. Returns an :class:`EnqueueResult`.
 
     Rejects unknown kinds, empty content, and oversized content (domain errors).
     The content is SCRUBBED before storage and the dedupe hash is over the
     scrubbed text, so re-submitting identical content is a no-op. ``allow_reserved``
     is set only by trusted LOCAL callers (the CLI session flush) so a PreCompact
     hook may file into kb-system; the public REST/MCP path always leaves it false.
+
+    Resubmitting content whose only existing row is TERMINALLY FAILED (status
+    'failed', attempts ≥ MAX_ATTEMPTS) resets that row to 'pending'/attempts=0 and
+    returns its id with ``requeued=True`` — a status flip (Invariant 5), so a bug
+    fixed after the cap was hit no longer strands the content behind the dedupe
+    UNIQUE. A row that is still pending/in-flight/extracted/under-cap stays a no-op
+    (id=None) so a live submission is never disturbed.
     """
     if kind not in QUEUE_KINDS:
         raise InvalidOperation(f"unknown ingest kind {kind!r}; one of {', '.join(QUEUE_KINDS)}")
@@ -80,16 +96,25 @@ def enqueue(
         meta["redactions"] = redactions
 
     with transaction() as conn:
+        # ON CONFLICT re-opens ONLY a terminally-failed row; other statuses fail the
+        # DO UPDATE ... WHERE, so RETURNING yields no row (id=None). The system
+        # column xmax is 0 on a fresh INSERT and non-zero on an UPDATE, which tells
+        # a re-queue apart from a brand-new enqueue.
         row = conn.execute(
             """
             INSERT INTO ingest_queue (project, kind, content, content_hash, meta)
             VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (kind, project, content_hash) DO NOTHING
-            RETURNING id
+            ON CONFLICT (kind, project, content_hash) DO UPDATE
+              SET status = 'pending', attempts = 0, error = NULL,
+                  meta = EXCLUDED.meta, processed_at = NULL
+              WHERE ingest_queue.status = 'failed' AND ingest_queue.attempts >= %s
+            RETURNING id, (xmax <> 0)
             """,
-            (project, kind, clean, content_hash, Jsonb(meta)),
+            (project, kind, clean, content_hash, Jsonb(meta), MAX_ATTEMPTS),
         ).fetchone()
-    return int(row[0]) if row else None
+    if row is None:
+        return EnqueueResult(None, requeued=False)
+    return EnqueueResult(int(row[0]), requeued=bool(row[1]))
 
 
 def pending(limit: int = 50) -> list[dict[str, Any]]:

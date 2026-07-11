@@ -17,7 +17,37 @@ from typing import Any
 import httpx
 
 from kbcore.config import settings
-from kbcore.errors import ExtractorUnavailable
+from kbcore.errors import ExtractionFailed, ExtractorUnavailable
+
+# Extractor sampling: pin temperature=0 and a fixed seed so a row re-drained after
+# partial progress (a crash mid-batch left N items committed) re-extracts the SAME
+# titles/bodies — content-hash dedupe then collapses the retry instead of minting
+# reworded near-duplicates (Invariant 3).
+EXTRACT_TEMPERATURE = 0
+EXTRACT_SEED = 42
+
+
+def _classify_extractor_error(e: httpx.HTTPError) -> Exception:
+    """Split an httpx error into connectivity (defer) vs content (bounded) failure.
+
+    Connectivity → :class:`ExtractorUnavailable` (Ollama down/restarting, model not
+    pulled/loaded, a 5xx hiccup): the drain leaves the row pending and retries.
+    Content/timeout → :class:`ExtractionFailed` (a per-row ReadTimeout on the long
+    budget, or a 4xx shaped by this request): the drain bounds it with the attempts
+    cap so a poison row can't retry every night forever (queue self-heal taxonomy).
+    """
+    msg = f"extraction call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        body = (e.response.text or "").lower()
+        model_missing = status == 404 or ("model" in body and "not found" in body)
+        if not model_missing and 400 <= status < 500:
+            return ExtractionFailed(msg)  # bad request shaped by this row's content
+        return ExtractorUnavailable(msg)  # model-not-loaded / 5xx → transient
+    if isinstance(e, httpx.TimeoutException) and not isinstance(e, httpx.ConnectTimeout):
+        return ExtractionFailed(msg)  # read timeout: THIS row is too heavy — bound it
+    return ExtractorUnavailable(msg)  # connect errors and other transport failures
+
 
 # Reasoning models (deepseek-r1, qwen3 with thinking on, ...) may wrap or prefix
 # the answer with a <think>...</think> block, and some models fence the JSON in
@@ -100,6 +130,7 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
         "format": "json",
         "keep_alive": _keep_alive(),
         "stream": False,
+        "options": {"temperature": EXTRACT_TEMPERATURE, "seed": EXTRACT_SEED},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": transcript_text},
@@ -109,15 +140,15 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
         resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
     except httpx.HTTPError as e:
-        raise ExtractorUnavailable(
-            f"extraction call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
-        ) from e
+        raise _classify_extractor_error(e) from e
 
     try:
         content = resp.json()["message"]["content"]
         data = parse_model_json(content)
     except (KeyError, ValueError, TypeError) as e:
-        raise ExtractorUnavailable(
+        # Deterministic in this row's content (truncated JSON, unterminated <think>,
+        # missing message key): bound it with the attempts cap, don't defer forever.
+        raise ExtractionFailed(
             f"extractor returned unparseable output: {e.__class__.__name__}: {e}"
         ) from e
 

@@ -9,11 +9,32 @@ from __future__ import annotations
 import httpx
 
 from kbcore.config import settings
-from kbcore.errors import EmbedderUnavailable
+from kbcore.errors import EmbedderUnavailable, ExtractionFailed
 
 # Short keep-alive per OPS-1 — embedder loads on demand and unloads fast.
 KEEP_ALIVE = "2m"
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+
+
+def _classify_embed_error(e: httpx.HTTPError) -> Exception:
+    """Connectivity (defer) vs content (bounded) for an embed HTTP failure.
+
+    Mirror of llm._classify_extractor_error: a per-row ReadTimeout or a 4xx shaped
+    by a pathological chunk is deterministic → :class:`ExtractionFailed` (the queue
+    drain bounds it via the attempts cap); connect errors, model-not-loaded and 5xx
+    are transient → :class:`EmbedderUnavailable` (deferred and retried).
+    """
+    msg = f"embedding call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        body = (e.response.text or "").lower()
+        model_missing = status == 404 or ("model" in body and "not found" in body)
+        if not model_missing and 400 <= status < 500:
+            return ExtractionFailed(msg)
+        return EmbedderUnavailable(msg)
+    if isinstance(e, httpx.TimeoutException) and not isinstance(e, httpx.ConnectTimeout):
+        return ExtractionFailed(msg)
+    return EmbedderUnavailable(msg)
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
@@ -32,10 +53,9 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         resp.raise_for_status()
     except httpx.HTTPError as e:
         # Clean domain error for CLI/MCP consumers; full trace stays in logs
-        # (CLAUDE.md §Code style).
-        raise EmbedderUnavailable(
-            f"embedding call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
-        ) from e
+        # (CLAUDE.md §Code style). Connectivity → EmbedderUnavailable (defer);
+        # content/timeout → ExtractionFailed (attempts-capped in the drain).
+        raise _classify_embed_error(e) from e
     vectors = resp.json()["embeddings"]
     for v in vectors:
         if len(v) != settings.kb_embed_dim:

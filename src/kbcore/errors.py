@@ -28,4 +28,19 @@ class EmbedderUnavailable(KBError):
 
 
 class ExtractorUnavailable(KBError):
-    """The Ollama extractor (/api/chat) could not be reached or returned unusable output."""
+    """The Ollama extractor (/api/chat) could not be reached (connectivity blip).
+
+    Reserved for TRANSIENT availability failures — connect errors, a model that is
+    not pulled/loaded, a 5xx server hiccup. The queue drain DEFERS these (row stays
+    'pending', attempts unchanged) so the next run retries once Ollama is back.
+    """
+
+
+class ExtractionFailed(KBError):
+    """The extractor ran but the FAILURE is deterministic in this row's content.
+
+    Unparseable / unterminated-<think> output, an HTTP 4xx shaped by the request,
+    or a per-row read timeout on the long budget — re-running the 14B on the same
+    text will fail identically. The queue drain marks these 'failed' (incrementing
+    attempts) so the attempts cap bounds a poison row instead of retrying forever.
+    """

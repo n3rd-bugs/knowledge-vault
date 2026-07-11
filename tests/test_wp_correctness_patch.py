@@ -1,0 +1,405 @@
+"""Correctness-patch batch — surface coverage for the reviewed WP1/WP2/queue fixes.
+
+MCP tool layer (FastMCP in-memory Client), REST (Starlette TestClient), CLI
+(typer CliRunner), and the ingest-queue self-heal taxonomy. Real DB in kb_test;
+Ollama mocked by conftest. Groups the tests that cross a public surface so the
+WP1/WP2 unit files stay focused on kbcore behavior.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from datetime import UTC, datetime
+
+import pytest
+from fastmcp import Client
+from fastmcp.exceptions import ToolError
+from starlette.testclient import TestClient
+from typer.testing import CliRunner
+
+from kbcore import db, graph, ingest_queue
+from kbcore.config import settings
+from kbcore.errors import ExtractionFailed, ExtractorUnavailable
+from kbcore.ingest import ingest
+from kbcore.items import get_item
+from kbworker import consolidate, sessions
+
+TEST_TOKEN = "kbtest-" + "0" * 32
+AUTH = {"Authorization": f"Bearer {TEST_TOKEN}"}
+
+
+def _blind(item_id: int) -> int:
+    """NULL an item's embedding so only graph expansion can surface it."""
+    with db.transaction() as conn:
+        conn.execute("UPDATE chunks SET embedding = NULL WHERE item_id = %s", (item_id,))
+    return item_id
+
+
+# --- MCP tool layer (kb_search as_of/expand, kb_save/kb_supersede valid-time) --
+
+
+def _mcp_call(tool: str, args: dict) -> str:
+    from kbmcp.server import mcp
+
+    async def run() -> str:
+        async with Client(mcp) as client:
+            res = await client.call_tool(tool, args)
+            return res.content[0].text
+
+    return asyncio.run(run())
+
+
+def test_mcp_kb_save_and_search_valid_time(kb):
+    out = _mcp_call(
+        "kb_save",
+        {
+            "project": "mcpvt",
+            "type": "note",
+            "title": "vt fact",
+            "body": "widgetzap is the fact",
+            "valid_from": "2026-01-01",
+            "valid_to": "2026-12-31",
+        },
+    )
+    assert "saved item" in out
+    assert "vt fact" in _mcp_call("kb_search", {"query": "widgetzap", "as_of": "2026-06-01"})
+    assert "vt fact" not in _mcp_call("kb_search", {"query": "widgetzap", "as_of": "2027-06-01"})
+
+
+def test_mcp_kb_save_rejects_inverted_interval(kb):
+    with pytest.raises(ToolError, match="strictly before"):
+        _mcp_call(
+            "kb_save",
+            {
+                "project": "mcpinv",
+                "type": "note",
+                "title": "inv",
+                "body": "x",
+                "valid_from": "2026-12-01",
+                "valid_to": "2026-01-01",
+            },
+        )
+
+
+def test_mcp_kb_search_expand_pulls_the_linked_neighbor(kb):
+    bug = ingest("mcpx", "bug", "Gearbox stalls", "the gearbox stalls under load")
+    fix = ingest("mcpx", "note", "Coupling fix", "replace the coupling")
+    graph.link(fix, "fixes", bug)
+    _blind(fix)
+    assert "Coupling fix" in _mcp_call("kb_search", {"query": "gearbox", "expand": True})
+    assert "Coupling fix" not in _mcp_call("kb_search", {"query": "gearbox", "expand": False})
+
+
+def test_mcp_kb_supersede_override_and_autoclose(kb):
+    save = _mcp_call(
+        "kb_save",
+        {
+            "project": "mcpss",
+            "type": "note",
+            "title": "orig",
+            "body": "widgetsup original fact",
+            "valid_from": "2024-01-01",
+        },
+    )
+    old_id = int(re.search(r"item (\d+)", save).group(1))
+    out = _mcp_call(
+        "kb_supersede",
+        {
+            "old_id": old_id,
+            "reason": "moved",
+            "new_body": "widgetsup moved fact",
+            "valid_from": "2025-01-01",
+        },
+    )
+    assert "superseded by" in out
+    assert get_item(old_id).valid_to == datetime(2025, 1, 1, tzinfo=UTC), "old window auto-closed"
+
+
+# --- REST surface (as_of/expand search, valid-time item + supersede) ----------
+
+
+@pytest.fixture()
+def client(kb, monkeypatch):
+    monkeypatch.setattr(settings, "kb_token", TEST_TOKEN)
+    monkeypatch.setattr(settings, "kb_bind", "127.0.0.1")
+    from kbrest.server import build_app
+
+    return TestClient(build_app())
+
+
+def test_rest_post_item_valid_time_and_interval_dedupe(client):
+    body = {
+        "project": "rvt",
+        "type": "note",
+        "title": "proto",
+        "body": "widget uses proto",
+        "valid_from": "2026-01-01T00:00:00Z",
+        "valid_to": "2026-07-01T00:00:00Z",
+    }
+    r = client.post("/api/items", headers=AUTH, json=body)
+    assert r.status_code == 201 and r.json()["duplicate"] is False
+    first_id = r.json()["item_id"]
+    # same text, DIFFERENT interval → a distinct assertion, not a duplicate
+    r2 = client.post(
+        "/api/items",
+        headers=AUTH,
+        json={**body, "valid_from": "2026-07-01T00:00:00Z", "valid_to": None},
+    )
+    assert r2.json()["duplicate"] is False and r2.json()["item_id"] != first_id
+    # exact same interval again → duplicate, pointing back at the first row
+    r3 = client.post("/api/items", headers=AUTH, json=body)
+    assert r3.json()["duplicate"] is True and r3.json()["item_id"] == first_id
+    # GET echoes the interval
+    g = client.get(f"/api/items/{first_id}", headers=AUTH)
+    assert g.json()["valid_from"].startswith("2026-01-01")
+
+
+def test_rest_post_item_rejects_inverted_interval(client):
+    r = client.post(
+        "/api/items",
+        headers=AUTH,
+        json={
+            "project": "rinv",
+            "type": "note",
+            "title": "inv",
+            "body": "x",
+            "valid_from": "2026-12-01T00:00:00Z",
+            "valid_to": "2026-01-01T00:00:00Z",
+        },
+    )
+    assert r.status_code == 400 and "strictly before" in r.json()["error"]
+
+
+def test_rest_supersede_override_and_autoclose(client):
+    old = ingest(
+        "rss", "note", "orig", "widget original", valid_from=datetime(2024, 1, 1, tzinfo=UTC)
+    )
+    r = client.post(
+        f"/api/items/{old}/supersede",
+        headers=AUTH,
+        json={"reason": "moved", "new_body": "widget moved", "valid_from": "2025-01-01T00:00:00Z"},
+    )
+    assert r.status_code == 200
+    new_id = r.json()["new_item_id"]
+    assert client.get(f"/api/items/{new_id}", headers=AUTH).json()["valid_from"].startswith("2025")
+    assert client.get(f"/api/items/{old}", headers=AUTH).json()["valid_to"].startswith("2025")
+
+
+def test_rest_search_expand_and_as_of(client):
+    bug = ingest(
+        "rse",
+        "bug",
+        "Gearbox stalls",
+        "the gearbox stalls",
+        valid_from=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    fix = ingest(
+        "rse",
+        "note",
+        "Coupling fix",
+        "replace the coupling",
+        valid_from=datetime(2026, 9, 1, tzinfo=UTC),
+    )
+    graph.link(fix, "fixes", bug)
+    _blind(fix)
+    ids = [
+        h["item_id"]
+        for h in client.get(
+            "/api/search", params={"q": "gearbox", "expand": "true"}, headers=AUTH
+        ).json()
+    ]
+    assert bug in ids and fix in ids, "expand=true pulls the linked neighbor in"
+    off = [
+        h["item_id"]
+        for h in client.get(
+            "/api/search", params={"q": "gearbox", "expand": "false"}, headers=AUTH
+        ).json()
+    ]
+    assert bug in off and fix not in off, "expand=false forces expansion OFF"
+    # as_of before the fix's window + expand → the neighbor is walled out
+    scoped = client.get(
+        "/api/search",
+        params={"q": "gearbox", "expand": "true", "as_of": "2026-06-01"},
+        headers=AUTH,
+    ).json()
+    ids2 = [h["item_id"] for h in scoped]
+    assert bug in ids2 and fix not in ids2, "neighbor outside the as_of window is excluded"
+
+
+# --- CLI surface (--valid-from/--valid-to, --as-of) ---------------------------
+
+
+def test_cli_add_valid_time_and_search_as_of(kb):
+    from kbcli.main import app
+
+    runner = CliRunner()
+    r = runner.invoke(
+        app,
+        [
+            "add",
+            "-p",
+            "clivt",
+            "--title",
+            "cli fact",
+            "--body",
+            "widgetcli fact",
+            "--valid-from",
+            "2026-01-01",
+            "--valid-to",
+            "2026-12-31",
+        ],
+    )
+    assert r.exit_code == 0 and "saved item" in r.output
+    assert "cli fact" in runner.invoke(app, ["search", "widgetcli", "--as-of", "2026-06-01"]).output
+    assert (
+        "cli fact"
+        not in runner.invoke(app, ["search", "widgetcli", "--as-of", "2027-06-01"]).output
+    )
+
+
+def test_cli_add_rejects_inverted_interval(kb):
+    from kbcli.main import app
+
+    r = CliRunner().invoke(
+        app,
+        [
+            "add",
+            "-p",
+            "cliinv",
+            "--title",
+            "inv",
+            "--body",
+            "x",
+            "--valid-from",
+            "2026-12-01",
+            "--valid-to",
+            "2026-01-01",
+        ],
+    )
+    assert r.exit_code == 1 and "strictly before" in r.output
+
+
+def test_cli_supersede_valid_from_autocloses(kb):
+    from kbcli.main import app
+
+    old = ingest(
+        "cliss", "note", "orig", "widget original", valid_from=datetime(2024, 1, 1, tzinfo=UTC)
+    )
+    r = CliRunner().invoke(
+        app,
+        [
+            "supersede",
+            str(old),
+            "--reason",
+            "moved",
+            "--body",
+            "widget moved",
+            "--valid-from",
+            "2025-01-01",
+        ],
+    )
+    assert r.exit_code == 0 and "superseded by" in r.output
+    assert get_item(old).valid_to == datetime(2025, 1, 1, tzinfo=UTC)
+
+
+# --- ingest-queue self-heal taxonomy (connectivity vs content) ----------------
+
+
+def _one_row(project: str) -> tuple[str, int]:
+    with db.connect() as conn:
+        return conn.execute(
+            "SELECT status, attempts FROM ingest_queue WHERE project = %s", (project,)
+        ).fetchone()
+
+
+def test_drain_connectivity_failure_leaves_row_pending_attempts_unchanged(kb, monkeypatch):
+    ingest_queue.enqueue("qconn", "User: a\nAssistant: b", kind="session")
+
+    def down(*a, **k):
+        raise ExtractorUnavailable("ollama restarting")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", down)
+    consolidate._drain_ingest_queue()
+    assert _one_row("qconn") == ("pending", 0), "an outage defers without burning an attempt"
+
+
+def test_drain_content_failure_marks_failed_and_is_bounded(kb, monkeypatch):
+    ingest_queue.enqueue("qcontent", "User: a\nAssistant: b", kind="session")
+
+    def bad(*a, **k):
+        raise ExtractionFailed("unparseable model output")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    for _ in range(5):  # more runs than the cap
+        consolidate._drain_ingest_queue()
+    assert _one_row("qcontent") == ("failed", ingest_queue.MAX_ATTEMPTS), "poison row stops at cap"
+
+
+def test_terminal_row_is_requeued_on_resubmit(kb, monkeypatch):
+    content = "User: alpha\nAssistant: beta"
+    first = ingest_queue.enqueue("qrequeue", content, kind="session")
+    assert first.id is not None and first.requeued is False
+
+    def bad(*a, **k):
+        raise ExtractionFailed("unparseable")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    for _ in range(5):
+        consolidate._drain_ingest_queue()
+    assert _one_row("qrequeue") == ("failed", ingest_queue.MAX_ATTEMPTS)
+
+    # resubmitting identical content re-opens the terminal row (status flip)
+    again = ingest_queue.enqueue("qrequeue", content, kind="session")
+    assert again.id == first.id and again.requeued is True
+    assert _one_row("qrequeue") == ("pending", 0)
+
+
+def test_pending_row_resubmit_is_a_noop_not_a_requeue(kb):
+    content = "User: gamma\nAssistant: delta"
+    first = ingest_queue.enqueue("qnoop", content, kind="session")
+    assert first.id is not None and first.requeued is False
+    again = ingest_queue.enqueue("qnoop", content, kind="session")
+    assert again.id is None and again.requeued is False, "a live pending row is never disturbed"
+
+
+def test_mcp_ingest_session_message_distinguishes_requeue(kb, monkeypatch):
+    content = "User: epsilon\nAssistant: zeta"
+    ingest_queue.enqueue("qmcpmsg", content, kind="session")
+
+    def bad(*a, **k):
+        raise ExtractionFailed("unparseable")
+
+    monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    for _ in range(5):
+        consolidate._drain_ingest_queue()
+    out = _mcp_call("kb_ingest_session", {"project": "qmcpmsg", "transcript": content})
+    assert "re-queued after prior failure" in out
+
+
+# --- extractor determinism (temperature=0, fixed seed) ------------------------
+
+
+def test_extract_items_pins_deterministic_options(monkeypatch):
+    from kbcore import llm
+
+    captured: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": '{"items": []}'}}
+
+    def fake_post(url, json=None, timeout=None):
+        captured.update(json)
+        return _Resp()
+
+    monkeypatch.setattr(llm.httpx, "post", fake_post)
+    llm.extract_items("some transcript text")
+    assert captured["options"] == {
+        "temperature": llm.EXTRACT_TEMPERATURE,
+        "seed": llm.EXTRACT_SEED,
+    }
+    assert captured["options"]["temperature"] == 0, "greedy decoding so retries dedupe by hash"

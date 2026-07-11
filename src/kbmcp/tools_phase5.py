@@ -111,11 +111,13 @@ def register(mcp) -> None:
         Re-submitting identical content is a no-op."""
         try:
             text = compress.resolve_transcript(transcript, transcript_gz)
-            queue_id = ingest_queue.enqueue(
+            res = ingest_queue.enqueue(
                 project, text, kind=kind, repo=repo, branch=branch, commit=commit
             )
-            if queue_id is None:
+            if res.id is None:
                 return "duplicate — already queued"
-            return f"queued for nightly extraction (id {queue_id})"
+            if res.requeued:
+                return f"re-queued after prior failure for nightly extraction (id {res.id})"
+            return f"queued for nightly extraction (id {res.id})"
         except (KBError, ValueError) as e:
             raise _wrap(e) from e

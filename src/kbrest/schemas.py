@@ -30,6 +30,10 @@ class SupersedeRequest(BaseModel):
     reason: str
     new_body: str | None = None
     new_item_id: int | None = None
+    # Optional valid-time OVERRIDE for the replacement (new_body path only); when
+    # omitted the replacement inherits the old item's interval (WP1). ISO-8601.
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
 
 
 class LinkRequest(BaseModel):

@@ -15,8 +15,9 @@ import pytest
 
 from kbcore.errors import InvalidOperation
 from kbcore.ingest import ingest
-from kbcore.items import _parse_instant, get_item
+from kbcore.items import get_item, parse_instant
 from kbcore.search import search
+from kbcore.supersede import supersede
 
 pytestmark = pytest.mark.usefixtures("kb")
 
@@ -102,16 +103,114 @@ def test_search_hit_carries_the_interval():
 
 
 def test_parse_instant_accepts_date_and_timestamp():
-    assert _parse_instant("2026-06-01", "as_of") == T
-    assert _parse_instant("2026-06-01T12:30:00+00:00", "as_of") == datetime(
+    assert parse_instant("2026-06-01", "as_of") == T
+    assert parse_instant("2026-06-01T12:30:00+00:00", "as_of") == datetime(
         2026, 6, 1, 12, 30, tzinfo=UTC
     )
     # A naive timestamp is assumed UTC (Invariant 7).
-    assert _parse_instant("2026-06-01T12:30:00", "as_of") == datetime(
-        2026, 6, 1, 12, 30, tzinfo=UTC
-    )
+    assert parse_instant("2026-06-01T12:30:00", "as_of") == datetime(2026, 6, 1, 12, 30, tzinfo=UTC)
 
 
 def test_parse_instant_rejects_garbage():
     with pytest.raises(InvalidOperation):
-        _parse_instant("not-a-date", "as_of")
+        parse_instant("not-a-date", "as_of")
+
+
+# --- interval validation (Task 2) ---------------------------------------------
+
+
+def test_ingest_rejects_inverted_interval():
+    with pytest.raises(InvalidOperation, match="strictly before"):
+        _ingest("inverted", valid_from=DEC, valid_to=MAR)
+
+
+def test_ingest_rejects_empty_interval():
+    # from == to is the empty half-open interval [T, T) — matches no as_of.
+    with pytest.raises(InvalidOperation, match="strictly before"):
+        _ingest("empty", valid_from=T, valid_to=T)
+
+
+def test_search_as_of_naive_datetime_is_normalized_to_utc():
+    # search() coerces a naive as_of at the read point (Invariant 7 symmetry).
+    ids = _four()
+    naive = datetime(2026, 6, 1)  # tzinfo is None
+    got = {h.item_id for h in search("widgetflux", as_of=naive)}
+    assert ids["covering"] in got and ids["unbounded"] in got
+    assert ids["ended"] not in got and ids["future"] not in got
+
+
+# --- content-hash dedupe vs a differing interval (Task 3) ---------------------
+
+
+def test_same_content_different_interval_is_a_distinct_assertion():
+    a = ingest("dedupe-vt", "note", "proto", "Widget uses proto v1.")
+    b = ingest("dedupe-vt", "note", "proto", "Widget uses proto v1.", valid_to=T)
+    assert a is not None and b is not None and a != b, "an interval makes it a new assertion"
+
+
+def test_interval_less_resave_still_dedupes():
+    a = ingest("dedupe-vt2", "note", "c", "body c")
+    b = ingest("dedupe-vt2", "note", "c", "body c")
+    assert a is not None and b is None, "interval-less idempotency unchanged (hard rule 3)"
+
+
+def test_identical_interval_resave_dedupes():
+    a = ingest("dedupe-vt3", "note", "d", "body d", valid_from=JAN, valid_to=DEC)
+    b = ingest("dedupe-vt3", "note", "d", "body d", valid_from=JAN, valid_to=DEC)
+    assert a is not None and b is None, "same content + same interval still dedupes"
+
+
+# --- supersede valid-time carry / override / auto-close (Task 1) ---------------
+
+
+def test_supersede_new_body_inherits_the_old_interval():
+    old = _ingest("bounded fact", valid_from=JAN, valid_to=DEC)
+    new = supersede(old, new_body="corrected bounded fact", reason="typo")
+    repl = get_item(new)
+    assert repl.valid_from == JAN and repl.valid_to == DEC, "correction carries the interval"
+
+
+def test_supersede_explicit_override_replaces_the_interval():
+    old = _ingest("v1 fact", valid_from=JAN, valid_to=DEC)
+    new = supersede(old, new_body="v2 fact", reason="new window", valid_from=MAR, valid_to=SEP)
+    repl = get_item(new)
+    assert repl.valid_from == MAR and repl.valid_to == SEP
+
+
+def test_supersede_explicit_new_start_auto_closes_the_open_old_window():
+    old = _ingest("service on host Y", valid_from=JAN)  # still true (valid_to NULL)
+    supersede(old, new_body="service on host Z", reason="moved", valid_from=T)
+    assert get_item(old).valid_to == T, "the old fact's open window is closed at the new start"
+
+
+def test_supersede_new_item_path_closes_with_the_new_items_start():
+    old = _ingest("running v1", valid_from=JAN)  # open
+    newer = _ingest("running v2", valid_from=SEP)  # carries its own start
+    supersede(old, new_item_id=newer, reason="upgraded")
+    assert get_item(old).valid_to == SEP, "old window closed at the successor's valid_from"
+    assert get_item(newer).valid_from == SEP, "the successor item is untouched"
+
+
+def test_supersede_plain_correction_does_not_auto_close():
+    old = _ingest("still true", valid_from=JAN)  # open, no new start supplied
+    supersede(old, new_body="still true (typo fixed)", reason="typo")
+    assert get_item(old).valid_to is None, "a plain correction leaves the window open"
+
+
+def test_supersede_rejects_valid_time_on_the_new_item_path():
+    old = _ingest("x")
+    newer = _ingest("y")
+    with pytest.raises(InvalidOperation, match="new_body path"):
+        supersede(old, new_item_id=newer, reason="r", valid_from=T)
+
+
+def test_supersede_override_inverted_interval_is_rejected():
+    old = _ingest("z", valid_from=JAN)
+    with pytest.raises(InvalidOperation, match="strictly before"):
+        supersede(old, new_body="z2", reason="r", valid_from=DEC, valid_to=MAR)
+
+
+def test_supersede_new_start_before_old_start_is_rejected():
+    old = _ingest("started march", valid_from=MAR)  # open
+    with pytest.raises(InvalidOperation, match="precedes"):
+        supersede(old, new_body="started earlier?", reason="bad", valid_from=JAN)

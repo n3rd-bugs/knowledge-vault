@@ -8,11 +8,12 @@ relation records the edge (Invariant 1/5).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import DuplicateContent, InvalidOperation, NotFound
-from kbcore.ingest import ingest_in
+from kbcore.ingest import _as_utc, ingest_in
 
 logger = logging.getLogger("kbcore.supersede")
 
@@ -23,27 +24,53 @@ def supersede(
     new_item_id: int | None = None,
     new_body: str | None = None,
     reason: str,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
 ) -> int:
-    """Supersede *old_id* with an existing item or a new body. Returns the new item id."""
+    """Supersede *old_id* with an existing item or a new body. Returns the new item id.
+
+    Valid-time (WP1): the MANDATED correction path must not erase a fact's validity
+    window. On the ``new_body`` path the replacement INHERITS the old item's
+    valid_from/valid_to by default; an explicit ``valid_from``/``valid_to`` OVERRIDES
+    that (world-changed correction). On the ``new_item_id`` path the existing item's
+    own interval governs, untouched. Whenever the replacement's start is NEWLY set
+    (explicit override, or the new item's own valid_from) and the old row is still
+    open (valid_to IS NULL), the old row's validity window is CLOSED at that start
+    (Zep/SQL:2011 validity-window close, NOT a body edit — items.body stays
+    immutable).
+    """
     if (new_item_id is None) == (new_body is None):
         raise InvalidOperation("pass exactly one of new_item_id or new_body")
+    if new_item_id is not None and (valid_from is not None or valid_to is not None):
+        # An existing item already carries its own interval; overriding it here
+        # would edit that item's window from a supersede call — reject instead of
+        # silently ignoring the arguments.
+        raise InvalidOperation("valid_from/valid_to apply only to the new_body path")
 
     with transaction() as conn:
         row = conn.execute(
-            "SELECT project, type, title, tags, status, meta FROM items WHERE id = %s", (old_id,)
+            "SELECT project, type, title, tags, status, meta, valid_from, valid_to "
+            "FROM items WHERE id = %s",
+            (old_id,),
         ).fetchone()
         if row is None:
             raise NotFound(f"item {old_id} does not exist")
-        project, type_, title, tags, status, old_meta = row
+        project, type_, title, tags, status, old_meta, old_valid_from, old_valid_to = row
         # Public-only instance: cannot supersede an item in a non-public project.
         scope.assert_writable(project)
         if status == "superseded":
             raise InvalidOperation(f"item {old_id} is already superseded")
 
+        # The instant (if any) at which the OLD fact stopped being true — set only
+        # when the replacement introduces a NEW start (explicit override or the new
+        # item's own valid_from), never for a plain interval-inheriting correction.
+        close_from: datetime | None = None
         if new_body is not None:
             # Carry knowledge anchors (code_ref etc.) onto the replacement;
             # redaction counts belong to the old body, not the new one.
             carried = {k: v for k, v in (old_meta or {}).items() if k != "redactions"}
+            repl_from = valid_from if valid_from is not None else old_valid_from
+            repl_to = valid_to if valid_to is not None else old_valid_to
             new_item_id = ingest_in(
                 conn,
                 project,
@@ -54,14 +81,18 @@ def supersede(
                 trust="verified",
                 tags=tags,
                 meta=carried or None,
+                valid_from=repl_from,
+                valid_to=repl_to,
             )
             if new_item_id is None:
                 raise DuplicateContent(
                     "replacement body duplicates existing content; pass new_item_id instead"
                 )
+            if valid_from is not None:
+                close_from = _as_utc(valid_from)  # explicit new start → world changed
         else:
             repl = conn.execute(
-                "SELECT status, project FROM items WHERE id = %s", (new_item_id,)
+                "SELECT status, project, valid_from FROM items WHERE id = %s", (new_item_id,)
             ).fetchone()
             # Public-only: a non-public replacement is indistinguishable from a
             # missing one — no existence/status oracle, no private id written
@@ -74,6 +105,7 @@ def supersede(
                 raise InvalidOperation(
                     f"replacement item {new_item_id} is {repl[0]}; must be active"
                 )
+            close_from = repl[2]  # the new item's own start closes the old window
         if new_item_id == old_id:
             raise InvalidOperation("an item cannot supersede itself")
 
@@ -86,6 +118,19 @@ def supersede(
             """,
             (new_item_id, reason, old_id),
         )
+        # Auto-close the old validity window (world-changed semantics). Only when
+        # the old fact was still open; a closed window is left as recorded.
+        if close_from is not None and old_valid_to is None:
+            if old_valid_from is not None and close_from <= old_valid_from:
+                # Would collapse/invert the old interval — the replacement cannot
+                # start at/before the fact it supersedes began.
+                raise InvalidOperation(
+                    "replacement valid_from precedes the superseded item's valid_from"
+                )
+            conn.execute(
+                "UPDATE items SET valid_to = %s, updated_at = now() WHERE id = %s",
+                (close_from, old_id),
+            )
         conn.execute(
             """
             INSERT INTO relations (project, src_kind, src_id, rel, dst_kind, dst_id)

@@ -90,8 +90,8 @@ def add(
             kind="manual",
             tags=list(tags),
             code_ref=_parse_code_ref(code_ref),
-            valid_from=items._parse_instant(valid_from, "valid_from") if valid_from else None,
-            valid_to=items._parse_instant(valid_to, "valid_to") if valid_to else None,
+            valid_from=items.parse_instant(valid_from, "valid_from") if valid_from else None,
+            valid_to=items.parse_instant(valid_to, "valid_to") if valid_to else None,
         )
     except (KBError, ValueError) as e:
         _fail(e)
@@ -160,7 +160,7 @@ def search_cmd(
             boost_project=boost_project,
             include_superseded=include_superseded,
             include_archived=include_archived,
-            as_of=items._parse_instant(as_of, "as_of") if as_of else None,
+            as_of=items.parse_instant(as_of, "as_of") if as_of else None,
             k=k,
             tool="cli.search",
         )
@@ -193,13 +193,24 @@ def supersede_cmd(
     reason: str = typer.Option(..., "--reason"),
     new_body: str | None = typer.Option(None, "--body"),
     new_item_id: int | None = typer.Option(None, "--new-item"),
+    valid_from: str | None = typer.Option(
+        None, "--valid-from", help="Override the replacement's valid-time start (--body path)"
+    ),
+    valid_to: str | None = typer.Option(
+        None, "--valid-to", help="Override the replacement's valid-time end (exclusive)"
+    ),
 ) -> None:
     """Replace an item without losing history (corrections go here, never edits)."""
     try:
         new_id = supersede_mod.supersede(
-            old_id, new_item_id=new_item_id, new_body=new_body, reason=reason
+            old_id,
+            new_item_id=new_item_id,
+            new_body=new_body,
+            reason=reason,
+            valid_from=items.parse_instant(valid_from, "valid_from") if valid_from else None,
+            valid_to=items.parse_instant(valid_to, "valid_to") if valid_to else None,
         )
-    except KBError as e:
+    except (KBError, ValueError) as e:
         _fail(e)
     typer.echo(f"item {old_id} superseded by {new_id}")
 

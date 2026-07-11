@@ -22,6 +22,7 @@ from kbcore import entities as entities_mod
 from kbcore import scope
 from kbcore.config import settings
 from kbcore.db import transaction
+from kbcore.errors import InvalidOperation
 from kbcore.models import ITEM_TYPES, SOURCE_KINDS, CodeRef
 from kbcore.scrub import scrub
 
@@ -52,9 +53,26 @@ def normalize_title(title: str) -> str:
     return " ".join(title.split())
 
 
-def content_hash(title: str, body: str) -> str:
-    """sha256 over normalized title+body — the source-level dedupe key (DATA-1)."""
-    return hashlib.sha256(f"{title}\n\n{body}".encode()).hexdigest()
+def content_hash(
+    title: str,
+    body: str,
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+) -> str:
+    """sha256 over normalized title+body — the source-level dedupe key (DATA-1).
+
+    In a bitemporal model identical text over a DIFFERENT validity interval is a
+    DISTINCT assertion (a recurring outage, a config state that came back), so the
+    canonical-UTC interval is folded into the key WHEN either bound is set. Content
+    with no interval keeps the pre-WP1 hash exactly, so existing rows and ingest
+    idempotency are untouched (a re-save of interval-less content still dedupes).
+    """
+    key = f"{title}\n\n{body}"
+    if valid_from is not None or valid_to is not None:
+        vf = valid_from.astimezone(UTC).isoformat() if valid_from else ""
+        vt = valid_to.astimezone(UTC).isoformat() if valid_to else ""
+        key = f"{key}\n\nvalid:{vf}..{vt}"
+    return hashlib.sha256(key.encode()).hexdigest()
 
 
 def ingest(
@@ -122,6 +140,14 @@ def ingest_in(
     """
     valid_from = _as_utc(valid_from)
     valid_to = _as_utc(valid_to)
+    if valid_from is not None and valid_to is not None and valid_from >= valid_to:
+        # Half-open interval [valid_from, valid_to): from == to is empty and
+        # from > to is inverted — both match NO as_of instant, so reject at the
+        # single write point instead of silently storing an unqueryable fact.
+        raise InvalidOperation(
+            f"valid_from ({valid_from.isoformat()}) must be strictly before "
+            f"valid_to ({valid_to.isoformat()})"
+        )
     if type not in ITEM_TYPES:
         raise ValueError(f"unknown item type {type!r}")
     if kind not in SOURCE_KINDS:
@@ -136,7 +162,7 @@ def ingest_in(
     title, title_redactions = scrub(title)
     for k, v in title_redactions.items():
         redactions[k] = redactions.get(k, 0) + v
-    chash = content_hash(title, body)
+    chash = content_hash(title, body, valid_from, valid_to)
 
     conn.execute("INSERT INTO projects (name) VALUES (%s) ON CONFLICT DO NOTHING", (project,))
 
@@ -188,18 +214,28 @@ def ingest_in(
     return item_id
 
 
-def find_duplicate(title: str, body: str, *, kind: str = "chat", uri: str = "") -> int | None:
+def find_duplicate(
+    title: str,
+    body: str,
+    *,
+    kind: str = "chat",
+    uri: str = "",
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+) -> int | None:
     """Item id whose source matches this content's dedupe key, or None.
 
     Lets callers (MCP kb_save) point at the existing item when ingest reports
-    a duplicate, instead of a dead-end 'nothing ingested'.
+    a duplicate, instead of a dead-end 'nothing ingested'. The valid-time interval
+    must match too (it is part of the hash — WP1), so a same-text/different-interval
+    save is correctly seen as NOT a duplicate.
     """
     from kbcore import scope
     from kbcore.db import connect
 
     title_n, _ = scrub(normalize_title(title))
     body_n, _ = scrub(normalize(body))
-    chash = content_hash(title_n, body_n)
+    chash = content_hash(title_n, body_n, _as_utc(valid_from), _as_utc(valid_to))
     # Public-only: never hand back a non-public item's id — kb_save's dup path
     # would otherwise turn a content match into an id/existence oracle for
     # private items (review finding). A non-public dup → return None.

@@ -357,7 +357,7 @@ def ingest_session(
                 if not win.strip():
                     continue  # a whitespace-only window carries no knowledge
                 part = f"#p{i}" if len(windows) > 1 else ""
-                qid = ingest_queue.enqueue(
+                res = ingest_queue.enqueue(
                     project,
                     win,
                     kind="session",
@@ -367,7 +367,7 @@ def ingest_session(
                     source_uri=f"{uri}{part}",
                     allow_reserved=True,  # trusted local flush may target kb-system
                 )
-                if qid is not None:
+                if res.id is not None:
                     saved += 1
             set_checkpoint(key, new_offset)
             return SessionSummary(

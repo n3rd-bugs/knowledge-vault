@@ -20,7 +20,7 @@ def test_transient_extractor_outage_leaves_row_pending(kb, monkeypatch):
     from kbcore.errors import ExtractorUnavailable
     from kbworker import consolidate, sessions
 
-    qid = ingest_queue.enqueue("drainproj", "User: x\nAssistant: y", kind="session")
+    qid = ingest_queue.enqueue("drainproj", "User: x\nAssistant: y", kind="session").id
     assert qid is not None
 
     def boom(*a, **k):
@@ -37,7 +37,7 @@ def test_permanent_error_still_marks_failed(kb, monkeypatch):
     from kbcore import ingest_queue
     from kbworker import consolidate, sessions
 
-    qid = ingest_queue.enqueue("drainproj2", "User: x\nAssistant: y", kind="session")
+    qid = ingest_queue.enqueue("drainproj2", "User: x\nAssistant: y", kind="session").id
 
     def boom(*a, **k):
         raise ValueError("genuinely malformed")
@@ -76,7 +76,7 @@ def test_failed_row_self_heals_on_retry(kb, monkeypatch):
     from kbcore import ingest_queue
     from kbworker import consolidate, sessions
 
-    qid = ingest_queue.enqueue("healproj", "User: a\nAssistant: b", kind="session")
+    qid = ingest_queue.enqueue("healproj", "User: a\nAssistant: b", kind="session").id
     calls = {"n": 0}
 
     def flaky(*a, **k):
@@ -102,7 +102,7 @@ def test_failed_row_retries_are_bounded(kb, monkeypatch):
     from kbcore import ingest_queue
     from kbworker import consolidate, sessions
 
-    qid = ingest_queue.enqueue("healproj2", "User: a\nAssistant: b", kind="session")
+    qid = ingest_queue.enqueue("healproj2", "User: a\nAssistant: b", kind="session").id
 
     def always_bad(*a, **k):
         raise ValueError("genuinely malformed forever")

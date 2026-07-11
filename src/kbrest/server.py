@@ -25,6 +25,7 @@ from kbcore import (
     jobs,
     review,
     search,
+    search_expand,
     stats,
     supersede,
 )
@@ -32,6 +33,7 @@ from kbcore.config import settings
 from kbcore.errors import (
     DuplicateContent,
     EmbedderUnavailable,
+    ExtractionFailed,
     ExtractorUnavailable,
     InvalidOperation,
     KBError,
@@ -71,6 +73,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ValueError, lambda r, e: _err(400, str(e)))
     app.add_exception_handler(EmbedderUnavailable, lambda r, e: _err(503, str(e)))
     app.add_exception_handler(ExtractorUnavailable, lambda r, e: _err(503, str(e)))
+    app.add_exception_handler(ExtractionFailed, lambda r, e: _err(422, str(e)))
     app.add_exception_handler(KBError, lambda r, e: _err(500, str(e)))
     app.add_exception_handler(Exception, lambda r, e: _err(500, "internal server error"))
 
@@ -88,11 +91,12 @@ def _register_read(app: FastAPI) -> None:
         tags: list[str] | None = Query(None),
         type: str | None = None,
         as_of: str | None = None,
-        expand: bool = False,
+        expand: bool | None = None,
         k: int = 8,
     ) -> list[SearchHit]:
-        # expand=true also surfaces the top hits' directly-linked neighbors (WP2).
-        as_of_dt = items._parse_instant(as_of, "as_of") if as_of else None
+        # expand unset → server default; true → force the top hits' linked
+        # neighbors in (WP2); false → force expansion OFF.
+        as_of_dt = items.parse_instant(as_of, "as_of") if as_of else None
         return search.search(
             q,
             project=project,
@@ -100,7 +104,7 @@ def _register_read(app: FastAPI) -> None:
             type=type,
             tags=tags,
             as_of=as_of_dt,
-            hops=1 if expand else 0,
+            hops=search_expand.hops_from_expand(expand),
             k=k,
             tool="rest.search",
         )
@@ -143,7 +147,7 @@ def _register_write(app: FastAPI) -> None:
     @app.post("/api/ingest-session", status_code=202)
     def api_ingest_session(payload: IngestSessionRequest) -> dict:
         # Scrub + store NOW (no GPU); the 14B extracts in the nightly drain.
-        queue_id = ingest_queue.enqueue(
+        res = ingest_queue.enqueue(
             payload.project,
             compress.resolve_transcript(payload.transcript, payload.transcript_gz),
             kind=payload.kind,
@@ -151,7 +155,7 @@ def _register_write(app: FastAPI) -> None:
             branch=payload.branch,
             commit=payload.commit,
         )
-        return {"queue_id": queue_id, "duplicate": queue_id is None}
+        return {"queue_id": res.id, "duplicate": res.id is None, "requeued": res.requeued}
 
     @app.post("/api/items", status_code=201)
     def api_create_item(payload: ItemCreate) -> dict:
@@ -169,7 +173,12 @@ def _register_write(app: FastAPI) -> None:
             valid_to=payload.valid_to,
         )
         if item_id is None:  # content-hash duplicate — point at the existing item
-            existing = ingest.find_duplicate(payload.title, payload.body)
+            existing = ingest.find_duplicate(
+                payload.title,
+                payload.body,
+                valid_from=payload.valid_from,
+                valid_to=payload.valid_to,
+            )
             return {"item_id": existing, "duplicate": True}
         return {"item_id": item_id, "duplicate": False}
 
@@ -180,6 +189,8 @@ def _register_write(app: FastAPI) -> None:
             new_item_id=payload.new_item_id,
             new_body=payload.new_body,
             reason=payload.reason,
+            valid_from=payload.valid_from,
+            valid_to=payload.valid_to,
         )
         return {"old_item_id": item_id, "new_item_id": new_id}
 

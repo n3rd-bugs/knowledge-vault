@@ -111,13 +111,14 @@ def _parse_day(value: str, param: str) -> date:
         raise InvalidOperation(f"{param} must be YYYY-MM-DD, got {value!r}") from e
 
 
-def _parse_instant(value: str, param: str) -> datetime:
+def parse_instant(value: str, param: str) -> datetime:
     """Parse a full ISO-8601 timestamp OR a bare date (→ midnight) into a tz-aware
     UTC datetime — the valid-time as_of / valid_from / valid_to parser (WP1).
 
     A bare date maps to that day at 00:00 UTC; a naive timestamp is assumed UTC
     (Invariant 7). Garbage raises a domain error instead of letting a raw
-    ValueError/psycopg error escape to MCP clients (mirrors _parse_day)."""
+    ValueError/psycopg error escape to MCP clients (mirrors _parse_day). Public
+    because kbcli/kbmcp/kbrest all parse instants across the package boundary."""
     try:
         dt = datetime.fromisoformat(value)
     except ValueError:
@@ -128,6 +129,10 @@ def _parse_instant(value: str, param: str) -> datetime:
                 f"{param} must be an ISO-8601 date or timestamp, got {value!r}"
             ) from e
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+# Back-compat private alias (pre-WP1-patch callers/tests imported the underscore).
+_parse_instant = parse_instant
 
 
 def timeline(

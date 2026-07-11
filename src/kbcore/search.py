@@ -18,6 +18,7 @@ from kbcore import embed as embed_mod
 from kbcore import scope, search_expand
 from kbcore.config import settings
 from kbcore.db import connect, transaction
+from kbcore.ingest import _as_utc
 from kbcore.models import CodeRef, SearchHit
 
 RRF_K = 60
@@ -103,23 +104,26 @@ def search(
     include_superseded: bool = False,
     include_archived: bool = False,
     as_of: datetime | None = None,
-    hops: int = 0,
+    hops: int | None = None,
     k: int = 8,
     tool: str = "search",
 ) -> list[SearchHit]:
     """Hybrid search over all projects by default (cross-domain reuse is the point).
 
     as_of (WP1 valid-time): when set, restrict to facts whose validity interval
-    covers that instant; unset (default) applies no valid-time filter.
+    covers that instant; unset (default) applies no valid-time filter. A naive
+    as_of is normalized to UTC at this read point (Invariant 7 symmetry with
+    ingest's write-point coercion).
 
-    hops (WP2 graph expansion): when > 0, also pull each strong hit's n-hop
-    relation-graph neighborhood into the results with a hop-decayed score. A
-    per-call hops>0 wins; otherwise KB_GRAPH_EXPAND_HOPS can turn it on globally.
-    hops<=0 (the default) is the exact pre-WP2 path — zero regression.
+    hops (WP2 graph expansion): pull each strong hit's n-hop neighborhood in,
+    scored by the seed that reaches it (hop-decayed). None (default) uses
+    KB_GRAPH_EXPAND_HOPS; explicit 0 forces expansion OFF; >0 overrides — capped at
+    GRAPH_MAX_HOPS so a misconfigured value can't explode the BFS.
     """
-    # Resolve effective hops: the param takes precedence when >0, else the config
-    # default; capped so a misconfigured value can't explode the BFS.
-    hops = min(hops or settings.kb_graph_expand_hops, search_expand.GRAPH_MAX_HOPS)
+    if hops is None:
+        hops = settings.kb_graph_expand_hops
+    hops = min(max(hops, 0), search_expand.GRAPH_MAX_HOPS)
+    as_of = _as_utc(as_of)
 
     statuses = ["active"]
     if include_superseded:
@@ -135,11 +139,14 @@ def search(
     with connect() as conn:
         vec_rows = _vector_leg(conn, query, where, params)
         kw_rows = _keyword_leg(conn, query, where, params)
-        fused = _rrf_fuse(vec_rows, kw_rows, boost_project, query)
+        fused = _rrf_fuse(vec_rows, kw_rows)  # RAW RRF, no bonuses yet
         if hops > 0 and fused:
-            # Seed from the top hits; expand_fused re-checks the SAME where on
-            # every neighbor, so no scope/status/valid-time leak (search_expand).
+            # expand_fused walls every neighbor against the SAME where per BFS
+            # level, so no scope/status/valid-time leak (search_expand).
             fused = search_expand.expand_fused(conn, fused, hops, where, params, max(k, 10))
+    # Bonuses apply AFTER the merge so they lift any candidate (direct OR neighbor)
+    # and the seed_floor stays on raw scores (un-boosted rank-1 can seed; finding).
+    fused = _apply_bonuses(fused, boost_project, query)
     # Materialize ALL fused candidates before truncating: the verified ≥
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
@@ -186,10 +193,12 @@ def _keyword_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[
 def _rrf_fuse(
     vec_rows: list[tuple[int, str]],
     kw_rows: list[tuple[int, str]],
-    boost_project: str | None,
-    query: str,
 ) -> list[tuple[int, float, str]]:
-    """RRF over both legs, collapsed to items (best/earliest chunk is the snippet)."""
+    """RAW RRF over both legs, collapsed to items (best/earliest chunk is snippet).
+
+    No bonuses here: boost_project / exact-identifier are applied by the caller
+    AFTER graph expansion (search_expand seeds off these RAW scores).
+    """
     scores: dict[int, float] = {}
     snippets: dict[int, str] = {}
     for leg in (vec_rows, kw_rows):
@@ -200,18 +209,24 @@ def _rrf_fuse(
             seen.add(item_id)
             scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (RRF_K + rank)
             snippets.setdefault(item_id, text)
-    if scores:
-        _apply_bonuses(scores, boost_project, query)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [(item_id, score, snippets[item_id]) for item_id, score in ranked]
 
 
-def _apply_bonuses(scores: dict[int, float], boost_project: str | None, query: str) -> None:
-    """Add the project boost and the exact-identifier bonus to the fused scores."""
+def _apply_bonuses(
+    fused: list[tuple[int, float, str]], boost_project: str | None, query: str
+) -> list[tuple[int, float, str]]:
+    """Return ``fused`` re-scored with the project boost + exact-identifier bonus.
+
+    Applied to every candidate (direct hits AND expanded neighbors) after the merge.
+    """
+    if not fused:
+        return fused
+    scores = {item_id: score for item_id, score, _snip in fused}
     ids = list(scores)
     tokens = _identifier_tokens(query)
     if not boost_project and not tokens:
-        return
+        return fused
     with connect() as conn:
         if boost_project:
             for (item_id,) in conn.execute(
@@ -234,6 +249,7 @@ def _apply_bonuses(scores: dict[int, float], boost_project: str | None, query: s
                 {"ids": ids, "pat": pattern},
             ).fetchall():
                 scores[item_id] += EXACT_ID_BONUS
+    return [(item_id, scores[item_id], snippet) for item_id, _score, snippet in fused]
 
 
 def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:

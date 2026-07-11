@@ -34,7 +34,7 @@ def _tmp_raw(tmp_path, monkeypatch):
 def test_enqueue_scrubs_and_is_idempotent(kb):
     fake = "ghp_" + "0" * 36
     content = f"We set the token to {fake} then moved on."
-    qid = ingest_queue.enqueue("p", content, kind="session", repo="/x/r", commit="deadbee")
+    qid = ingest_queue.enqueue("p", content, kind="session", repo="/x/r", commit="deadbee").id
     assert qid is not None
 
     with db.connect() as conn:
@@ -47,7 +47,7 @@ def test_enqueue_scrubs_and_is_idempotent(kb):
     assert meta["repo"] == "/x/r" and meta["commit"] == "deadbee"
 
     # identical content → no-op (dedupe on scrubbed hash)
-    assert ingest_queue.enqueue("p", content, kind="session") is None
+    assert ingest_queue.enqueue("p", content, kind="session").id is None
     with db.connect() as conn:
         n = conn.execute("SELECT count(*) FROM ingest_queue").fetchone()[0]
     assert n == 1
@@ -69,7 +69,7 @@ def test_enqueue_does_not_call_the_extractor(kb, monkeypatch):
         raise AssertionError("extractor called at submit — that would burn GPU!")
 
     monkeypatch.setattr(llm, "extract_items", boom)
-    assert ingest_queue.enqueue("p", "some content", kind="session") is not None
+    assert ingest_queue.enqueue("p", "some content", kind="session").id is not None
 
 
 # --- nightly drain -----------------------------------------------------------
@@ -235,7 +235,7 @@ def test_enqueue_rejects_reserved_project(kb):
 
 def test_enqueue_scrubs_meta_source_uri(kb):
     fake = "ghp_" + "0" * 36
-    qid = ingest_queue.enqueue("p", "hello world", kind="session", source_uri=f"leaked {fake}")
+    qid = ingest_queue.enqueue("p", "hello world", kind="session", source_uri=f"leaked {fake}").id
     with db.connect() as conn:
         meta = conn.execute("SELECT meta FROM ingest_queue WHERE id=%s", (qid,)).fetchone()[0]
     assert fake not in str(meta)

@@ -13,7 +13,7 @@ import json
 import pytest
 
 from kbcore import llm
-from kbcore.errors import ExtractorUnavailable
+from kbcore.errors import ExtractionFailed
 from kbcore.llm import parse_model_json
 
 _ITEMS = {"items": [{"type": "gotcha", "title": "t", "body": "b", "quote": "q", "tags": []}]}
@@ -79,5 +79,7 @@ def test_extract_items_unparseable_still_raises(monkeypatch):
             return {"message": {"content": "<think>never closed"}}
 
     monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: _Resp())
-    with pytest.raises(ExtractorUnavailable):
+    # Content-deterministic (unterminated <think>) → ExtractionFailed, so the queue
+    # drain bounds it with the attempts cap instead of deferring forever.
+    with pytest.raises(ExtractionFailed):
         llm.extract_items("some transcript text")

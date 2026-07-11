@@ -15,6 +15,8 @@ which otherwise returns every embedded item (no distance threshold).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from kbcore import db, graph, search_expand
@@ -23,6 +25,10 @@ from kbcore.ingest import ingest
 from kbcore.search import _filters, search
 
 pytestmark = pytest.mark.usefixtures("kb")
+
+T = datetime(2026, 6, 1, tzinfo=UTC)
+JAN = datetime(2026, 1, 1, tzinfo=UTC)
+SEP = datetime(2026, 9, 1, tzinfo=UTC)
 
 
 # --- helpers -----------------------------------------------------------------
@@ -233,10 +239,11 @@ def _chain(n: int) -> list[int]:
 
 def test_effective_hops_is_capped(monkeypatch):
     # A config default above the cap is clamped to GRAPH_MAX_HOPS (3): the 4-hop
-    # node is unreachable even though the config asks for 10.
+    # node is unreachable even though the config asks for 10. hops=None (unset)
+    # falls through to the config default (explicit 0 would force expansion OFF).
     ids = _chain(5)  # h0..h4 ; h4 is 4 hops from h0
     monkeypatch.setattr(settings, "kb_graph_expand_hops", 10)
-    got = {h.item_id for h in search("sprocket", hops=0)}  # 0 -> config 10 -> capped 3
+    got = {h.item_id for h in search("sprocket", hops=None)}  # None -> config 10 -> capped 3
     assert ids[3] in got, "3-hop node reached (cap = 3)"
     assert ids[4] not in got, "4-hop node beyond the cap is not reached"
 
@@ -247,3 +254,98 @@ def test_hops_param_takes_precedence_over_settings(monkeypatch):
     got = {h.item_id for h in search("sprocket", hops=1)}  # param 1 wins over config 5
     assert ids[1] in got, "1-hop node reached"
     assert ids[2] not in got, "2-hop node not reached — the param value (1) overrode config (5)"
+
+
+# --- per-seed scoring: neighbor scores off ITS seed, not the global best ------
+
+
+def test_neighbor_scores_off_its_own_seed_not_the_global_best():
+    """The regression fix: a neighbor of a weaker (but qualifying) seed gets that
+    seed's score*DECAY, not the top hit's score*DECAY (which used to let a
+    zero-relevance neighbor tie/outrank genuine direct hits)."""
+    top = ingest("p", "note", "Top", "gearbox topic root")
+    weak_seed = ingest("p", "note", "WeakSeed", "gearbox weak but qualifying")
+    nbr = ingest("p", "note", "Nbr", "reachable only via the weak seed")
+    graph.link(weak_seed, "depends_on", nbr)
+    where, params = _filters(None, None, None, None, ["active"], None)
+    best = 0.0328
+    # weak_seed sits exactly at the seed floor (best*DECAY), so it qualifies as a
+    # seed; its neighbor must decay from IT, not from the global best.
+    fused = [(top, best, "top"), (weak_seed, best * search_expand.GRAPH_DECAY, "weak")]
+    with db.connect() as conn:
+        out = search_expand.expand_fused(conn, fused, 1, where, params, 10)
+    scores = {i: s for i, s, _ in out}
+    d = search_expand.GRAPH_DECAY
+    assert scores[nbr] == pytest.approx(best * d * d), "neighbor decays from the weak seed"
+    assert scores[nbr] < scores[weak_seed], "neighbor ranks strictly below its vouching seed"
+
+
+def test_unbonused_rank1_hit_can_still_seed_under_a_project_boost():
+    """seed_floor is computed on RAW scores now, so a boost on the top hit no
+    longer inflates the floor above the max raw RRF and starves un-boosted seeds:
+    the linked fix of an un-boosted rank-1 hit is still pulled in."""
+    bug = ingest("motor-ctl", "bug", "Gearbox stalls", "the gearbox stalls under load")
+    fix = ingest("motor-ctl", "note", "Coupling fix", "replace the coupling")
+    graph.link(fix, "fixes", bug)
+    _blind(fix)
+    # boost a DIFFERENT project; the bug is rank-1 raw but carries no bonus.
+    ids = [h.item_id for h in search("gearbox", boost_project="power-board", hops=1)]
+    assert bug in ids and fix in ids, "un-boosted rank-1 hit still seeds its neighborhood"
+
+
+# --- scope-walled BFS: a withheld node is neither surfaced NOR a relay hop -----
+
+
+def test_bfs_does_not_relay_through_a_withheld_node(monkeypatch):
+    a = ingest("pub", "bug", "Gearbox stalls", "the gearbox stalls under load")
+    x = ingest("priv", "note", "Private relay", "internal relay note")
+    b = ingest("pub", "note", "Public advisory", "downstream public advisory")
+    graph.link(a, "depends_on", x)  # a -> x  (x is private)
+    graph.link(x, "depends_on", b)  # x -> b  (b public, reachable ONLY via x)
+    _blind(x)
+    _blind(b)
+    _make_public("pub")  # priv stays private
+    monkeypatch.setattr(settings, "kb_public_only", True)
+    ids = [h.item_id for h in search("gearbox", hops=3)]
+    assert a in ids, "the public seed is found"
+    assert x not in ids, "the private relay is withheld"
+    assert b not in ids, "a public node reachable only THROUGH the private relay is not surfaced"
+
+
+# --- as_of + expand together: the neighbor re-checks the SAME where ------------
+
+
+def test_as_of_and_expand_exclude_a_neighbor_outside_the_interval():
+    bug = ingest("p", "bug", "Gearbox stalls", "the gearbox stalls under load", valid_from=JAN)
+    fix = ingest("p", "note", "Coupling fix", "replace the coupling", valid_from=SEP)  # future vs T
+    graph.link(fix, "fixes", bug)
+    _blind(fix)
+    # No as_of: the neighbor is pulled in.
+    assert fix in [h.item_id for h in search("gearbox", hops=1)]
+    # as_of=T is before the fix's valid_from — the SAME where wall drops the neighbor.
+    got = {h.item_id for h in search("gearbox", hops=1, as_of=T)}
+    assert bug in got and fix not in got, "an expanded neighbor outside as_of is excluded"
+
+
+# --- BFS breadth cap + expand-flag mapping ------------------------------------
+
+
+def test_expand_scored_respects_the_breadth_cap():
+    seed = ingest("p", "note", "Hub", "hub node")
+    kids = [ingest("p", "note", f"K{i}", f"kid {i}") for i in range(5)]
+    for kid in kids:
+        graph.link(seed, "part_of", kid)
+    with db.connect() as conn:
+        reached = graph.expand_items_scored(
+            conn, {seed: 1.0}, 1, 0.5, lambda ids: set(ids), max_visited=3
+        )
+    assert len(reached) == 3, "BFS stops once the breadth cap is hit"
+
+
+def test_hops_from_expand_mapping(monkeypatch):
+    monkeypatch.setattr(settings, "kb_graph_expand_hops", 2)
+    assert search_expand.hops_from_expand(None) is None  # use the server default
+    assert search_expand.hops_from_expand(False) == 0  # force OFF
+    assert search_expand.hops_from_expand(True) == 2  # >= config default
+    monkeypatch.setattr(settings, "kb_graph_expand_hops", 0)
+    assert search_expand.hops_from_expand(True) == 1  # never fewer than one hop

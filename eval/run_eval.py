@@ -1,43 +1,16 @@
-"""eval/run_eval.py — retrieval eval: hit@5 and MRR per golden query (DATA-5).
+"""eval/run_eval.py — retrieval eval CLI: hit@5 and MRR per golden query (DATA-5).
 
-A query is a hit if any expected substring appears in the title, snippet, or
-full body of a top-5 result. Run via `make eval`. Exits non-zero when --gate
-is given and hit@5 falls below it (Phase 1 informal gate 0.7; Phase 5 AC 0.8).
+Thin wrapper over ``kbcore.eval_harness`` (the same logic the nightly regression
+sentinel replays). Run via `make eval`. Exits non-zero when --gate is given and
+hit@5 falls below it (Phase 1 informal gate 0.7; Phase 5 AC 0.8).
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
-import yaml
-
-from kbcore.items import get_item
-from kbcore.search import search
-
-GOLDEN = Path(__file__).resolve().parent / "golden.yaml"
-K = 5
-
-
-def evaluate() -> tuple[list[tuple[str, int | None]], float, float]:
-    """Returns (per-query [(query, rank|None)], hit@5, MRR)."""
-    golden = yaml.safe_load(GOLDEN.read_text(encoding="utf-8"))
-    results: list[tuple[str, int | None]] = []
-    for case in golden:
-        query, expected = case["q"], case["expect_substr"]
-        hits = search(query, k=K, tool="eval")
-        rank: int | None = None
-        for i, hit in enumerate(hits, start=1):
-            haystack = f"{hit.title}\n{hit.snippet}\n{get_item(hit.item_id).body}"
-            if any(sub.lower() in haystack.lower() for sub in expected):
-                rank = i
-                break
-        results.append((query, rank))
-    n = len(results)
-    hit_at_5 = sum(1 for _, r in results if r is not None) / n if n else 0.0
-    mrr = sum(1.0 / r for _, r in results if r is not None) / n if n else 0.0
-    return results, hit_at_5, mrr
+from kbcore.eval_harness import evaluate
 
 
 def main() -> int:
@@ -46,6 +19,9 @@ def main() -> int:
     args = parser.parse_args()
 
     results, hit_at_5, mrr = evaluate()
+    if not results:
+        print("golden set is empty or missing; nothing to evaluate")
+        return 0
     width = max(len(q) for q, _ in results)
     print(f"{'query':<{width}}  rank")
     print("-" * (width + 6))

@@ -56,6 +56,33 @@ def queue_review(
         return queue_review_in(conn, item_id, reason, detail)
 
 
+def open_review_by_reason(reason: str) -> tuple[int, dict[str, Any]] | None:
+    """The oldest open review row ``(id, detail)`` for a reason, or None.
+
+    Dedup + self-heal helper for the search-quality sentinel: it enqueues at most
+    one open ``search_regression`` row and auto-resolves it once quality recovers.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, detail FROM review_queue "
+            "WHERE resolved = false AND reason = %s ORDER BY id LIMIT 1",
+            (reason,),
+        ).fetchone()
+    if row is None:
+        return None
+    return int(row[0]), (row[1] if isinstance(row[1], dict) else {})
+
+
+def resolve_review(queue_id: int) -> None:
+    """Mark a review row resolved (status flip, Invariant 5 — no item mutation).
+
+    A generic close for item-less rows (the search-quality sentinel's regression
+    flag) that promote/reject/supersede — all of which require an item — cannot.
+    """
+    with transaction() as conn:
+        conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
+
+
 def list_open_review() -> list[ReviewEntry]:
     """Unresolved review-queue rows joined to their item (kb review list, §7.4)."""
     # Public-only instance: never list rows for items in non-public projects

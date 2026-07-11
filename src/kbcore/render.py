@@ -153,8 +153,15 @@ def render_review(entries: list[ReviewEntry]) -> str:
     lines = []
     for e in entries:
         title = e.title or "(no item)"
-        lines.append(f"[{e.queue_id}] {e.reason} · item {e.item_id} · {e.trust or '-'} · {title}")
+        item = e.item_id if e.item_id is not None else "—"
+        lines.append(f"[{e.queue_id}] {e.reason} · item {item} · {e.trust or '-'} · {title}")
         d = e.detail
+        if e.reason == "search_regression" and "observed_hit_at_5" in d:
+            # Search-quality drop flagged by the nightly sentinel (§8).
+            lines.append(
+                f"    hit@5 {d['observed_hit_at_5']:.2f} / MRR {d['observed_mrr']:.2f} "
+                f"(baseline {d['baseline_hit_at_5']:.2f} / {d['baseline_mrr']:.2f})"
+            )
         if "in_favor_a" in d:
             # Corroboration counts for contradictions: raw + trust-weighted
             # (verified=2, unverified=1), refreshed by the nightly pass.

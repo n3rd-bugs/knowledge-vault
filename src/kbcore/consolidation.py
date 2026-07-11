@@ -29,6 +29,28 @@ def last_consolidation_at() -> datetime | None:
     return row[0] if row and row[0] else None
 
 
+def previous_eval_metrics() -> dict[str, float] | None:
+    """Eval hit@5/MRR recorded in the most recent kb-system report's meta.
+
+    The search-quality sentinel compares each run against this — the metrics
+    live in the report item's ``meta`` (no new table). Returns None when no prior
+    report carries a completed eval (first run, or last run's eval was
+    skipped/errored), so the first successful eval just establishes a baseline.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT meta FROM items WHERE project = 'kb-system' AND type = 'report' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+    meta = row[0] if row else None
+    if not isinstance(meta, dict) or meta.get("eval_status") != "ok":
+        return None
+    try:
+        return {"hit_at_5": float(meta["eval_hit_at_5"]), "mrr": float(meta["eval_mrr"])}
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _lead_pairs(project: str, low: float, high: float) -> list[tuple[int, int, float]]:
     """Active-item pairs whose lead-chunk cosine is in ``[low, high)`` (pass ``high``
     >= 1.0 for no upper bound). Only current-model embeddings compared (DATA-3).

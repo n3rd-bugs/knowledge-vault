@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     # 2-night stable margin (owner refinement of verdict V4). Kill switches:
     kb_auto_supersede_doc_refresh: bool = True
     kb_auto_resolve_evidence: bool = True
+    # Search-quality regression sentinel (§8): the nightly consolidation replays
+    # the golden retrieval eval and flags a hit@5/MRR drop vs the prior run. Set
+    # False to skip the eval entirely (kill switch).
+    kb_eval_in_consolidation: bool = True
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")

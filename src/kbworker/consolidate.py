@@ -23,7 +23,7 @@ from kbcore.errors import EmbedderUnavailable, ExtractionFailed, ExtractorUnavai
 from kbcore.ingest import ingest
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
-from kbworker import sessions
+from kbworker import eval_sentinel, sessions
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -309,6 +309,12 @@ def main() -> dict[str, Any]:
             ),
         )
         _run_step(counts, "reembedded", reembed_mod.reembed)
+
+        # Search-quality regression sentinel (§8): replay the golden eval, record
+        # hit@5/MRR, flag a drop vs the previous run. Advisory — never aborts the
+        # run. Runs before the counts below so a freshly-enqueued regression row
+        # is reflected in review_queue_open.
+        eval_sentinel.run_sentinel(counts)
 
         counts["review_queue_open"] = consolidation.open_review_count()
         counts["ingest_queue_pending"] = ingest_queue.queue_depth()

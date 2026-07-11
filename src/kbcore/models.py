@@ -35,7 +35,7 @@ RELATIONS = (
     "alternative_to",
 )
 SOURCE_KINDS = ("manual", "chat", "file", "session", "git")
-REVIEW_REASONS = ("unverified_extraction", "contradiction", "dup_cluster")
+REVIEW_REASONS = ("unverified_extraction", "contradiction", "dup_cluster", "search_regression")
 
 
 class CodeRef(BaseModel):

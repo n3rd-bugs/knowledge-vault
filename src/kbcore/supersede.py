@@ -104,10 +104,11 @@ def supersede(
             repl = conn.execute(
                 "SELECT status, project, valid_from FROM items WHERE id = %s", (new_item_id,)
             ).fetchone()
-            # Public-only: a non-public replacement is indistinguishable from a
-            # missing one — no existence/status oracle, no private id written
-            # onto the public item's superseded_by (review finding).
-            if repl is None or (scope.public_only() and not scope.project_is_public(conn, repl[1])):
+            # A replacement the caller cannot read is indistinguishable from a
+            # missing one — no existence/status oracle, no withheld id written onto
+            # the visible item's superseded_by (review finding). Walls off both
+            # public-only and grantee scope.
+            if repl is None or not scope.project_readable(conn, repl[1]):
                 raise NotFound(f"replacement item {new_item_id} does not exist")
             if repl[0] != "active":
                 # Guards against supersession cycles and chains that end in a

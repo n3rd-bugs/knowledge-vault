@@ -47,19 +47,21 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
         ) = row
         relations: list[Relation] = []
         if with_relations:
-            # Public-only: drop relations whose OTHER endpoint is an item in a
-            # non-public project — otherwise a public item's relation list would
-            # expose a private item's id (id oracle). Entity endpoints are kept.
+            # Drop relations whose OTHER endpoint is an item in a project this
+            # request cannot read (public-only and/or grantee) — otherwise a visible
+            # item's relation list would expose a withheld item's id (id oracle).
+            # Entity endpoints are kept. The value rides the `vis` named param.
+            hidden_frag, hide_params = scope.hidden_predicate_named("o.project")
             hide = (
-                """
+                f"""
                 AND NOT EXISTS (
                     SELECT 1 FROM items o WHERE o.id = CASE WHEN src_id = %(id)s THEN dst_id
                                                            ELSE src_id END
                       AND (CASE WHEN src_id = %(id)s THEN dst_kind ELSE src_kind END) = 'item'
-                      AND o.project NOT IN (SELECT name FROM projects WHERE public IS TRUE)
+                      AND ({hidden_frag})
                 )
                 """
-                if scope.public_only()
+                if hidden_frag
                 else ""
             )
             rel_rows = conn.execute(
@@ -70,8 +72,8 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
                 WHERE ((src_kind = 'item' AND src_id = %(id)s)
                     OR (dst_kind = 'item' AND dst_id = %(id)s)) {hide}
                 ORDER BY id
-                """,  # noqa: S608 — `hide` is a constant fragment, no user data
-                {"id": item_id},
+                """,  # noqa: S608 — `hide` is built from constant fragments; values ride params
+                {"id": item_id, **hide_params},
             ).fetchall()
             relations = [
                 Relation(src_id=s, rel=r, dst_id=d, direction=direc) for s, r, d, direc in rel_rows
@@ -220,10 +222,12 @@ def timeline(
 
 def log_access(item_id: int, tool: str, query: str | None = None) -> None:
     """Record a direct item access (kb_get / kb get) for staleness scoring."""
+    p = scope.current()
+    pname = None if p.is_owner else p.name  # audit: grantee name; NULL for owner
     with transaction() as conn:
         conn.execute(
-            "INSERT INTO access_log (item_id, tool, query) VALUES (%s, %s, %s)",
-            (item_id, tool, query),
+            "INSERT INTO access_log (item_id, tool, query, principal) VALUES (%s, %s, %s, %s)",
+            (item_id, tool, query, pname),
         )
 
 
@@ -237,8 +241,12 @@ def find_by_title(title: str) -> int | None:
 
 
 def list_projects() -> list[ProjectInfo]:
-    """Project registry with item counts and last activity (kb_projects)."""
-    where = "WHERE p.public IS TRUE" if scope.public_only() else ""
+    """Project registry with item counts and last activity (kb_projects).
+
+    A grantee (and/or a public-only instance) enumerates ONLY the projects it may
+    read — a withheld project is simply absent, never counted, no volume leak."""
+    vis_frag, vis_params = scope.project_predicate("p.name")
+    where = f"WHERE {vis_frag}" if vis_frag else ""
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -248,7 +256,8 @@ def list_projects() -> list[ProjectInfo]:
             {where}
             GROUP BY p.name, p.domain, p.repos, p.description, p.archived, p.public
             ORDER BY max(i.created_at) DESC NULLS LAST
-            """  # noqa: S608 — `where` is a constant literal, not user input
+            """,  # noqa: S608 — `where` is a constant fragment; values ride params
+            vis_params,
         ).fetchall()
     return [
         ProjectInfo(

@@ -263,3 +263,66 @@ def test_phase5_tools_roundtrip(mcp_server):
             assert "duplicate" in dup.content[0].text
 
     asyncio.run(roundtrip())
+
+
+def test_grantee_token_walls_reads_over_real_http(mcp_server):
+    """End-to-end over a REAL served instance (server-mode ON, so the FastMCP
+    PrincipalMiddleware — not an in-process contextvar — must carry the grantee into
+    tool execution): a grantee sees only its granted project and is denied the
+    owner-only review tool. This is the judge-mandated served-instance propagation
+    test — if the principal did not reach the tool, fail-closed would 500 everything."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+    from fastmcp.exceptions import ToolError
+
+    from kbcore import principals
+    from kbcore.ingest import ingest
+    from kbcore.items import set_project
+
+    # Seed (owner-side, in this process) a granted + a withheld project.
+    set_project("share-ok", public=False)
+    set_project("share-hidden", public=False)
+    ok = ingest("share-ok", "note", "granted zephyr note", "the granted zephyr fact", uri="g-ok")
+    hidden = ingest(
+        "share-hidden", "gotcha", "withheld zephyr secret", "the withheld zephyr fact", uri="g-hid"
+    )
+    _pid, gtoken = principals.create_principal("e2e-grantee", kind="token")
+    principals.grant("e2e-grantee", "share-ok", rw=False)
+
+    async def roundtrip():
+        transport = StreamableHttpTransport(
+            mcp_server, headers={"Authorization": f"Bearer {gtoken}"}
+        )
+        async with Client(transport) as client:
+            # search: only the granted project's item surfaces
+            res = await client.call_tool("kb_search", {"query": "zephyr fact"})
+            text = res.content[0].text
+            assert "granted zephyr note" in text
+            assert "withheld zephyr secret" not in text, "grantee saw a withheld item"
+
+            # kb_get: granted item visible, withheld item looks absent (ToolError)
+            got = await client.call_tool("kb_get", {"id": ok})
+            assert "granted zephyr" in got.content[0].text
+            with pytest.raises(ToolError):  # NotFound → clean ToolError
+                await client.call_tool("kb_get", {"id": hidden})
+
+            # kb_projects enumerates only the grant
+            projs = (await client.call_tool("kb_projects", {})).content[0].text
+            assert "share-ok" in projs and "share-hidden" not in projs
+
+            # owner-only review tool is refused for the grantee
+            with pytest.raises(ToolError) as ei:
+                await client.call_tool("kb_review_list", {})
+            assert "owner only" in str(ei.value).lower()
+
+    asyncio.run(roundtrip())
+
+
+def test_unknown_grantee_token_401(mcp_server):
+    # A well-formed but unknown kbg_ token is indistinguishable from any wrong token.
+    r = httpx.post(
+        mcp_server,
+        json={"jsonrpc": "2.0", "method": "ping", "id": 1},
+        headers={"Authorization": "Bearer kbg_" + "z" * 43},
+    )
+    assert r.status_code == 401

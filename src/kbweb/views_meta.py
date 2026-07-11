@@ -11,6 +11,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
+from kbcore import scope
 from kbcore.browse import list_tags
 from kbcore.config import settings
 from kbcore.errors import NotFound
@@ -62,17 +63,21 @@ def stats_view(request: Request) -> Response:  # GET /stats — the dashboard
 
 
 def review_view(request: Request) -> Response:  # GET /review — list only, no actions
+    # Owner-only (per-project sharing v1): review_queue.detail JSONB can carry
+    # cross-project titles/ids that the row-level scope gate does not cover, so a
+    # grantee must not see the review queue at all.
+    scope.require_owner("the review queue")
     return templates.TemplateResponse(request, "review.html", {"entries": list_open_review()})
 
 
 def setup_view(request: Request) -> Response:  # GET /setup — connect a target machine
     """Target-machine setup: the connector token + copy-paste steps.
 
-    Auth-gated by SessionAuthMiddleware like the rest of the UI. The bearer is
-    rendered here at the owner's explicit request (it is masked + reveal-on-click
-    client-side); it is read from config at render time, never hardcoded. Still a
-    pure read — Invariant 11 (no write imports) holds.
+    Owner-only: this page renders the MASTER bearer — a grantee must never see it
+    (they use their own kbg_ token / Google identity). Auth-gated by
+    SessionAuthMiddleware; still a pure read — Invariant 11 (no write imports) holds.
     """
+    scope.require_owner("the setup page")
     base = settings.kb_public_url.rstrip("/")
     return templates.TemplateResponse(
         request,

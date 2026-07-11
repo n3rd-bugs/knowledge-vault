@@ -19,6 +19,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from kbcore import principals, scope
 from kbcore.config import settings
 from kbcore.errors import KBError, NotFound
 from kbmcp.server import _validate_runtime_config
@@ -28,16 +29,34 @@ from kbweb.ui import STATIC_DIR, code_css, templates
 log = logging.getLogger("kbweb")
 
 
+def _principal_for_identity(identity: str | None) -> scope.Principal | None:
+    """Re-resolve the cookie's identity to a LIVE principal on every request.
+
+    "owner" → the unrestricted owner; "g:<name>" → the grantee if still live
+    (re-checked in the DB so a revoked grantee's valid cookie dies immediately).
+    None ⇒ the request must bounce to /login."""
+    if identity == auth.OWNER_IDENTITY:
+        return scope.OWNER
+    if identity and identity.startswith("g:"):
+        return principals.resolve_name(identity[2:])
+    return None
+
+
 class SessionAuthMiddleware(BaseHTTPMiddleware):
-    """Redirect unauthenticated requests to /login (except /login, /static, /auth/google)."""
+    """Redirect unauthenticated requests to /login (except /login, /static,
+    /auth/google) and bind the resolved principal for the request (grantees see
+    only their granted projects in every view)."""
 
     async def dispatch(self, request, call_next):
         path = request.url.path
         if path == "/login" or path.startswith("/static") or path.startswith("/auth/google"):
             return await call_next(request)
-        if not auth.cookie_valid(request.cookies.get(auth.COOKIE)):
+        identity = auth.cookie_identity(request.cookies.get(auth.COOKIE))
+        principal = _principal_for_identity(identity)
+        if principal is None:
             return RedirectResponse("/login", status_code=302)
-        return await call_next(request)
+        with scope.use_principal(principal):
+            return await call_next(request)
 
 
 # --- auth views ---------------------------------------------------------------
@@ -47,18 +66,27 @@ async def login(request):  # GET shows form, POST checks token
     error = None
     if request.method == "POST":
         form = await request.form()
-        if auth.token_ok(str(form.get("token") or "")):
-            return _issue_session("/")
+        supplied = str(form.get("token") or "")
+        if auth.token_ok(supplied):
+            return _issue_session("/", auth.OWNER_IDENTITY)  # master → owner
+        grantee = principals.resolve_token(supplied)  # a kbg_ token → grantee
+        if grantee is not None:
+            return _issue_session("/", auth.grantee_identity(grantee.name))
         error = "Invalid token."
     status = 401 if error else 200
     return templates.TemplateResponse(request, "login.html", {"error": error}, status_code=status)
 
 
-def _issue_session(location: str) -> RedirectResponse:
-    """A redirect that also sets the signed session cookie (shared by both logins)."""
+def _issue_session(location: str, identity: str) -> RedirectResponse:
+    """A redirect that also sets the signed session cookie carrying the principal
+    identity (shared by both logins)."""
     resp = RedirectResponse(location, status_code=303)
     resp.set_cookie(
-        auth.COOKIE, auth.issue_cookie(), httponly=True, samesite="lax", max_age=auth.MAX_AGE
+        auth.COOKIE,
+        auth.issue_cookie(identity),
+        httponly=True,
+        samesite="lax",
+        max_age=auth.MAX_AGE,
     )
     return resp
 
@@ -85,8 +113,15 @@ async def google_callback(request):  # GET /auth/google/callback
         log.warning("google callback rejected: missing code or state mismatch")
     else:
         email = auth.exchange_google_code(code)
+        identity = None
         if email and auth.email_allowed(email):
-            resp = _issue_session("/")
+            identity = auth.OWNER_IDENTITY  # allowlisted owner email
+        elif email:
+            grantee = principals.resolve_email(email)  # a kind='google' grantee
+            if grantee is not None:
+                identity = auth.grantee_identity(grantee.name)
+        if identity is not None:
+            resp = _issue_session("/", identity)
             resp.delete_cookie(auth.STATE_COOKIE)
             return resp
         log.warning("google callback rejected: email not allowed or exchange failed: %r", email)
@@ -147,6 +182,10 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # Fail-closed on the served process (see kbmcp.server.main): a request without a
+    # resolved principal RAISES rather than defaulting to OWNER. SessionAuthMiddleware
+    # binds it per request.
+    scope.enter_server_mode()
     log.info("kb-web starting on %s:%s", settings.kb_bind, settings.kb_web_port)
     uvicorn.run(build_app(), host=settings.kb_bind, port=settings.kb_web_port, log_level="info")
 

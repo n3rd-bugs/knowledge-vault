@@ -251,23 +251,25 @@ def find_duplicate(
     title_n, _ = scrub(normalize_title(title))
     body_n, _ = scrub(normalize(body))
     chash = content_hash(title_n, body_n, _as_utc(valid_from), _as_utc(valid_to))
-    # Public-only: never hand back a non-public item's id — kb_save's dup path
-    # would otherwise turn a content match into an id/existence oracle for
-    # private items (review finding). A non-public dup → return None.
-    gate = (
-        "AND i.project IN (SELECT name FROM projects WHERE public IS TRUE)"
-        if scope.public_only()
-        else ""
-    )
+    # Never hand back the id of an item the caller cannot read — kb_save's dup path
+    # would otherwise turn a content match into an id/existence oracle for a
+    # withheld item (review finding). A withheld dup → return None (public-only
+    # AND/OR grantee scope). NOTE: the sources UNIQUE(kind,uri,content_hash) is
+    # global, so a *new* save of content byte-identical to a withheld item still
+    # dedupes away and reports "duplicate content — nothing ingested"; that
+    # residual content-hash existence oracle is a known, accepted residual (it
+    # requires already possessing the exact bytes) — see the final risk notes.
+    gate, gate_params = scope.project_predicate("i.project")
+    gate_sql = f"AND {gate}" if gate else ""
     with connect() as conn:
         row = conn.execute(
             f"""
             SELECT i.id FROM items i
             JOIN sources s ON s.id = i.source_id
-            WHERE s.kind = %s AND s.uri = %s AND s.content_hash = %s {gate}
+            WHERE s.kind = %s AND s.uri = %s AND s.content_hash = %s {gate_sql}
             ORDER BY i.id LIMIT 1
-            """,  # noqa: S608 — gate is a constant fragment, no user data
-            (kind, uri, chash),
+            """,  # noqa: S608 — gate is a constant fragment; values ride params
+            (kind, uri, chash, *gate_params),
         ).fetchone()
     return row[0] if row else None
 

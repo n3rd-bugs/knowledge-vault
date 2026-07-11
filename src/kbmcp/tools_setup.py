@@ -14,8 +14,9 @@ import logging
 from pathlib import Path
 
 from fastmcp.exceptions import ToolError
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_headers
 
+from kbcore import scope
 from kbcore.config import settings
 from kbmcp import ANNOTATIONS_WRITE, ANNOTATIONS_WRITE_IDEMPOTENT
 
@@ -35,23 +36,29 @@ def _read(name: str) -> str:
     return (ASSETS_DIR / name).read_text()
 
 
-def _caller_holds_bearer() -> bool:
-    """True iff the CALLING client already possesses the static bearer.
+def _presented_bearer_token() -> str | None:
+    """The exact bearer the CALLER presented on THIS request, or None.
 
-    Two cases: (a) the local kb-mcp instance — FastMCP auth is off there and the
-    ASGI middleware already validated the bearer, so get_access_token() is None;
-    (b) the public MultiAuth instance authenticated this request via the
-    StaticTokenVerifier (client_id == 'bearer'). An OAuth principal (Google)
-    returns False: echoing the bearer to an identity-authenticated session would
-    ESCALATE a revocable grant into the permanent master key.
+    Per-project sharing makes this ECHO the caller's own token — never
+    ``settings.kb_token`` unconditionally. Cases:
+    - **OAuth identity** (Google, ``client_id != 'bearer'``) → None: an
+      identity-authed session presented no static bearer; echoing one would
+      ESCALATE it (the pre-fix bug handed such callers the MASTER key).
+    - **Public master** (``client_id == 'bearer'``) or **local bearer**
+      (``get_access_token()`` is None; the ASGI middleware already validated it) →
+      echo the presented Authorization header. For the owner that is the master;
+      for a ``kbg_`` grantee that is THEIR OWN token — disclosing nothing new.
     """
     try:
         tok = get_access_token()
     except Exception:  # outside a request context (tests calling directly)
-        return False
-    if tok is None:
-        return True
-    return getattr(tok, "client_id", "") == "bearer"
+        tok = None
+    if tok is not None and getattr(tok, "client_id", "") != "bearer":
+        return None
+    header = get_http_headers().get("authorization", "")
+    if header[:7].lower() == "bearer ":
+        return header[7:].strip() or None
+    return None
 
 
 def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> str:
@@ -60,9 +67,10 @@ def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> 
 
     The REMOTE config's ``KB_REST_URL`` is filled from (in order) the ``rest_url``
     argument, the server's configured ``kb_public_rest_url``, else a generic
-    placeholder. ``token`` is embedded ONLY when the tool layer verified the
-    caller already holds the bearer (see ``_caller_holds_bearer``); OAuth-authed
-    callers get an explanation + tokenless alternatives instead.
+    placeholder. ``token`` is the caller's OWN presented bearer (see
+    ``_presented_bearer_token``) — the master for the owner, a grantee's own kbg_
+    token for a grantee, and None for OAuth-authed callers (who get an explanation
+    + tokenless alternatives instead).
     """
     configured = (rest_url or settings.kb_public_rest_url or "").strip()
     url = (configured or _PLACEHOLDER_URL).rstrip("/")
@@ -171,6 +179,9 @@ def register(mcp) -> None:
         """
         from kbcore import jobs
 
+        # Owner-only (v1): consolidation spans the WHOLE KB and spends the owner's
+        # GPU/14B (Invariant 8) — a grantee cannot trigger it.
+        scope.require_owner("kb_consolidate")
         req_id, created = jobs.request_consolidation("mcp")
         head = (
             f"queued consolidation request #{req_id}"
@@ -179,9 +190,9 @@ def register(mcp) -> None:
         )
         return f"{head}\n{_consolidation_status_line()}"
 
-    # NOT read-only despite writing nothing: kb_setup can return the master bearer
-    # to bearer-authed callers, so it must keep full approval friction (a lighter,
-    # read-only badge would let a prompt-injected session pull the key silently).
+    # NOT read-only despite writing nothing: kb_setup can return the caller's bearer
+    # (the master for the owner), so it must keep full approval friction (a lighter,
+    # read-only badge would let a prompt-injected session pull the token silently).
     @mcp.tool(annotations=ANNOTATIONS_WRITE)
     def kb_setup(rest_url: str | None = None) -> str:
         """Set up the KB Claude Code session hooks on the machine running this
@@ -196,8 +207,7 @@ def register(mcp) -> None:
         Claude Code, you can write the files and run install.sh yourself.
         """
         try:
-            token = settings.kb_token if _caller_holds_bearer() else None
-            return build_setup_guide(rest_url, token=token)
+            return build_setup_guide(rest_url, token=_presented_bearer_token())
         except OSError as e:  # packaged assets unreadable — surface cleanly
             log.exception("kb_setup asset read failed")
             raise ToolError(f"setup assets unavailable: {e}") from e

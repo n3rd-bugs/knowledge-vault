@@ -130,21 +130,30 @@ def test_guide_withholds_token_by_default(monkeypatch):
 
 
 def test_kb_setup_gates_token_on_caller_principal(kb, monkeypatch):
-    """Bearer/local principals get the token; OAuth principals never do."""
+    """kb_setup echoes the caller's OWN presented bearer: the master for the owner,
+    a grantee's own kbg_ token for a grantee (NEVER the master — escalation guard),
+    and nothing for OAuth callers (no static bearer to echo)."""
     import asyncio
 
     from fastmcp import Client, FastMCP
 
     from kbcore.config import settings
 
-    monkeypatch.setattr(settings, "kb_token", "kbtest-" + "7" * 32)
+    master = "kbtest-" + "7" * 32
+    grantee = "kbg_" + "a" * 43
+    monkeypatch.setattr(settings, "kb_token", master)
 
     class _Tok:
         def __init__(self, cid):
             self.client_id = cid
 
-    def run_with(principal):
+    def run_with(principal, header):
         monkeypatch.setattr(tools_setup, "get_access_token", lambda: principal)
+        monkeypatch.setattr(
+            tools_setup,
+            "get_http_headers",
+            lambda *a, **k: {"authorization": header} if header else {},
+        )
         mcp = FastMCP(name="kb-test")
         tools_setup.register(mcp)
 
@@ -155,12 +164,17 @@ def test_kb_setup_gates_token_on_caller_principal(kb, monkeypatch):
 
         return asyncio.run(call())
 
-    # local instance (FastMCP auth off -> None) and static-bearer principal: embedded
-    assert "KB_TOKEN=kbtest-" + "7" * 32 in run_with(None)
-    assert "KB_TOKEN=kbtest-" + "7" * 32 in run_with(_Tok("bearer"))
-    # OAuth principal: withheld, with the explanation
-    oauth_guide = run_with(_Tok("google-oauth-client-abc"))
-    assert "kbtest-" + "7" * 32 not in oauth_guide
+    # local instance (FastMCP auth off -> None): the presented master header is echoed
+    assert f"KB_TOKEN={master}" in run_with(None, f"Bearer {master}")
+    # public static-bearer principal (client_id 'bearer'): the master is echoed
+    assert f"KB_TOKEN={master}" in run_with(_Tok("bearer"), f"Bearer {master}")
+    # grantee on the local/bearer surface: gets THEIR OWN token, never the master
+    g = run_with(None, f"Bearer {grantee}")
+    assert f"KB_TOKEN={grantee}" in g
+    assert master not in g, "master key must NEVER be handed to a grantee (escalation)"
+    # OAuth principal: withheld regardless of any header, with the explanation
+    oauth_guide = run_with(_Tok("google-oauth-client-abc"), "Bearer some-google-access-token")
+    assert master not in oauth_guide
     assert "OAuth" in oauth_guide
 
 

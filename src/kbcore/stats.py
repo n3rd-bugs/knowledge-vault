@@ -13,59 +13,70 @@ from kbcore import scope
 from kbcore.config import settings
 from kbcore.db import connect
 
-_SUB = "(SELECT name FROM projects WHERE public IS TRUE)"
-
 
 def stats() -> dict[str, Any]:
     """Snapshot of corpus health/size for kb_stats.
 
-    Under a public-only instance every counter is scoped to public projects, so
-    private/NDA volume never leaks through aggregate numbers.
+    Every counter is scoped to the projects the request may read (public-only
+    instance AND/OR grantee grants), so private/NDA volume never leaks through
+    aggregate numbers. Fragments are constant; the grant project list rides params.
     """
-    po = scope.public_only()
-    # Constant SQL fragments (no user input); empty in full-access mode.
-    iw = f"WHERE project IN {_SUB}" if po else ""  # items / entities / relations
-    jw = f"WHERE i.project IN {_SUB}" if po else ""  # joined items alias `i`
-    ja = f"AND i.project IN {_SUB}" if po else ""  # append to an existing WHERE
-    pa = f"AND project IN {_SUB}" if po else ""  # append (bare project column)
+    proj_frag, proj_params = scope.project_predicate("project")  # bare project column
+    iproj_frag, iproj_params = scope.project_predicate("i.project")  # joined items alias
+    iw = f"WHERE {proj_frag}" if proj_frag else ""  # items / entities / relations
+    jw = f"WHERE {iproj_frag}" if iproj_frag else ""  # joined items alias `i`
+    ja = f"AND {iproj_frag}" if iproj_frag else ""  # append to an existing WHERE
+    pa = f"AND {proj_frag}" if proj_frag else ""  # append (bare project column)
     with connect() as conn:
         by_type = dict(
-            conn.execute(f"SELECT type, count(*) FROM items {iw} GROUP BY type").fetchall()  # noqa: S608
+            conn.execute(
+                f"SELECT type, count(*) FROM items {iw} GROUP BY type",
+                proj_params,  # noqa: S608
+            ).fetchall()
         )
         by_project = dict(
             conn.execute(
-                f"SELECT project, count(*) FROM items {iw} GROUP BY project ORDER BY count(*) DESC"  # noqa: S608
+                f"SELECT project, count(*) FROM items {iw} GROUP BY project ORDER BY count(*) DESC",  # noqa: S608
+                proj_params,
             ).fetchall()
         )
         by_status = dict(
-            conn.execute(f"SELECT status, count(*) FROM items {iw} GROUP BY status").fetchall()  # noqa: S608
+            conn.execute(
+                f"SELECT status, count(*) FROM items {iw} GROUP BY status",
+                proj_params,  # noqa: S608
+            ).fetchall()
         )
         by_trust = dict(
             conn.execute(
                 "SELECT COALESCE(s.trust, 'verified'), count(*) "
-                f"FROM items i LEFT JOIN sources s ON s.id = i.source_id {jw} GROUP BY 1"  # noqa: S608
+                f"FROM items i LEFT JOIN sources s ON s.id = i.source_id {jw} GROUP BY 1",  # noqa: S608
+                iproj_params,
             ).fetchall()
         )
-        items_total = conn.execute(f"SELECT count(*) FROM items {iw}").fetchone()[0]  # noqa: S608
+        items_total = conn.execute(f"SELECT count(*) FROM items {iw}", proj_params).fetchone()[0]  # noqa: S608
         chunks = conn.execute(
-            f"SELECT count(*) FROM chunks c JOIN items i ON i.id = c.item_id {jw}"  # noqa: S608
+            f"SELECT count(*) FROM chunks c JOIN items i ON i.id = c.item_id {jw}",  # noqa: S608
+            iproj_params,
         ).fetchone()[0]
-        entities = conn.execute(f"SELECT count(*) FROM entities {iw}").fetchone()[0]  # noqa: S608
-        relations = conn.execute(f"SELECT count(*) FROM relations {iw}").fetchone()[0]  # noqa: S608
+        entities = conn.execute(f"SELECT count(*) FROM entities {iw}", proj_params).fetchone()[0]  # noqa: S608
+        relations = conn.execute(f"SELECT count(*) FROM relations {iw}", proj_params).fetchone()[0]  # noqa: S608
         review_open = conn.execute(
             "SELECT count(*) FROM review_queue rq LEFT JOIN items i ON i.id = rq.item_id "
-            f"WHERE rq.resolved = false {ja}"  # noqa: S608
+            f"WHERE rq.resolved = false {ja}",  # noqa: S608
+            iproj_params,
         ).fetchone()[0]
         last_report = conn.execute(
             "SELECT max(created_at) FROM items "
-            f"WHERE project = 'kb-system' AND type = 'report' {pa}"  # noqa: S608
+            f"WHERE project = 'kb-system' AND type = 'report' {pa}",  # noqa: S608
+            proj_params,
         ).fetchone()[0]
         # Guarded in a separate statement so kb_stats survives migration 002 not
         # yet being applied (a missing table would fail the whole query at parse).
         queue_exists = conn.execute("SELECT to_regclass('ingest_queue')").fetchone()[0]
         queue_pending = (
             conn.execute(
-                f"SELECT count(*) FROM ingest_queue WHERE status = 'pending' {pa}"  # noqa: S608
+                f"SELECT count(*) FROM ingest_queue WHERE status = 'pending' {pa}",  # noqa: S608
+                proj_params,
             ).fetchone()[0]
             if queue_exists
             else 0

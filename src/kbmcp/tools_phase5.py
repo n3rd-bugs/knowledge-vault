@@ -12,7 +12,7 @@ import logging
 
 from fastmcp.exceptions import ToolError
 
-from kbcore import compress, graph, ingest_queue, items, render, stats
+from kbcore import compress, graph, ingest_queue, items, render, scope, stats
 from kbcore import review as review_mod
 from kbcore.errors import KBError
 from kbmcp import (
@@ -73,6 +73,9 @@ def register(mcp) -> None:
         the queue is longer than the limit, a '(showing N of M open)' footer is
         appended so you know to page with a larger limit or resolve some first."""
         try:
+            # Owner-only (v1): review detail JSONB can carry cross-project titles/ids
+            # a grantee must not see (the row-level scope gate does not cover detail).
+            scope.require_owner("kb_review_list")
             lim = max(1, min(int(limit), _REVIEW_LIST_MAX))
             entries = review_mod.list_open_review(limit=lim)
             text = render.render_review(entries)
@@ -90,6 +93,7 @@ def register(mcp) -> None:
         'reject' (archive the item), or 'supersede' (retire the flagged item with
         new_item_id — for contradictions)."""
         try:
+            scope.require_owner("kb_review_resolve")  # owner-only (v1), see kb_review_list
             if action == "promote":
                 return f"promoted item {review_mod.promote(queue_id)} to verified"
             if action == "reject":

@@ -138,9 +138,14 @@ def search(
         statuses.append("archived")
 
     where, params = _filters(project, domain, type, tags, statuses, as_of)
-    # Public-only instance: both legs JOIN projects p, so restrict to public ones.
-    if scope.public_only():
-        where = f"{where} AND p.public IS TRUE"
+    # Visibility wall (public-only instance AND/OR grantee grants): restrict both
+    # legs to the projects this request may read. Because expand_fused/_scoped_ids
+    # re-run this EXACT where+params per BFS level, graph expansion inherits the
+    # same wall — a withheld item is neither surfaced nor used as a relay hop.
+    vis_frag, vis_params = scope.project_predicate("i.project")
+    if vis_frag:
+        where = f"{where} AND {vis_frag}"
+        params = [*params, *vis_params]
 
     with connect() as conn:
         vec_rows = _vector_leg(conn, query, where, params)
@@ -354,8 +359,10 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
 def _log_access(hits: list[SearchHit], tool: str, query: str) -> None:
     if not hits:
         return
+    p = scope.current()
+    pname = None if p.is_owner else p.name  # audit: grantee name; NULL for owner
     with transaction() as conn:
         conn.cursor().executemany(
-            "INSERT INTO access_log (item_id, tool, query) VALUES (%s, %s, %s)",
-            [(h.item_id, tool, query) for h in hits],
+            "INSERT INTO access_log (item_id, tool, query, principal) VALUES (%s, %s, %s, %s)",
+            [(h.item_id, tool, query, pname) for h in hits],
         )

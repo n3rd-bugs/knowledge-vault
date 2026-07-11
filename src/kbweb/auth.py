@@ -38,20 +38,36 @@ def _serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(settings.kb_token, salt=_SALT)
 
 
-def issue_cookie() -> str:
-    """A fresh signed session value to set in the ``kb_session`` cookie."""
-    return _serializer().dumps("ok")
+# Cookie payload = the principal IDENTITY: "owner" for the owner (master token or
+# an allowlisted email), or "g:<name>" for a grantee. The old literal "ok" cookies
+# fail to parse as an identity and force one clean re-login (no security downgrade).
+OWNER_IDENTITY = "owner"
+
+
+def grantee_identity(name: str) -> str:
+    return f"g:{name}"
+
+
+def issue_cookie(identity: str = OWNER_IDENTITY) -> str:
+    """A fresh signed session value carrying the principal identity."""
+    return _serializer().dumps(identity)
+
+
+def cookie_identity(value: str | None) -> str | None:
+    """The signed principal identity ("owner" / "g:<name>"), or None if the cookie
+    is absent, malformed, or expired."""
+    if not value:
+        return None
+    try:
+        identity = _serializer().loads(value, max_age=MAX_AGE)
+    except BadData:
+        return None
+    return identity if isinstance(identity, str) and identity else None
 
 
 def cookie_valid(value: str | None) -> bool:
     """True if the cookie is present, correctly signed, and unexpired."""
-    if not value:
-        return False
-    try:
-        _serializer().loads(value, max_age=MAX_AGE)
-        return True
-    except BadData:
-        return False
+    return cookie_identity(value) is not None
 
 
 def token_ok(supplied: str | None) -> bool:

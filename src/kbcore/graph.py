@@ -35,16 +35,17 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
         # Public-only instance: cannot write a relation from a non-public item.
         scope.assert_writable(src[0])
         dst = conn.execute("SELECT project FROM items WHERE id = %s", (dst_item_id,)).fetchone()
-        # A non-public dst is indistinguishable from a missing one (no id oracle).
-        if dst is None or (scope.public_only() and not scope.project_is_public(conn, dst[0])):
+        # A dst the caller cannot read is indistinguishable from a missing one
+        # (no id oracle) — walls off both public-only and grantee scope.
+        if dst is None or not scope.project_readable(conn, dst[0]):
             raise NotFound(f"item {dst_item_id} does not exist")
         # Same gate for evidence_item — else its FK to items() is an existence
-        # oracle for arbitrary (incl. private) ids (review finding).
+        # oracle for arbitrary (incl. withheld) ids (review finding).
         if evidence_item is not None:
             ev = conn.execute(
                 "SELECT project FROM items WHERE id = %s", (evidence_item,)
             ).fetchone()
-            if ev is None or (scope.public_only() and not scope.project_is_public(conn, ev[0])):
+            if ev is None or not scope.project_readable(conn, ev[0]):
                 raise NotFound(f"item {evidence_item} does not exist")
         row = conn.execute(
             """
@@ -253,19 +254,18 @@ def trace(node_kind: str, node_id: int, direction: str = "both", depth: int = 2)
     if node_kind not in ("item", "entity"):
         raise InvalidOperation(f"node_kind must be 'item' or 'entity', got {node_kind!r}")
     with connect() as conn:
-        po = scope.public_only()
-        pub_cache: dict[str, bool] = {}
+        read_cache: dict[str, bool] = {}
 
-        def is_public(project: str | None) -> bool:
+        def is_readable(project: str | None) -> bool:
             if not project:
                 return False
-            if project not in pub_cache:
-                pub_cache[project] = scope.project_is_public(conn, project)
-            return pub_cache[project]
+            if project not in read_cache:
+                read_cache[project] = scope.project_readable(conn, project)
+            return read_cache[project]
 
         root = _node_info(conn, node_kind, node_id)
-        if root.get("missing") or (po and not is_public(root.get("project"))):
-            # Withheld (non-public) roots are indistinguishable from missing.
+        if root.get("missing") or not is_readable(root.get("project")):
+            # Withheld (out-of-scope) roots are indistinguishable from missing.
             raise NotFound(f"{node_kind} {node_id} does not exist")
         visited: set[tuple[str, int]] = set()
 
@@ -278,8 +278,9 @@ def trace(node_kind: str, node_id: int, direction: str = "both", depth: int = 2)
             edges = []
             for rel, dirn, nk, ni in _neighbors(conn, node["kind"], node["id"], direction):
                 child = _node_info(conn, nk, ni)
-                # Public-only: never traverse into or reveal a non-public node.
-                if child.get("missing") or (po and not is_public(child.get("project"))):
+                # Never traverse into or reveal an out-of-scope node — a withheld
+                # item can bridge neither two public ones nor two granted ones.
+                if child.get("missing") or not is_readable(child.get("project")):
                     continue
                 edges.append({"rel": rel, "direction": dirn, "node": build(child, remaining - 1)})
             node["edges"] = edges
@@ -312,19 +313,20 @@ def similar(item_id: int, k: int = 5) -> list[SimilarHit]:
         ).fetchone()
         if base is None or base[0] is None:
             return []
-        # Public-only: JOIN projects so results never surface a non-public item.
-        public_join = "JOIN projects p ON p.name = i.project" if scope.public_only() else ""
-        public_where = "AND p.public IS TRUE" if scope.public_only() else ""
+        # Visibility wall (public-only and/or grantee): results never surface an
+        # item the caller cannot read. The value rides the `vis` named param.
+        vis_frag, vis_named = scope.project_predicate_named("i.project")
+        vis_where = f"AND {vis_frag}" if vis_frag else ""
         rows = conn.execute(
             f"""
             SELECT i.id, i.title, i.type, i.project, 1 - (c.embedding <=> %(v)s::vector) AS score
-            FROM chunks c JOIN items i ON i.id = c.item_id {public_join}
+            FROM chunks c JOIN items i ON i.id = c.item_id
             WHERE c.ord = 0 AND c.embed_model = %(model)s AND c.embedding IS NOT NULL
-              AND i.status = 'active' AND i.id <> %(self)s {public_where}
+              AND i.status = 'active' AND i.id <> %(self)s {vis_where}
             ORDER BY c.embedding <=> %(v)s::vector
             LIMIT %(k)s
-            """,  # noqa: S608 — join/where fragments are constant literals
-            {"v": base[0], "model": settings.kb_embed_model, "self": item_id, "k": k},
+            """,  # noqa: S608 — vis_where is a constant fragment; values ride params
+            {"v": base[0], "model": settings.kb_embed_model, "self": item_id, "k": k, **vis_named},
         ).fetchall()
     return [
         SimilarHit(item_id=r[0], title=r[1], type=r[2], project=r[3], score=float(r[4]))

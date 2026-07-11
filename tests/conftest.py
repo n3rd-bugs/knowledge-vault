@@ -46,6 +46,23 @@ def fake_embeddings(monkeypatch):
     monkeypatch.setattr(embed, "embed_texts", lambda texts: [fake_vector(t) for t in texts])
 
 
+@pytest.fixture(autouse=True)
+def _reset_scope():
+    """Reset the per-request principal scope between tests (per-project sharing).
+
+    A test (or an in-process ``build_app()``) may flip server-mode or leave a
+    principal cached; without this, a later kbcore-direct test could fail-closed or
+    see a stale grantee. Guarantees every test starts as the implicit OWNER.
+    """
+    from kbcore import principals, scope
+
+    scope._reset_server_mode()
+    principals._clear_cache()
+    yield
+    scope._reset_server_mode()
+    principals._clear_cache()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _force_test_schema():
     """Belt-and-suspenders isolation (autouse): point ``settings.kb_db_schema`` at
@@ -99,7 +116,8 @@ def kb(kb_schema):
         conn.execute(
             """
             TRUNCATE access_log, review_queue, relations, entities, chunks, items,
-                     sources, projects, session_checkpoints, ingest_queue
+                     sources, projects, session_checkpoints, ingest_queue,
+                     principal_grants, principals
                      RESTART IDENTITY CASCADE
             """
         )

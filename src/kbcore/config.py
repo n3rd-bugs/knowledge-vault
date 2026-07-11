@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Public/cloud instance gate: when true, reads see only projects flagged
     # public and writes to non-public projects are rejected (no existence leak).
     kb_public_only: bool = False
+    # Per-project sharing (migration 011): TTL, in seconds, of the server-side
+    # cache mapping a presented `kbg_` bearer to its resolved principal. Kept
+    # short (default 60s) so a `kb principal revoke` takes effect within one
+    # minute on every surface — the cache must never mask a revocation for long.
+    kb_principal_cache_ttl: int = 60
     # OAuth (for claude.ai web/mobile connectors). When enabled the public MCP
     # instance accepts BOTH Google OAuth and the static bearer (MultiAuth).
     kb_oauth_enabled: bool = False

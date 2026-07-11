@@ -24,6 +24,7 @@ from kbcore import (
     items,
     jobs,
     review,
+    scope,
     search,
     search_expand,
     stats,
@@ -146,6 +147,8 @@ def _register_read(app: FastAPI) -> None:
 
     @app.get("/api/review")
     def api_review() -> list[ReviewEntry]:
+        # Owner-only (v1): review detail JSONB can carry cross-project titles/ids.
+        scope.require_owner("the review queue")
         return review.list_open_review()
 
 
@@ -218,7 +221,9 @@ def _register_write(app: FastAPI) -> None:
     @app.post("/api/consolidate", status_code=202)
     def api_consolidate() -> dict:
         # Enqueue only — the host worker (GPU) runs it (Invariant 8). Deduped
-        # against an in-flight run so repeated clicks don't stack.
+        # against an in-flight run so repeated clicks don't stack. Owner-only:
+        # a grantee cannot spend the owner's GPU on a whole-KB run.
+        scope.require_owner("consolidation")
         req_id, created = jobs.request_consolidation("rest")
         return {
             "request_id": req_id,
@@ -232,6 +237,7 @@ def _register_write(app: FastAPI) -> None:
 
     @app.post("/api/review/{queue_id}/resolve")
     def api_review_resolve(queue_id: int, payload: ReviewResolveRequest) -> dict:
+        scope.require_owner("the review queue")  # owner-only (v1), see GET /api/review
         action = payload.action
         if action == "promote":
             return {"item_id": review.promote(queue_id), "action": action}
@@ -283,6 +289,11 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # Fail-closed on the served process (see kbmcp.server.main): a request without a
+    # resolved principal RAISES rather than defaulting to OWNER. The shared
+    # BearerAuthMiddleware sets it; anyio copies the ContextVar into the sync-route
+    # threadpool.
+    scope.enter_server_mode()
     log.info("kb-rest starting on %s:%s", settings.kb_bind, settings.kb_rest_port)
     uvicorn.run(build_app(), host=settings.kb_bind, port=settings.kb_rest_port, log_level="info")
 

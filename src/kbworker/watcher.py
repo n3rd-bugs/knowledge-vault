@@ -20,6 +20,7 @@ from watchdog.observers import Observer
 
 from kbcore import jobs
 from kbcore.config import settings
+from kbcore.deepsearch import deep_search
 from kbcore.ingest import archive_raw, ingest
 from kbworker import consolidate, reposcan
 from kbworker.watcher_parsers import is_supported, parse
@@ -172,6 +173,7 @@ def main() -> None:
         while True:
             scan_inbox()
             _drain_consolidation_requests()
+            _drain_deep_search_jobs()
             now = time.monotonic()
             if _reposcan_due(last_reposcan, now):
                 _run_reposcan()
@@ -202,6 +204,41 @@ def _drain_consolidation_requests() -> None:
     except Exception as e:  # noqa: BLE001 — one bad run must not kill the watcher
         logger.exception("on-demand consolidation row %s failed", req_id)
         jobs.finish_consolidation(req_id, {"error": f"{type(e).__name__}: {e}"}, ok=False)
+
+
+def _drain_deep_search_jobs() -> None:
+    """Run any async deep-search job enqueued via kb_deep_search(wait=False).
+
+    Like consolidation, the host worker is the ONLY executor — the MCP tool just
+    records intent, and the worker (with the GPU) runs deepsearch.deep_search().
+    This is explicit user-invoked LLM work, so it is Invariant-8-compliant; GPU
+    courtesy (keep_alive) is honored inside deep_search via settings. One job per
+    pass so the inbox/consolidation drains still make progress; a failure is
+    recorded (status flip), never allowed to kill the watcher loop.
+    """
+    job = jobs.claim_pending_deep_search()
+    if job is None:
+        return
+    logger.info("async deep-search job %s claimed — running", job["id"])
+    params = job.get("params") or {}
+    try:
+        res = deep_search(
+            job["question"], project=params.get("project"), save=params.get("save", True)
+        )
+        jobs.finish_deep_search(
+            job["id"],
+            {
+                "item_id": res.item_id,
+                "report": res.report,
+                "queries": res.queries,
+                "sources": res.sources,
+            },
+            ok=True,
+        )
+        logger.info("async deep-search job %s done: report item %s", job["id"], res.item_id)
+    except Exception as e:  # noqa: BLE001 — one bad run must not kill the watcher
+        logger.exception("async deep-search job %s failed", job["id"])
+        jobs.finish_deep_search(job["id"], {"error": f"{type(e).__name__}: {e}"}, ok=False)
 
 
 def _reposcan_due(last: float | None, now: float) -> bool:

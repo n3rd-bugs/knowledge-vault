@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     # upstream expiry so a client hiccup doesn't surface as an hourly logout;
     # the proxy refreshes Google underneath (access_type=offline).
     kb_oauth_token_ttl: int = 86_400
+    # OAuth client onboarding: CIMD (Client ID Metadata Document) vs Dynamic Client
+    # Registration. False = advertise DCR-only (historical claude.ai-compat default,
+    # see the enable_cimd site in kbmcp.server). Flip true to A/B the now-switchable
+    # DCR-vs-CIMD choice from .env without a rebuild. Default UNCHANGED.
+    kb_oauth_cimd: bool = False
     google_client_id: str = ""
     google_client_secret: str = ""
     ollama_url: str = "http://127.0.0.1:11434"

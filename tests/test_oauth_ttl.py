@@ -32,3 +32,50 @@ def test_build_auth_passes_token_ttl(monkeypatch):
         provider, "fastmcp_access_token_expiry_seconds", None
     )
     assert ttl == 12_345, f"ttl not passed through (got {ttl!r})"
+
+
+def _oauth_settings(monkeypatch):
+    monkeypatch.setattr(settings, "kb_oauth_enabled", True)
+    monkeypatch.setattr(settings, "google_client_id", "cid.apps.googleusercontent.com")
+    monkeypatch.setattr(settings, "google_client_secret", "GOCSPX-" + "0" * 20)
+    monkeypatch.setattr(settings, "kb_token", TEST_TOKEN)
+    monkeypatch.setattr(settings, "kb_public_url", "https://kb.example.com")
+
+
+def test_build_auth_sets_proactive_refresh_threshold(monkeypatch):
+    """token_expiry_threshold_seconds > 0 so a token refreshes BEFORE it expires,
+    avoiding a mid-flight expiry that surfaces to claude.ai as a spurious logout."""
+    _oauth_settings(monkeypatch)
+    from kbmcp.server import _build_auth
+
+    auth = _build_auth()
+    provider = getattr(auth, "server", None) or getattr(auth, "_server", None) or auth
+    threshold = getattr(provider, "_token_expiry_threshold_seconds", None)
+    if threshold is None:
+        threshold = getattr(provider, "token_expiry_threshold_seconds", None)
+    assert threshold and threshold > 0, f"proactive refresh threshold not set (got {threshold!r})"
+
+
+def test_build_auth_cimd_follows_config_flag(monkeypatch):
+    """enable_cimd is wired to KB_OAUTH_CIMD (owner A/Bs DCR vs CIMD via .env)."""
+    _oauth_settings(monkeypatch)
+    from fastmcp.server.auth.providers import google as google_mod
+
+    import kbmcp.server as srv
+
+    captured: dict = {}
+    real_init = google_mod.GoogleProvider.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured["enable_cimd"] = kwargs.get("enable_cimd")
+        return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(google_mod.GoogleProvider, "__init__", spy_init)
+
+    monkeypatch.setattr(settings, "kb_oauth_cimd", False)
+    srv._build_auth()
+    assert captured["enable_cimd"] is False
+
+    monkeypatch.setattr(settings, "kb_oauth_cimd", True)
+    srv._build_auth()
+    assert captured["enable_cimd"] is True

@@ -15,8 +15,17 @@ from fastmcp.exceptions import ToolError
 from kbcore import compress, graph, ingest_queue, items, render, stats
 from kbcore import review as review_mod
 from kbcore.errors import KBError
+from kbmcp import (
+    ANNOTATIONS_READ,
+    ANNOTATIONS_WRITE,
+    ANNOTATIONS_WRITE_IDEMPOTENT,
+    toolset_footer,
+)
 
 log = logging.getLogger("kbmcp")
+
+_REVIEW_LIST_MAX = 100
+_REVIEW_LIST_DEFAULT = 25
 
 
 def _wrap(err: Exception) -> ToolError:
@@ -27,7 +36,7 @@ def _wrap(err: Exception) -> ToolError:
 def register(mcp) -> None:
     """Register the Phase 5 tools on the given FastMCP instance."""
 
-    @mcp.tool
+    @mcp.tool(annotations=ANNOTATIONS_READ)
     def kb_trace(node_id: int, node_kind: str = "item", depth: int = 2) -> str:
         """Trace how a decision/bug/entity connects: supersession chains, fixes,
         derived_from, alternatives, and entity mentions, as an indented tree.
@@ -41,7 +50,7 @@ def register(mcp) -> None:
         except KBError as e:
             raise _wrap(e) from e
 
-    @mcp.tool
+    @mcp.tool(annotations=ANNOTATIONS_READ)
     def kb_similar(item_id: int, k: int = 5) -> str:
         """Nearest active items to this one by meaning — "have we hit this before?".
 
@@ -55,15 +64,27 @@ def register(mcp) -> None:
         except KBError as e:
             raise _wrap(e) from e
 
-    @mcp.tool
-    def kb_review_list() -> str:
-        """List open review-queue entries (unverified extractions + contradictions)."""
+    @mcp.tool(annotations=ANNOTATIONS_READ)
+    def kb_review_list(limit: int = _REVIEW_LIST_DEFAULT) -> str:
+        """List open review-queue entries (unverified extractions + contradictions).
+
+        limit caps how many rows are returned (default 25, max 100), oldest first,
+        so a big nightly extraction can't blow the connector's context budget. When
+        the queue is longer than the limit, a '(showing N of M open)' footer is
+        appended so you know to page with a larger limit or resolve some first."""
         try:
-            return render.render_review(review_mod.list_open_review())
-        except KBError as e:
+            lim = max(1, min(int(limit), _REVIEW_LIST_MAX))
+            entries = review_mod.list_open_review(limit=lim)
+            text = render.render_review(entries)
+            if len(entries) == lim:
+                total = review_mod.count_open_review()
+                if total > lim:
+                    text += f"\n(showing {lim} of {total} open — raise limit or resolve some)"
+            return text
+        except (KBError, ValueError) as e:
             raise _wrap(e) from e
 
-    @mcp.tool
+    @mcp.tool(annotations=ANNOTATIONS_WRITE)
     def kb_review_resolve(queue_id: int, action: str, new_item_id: int | None = None) -> str:
         """Resolve one review-queue row. action='promote' (trust→verified),
         'reject' (archive the item), or 'supersede' (retire the flagged item with
@@ -82,16 +103,19 @@ def register(mcp) -> None:
         except (KBError, ValueError) as e:
             raise _wrap(e) from e
 
-    @mcp.tool
+    @mcp.tool(annotations=ANNOTATIONS_READ)
     def kb_stats() -> str:
         """Corpus health: counts by type/project/trust/status, entities, relations,
-        open review queue, embed model, and last consolidation date."""
+        open review queue, embed model, last consolidation date, and the toolset
+        schema-version (reconnect the connector if yours is older)."""
         try:
-            return render.render_stats(stats.stats())
+            # Append the toolset schema-version so a long-lived connector session can
+            # notice its cached tools/list predates the server and reconnect.
+            return render.render_stats(stats.stats()) + "\n" + toolset_footer()
         except KBError as e:
             raise _wrap(e) from e
 
-    @mcp.tool
+    @mcp.tool(annotations=ANNOTATIONS_WRITE_IDEMPOTENT)
     def kb_ingest_session(
         project: str,
         transcript: str | None = None,
@@ -117,9 +141,13 @@ def register(mcp) -> None:
             if res.id is None:
                 return "duplicate — already queued"
             if res.permanently_failed:
+                # The row exhausted both its retry budget AND its re-arm budget, so a
+                # re-submit will NOT re-queue it — a human must inspect the queue row.
+                # Say so plainly rather than implying a resubmit might help.
                 return (
-                    f"permanently failed after repeated retries — needs manual review "
-                    f"(id {res.id}); resubmitting identical content will not re-queue it"
+                    f"could not be extracted after repeated retries and re-submissions — "
+                    f"this content needs manual review (queue id {res.id}); re-submitting the "
+                    f"same content will not re-queue it. Ask a KB maintainer to inspect the row."
                 )
             if res.requeued:
                 return f"re-queued after prior failure for nightly extraction (id {res.id})"

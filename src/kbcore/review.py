@@ -83,16 +83,30 @@ def resolve_review(queue_id: int) -> None:
         conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
 
 
-def list_open_review() -> list[ReviewEntry]:
-    """Unresolved review-queue rows joined to their item (kb review list, §7.4)."""
-    # Public-only instance: never list rows for items in non-public projects
-    # (they leak private ids/titles/quotes). A NULL-item row → NULL IN (...) →
-    # not TRUE → dropped, matching stats.review_open (review finding).
-    gate = (
+def _public_gate() -> str:
+    """SQL fragment restricting review rows to public-project items, or '' (full).
+
+    Public-only instance: never list rows for items in non-public projects (they
+    leak private ids/titles/quotes). A NULL-item row → NULL IN (...) → not TRUE →
+    dropped, matching stats.review_open (review finding).
+    """
+    return (
         "AND i.project IN (SELECT name FROM projects WHERE public IS TRUE)"
         if scope.public_only()
         else ""
     )
+
+
+def list_open_review(limit: int | None = None) -> list[ReviewEntry]:
+    """Unresolved review-queue rows joined to their item (kb review list, §7.4).
+
+    ``limit`` caps the number of rows returned (oldest-first by queue id) so a
+    connector result never blows the context budget after a big nightly extraction;
+    None returns all. Pair with :func:`count_open_review` to report truncation.
+    """
+    gate = _public_gate()
+    lim = "LIMIT %s" if limit is not None else ""
+    params: list = [int(limit)] if limit is not None else []
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -102,7 +116,9 @@ def list_open_review() -> list[ReviewEntry]:
             LEFT JOIN sources s ON s.id = i.source_id
             WHERE rq.resolved = false {gate}
             ORDER BY rq.id
-            """  # noqa: S608 — gate is a constant fragment, no user data
+            {lim}
+            """,  # noqa: S608 — gate/lim are constant fragments; limit is parameterized
+            params,
         ).fetchall()
     return [
         ReviewEntry(
@@ -116,6 +132,24 @@ def list_open_review() -> list[ReviewEntry]:
         )
         for r in rows
     ]
+
+
+def count_open_review() -> int:
+    """Total open review rows visible to this instance (cheap COUNT for truncation).
+
+    Uses the same public gate as :func:`list_open_review`; needs the items LEFT JOIN
+    so the gate's ``i.project`` predicate resolves (NULL-item rows drop under it).
+    """
+    gate = _public_gate()
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT count(*) FROM review_queue rq
+            LEFT JOIN items i ON i.id = rq.item_id
+            WHERE rq.resolved = false {gate}
+            """  # noqa: S608 — gate is a constant fragment, no user data
+        ).fetchone()
+    return int(row[0])
 
 
 def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:

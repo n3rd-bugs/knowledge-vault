@@ -17,6 +17,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 
 from kbcore.config import settings
+from kbmcp import ANNOTATIONS_WRITE, ANNOTATIONS_WRITE_IDEMPOTENT
 
 log = logging.getLogger("kbmcp.setup")
 
@@ -159,7 +160,7 @@ def _consolidation_status_line() -> str:
 def register(mcp) -> None:
     """Register the control-plane tools (kb_setup, kb_consolidate)."""
 
-    @mcp.tool
+    @mcp.tool(annotations=ANNOTATIONS_WRITE_IDEMPOTENT)
     def kb_consolidate() -> str:
         """Request an on-demand nightly consolidation run (dedupe, summaries,
         contradiction detection + evidence + auto-resolution, archive, re-embed).
@@ -178,7 +179,10 @@ def register(mcp) -> None:
         )
         return f"{head}\n{_consolidation_status_line()}"
 
-    @mcp.tool
+    # NOT read-only despite writing nothing: kb_setup can return the master bearer
+    # to bearer-authed callers, so it must keep full approval friction (a lighter,
+    # read-only badge would let a prompt-injected session pull the key silently).
+    @mcp.tool(annotations=ANNOTATIONS_WRITE)
     def kb_setup(rest_url: str | None = None) -> str:
         """Set up the KB Claude Code session hooks on the machine running this
         client. Returns a ready-to-apply guide plus the hook scripts and an

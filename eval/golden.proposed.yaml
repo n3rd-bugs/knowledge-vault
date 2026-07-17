@@ -1,0 +1,19 @@
+# eval/golden.proposed.yaml — PROPOSED golden cases pending OWNER approval.
+# NOT loaded by the eval (load_golden reads golden.yaml only). These cases pin
+# LIVE item ids, which cannot be resolved from the repo: look each title up in
+# the live corpus (`kb search "<title>"` → id), replace the 0 placeholders,
+# then move the case into eval/golden.yaml. `kb eval mine` emits more
+# candidates in exactly this shape from real search→kb_get usage.
+
+- q: "UART dropping bytes at high baud rate"
+  # FIXME: live id of "UART RX drops bytes at 115200 baud during PWM bursts"
+  expect_item_id: 0
+  expect_rank_le: 3
+
+- q: "TPS55288 I2C output voltage"
+  expect_substr: ["TPS55288"]
+  # FIXME: live id of "بینن کی سلطنت — سبق کے نوٹس (Kingdom of Benin lesson notes)"
+  # Guard: cross-domain leakage — an unrelated teaching item creeping into the
+  # top-5 for a hardware identifier query (e.g. via graph expansion) must fail.
+  forbid_item_id: 0
+  kwargs: {expand: true}

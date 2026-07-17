@@ -22,12 +22,18 @@ def main() -> int:
     if not results:
         print("golden set is empty or missing; nothing to evaluate")
         return 0
-    width = max(len(q) for q, _ in results)
-    print(f"{'query':<{width}}  rank")
-    print("-" * (width + 6))
-    for query, rank in results:
-        print(f"{query:<{width}}  {rank if rank is not None else 'MISS'}")
-    print("-" * (width + 6))
+    width = max(len(r.query) for r in results)
+    print(f"{'query':<{width}}  rank  status")
+    print("-" * (width + 14))
+    for r in results:
+        rank = r.rank if r.rank is not None else "MISS"
+        if r.passed:
+            status = "ok"
+        else:
+            failed = "; ".join(f"{c.name}: {c.detail}" for c in r.criteria if not c.ok)
+            status = f"FAIL ({failed})"
+        print(f"{r.query:<{width}}  {rank!s:<4}  {status}")
+    print("-" * (width + 14))
     print(f"queries: {len(results)}   hit@5: {hit_at_5:.2f}   MRR: {mrr:.2f}")
     if args.gate is not None and hit_at_5 < args.gate:
         print(f"FAIL: hit@5 {hit_at_5:.2f} < gate {args.gate:.2f}")

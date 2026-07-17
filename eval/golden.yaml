@@ -57,3 +57,22 @@
   expect_substr: ["DNP3"]
 - q: "blacksigma cb212 OBD-II telematics server endpoints"  # identifier + project
   expect_substr: ["OBD"]
+
+# --- Measurement foundation: rank-sensitive cases + search kwargs (see
+# kbcore.eval_harness docstring for the schema). These catch DEMOTIONS that
+# plain hit@5 cannot see, and exercise boost_project / expand / as_of in the
+# eval so a regression in those knobs shows up nightly. ---
+- q: "drv_spi_write"                                     # bare exact symbol must stay near the top
+  expect_substr: ["DRV8706", "drv_spi_write"]
+  expect_rank_le: 3
+- q: "SPI mode polarity problem motor driver"            # project boost exercised end-to-end
+  expect_substr: ["DRV8706"]
+  expect_rank_le: 3
+  kwargs: {boost_project: "motor-ctl"}
+- q: "TPS55288 I2C output voltage"                       # as_of plumbing: NULL-bounded facts stay visible
+  expect_substr: ["TPS55288"]
+  kwargs: {as_of: "2026-01-01"}
+- q: "how did we fix the UART byte loss"                 # graph expansion ON must not displace the direct hit
+  expect_substr: ["ring buffer"]
+  expect_rank_le: 5
+  kwargs: {expand: true}

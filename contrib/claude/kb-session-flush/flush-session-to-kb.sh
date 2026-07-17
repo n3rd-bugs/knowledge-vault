@@ -43,8 +43,24 @@ esac
 PROJECT=$(basename "${CWD:-sessions}" | tr '[:upper:]' '[:lower:]' \
   | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
 [ -z "$PROJECT" ] && PROJECT=sessions
+# Git context for code_ref anchoring: kb_ingest_session accepts repo/branch/
+# commit and the drain stamps a code_ref from them. Local plumbing reads only
+# (ms-cheap, no network); a non-git CWD degrades silently to empty. GITCTX is
+# the ready-made JSON fragment the network arg builders merge in — empty
+# fields are OMITTED entirely (never sent as "").
+REPO=$(git -C "${CWD:-.}" remote get-url origin 2>/dev/null)
+[ -n "$REPO" ] || REPO=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null)
+REPO=${REPO%/}; REPO=${REPO%.git}; REPO=${REPO##*/}; REPO=${REPO##*:}
+BRANCH=$(git -C "${CWD:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null)
+[ "$BRANCH" = "HEAD" ] && BRANCH=""   # detached HEAD names no branch
+COMMIT=$(git -C "${CWD:-.}" rev-parse --short HEAD 2>/dev/null)
+GITCTX=$(jq -n --arg r "$REPO" --arg b "$BRANCH" --arg c "$COMMIT" \
+  '(if $r != "" then {repo:$r} else {} end)
+   + (if $b != "" then {branch:$b} else {} end)
+   + (if $c != "" then {commit:$c} else {} end)')
+[ -n "$GITCTX" ] || GITCTX='{}'
 LOG="$HOME/.claude/hooks/flush-session.log"
-export T CWD SID PROJECT LOG
+export T CWD SID PROJECT LOG REPO BRANCH COMMIT GITCTX
 
 # Opportunistic housekeeping — bound our OWN state/log growth so a daily-driver
 # machine doesn't accumulate thousands of dead .offset files and an unrotated
@@ -67,7 +83,11 @@ if [ -n "${KB_DIR:-}" ]; then
   "$DETACH" bash -c '
     echo "$(date -Is) local $PROJECT $T"
     cd "$KB_DIR" 2>/dev/null || { echo "$(date -Is) local $PROJECT BUG: KB_DIR unreachable ($KB_DIR)"; exit 0; }
-    if "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue; then
+    set --   # git-context flags for code_ref — empty values omitted entirely
+    [ -n "$REPO" ] && set -- "$@" --repo "$REPO"
+    [ -n "$BRANCH" ] && set -- "$@" --branch "$BRANCH"
+    [ -n "$COMMIT" ] && set -- "$@" --commit "$COMMIT"
+    if "$UV" run kb ingest-session "$T" --project "$PROJECT" --queue "$@"; then
       # Log the same fully-drained success marker the network paths emit, so a
       # prior stale FAILED self-clears in the pre-brief warn logic instead of
       # resurfacing as noise for ~40 firings (LOCAL never chunks — a successful
@@ -136,13 +156,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         # plaintext fallback keeps minimal systems working.
         if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
            && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" \
-            "{project:\$p,transcript_gz:\$t,kind:\"session\"}" >"$TMPC.args"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" --argjson g "$GITCTX" \
+            "{project:\$p,transcript_gz:\$t,kind:\"session\"} + \$g" >"$TMPC.args"
           rm -f "$TMPC.gz64"
         else
           rm -f "$TMPC.gz64"
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
-            "{project:\$p,transcript:\$t,kind:\"session\"}" >"$TMPC.args"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" --argjson g "$GITCTX" \
+            "{project:\$p,transcript:\$t,kind:\"session\"} + \$g" >"$TMPC.args"
         fi
         if [ ! -s "$TMPC.args" ] || ! jq -e . "$TMPC.args" >/dev/null 2>&1; then
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
@@ -154,14 +174,14 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         BODYF="$TMPC.body"
         if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
            && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" \
-            "{project:\$p,kind:\"session\",transcript_gz:\$t}" >"$BODYF"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" --argjson g "$GITCTX" \
+            "{project:\$p,kind:\"session\",transcript_gz:\$t} + \$g" >"$BODYF"
           rm -f "$TMPC.gz64"
         else
           rm -f "$TMPC.gz64"
           BODYF="$TMPC.body"
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" \
-            "{project:\$p,kind:\"session\",transcript:\$t}" >"$BODYF"
+          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" --argjson g "$GITCTX" \
+            "{project:\$p,kind:\"session\",transcript:\$t} + \$g" >"$BODYF"
         fi
         if [ ! -s "$BODYF" ] || ! jq -e . "$BODYF" >/dev/null 2>&1; then
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"

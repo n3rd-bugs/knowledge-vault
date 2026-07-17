@@ -149,7 +149,10 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # the whole hook budget; bail in ~2s if we can't even open a connection.
   if curl -sS -o /dev/null --connect-timeout 2 --max-time 3 "$KB_MCP_URL" >/dev/null 2>&1; then
     HELPER="$(dirname "$0")/kb-mcp-call.sh"
-    ARGS=$(jq -n --arg q "$QUERY" --argjson k "$K" '{query:$q,k:$k}')
+    # boost_project mirrors LOCAL mode's --boost-project so recall ranking does
+    # not silently differ by transport; omitted entirely if PROJECT is empty.
+    ARGS=$(jq -n --arg q "$QUERY" --argjson k "$K" --arg bp "$PROJECT" \
+      '{query:$q,k:$k} + (if $bp != "" then {boost_project:$bp} else {} end)')
     HITS=$(KB_MCP_URL="$KB_MCP_URL" KB_TOKEN="$KB_TOKEN" \
       kb_timeout "$HELPER_TO" bash "$HELPER" kb_search "$ARGS" 2>/dev/null) || HITS=""
   fi

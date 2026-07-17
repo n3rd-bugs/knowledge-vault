@@ -1,66 +1,51 @@
-"""kbcore.search — hybrid vector+keyword search fused with RRF (PLAN.md §5.4).
+"""kbcore.search — hybrid search fused with RRF (PLAN.md §5.4).
 
-Vector leg: cosine over current-model chunks. Keyword leg:
-``websearch_to_tsquery('simple', q)`` — 'simple' keeps Urdu and identifiers
-like TPS55288 un-stemmed (DATA-6/V7). Fused with RRF (Σ 1/(60+rank)), collapsed
-to items (best chunk wins), +0.05 boost_project bonus, verified ≥ unverified at
-equal score.
+Three candidate legs (kbcore.search_legs): vector cosine, keyword
+``websearch_to_tsquery('simple', q)`` with an OR fallback, and a word-boundary
+identifier leg. Fused with RRF (Σ 1/(60+rank)), collapsed to items (best chunk
+wins). boost_project multiplies a candidate's fused score by BOOST_FACTOR
+(rank-preserving: it breaks near-ties toward the boosted project but can never
+lift a weak local hit over a strong cross-project answer); exact-identifier
+matches add a small additive bonus capped at ~one rank-1 RRF increment.
+Verified >= unverified at equal score.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import re
 from datetime import datetime
 from typing import Any
 
-from kbcore import embed as embed_mod
 from kbcore import scope, search_expand
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.ingest import _as_utc
 from kbcore.models import CodeRef, SearchHit
+from kbcore.search_legs import (
+    MAX_ID_TOKENS,
+    RRF_K,
+    _id_dominant,
+    _identifier_leg,
+    _identifier_tokens,
+    _keyword_leg,
+    _rrf_fuse,
+    _vector_leg,
+)
 
-RRF_K = 60
-CANDIDATES = 40
-BOOST = 0.05
-# Exact-identifier bonus (§5.4 tuning): when the query carries an identifier
-# token (see _is_identifier — a digit, an underscore, an all-caps acronym, or an
-# internal capital: drv_spi_write, TPS55288, SPI, PageNumber) that appears as a
-# WHOLE WORD in a candidate's title or body, add this. It rescues exact-symbol
-# lookups whose extra common word ("drv_spi_write gotcha") dilutes the vector
-# match under RRF and AND-fails the keyword leg. Principled: helps every
-# exact-symbol query, and is a genuine no-op for plain-word searches — a
-# sentence-initial capital ("How", "Postgres") is NOT treated as an identifier.
-EXACT_ID_BONUS = 0.05
-# Cap identifier tokens scanned in _apply_bonuses: each is one unindexed word-regex
-# over the candidate items' chunks, and the id set now spans direct hits + expanded
-# neighbors — an unbounded token count (a 500-token query) amplifies into 500
-# chunk-scans per search. 8 matches the 'identifier rescue' intent (review finding).
-MAX_ID_TOKENS = 8
+# Project boost (rank-preserving, scale-free): a boosted candidate's fused
+# score is MULTIPLIED by this factor, flipping only near-ties (score ratio <
+# factor). The old flat +0.05 exceeded any raw RRF score, so every boosted tail
+# hit categorically buried cross-project rank-1 answers — the exact hits the KB
+# exists to surface, since agents always pass boost_project=<current project>.
+# Max boost delta on a 3-leg rank-1 (~0.049) is ~0.012 < one rank-1 increment.
+BOOST_FACTOR = 1.25
+# Exact-identifier bonus: small additive per whole-word-matched token, TOTAL
+# capped at ~one rank-1 RRF increment regardless of token count — breaks ties
+# toward the exact symbol without flipping strong vs weak. (Candidate
+# GENERATION for symbols is the identifier leg's job; this only nudges.)
+EXACT_ID_BONUS = 1.0 / (2 * (RRF_K + 1))  # ~0.0082 per matched token
+EXACT_ID_BONUS_CAP = 1.0 / (RRF_K + 1)  # ~0.0164 total — one rank-1 increment
 SNIPPET_CHARS = 300
-
-_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-
-
-def _is_identifier(t: str) -> bool:
-    """True for real code identifiers, not ordinary capitalized words.
-
-    Qualifies: a digit or underscore anywhere; an all-caps acronym (len ≥ 2,
-    e.g. SPI, OBD); an internal capital (camelCase/PascalCase, e.g. PageNumber).
-    Excludes sentence-initial capitals and single letters (How, Postgres, A, I).
-    """
-    if any(c.isdigit() for c in t) or "_" in t:
-        return True
-    if len(t) >= 2 and t.isupper():
-        return True
-    return any(c.isupper() for c in t[1:])  # capital after the first char
-
-
-def _identifier_tokens(query: str) -> list[str]:
-    """Identifier-like query tokens (deduped, order-preserving)."""
-    return list(dict.fromkeys(t for t in _WORD_RE.findall(query) if _is_identifier(t)))
 
 
 def _filters(
@@ -90,8 +75,8 @@ def _filters(
         params.append(tags)
     if as_of is not None:
         # Valid-time as_of (WP1): keep only facts whose interval covers T.
-        # Half-open (valid_to exclusive); NULL bounds are unbounded. Both legs
-        # JOIN items i and inherit this, so vector + keyword stay consistent.
+        # Half-open (valid_to exclusive); NULL bounds are unbounded. All legs
+        # JOIN items i and inherit this, so they stay consistent.
         where.append(
             "(i.valid_from IS NULL OR i.valid_from <= %s)"
             " AND (i.valid_to IS NULL OR i.valid_to > %s)"
@@ -138,7 +123,7 @@ def search(
         statuses.append("archived")
 
     where, params = _filters(project, domain, type, tags, statuses, as_of)
-    # Visibility wall (public-only instance AND/OR grantee grants): restrict both
+    # Visibility wall (public-only instance AND/OR grantee grants): restrict all
     # legs to the projects this request may read. Because expand_fused/_scoped_ids
     # re-run this EXACT where+params per BFS level, graph expansion inherits the
     # same wall — a withheld item is neither surfaced nor used as a relay hop.
@@ -147,10 +132,19 @@ def search(
         where = f"{where} AND {vis_frag}"
         params = [*params, *vis_params]
 
+    id_tokens = _identifier_tokens(query)[:MAX_ID_TOKENS]
     with connect() as conn:
         vec_rows = _vector_leg(conn, query, where, params)
         kw_rows = _keyword_leg(conn, query, where, params)
-        fused = _rrf_fuse(vec_rows, kw_rows)  # RAW RRF, no bonuses yet
+        # The identifier leg only fires for identifier-DOMINANT queries (bare
+        # symbols, part numbers) — for prose that merely mentions an acronym it
+        # would inject recency-ranked mentions as noise (search_legs).
+        id_rows = (
+            _identifier_leg(conn, id_tokens, where, params)
+            if _id_dominant(query, id_tokens)
+            else []
+        )
+        fused = _rrf_fuse(vec_rows, kw_rows, id_rows)  # RAW RRF, no bonuses yet
         expansion_origin: dict[int, int] = {}
         if hops > 0 and fused:
             # expand_fused walls every neighbor against the SAME where per BFS
@@ -163,8 +157,8 @@ def search(
         # Bonuses apply AFTER the merge so they lift any candidate (direct OR
         # neighbor) and the seed_floor stays on raw scores (un-boosted rank-1 can
         # seed; finding). Reuse the legs' connection — no extra connect (finding).
-        fused = _apply_bonuses(conn, fused, boost_project, query, expansion_origin)
-    # Materialize ALL fused candidates before truncating: the verified ≥
+        fused = _apply_bonuses(conn, fused, boost_project, id_tokens, expansion_origin)
+    # Materialize ALL fused candidates before truncating: the verified >=
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
     # to displace a verified one).
@@ -176,78 +170,25 @@ def search(
     return hits
 
 
-def _vector_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[int, str]]:
-    qvec = json.dumps(embed_mod.embed_one(query), separators=(",", ":"))
-    rows = conn.execute(
-        f"""
-        SELECT c.item_id, c.text
-        FROM chunks c
-        JOIN items i ON i.id = c.item_id
-        LEFT JOIN projects p ON p.name = i.project
-        WHERE c.embed_model = %s AND c.embedding IS NOT NULL AND {where}
-        ORDER BY c.embedding <=> %s::vector
-        LIMIT {CANDIDATES}
-        """,
-        [settings.kb_embed_model, *params, qvec],
-    ).fetchall()
-    return [(r[0], r[1]) for r in rows]
-
-
-def _keyword_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[int, str]]:
-    rows = conn.execute(
-        f"""
-        SELECT c.item_id, c.text
-        FROM chunks c
-        JOIN items i ON i.id = c.item_id
-        LEFT JOIN projects p ON p.name = i.project,
-        websearch_to_tsquery('simple', %s) q
-        WHERE c.tsv @@ q AND {where}
-        ORDER BY ts_rank_cd(c.tsv, q) DESC
-        LIMIT {CANDIDATES}
-        """,
-        [query, *params],
-    ).fetchall()
-    return [(r[0], r[1]) for r in rows]
-
-
-def _rrf_fuse(
-    vec_rows: list[tuple[int, str]],
-    kw_rows: list[tuple[int, str]],
-) -> list[tuple[int, float, str]]:
-    """RAW RRF over both legs, collapsed to items (best/earliest chunk is snippet).
-
-    No bonuses here: boost_project / exact-identifier are applied by the caller
-    AFTER graph expansion (search_expand seeds off these RAW scores).
-    """
-    scores: dict[int, float] = {}
-    snippets: dict[int, str] = {}
-    for leg in (vec_rows, kw_rows):
-        seen: set[int] = set()
-        for rank, (item_id, text) in enumerate(leg, start=1):
-            if item_id in seen:
-                continue  # best chunk per item per leg
-            seen.add(item_id)
-            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (RRF_K + rank)
-            snippets.setdefault(item_id, text)
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    return [(item_id, score, snippets[item_id]) for item_id, score in ranked]
-
-
 def _apply_bonuses(
     conn,
     fused: list[tuple[int, float, str]],
     boost_project: str | None,
-    query: str,
+    id_tokens: list[str],
     expansion_origin: dict[int, int],
 ) -> list[tuple[int, float, str]]:
     """Return ``fused`` re-scored with the project boost + exact-identifier bonus.
 
-    Applied to every candidate (direct hits AND expanded neighbors) after the merge,
-    reusing the legs' ``conn`` (no extra connect — finding). A pure expansion
-    neighbor is then CLAMPED strictly below its vouching seed's POST-bonus score:
-    BOOST/EXACT_ID_BONUS (0.05) each exceed the max raw RRF (~0.0328), so an
-    un-clamped bonus on a query-blind neighbor could categorically outrank its own
-    seed and genuine direct hits, breaking the documented 'never outranks its seed'
+    Applied to every candidate (direct hits AND expanded neighbors) after the
+    merge, reusing the legs' ``conn`` (no extra connect — finding). Arithmetic
+    (rank-preserving by design): a boosted-project candidate's score is
+    multiplied by BOOST_FACTOR; each whole-word identifier match adds
+    EXACT_ID_BONUS, with the TOTAL capped at EXACT_ID_BONUS_CAP (~one rank-1
+    RRF increment) no matter how many tokens match. Neither can lift a weak
+    tail hit over a strong cross-project rank-1 hit. A pure expansion neighbor
+    is then CLAMPED strictly below its vouching seed's POST-bonus score: a
+    boosted+bonused query-blind neighbor could otherwise still edge past a
+    low-scoring seed, breaking the documented 'never outranks its seed'
     guarantee (finding). ``expansion_origin`` maps each pure-neighbor id → the
     direct-hit seed that vouches for it (threaded out of search_expand).
     """
@@ -255,16 +196,16 @@ def _apply_bonuses(
         return fused
     scores = {item_id: score for item_id, score, _snip in fused}
     ids = list(scores)
-    tokens = _identifier_tokens(query)[:MAX_ID_TOKENS]
-    if not boost_project and not tokens:
+    if not boost_project and not id_tokens:
         return fused
     if boost_project:
         for (item_id,) in conn.execute(
             "SELECT id FROM items WHERE id = ANY(%s) AND project = %s",
             (ids, boost_project),
         ).fetchall():
-            scores[item_id] += BOOST
-    for token in tokens:
+            scores[item_id] *= BOOST_FACTOR
+    matches: dict[int, int] = {}
+    for token in id_tokens:
         # \m..\M are Postgres word boundaries; identifier tokens are
         # [A-Za-z0-9_] so no regex metachar escaping is needed.
         pattern = rf"\m{token}\M"
@@ -278,7 +219,9 @@ def _apply_bonuses(
             """,
             {"ids": ids, "pat": pattern},
         ).fetchall():
-            scores[item_id] += EXACT_ID_BONUS
+            matches[item_id] = matches.get(item_id, 0) + 1
+    for item_id, n in matches.items():
+        scores[item_id] += min(n * EXACT_ID_BONUS, EXACT_ID_BONUS_CAP)
     # Restore the seed guarantee post-bonus: a neighbor surfaced ONLY by expansion
     # (empty-snippet, query-blind) must rank strictly below the direct hit that
     # vouched for it. The seed is always a direct hit, hence present in `scores`.
@@ -330,8 +273,9 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
         score, snippet = by_id[id_]
         if sup_by is not None and sup_by not in readable_sup:
             sup_by = None  # withheld successor id must not leak via the hit scalar
-        # An expanded graph neighbor has no matching chunk (empty snippet); fall
-        # back to the item body prefix so it still renders a preview (WP2).
+        # An expanded graph neighbor or identifier-leg title match has no chunk
+        # snippet (empty string); fall back to the item body prefix so it still
+        # renders a preview (WP2).
         snippet = snippet or body or ""
         code_ref = None
         if isinstance(meta, dict) and meta.get("code_ref"):
@@ -356,7 +300,7 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
                 score=score,
             )
         )
-    # verified ≥ unverified at equal score, then recency for stability
+    # verified >= unverified at equal score, then recency for stability
     hits.sort(key=lambda h: (h.score, h.trust == "verified", h.created_at), reverse=True)
     return hits
 

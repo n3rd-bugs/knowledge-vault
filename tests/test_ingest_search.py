@@ -78,7 +78,7 @@ def test_search_project_filter_and_boost():
     scoped = search("SPI polarity", project="other-proj")
     assert {h.project for h in scoped} == {"other-proj"}
     boosted = search("SPI polarity", boost_project="other-proj")
-    assert boosted[0].project == "other-proj", "+0.05 boost must float the project"
+    assert boosted[0].project == "other-proj", "the project boost must float the near-tied copy"
 
 
 def test_supersede_hides_old_from_default_search_and_flag_recovers_it():

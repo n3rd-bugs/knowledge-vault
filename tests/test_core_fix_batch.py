@@ -147,9 +147,9 @@ def test_bonused_neighbor_cannot_outrank_its_unbonused_seed(kb):
     fix = ingest("motor-ctl", "note", "Coupling reference", "replace the coupling")
     graph.link(fix, "fixes", bug)
     _blind(fix)  # pure neighbor: reachable only via expansion
-    # Boost motor-ctl: the neighbor gets +0.05 while its seed (in workshop) gets
-    # none. The bonus exceeds max raw RRF (~0.0328), so WITHOUT the clamp the
-    # query-blind neighbor would categorically outrank its own seed (finding).
+    # Boost motor-ctl: the neighbor's score is multiplied by BOOST_FACTOR while
+    # its seed (in workshop) gets nothing. WITHOUT the clamp, stacked bonuses on
+    # a query-blind neighbor could edge it past its own seed (finding).
     hits = search("gearbox", boost_project="motor-ctl", hops=1)
     ids = [h.item_id for h in hits]
     assert bug in ids and fix in ids

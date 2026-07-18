@@ -149,7 +149,10 @@ def extract_items(transcript_text: str) -> list[dict[str, Any]]:
         "format": "json",
         "keep_alive": _keep_alive(),
         "stream": False,
-        "options": {"seed": EXTRACT_SEED},
+        # num_ctx MUST be explicit: Ollama's runtime default (4K) silently
+        # truncates the transcript and caps output mid-JSON (done_reason=
+        # length) — measured grounding collapse, bench 2026-07-18.
+        "options": {"seed": EXTRACT_SEED, "num_ctx": settings.kb_llm_num_ctx},
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": transcript_text},
@@ -205,8 +208,11 @@ def _chat(
     }
     if json_format:
         payload["format"] = "json"
+    # Same explicit-num_ctx rule as extract_items: the runtime default truncates
+    # long judge/summary inputs and cuts output mid-JSON (bench 2026-07-18).
+    payload["options"] = {"num_ctx": settings.kb_llm_num_ctx}
     if seed is not None:
-        payload["options"] = {"seed": seed}
+        payload["options"]["seed"] = seed
     try:
         resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()

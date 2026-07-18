@@ -434,6 +434,7 @@ def test_mcp_ingest_session_message_distinguishes_requeue(kb, monkeypatch):
 
 def test_extract_items_pins_deterministic_options(monkeypatch):
     from kbcore import llm
+    from kbcore.config import settings
 
     captured: dict = {}
 
@@ -452,5 +453,7 @@ def test_extract_items_pins_deterministic_options(monkeypatch):
     llm.extract_items("some transcript text")
     # Determinism-for-retry comes from the pinned SEED alone; temperature=0 (greedy
     # decoding, forbidden on qwen3 thinking mode) was dropped (review finding).
-    assert captured["options"] == {"seed": llm.EXTRACT_SEED}
+    # num_ctx rides along since 2026-07-18: the runtime default (4K) silently
+    # truncated transcripts and cut JSON mid-object (see test_llm_num_ctx).
+    assert captured["options"] == {"seed": llm.EXTRACT_SEED, "num_ctx": settings.kb_llm_num_ctx}
     assert "temperature" not in captured["options"], "no greedy decoding; seed pins the retry"

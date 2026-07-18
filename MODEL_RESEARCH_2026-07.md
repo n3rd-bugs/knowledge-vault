@@ -123,3 +123,41 @@ Recommended sequencing: A now → B once NuExtract3 passes the strict-substring 
 - Community reports still describe significant factual hallucination in Gemma 4 models (e.g., invented product details when summarizing), so grounding failure may persist post-refresh
 
 *Produced 2026-07-18 by a 46-agent research workflow (5-angle web sweep, 20 load-bearing claims 2-lens adversarially verified). Baseline: KB item 313 (2026-07-03 extractor benchmark).*
+
+---
+
+## Addendum 2026-07-18: local benchmark results (the §5 questions, answered)
+
+### Extractor SEC-3 grounding bench (item-313 harness rerun, 3 real transcripts, production quote check)
+
+Round 1 exposed a **production bug**: no call in `kbcore.llm` passed `options.num_ctx`, so every
+extraction ran at Ollama's runtime default context — input silently truncated, output cut mid-JSON
+(`done_reason=length`). The incumbent measured 0% grounding on >4K-token transcripts until the fix.
+Production's real grounding survival was **36.2%** (567 rejected / 322 saved) — item 313's "100%"
+held only on its curated transcripts. Fixed: `kb_llm_num_ctx` (default 16384) now rides every call.
+
+Round 2 (num_ctx=16384, all `done_reason=stop`):
+
+| model | grounded | items | speed/call | verdict |
+|---|---|---|---|---|
+| qwen3:14b (incumbent) | 6/13 (46%) | 13 | 17-27s | **keep** — best balance |
+| granite4.1:8b | 4/9 (44%) | 9 | **7-9s** | fast-fallback candidate (had 2 JSON failures at default ctx; clean at 16K) |
+| gemma3:12b | 4/16 (25%) | 16 | 13-15s | paraphrases code-heavy quotes; fallback status doubtful vs granite |
+| qwen3.6:latest (35B-A3B) | 3/11 (27%) | 11 | 92-104s | **rejected** — slower AND worse grounding; also emitted empty content (thinking ate the budget) until think=False |
+
+No model exceeds 50% verbatim grounding on real code-heavy transcripts → the recovery lever is the
+verify/quote-repair stage (report §3), not a model swap.
+
+### Embedder A/B (eval-v2, kb_test corpus clone; baseline bit-identical to live sentinel 0.690/0.569)
+
+| config | hit@5 | MRR | cases |
+|---|---|---|---|
+| bge-m3 (incumbent) | 0.690 | 0.569 | 20/29 |
+| qwen3-embedding:0.6b, plain queries | 0.655 | 0.595 | 19/29 |
+| **qwen3-embedding:0.6b + retrieval instruction prefix** | **0.724** | **0.613** | **21/29** |
+
+Sanity gates all passed (unit-norm 1024-dim drop-in; no pooling degeneracy); 5242-chunk reembed =
+182s. The prefix is REQUIRED (plain queries regress). One regression: the DRV8706 SPI-polarity
+cross-project case drops rank 3→5. Six cases fail under every embedder (Urdu, drv_spi_write-gotcha,
+UART trio, ollama-keep-alive) — corpus/leg gaps, not embedder-sensitive. Adoption pending owner
+decision + query-prefix support in kbcore.embed.

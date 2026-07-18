@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     # consolidation runtime. Cost: ~10GB VRAM stays occupied. Kill switch: set 0
     # (unload per call) or a bounded value like 300 (seconds) to reclaim VRAM.
     kb_llm_keep_alive: int = -1
+    # Context window for every /api/chat LLM call. Without an explicit num_ctx,
+    # Ollama runs its RUNTIME default (4K), silently truncating transcript input
+    # and capping JSON output (done_reason=length) — measured 2026-07-18: the
+    # incumbent's grounding collapsed to 0% on >4K-token transcripts and every
+    # model's output could be cut mid-JSON. 16384 covers our 16K-char extraction
+    # window with output headroom; KV cost at 16K ≈ +2-3GB (fits beside the
+    # resident 14B). Raise only after checking VRAM headroom.
+    kb_llm_num_ctx: int = 16384
     # Deep search (explicit user-invoked, local Ollama): empty -> extract model.
     kb_deep_model: str = ""
     kb_deep_max_items: int = 16

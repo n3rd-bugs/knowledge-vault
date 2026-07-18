@@ -1,8 +1,9 @@
-"""kbweb.auth — signed session cookies for the read-only web UI (Phase 6b).
+"""kbweb.auth — signed session cookies for the web UI (Phase 6b; Inv. 11 amended).
 
 Login checks the supplied token against ``settings.kb_token`` (constant-time)
 and, on success, issues an itsdangerous-signed cookie whose secret IS the token.
-Anonymous access is refused everywhere except /login and /static.
+Anonymous access is refused everywhere except /login and /static. Also home to
+the admin CSRF token (the owner-only authz carve-out's POST guard).
 """
 
 from __future__ import annotations
@@ -138,6 +139,44 @@ def email_allowed(email: str) -> bool:
     """True iff email is on the (non-empty) allowlist. Empty list ⇒ deny all."""
     allowed = settings.web_allowed_emails
     return bool(allowed) and email.lower() in allowed
+
+
+# --- Admin CSRF (the ONLY state-changing web forms — Inv. 11 carve-out) -------
+#
+# The session cookie is SameSite=lax, which already blocks the cookie on
+# cross-site POSTs; this signed token is the primary explicit gate (and covers
+# legacy/lax-bypass corners), bound to the OWNER identity so a token minted for
+# one identity can never authorize another. Same-origin checking is layered on
+# top in views_admin (defense-in-depth).
+_CSRF_SALT = "kbweb-admin-csrf"
+CSRF_MAX_AGE = 60 * 60 * 2  # 2 h — re-minted on every /admin render
+
+
+def _csrf_serializer() -> URLSafeTimedSerializer:
+    # Distinct salt: an admin CSRF token must never validate as a session cookie
+    # or OAuth state (and vice versa).
+    return URLSafeTimedSerializer(settings.kb_token, salt=_CSRF_SALT)
+
+
+def issue_csrf(identity: str) -> str:
+    """A signed anti-CSRF token bound to the signed-in identity.
+
+    Minted into the admin page; required on every mutating admin POST."""
+    return _csrf_serializer().dumps({"n": secrets.token_urlsafe(8), "id": identity})
+
+
+def csrf_ok(signed: str | None, identity: str) -> bool:
+    """True iff the token is present, correctly signed, unexpired, and bound to
+    ``identity``. Missing/malformed/expired/foreign-identity all collapse to False."""
+    if not signed:
+        return False
+    try:
+        payload = _csrf_serializer().loads(signed, max_age=CSRF_MAX_AGE)
+    except BadData:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return secrets.compare_digest(str(payload.get("id") or ""), identity)
 
 
 def _state_serializer() -> URLSafeTimedSerializer:

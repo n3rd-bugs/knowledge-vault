@@ -139,8 +139,7 @@ def kb(kb_schema):
         current = conn.execute("SELECT current_schema()").fetchone()[0]
         if current != "kb_test":
             raise RuntimeError(
-                f"live-data guard: refusing TRUNCATE, current_schema()={current!r} "
-                "is not 'kb_test'"
+                f"live-data guard: refusing TRUNCATE, current_schema()={current!r} is not 'kb_test'"
             )
         conn.execute(
             """

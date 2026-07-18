@@ -105,3 +105,25 @@ Trigger: primary use case narrowed to **multidomain software development** (embe
 - [x] Backups exist **and restore is tested**
 - [x] First usable milestone ≤ 1 day of Claude Code sessions
 - [x] Every phase has machine-checkable acceptance criteria
+
+---
+
+## Amendment A11-1 — Invariant 11 carve-out: owner-only authz routes (2026-07-18)
+
+**Decision (owner):** Invariant 11 is amended from "the web UI is read-only by construction" to
+"the web UI performs **no knowledge mutation**". The ONLY mutating web routes permitted are the
+OWNER-ONLY authorization-config actions `POST /admin/grant` / `POST /admin/revoke`, which call
+`kbcore.principals.grant()`/`ungrant()` with `rw=false` hardwired.
+
+**Why this does not weaken what Inv. 11 protects.** Inv. 11 exists to guarantee that a web
+session — the most exposed, most phishable surface — can never alter *knowledge* (items, sources,
+relations, review state, immutability/supersession semantics). The carve-out touches only
+`principal_grants`, an authorization-config table: no item row is ever written from kbweb, and the
+knowledge-write import test still covers every kbweb module. A **grantee** session gains nothing —
+non-owners receive the byte-identical 404 an unknown path yields (no admin-existence oracle) and
+never see an admin link. A hijacked **owner** cookie gains no authority it did not already have:
+the owner's `/setup` page already renders the master bearer, which transitively allows every REST
+write — so owner-session compromise was already total, and the new routes add CSRF-token +
+same-origin defenses that `/setup` never needed. Scope is frozen: share grant/revoke only —
+principal lifecycle (create/revoke/rotate) stays CLI-only, and any future mutating web route
+re-opens this review.

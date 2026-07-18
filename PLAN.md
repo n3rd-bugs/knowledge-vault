@@ -480,10 +480,16 @@ still sees everything.
 **Phase-6 discipline** (extends PLAN §1): the ONLY public listener is the Traefik TLS endpoint on
 `:8803`; every app service binds a container-private network and requires the bearer (**Inv. 10** —
 no unauthenticated surface; the deliberate container `0.0.0.0` bind is gated behind an explicit
-`KB_ALLOW_ANY_BIND`, the default still refuses accidental host-public binds). The **web UI stays
-read-only** — it imports zero write functions (**Inv. 11**); the REST facade is a write surface
-with the identical bearer. Offsite copies are **encrypted at rest** and the age key never sits
-beside the ciphertext or in git (**Inv. 12**).
+`KB_ALLOW_ANY_BIND`, the default still refuses accidental host-public binds). The **web UI performs
+no knowledge mutation** (**Inv. 11**, amended 2026-07-18): items, sources, relations, review state —
+all knowledge — are never written from kbweb, which imports zero knowledge-write functions and
+serves data routes as GET/HEAD only. The SOLE permitted mutating routes are the OWNER-ONLY
+AUTHORIZATION-CONFIG actions `POST /admin/grant` and `POST /admin/revoke` (grant/revoke a read-only
+project share via `kbcore.principals.grant`/`ungrant`, always `rw=false`), gated on the OWNER
+identity (non-owners get the byte-identical 404 of an unknown path) and CSRF-protected. This
+carve-out must never be broadened beyond share grant/revoke (see ADVERSARIAL_REVIEW.md, Amendment
+A11-1). The REST facade is a write surface with the identical bearer. Offsite copies are
+**encrypted at rest** and the age key never sits beside the ciphertext or in git (**Inv. 12**).
 
 **6a — REST facade (~1-2 h)** — ARCH-4; JSON API for non-MCP consumers and the backing of the
 public endpoint. Tasks: `src/kbrest/server.py` — FastAPI over **kbcore only** (no SQL), reusing
@@ -496,7 +502,9 @@ AC: `curl` without token → 401; `GET /api/search?q=SPI+polarity` returns JSON 
 + trust; `GET /api/items/<id>` matches `kb_get`; a `POST /api/items` save then a search finds it;
 unsupported verbs → 405.
 
-**6b — Read-only web UI (~2-3 h)** — browse the KB outside Claude; strictly read-only (Inv. 11).
+**6b — Read-only web UI (~2-3 h)** — browse the KB outside Claude; strictly read-only (Inv. 11 as
+originally stated; amended 2026-07-18 to "no knowledge mutation" with the owner-only /admin authz
+carve-out — see the Phase-6 discipline block above and ADVERSARIAL_REVIEW.md A11-1).
 Tasks: `src/kbweb/server.py` — server-rendered app (Starlette + Jinja, **no build step**) over
 **kbcore read functions only**; port `KB_WEB_PORT=8323`. Views: **search** (hits with the SEC-3
 provenance header, trust badge, code-anchor line, tags), **item** (`get_item`: body + relations +

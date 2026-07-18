@@ -1,10 +1,14 @@
-"""kbweb.server — read-only web UI: app assembly + auth (PLAN.md §10, Inv. 11).
+"""kbweb.server — web UI: app assembly + auth (PLAN.md §10, Inv. 11 amended).
 
 Views live in kbweb.views_search / views_items / views_meta (all GET); this
 module owns the session middleware, login (token + Google OAuth), error
-handlers and startup guards. READ-ONLY by construction (Invariant 11): every
-data route is GET/HEAD and no kbweb module imports a kbcore write function —
-a test asserts both mechanically. Run: ``python -m kbweb.server``.
+handlers and startup guards. NO KNOWLEDGE MUTATION by construction
+(Invariant 11, amended 2026-07-18): every data route is GET/HEAD and no kbweb
+module imports a kbcore knowledge-write function — a test asserts both
+mechanically. The sole mutating routes are the OWNER-ONLY authz-config actions
+in kbweb.views_admin (project-share grant/revoke); the session middleware
+walls the whole /admin* subtree off from non-owners with the byte-identical
+unknown-path 404. Run: ``python -m kbweb.server``.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import secrets
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -23,7 +27,7 @@ from kbcore import principals, scope
 from kbcore.config import settings
 from kbcore.errors import KBError, NotFound
 from kbmcp.server import _validate_runtime_config
-from kbweb import auth, views_items, views_meta, views_search
+from kbweb import auth, views_admin, views_items, views_meta, views_search
 from kbweb.ui import STATIC_DIR, code_css, templates
 
 log = logging.getLogger("kbweb")
@@ -45,7 +49,8 @@ def _principal_for_identity(identity: str | None) -> scope.Principal | None:
 class SessionAuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except /login, /static,
     /auth/google) and bind the resolved principal for the request (grantees see
-    only their granted projects in every view)."""
+    only their granted projects in every view). Walls the owner-only /admin*
+    subtree off from non-owners with the router's byte-identical 404."""
 
     async def dispatch(self, request, call_next):
         path = request.url.path
@@ -55,6 +60,12 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         principal = _principal_for_identity(identity)
         if principal is None:
             return RedirectResponse("/login", status_code=302)
+        if (path == "/admin" or path.startswith("/admin/")) and not principal.is_owner:
+            # The owner-only authz surface (Inv. 11 carve-out) must be
+            # INDISTINGUISHABLE from a nonexistent path for any grantee:
+            # answered BEFORE routing so no method probe can elicit a 405,
+            # byte-identical to the router's own unknown-path 404.
+            return PlainTextResponse("Not Found", status_code=404)
         with scope.use_principal(principal):
             return await call_next(request)
 
@@ -157,6 +168,8 @@ ROUTES = [
     *views_search.ROUTES,
     *views_items.ROUTES,
     *views_meta.ROUTES,
+    # Owner-only authz-config carve-out (Inv. 11 amended) — the ONLY mutating routes.
+    *views_admin.ROUTES,
 ]
 
 

@@ -1,5 +1,8 @@
-"""Phase 6b — read-only web UI (Starlette). In-process via TestClient against
-kb_test; Ollama mocked by conftest. Proves the read-only invariant (Inv. 11).
+"""Phase 6b — web UI (Starlette). In-process via TestClient against kb_test;
+Ollama mocked by conftest. Proves Invariant 11 (amended 2026-07-18): the web UI
+performs NO KNOWLEDGE MUTATION — the only mutating routes are the explicit
+owner-only /admin authz allowlist (project-share grant/revoke), unreachable
+without the OWNER identity. Behavioral admin tests live in test_web_admin.py.
 """
 
 from __future__ import annotations
@@ -96,22 +99,33 @@ def test_web_item_missing_is_404(client):
     assert client.get("/item/999999").status_code == 404
 
 
-def test_web_is_read_only(web_app):
-    # (1) every route is GET-only except /login (which is GET+POST for auth,
-    #     performs NO kbcore write); nothing anywhere allows PUT/DELETE/PATCH.
-    #     The /static Mount has no .methods attribute — StaticFiles serves
-    #     GET/HEAD only by construction.
+# The Inv. 11 carve-out (amended 2026-07-18, ADVERSARIAL_REVIEW.md A11-1): the
+# ONLY mutating web routes — owner-only AUTHORIZATION-CONFIG actions (project-
+# share grant/revoke). Adding ANY other path here requires re-opening the review.
+ADMIN_MUTATING_ROUTES = {"/admin/grant", "/admin/revoke"}
+
+
+def test_web_no_knowledge_mutation(web_app):
+    # (1) every route is GET-only except /login (GET+POST for auth, NO kbcore
+    #     write) and the explicit owner-only authz allowlist; nothing anywhere
+    #     allows PUT/DELETE/PATCH. The /static Mount has no .methods attribute —
+    #     StaticFiles serves GET/HEAD only by construction.
     for route in web_app.routes:
         methods = set(getattr(route, "methods", None) or ())
         assert not (methods & {"PUT", "DELETE", "PATCH"}), f"{route.path} exposes a mutation verb"
-        if route.path == "/login":
+        if route.path == "/login" or route.path in ADMIN_MUTATING_ROUTES:
             assert methods <= {"GET", "POST", "HEAD"}
         else:
             assert methods <= {"GET", "HEAD"}, f"{route.path} is not GET-only: {methods}"
+    # The POST-capable set is EXACTLY login + the allowlist — nothing may creep in.
+    posters = {r.path for r in web_app.routes if "POST" in set(getattr(r, "methods", None) or ())}
+    assert posters == {"/login"} | ADMIN_MUTATING_ROUTES, f"unexpected POST routes: {posters}"
 
-    # (2) EVERY kbweb module imports zero KB-write functions (Invariant 11) —
-    #     not just server: the view split must not smuggle a write name in.
+    # (2) EVERY kbweb module imports zero KNOWLEDGE-write functions — the
+    #     amendment did NOT relax this: authz config is not knowledge, and
+    #     items/sources/relations stay unreachable from the web tier.
     import importlib
+    import inspect
     import pkgutil
 
     import kbweb
@@ -120,6 +134,47 @@ def test_web_is_read_only(web_app):
         mod = importlib.import_module(f"kbweb.{mod_info.name}")
         leaked = WRITE_NAMES & set(dir(mod))
         assert not leaked, f"write name(s) {leaked} leaked into kbweb.{mod_info.name}"
+
+    # (3) the carve-out stays CONFINED: authz mutation happens ONLY in
+    #     views_admin, and ONLY share grant/ungrant — principal lifecycle
+    #     (create/revoke/rotate) and rw=true grants are unreachable from the web.
+    from kbweb import views_admin
+
+    admin_src = inspect.getsource(views_admin)
+    for forbidden in ("create_principal", "principals.revoke(", "rotate(", "rw=True"):
+        assert forbidden not in admin_src, f"{forbidden!r} must not be reachable from the web admin"
+    assert "rw=False" in admin_src, "the web admin must hardwire read-only grants"
+    for mod_info in pkgutil.iter_modules(kbweb.__path__):
+        if mod_info.name == "views_admin":
+            continue
+        src = inspect.getsource(importlib.import_module(f"kbweb.{mod_info.name}"))
+        assert "principals.grant(" not in src and "principals.ungrant(" not in src, (
+            f"authz mutation leaked into kbweb.{mod_info.name}"
+        )
+
+
+def test_admin_routes_unreachable_without_owner_identity(client):
+    """The carve-out routes exist ONLY for the OWNER identity: unauthenticated →
+    the same generic login redirect as every page; a signed-in GRANTEE → the
+    byte-identical 404 of a nonexistent path (never a 403/405 that would reveal
+    the surface). The full behavioral matrix lives in test_web_admin.py."""
+    from kbcore import principals
+
+    r = client.get("/admin", follow_redirects=False)
+    assert r.status_code == 302 and r.headers["location"] == "/login"
+    for path in ADMIN_MUTATING_ROUTES:
+        r = client.post(path, follow_redirects=False)
+        assert r.status_code == 302 and r.headers["location"] == "/login"
+
+    _pid, token = principals.create_principal("inv11-grantee", kind="token")
+    assert client.post("/login", data={"token": token}).status_code == 200
+    ghost = client.get("/definitely-not-a-route")
+    assert ghost.status_code == 404
+    for path in ("/admin", *ADMIN_MUTATING_ROUTES, "/admin/anything"):
+        got = client.get(path)
+        assert got.status_code == 404, f"grantee {path} → {got.status_code}, wanted 404"
+        assert got.content == ghost.content, f"grantee {path} 404 differs from unknown-path 404"
+        assert got.headers["content-type"] == ghost.headers["content-type"]
 
 
 def test_static_assets_served_without_auth(client):

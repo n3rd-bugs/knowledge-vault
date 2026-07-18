@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Share admin · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Project shares</h2>
+<p class="prov">Owner-only authorization config (Invariant 11 carve-out): grant or revoke
+  <strong>read-only</strong> project shares — every grant made here is rw=false.
+  Principals themselves (create / revoke / rotate) are managed via the CLI.</p>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Grant a project (read-only)</h3>
+  {% set live = principals | rejectattr("revoked_at") | list %}
+  {% if live and projects %}
+  <form method="post" action="/admin/grant" class="bar">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <select name="name" required>
+      {% for p in live %}
+      <option value="{{ p.name }}">{{ p.name }} ({{ p.kind }}{% if p.email %} · {{ p.email }}{% endif %})</option>
+      {% endfor %}
+    </select>
+    <select name="project" required>
+      {% for proj in projects %}<option value="{{ proj }}">{{ proj }}</option>{% endfor %}
+    </select>
+    <button type="submit">Grant read-only</button>
+  </form>
+  {% else %}
+  <p class="prov">No live principals to grant to — create one with the CLI first.</p>
+  {% endif %}
+</div>
+
+<h3>Principals</h3>
+{% if not principals %}<p class="prov">No principals exist yet.</p>{% endif %}
+<div class="grid-cards">
+  {% for p in principals %}
+  <div class="card">
+    <h3 style="margin:.1rem 0 .3rem">{{ p.name }}</h3>
+    <div>
+      <span class="tag">{{ p.kind }}</span>
+      {% if p.email %}<span class="tag">{{ p.email }}</span>{% endif %}
+      {% if p.revoked_at %}<span class="badge archived">revoked</span>{% endif %}
+      {% if p.expires_at %}<span class="badge">expires {{ p.expires_at.date().isoformat() }}</span>{% endif %}
+    </div>
+    {% if p.note %}<p class="snippet">{{ p.note }}</p>{% endif %}
+    <div class="prov">created <time>{{ p.created_at.date().isoformat() }}</time></div>
+    {% if p.grants %}
+    <ul class="grant-list" style="list-style:none;padding:0;margin:.5rem 0 0">
+      {% for project, rw in p.grants %}
+      <li style="display:flex;gap:.5rem;align-items:center;margin:.2rem 0">
+        <span class="tag">{{ project }}</span>
+        <span class="badge">{{ "read-write" if rw else "read-only" }}</span>
+        <form method="post" action="/admin/revoke" style="display:inline;margin:0">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="name" value="{{ p.name }}">
+          <input type="hidden" name="project" value="{{ project }}">
+          <button type="submit">revoke</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="prov">no project grants</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

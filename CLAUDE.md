@@ -24,6 +24,7 @@ You are implementing the system specified in `PLAN.md` (v2.1 — primary use cas
 7. `TIMESTAMPTZ`/UTC everywhere. `datetime.now(timezone.utc)`, never naive datetimes.
 8. GPU courtesy: embed calls set short keep-alive; the 14B extractor is invoked only from `consolidate.py` or explicit user-invoked runs (`kb ingest-session`, `kb deep-search`). Residency: `KB_LLM_KEEP_ALIVE=-1` keeps it loaded (owner decision 2026-07 — idle residency is power-cheap; set 0 to reclaim VRAM).
 9. **The KB is not a code index.** Never bulk-ingest source trees; the repo scanner reads docs/ADR/README files only. Knowledge about code carries a `code_ref` anchor ({repo, path, lines, commit, symbol}) instead of the code itself.
+10. **The web UI mutates no knowledge** (Inv. 11, amended 2026-07-18). kbweb never writes items/sources/relations/review state and imports zero knowledge-write functions; data routes are GET/HEAD only. Sole carve-out: the owner-only authorization-config routes `POST /admin/grant|revoke` (read-only project shares via `kbcore.principals.grant`/`ungrant`, always `rw=false`, CSRF-protected; non-owners get the byte-identical 404 of an unknown path). Never broaden this carve-out beyond share grant/revoke.
 
 ## Code style
 - Type hints on all public functions; `pydantic` models in `kbcore/models.py` for tool/CLI I/O shapes.

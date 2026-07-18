@@ -161,3 +161,48 @@ Sanity gates all passed (unit-norm 1024-dim drop-in; no pooling degeneracy); 524
 cross-project case drops rank 3→5. Six cases fail under every embedder (Urdu, drv_spi_write-gotcha,
 UART trio, ollama-keep-alive) — corpus/leg gaps, not embedder-sensitive. Adoption pending owner
 decision + query-prefix support in kbcore.embed.
+
+---
+
+## Addendum 2 (2026-07-18): multi-LLM converging pipeline — prototype measurements
+
+Owner asked for an unboxed exploration of "multiple LLMs processing data and converging."
+All three mechanisms prototyped on the round-2 bench data (3 real transcripts, production code paths).
+
+### 1. Quote repair (pure code, no LLM)
+62% of ALL ungrounded quotes fuzzy-locate to a true verbatim span at difflib ratio >= 0.95 —
+models quote *nearly* right; a ~50-line locator recovers them while keeping SEC-3's verbatim
+invariant (the stored quote becomes the located true span; model_quote + repair_ratio kept for audit).
+Usable-item rates after repair: qwen3:14b 12/13 (92%), gemma3:12b 13/16 (81%), granite4.1:8b 6/9 (67%).
+
+### 2. Ensemble + convergence + factored verification
+- Corroboration is LOW (29% of clusters multi-model): models find DIFFERENT knowledge → the right
+  shape is UNION + per-item verification, NOT consensus voting (consensus would discard most knowledge).
+- Ensemble union + repair yields **21 quote-anchored knowledge units vs 5 under today's policy (4x)**;
+  12/24 clusters had no qwen3:14b member at all.
+- Judge quality is measured and asymmetric: qwen3:14b as factored judge = perfect on this sample
+  (approved reals, caught 6/6 fabricated probes); gemma3:12b as judge FAILED both directions
+  (rejected 4 real, approved 5/6 fakes) → gemma is disqualified from the judge slot.
+- Judge cost ~6.3 s/item; keep_alive=0 reloads are ~free (page cache).
+
+### 3. Retrieval convergence (dual-embedder RRF fusion, kb_test, n=29 golden)
+| config | hit@5 | MRR | cases |
+|---|---|---|---|
+| bge-m3 (live, validated bit-identical) | 0.724 | 0.603 | 21/29 |
+| qwen3-embedding:0.6b + prefix (swap) | **0.759** | 0.641 | **22/29** |
+| fusion K=60 | 0.724 | 0.661 | 21/29 |
+| fusion K=100 | 0.724 | **0.701** | 21/29 |
+
+Fusion rescues DRV8706 SPI-polarity (3 -> **1**) but pushes both systemd wins out of top-5; swap wins
+hit@5 but keeps the DRV8706 regression (3 -> 5). No config dominates. Fusion costs +117 ms/query and
+needs an additive second-vector migration + double embedding on ingest. Six golden cases miss under
+EVERY config (Urdu, UART trio, ollama-keep-alive, cross-project SPI phrasing) — corpus/leg gaps that
+cap all embedder work.
+
+### Proposed pipeline v2 (evidence-backed, pending owner approval)
+extract[qwen3:14b + granite4.1:8b + gemma3:12b, independent] -> quote-repair(>=0.95) ->
+converge[cluster @0.80, UNION, corroboration recorded in meta] -> factored verify
+[qwen3:14b judges gemma/granite items; qwen items pass via corroboration now, MiniCheck-770M sidecar
+later] -> ingest as unverified + review rows (existing triage keeps working). Fails route to review,
+never deleted (Inv. 5); repaired quotes stay verbatim (Inv. 4); all inside consolidate.py (Inv. 8).
+Measured yield: ~4x knowledge units per session at ~3-4x nightly GPU (window is empty; loads ~free).

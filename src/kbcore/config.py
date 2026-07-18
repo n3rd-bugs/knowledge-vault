@@ -134,6 +134,19 @@ class Settings(BaseSettings):
     # WP2 graph expansion: default n-hop neighbor pull-in in search (0=off). A
     # per-call hops>0 overrides this; search caps the effective value to 3 hops.
     kb_graph_expand_hops: int = 0
+    # Optional cross-encoder rerank sidecar (llama-server --reranking with the
+    # verified Qwen3-Reranker-0.6B GGUF). Empty = off (no HTTP call ever made).
+    # Fail-open: a down/slow sidecar leaves the fused order untouched. Measured
+    # 2026-07-18: ~425 ms warm for top_n=20 x ~500-token docs on the 4080S.
+    kb_rerank_url: str = ""
+    kb_rerank_top_n: int = 20
+    kb_rerank_timeout: float = 2.0
+    # Cross-family judge for PRIMARY-sourced ensemble singletons (probe-benched
+    # 2026-07-18: granite4.1:8b approved 7/7 reals, caught 6/6 fabricated
+    # probes, ~2.7s/item). Empty = primary singletons pass unjudged (the
+    # pre-secondary behavior). A judge FAIL still ingests, flagged
+    # verified_by='secondary-judge-failed' for triage (demote, never drop).
+    kb_ensemble_secondary_judge: str = ""
     # Auto-resolution (owner decision, 2026-07): a re-ingested newer revision of
     # the SAME source doc supersedes its predecessor (git history IS the human
     # decision), and lopsided-evidence contradictions auto-resolve after a

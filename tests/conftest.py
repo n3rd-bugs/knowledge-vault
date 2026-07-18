@@ -62,6 +62,22 @@ def fake_embeddings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _neutral_feature_flags(monkeypatch):
+    """Pin production feature flags to their code DEFAULTS for every test.
+
+    settings reads .env, so a live deployment flag (ensemble live-mode, rerank
+    sidecar URL, embedder query prefix) would silently reroute the code paths
+    under test — the ensemble .env flip broke 13 v1-path tests exactly this
+    way. Tests that exercise a flag set it explicitly via monkeypatch.
+    """
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "")
+    monkeypatch.setattr(settings, "kb_ensemble_shadow", True)
+    monkeypatch.setattr(settings, "kb_rerank_url", "")
+    monkeypatch.setattr(settings, "kb_embed_query_prefix", "")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "")
+
+
+@pytest.fixture(autouse=True)
 def _reset_scope():
     """Reset the per-request principal scope between tests (per-project sharing).
 

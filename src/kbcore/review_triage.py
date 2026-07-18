@@ -21,7 +21,7 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from kbcore import consolidation, graph, llm, review
+from kbcore import cluster_util, consolidation, graph, llm, review
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.errors import (
@@ -156,30 +156,73 @@ def _close_row(queue_id: int, kind: str, **extra: Any) -> None:
         )
 
 
-def _apply_one(qid: int, item_id: int, action: str, triage: dict[str, Any]) -> str:
-    """Apply one stored suggestion; raises to leave the row OPEN for a human."""
+def _apply_one(qid: int, item_id: int, action: str) -> str:
+    """Apply one keep/reject_noise suggestion; raises to leave the row OPEN."""
     if action == "keep":
         # Item untouched: stays active + unverified (a triage 'keep' is NOT a
         # promotion — trust upgrades remain human-only via review.promote).
         _close_row(qid, "triage_keep")
         return "kept (row closed; item stays active + unverified)"
-    if action == "reject_noise":
-        review.reject(qid)  # archives the item + resolves the row (status flips)
-        return f"rejected item {item_id} (archived)"
-    # reject_duplicate: mark_duplicate flips status + records derived_from.
-    dup_of = triage.get("dup_of")
-    if isinstance(dup_of, bool) or not isinstance(dup_of, int):
-        raise InvalidOperation("reject_duplicate suggestion carries no valid dup_of")
+    review.reject(qid)  # archives the item + resolves the row (status flips)
+    return f"rejected item {item_id} (archived)"
+
+
+def _apply_duplicate_clusters(dup_rows: list[tuple[int, int, dict[str, Any]]]) -> dict[int, str]:
+    """Cluster-canonicalize the batch's reject_duplicate rows (KB gotcha 958).
+
+    Pairwise LLM edges are not a consistent DAG (reciprocal pairs / chains), and
+    blind per-edge apply retired BOTH ends of a reciprocal pair. So: union-find
+    the valid {item, dup_of} edges; canonical per cluster = best ACTIVE member
+    by the nightly dedupe's rule (consolidation.item_ranks: oldest verified,
+    else oldest — item_ranks alone doesn't fit since it ignores status, so only
+    active members are ranked). Non-canonical members retire to the CLUSTER
+    canonical even when it differs from a row's stored dup_of (stamped
+    note='cluster_canonicalized'); a canonical's own row closes as the cluster
+    winner; an all-retired cluster just closes its rows. Per-member isolation:
+    a raise stamps that member's rows 'error: …' and leaves them open.
+    """
+    outcomes: dict[int, str] = {}
+    if not dup_rows:
+        return outcomes
+    ids = {item_id for _, item_id, _ in dup_rows}
+    for _, _, triage in dup_rows:
+        d = triage.get("dup_of")
+        if isinstance(d, int) and not isinstance(d, bool):
+            ids.add(d)
     with connect() as conn:
-        canon = conn.execute("SELECT id FROM items WHERE id = %s", (dup_of,)).fetchone()
-    if canon is None:
-        raise InvalidOperation(f"dup_of item {dup_of} does not exist")
-    if consolidation.mark_duplicate(item_id, dup_of):
-        _close_row(qid, "triage_duplicate", dup_of=dup_of)
-        return f"item {item_id} marked duplicate of {dup_of}"
-    # Something else already retired the item — the review question is moot.
-    _close_row(qid, "item_retired")
-    return f"item {item_id} already retired; row closed"
+        found = conn.execute(
+            "SELECT id, type, status FROM items WHERE id = ANY(%s)", (list(ids),)
+        ).fetchall()
+    info = {r[0]: (r[1], r[2]) for r in found}
+    edges = cluster_util.validate_dup_edges(dup_rows, info, outcomes)
+    rows_by_item: dict[int, list[tuple[int, int]]] = {}
+    for qid, item_id, dup_of in edges:
+        rows_by_item.setdefault(item_id, []).append((qid, dup_of))
+
+    for comp in cluster_util.clusters((i, d) for _, i, d in edges):
+        actives = [i for i in comp if info.get(i, ("", ""))[1] == "active"]
+        ranks = consolidation.item_ranks(actives)
+        canonical = min(actives, key=lambda i: ranks[i]) if actives else None
+        for member in sorted(comp):
+            member_rows = rows_by_item.get(member, [])
+            try:
+                if member == canonical:
+                    for qid, _ in member_rows:
+                        _close_row(qid, "triage_keep", note="cluster_winner")
+                        outcomes[qid] = f"item {member} kept as cluster canonical (row closed)"
+                elif canonical is not None and consolidation.mark_duplicate(member, canonical):
+                    for qid, stored in member_rows:
+                        extra = {"note": "cluster_canonicalized"} if stored != canonical else {}
+                        _close_row(qid, "triage_duplicate", dup_of=canonical, **extra)
+                        outcomes[qid] = f"item {member} marked duplicate of {canonical}"
+                else:  # member (or the whole cluster) already retired — the row is moot
+                    for qid, _ in member_rows:
+                        _close_row(qid, "item_retired")
+                        outcomes[qid] = f"item {member} already retired; row closed"
+            except Exception as e:  # noqa: BLE001 — per-member isolation; rows stay open
+                for qid, _ in member_rows:
+                    outcomes.setdefault(qid, f"error: {e}")
+    return outcomes
 
 
 def apply_triage(
@@ -191,13 +234,12 @@ def apply_triage(
 
     Selects open ``unverified_extraction`` rows WITH a stored triage whose
     action is in ``actions`` (None = all of :data:`llm.TRIAGE_ACTIONS`),
-    optionally narrowed by ``project`` and/or explicit ``queue_ids``. Per row:
-    'keep' closes the row (item untouched); 'reject_noise' archives the item
-    via review.reject; 'reject_duplicate' runs consolidation.mark_duplicate
-    against the suggested canonical (already-retired items close the row as
-    ``item_retired``). A missing/invalid ``dup_of`` — or any raise — becomes an
-    ``'error: …'`` outcome and LEAVES THE ROW OPEN for a human (per-row
-    isolation). Returns ``[(queue_id, outcome)]`` ordered by queue id.
+    optionally narrowed by ``project`` and/or explicit ``queue_ids``. 'keep'
+    closes the row (item untouched); 'reject_noise' archives the item; all
+    'reject_duplicate' rows are canonicalized TOGETHER (never edge-by-edge) via
+    :func:`_apply_duplicate_clusters`. An invalid ``dup_of`` — or any raise —
+    becomes an ``'error: …'`` outcome and LEAVES THE ROW OPEN for a human
+    (per-row isolation). Returns ``[(queue_id, outcome)]`` ordered by queue id.
     """
     if actions is not None:
         unknown = set(actions) - set(llm.TRIAGE_ACTIONS)
@@ -228,14 +270,22 @@ def apply_triage(
     with connect() as conn:
         rows = conn.execute("\n".join(sql), params).fetchall()
 
-    outcomes: list[tuple[int, str]] = []
+    selected: list[tuple[int, int, str, dict[str, Any]]] = []
     for qid, item_id, detail in rows:
         triage = (detail if isinstance(detail, dict) else {}).get("triage") or {}
         action = triage.get("action")
-        if action not in wanted:
-            continue
+        if action in wanted:
+            selected.append((qid, item_id, action, triage))
+
+    outcomes: dict[int, str] = {}
+    for qid, item_id, action, _triage in selected:
+        if action == "reject_duplicate":
+            continue  # canonicalized cluster-wide below, never edge-by-edge
         try:
-            outcomes.append((qid, _apply_one(qid, item_id, action, triage)))
+            outcomes[qid] = _apply_one(qid, item_id, action)
         except Exception as e:  # noqa: BLE001 — per-row isolation; the row stays open
-            outcomes.append((qid, f"error: {e}"))
-    return outcomes
+            outcomes[qid] = f"error: {e}"
+    outcomes.update(
+        _apply_duplicate_clusters([(q, i, t) for q, i, a, t in selected if a == "reject_duplicate"])
+    )
+    return [(qid, outcomes[qid]) for qid, _i, _a, _t in selected]  # rows were ORDER BY rq.id

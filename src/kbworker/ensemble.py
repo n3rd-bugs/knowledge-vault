@@ -210,9 +210,33 @@ def run_ensemble(
         rep = _representative(members, primary)
         item = rep["item"]
         # Survivor policy (e), checked in order; only non-primary singletons
-        # ever reach the judge (which is ALWAYS the primary — see module doc).
+        # ever reach the primary judge. Primary singletons additionally get a
+        # SECONDARY cross-family judge when configured (granite4.1:8b passed
+        # the probe bench 2026-07-18: 7/7 reals approved, 6/6 fabricated
+        # probes caught, ~2.7s/item) — but demote-to-review semantics apply:
+        # a secondary-judge fail still ingests (v1 would have kept the item)
+        # with verified_by='secondary-judge-failed', a visible flag for triage,
+        # never a silent drop.
         if rep["model"] == primary:
+            # Corroborated primary reps keep the 'primary-source' label (the
+            # pinned WP-B2 contract); corroboration merely SKIPS the judge.
             verified_by = "primary-source"
+            if len(found_by) < 2 and settings.kb_ensemble_secondary_judge:
+                judged += 1
+                try:
+                    verdict = llm.verify_item(
+                        str(item.get("title") or ""),
+                        str(item.get("body") or ""),
+                        text,
+                        judge_model=settings.kb_ensemble_secondary_judge,
+                        keep_alive=0,
+                    )
+                    verified_by = (
+                        "secondary-judge" if verdict.get("supported") else "secondary-judge-failed"
+                    )
+                except (ExtractorUnavailable, ExtractionFailed) as e:
+                    logger.warning("secondary judge failed for %r: %s", item.get("title"), e)
+                    judge_errors += 1  # item still survives (primary-sourced)
         elif len(found_by) >= 2:
             verified_by = "corroboration"
         else:

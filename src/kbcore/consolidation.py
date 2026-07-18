@@ -21,10 +21,21 @@ from kbcore.supersede import supersede
 
 
 def last_consolidation_at() -> datetime | None:
-    """created_at of the most recent kb-system report — the "since last run" mark."""
+    """created_at of the most recent kb-system CONSOLIDATION report — the "since
+    last run" mark for the nightly summarize step.
+
+    Requires ``meta->>'consolidation' = 'true'``: deep-search (and any manual
+    ``kb_save``) also writes ``type='report'`` items WITHOUT that marker, and
+    matching on type alone let such a report poison ``since`` so the next
+    nightly missed items saved between the real consolidation and the foreign
+    report (KB item 942 §2). Returns None when no consolidation report exists
+    (genuine first run — the summarize step then floors ``since`` to the epoch).
+    """
     with connect() as conn:
         row = conn.execute(
-            "SELECT max(created_at) FROM items WHERE project = 'kb-system' AND type = 'report'"
+            "SELECT max(created_at) FROM items "
+            "WHERE project = 'kb-system' AND type = 'report' "
+            "  AND meta->>'consolidation' = 'true'"
         ).fetchone()
     return row[0] if row and row[0] else None
 

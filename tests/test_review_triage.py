@@ -224,6 +224,118 @@ def test_apply_triage_filters(kb):
         review_triage.apply_triage(actions={"obliterate"})
 
 
+# --- apply_triage cluster canonicalization (KB gotcha 958) -------------------
+# The first live triage run showed pairwise reject_duplicate edges are NOT a
+# consistent DAG (reciprocal pairs + chains); apply_triage union-finds them and
+# retires to ONE canonical per cluster (item_ranks over ACTIVE members).
+
+
+def _rel(src: int, dst: int) -> bool:
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM relations WHERE src_id = %s AND rel = 'derived_from' AND dst_id = %s",
+            (src, dst),
+        ).fetchone()
+    return row is not None
+
+
+def test_apply_triage_reciprocal_pair_retires_one_side(kb):
+    a, qa = _unverified("p", "recip-a")
+    b, qb = _unverified("p", "recip-b")
+    _store(qa, "reject_duplicate", dup_of=b)  # A dup-of B ...
+    _store(qb, "reject_duplicate", dup_of=a)  # ... AND B dup-of A (reciprocal)
+
+    out = dict(review_triage.apply_triage())
+    # oldest active member wins (item_ranks: same trust → oldest): A stays, ONLY B retires
+    assert out[qa] == f"item {a} kept as cluster canonical (row closed)"
+    assert out[qb] == f"item {b} marked duplicate of {a}"
+    assert get_item(a).status == "active" and get_item(b).status == "duplicate"
+    assert _rel(b, a) and not _rel(a, b)
+    resolved, detail = _row(qa)  # canonical's own row: closed as the cluster winner
+    assert resolved is True
+    assert detail["auto_resolution"]["kind"] == "triage_keep"
+    assert detail["auto_resolution"]["note"] == "cluster_winner"
+    resolved, detail = _row(qb)
+    assert resolved is True
+    assert detail["auto_resolution"]["kind"] == "triage_duplicate"
+    assert detail["auto_resolution"]["dup_of"] == a
+    assert "note" not in detail["auto_resolution"]  # stored dup_of == canonical: no retarget
+    assert review_triage.apply_triage() == []  # idempotent re-run: nothing changes
+
+
+def test_apply_triage_chain_collapses_to_oldest_active(kb):
+    a, qa = _unverified("p", "chain-a")
+    b, qb = _unverified("p", "chain-b")
+    c = ingest("p", "note", "chain-c", "body chain-c", trust="unverified", uri="chain-c")
+    _store(qa, "reject_duplicate", dup_of=b)  # A → B
+    _store(qb, "reject_duplicate", dup_of=c)  # B → C (B itself retires: a chain)
+
+    out = dict(review_triage.apply_triage())
+    # canonical = OLDEST active member of the whole cluster (A), not any stored target
+    assert out[qa] == f"item {a} kept as cluster canonical (row closed)"
+    assert out[qb] == f"item {b} marked duplicate of {a}"
+    assert get_item(a).status == "active"
+    assert get_item(b).status == "duplicate" and get_item(c).status == "duplicate"
+    assert _rel(b, a) and _rel(c, a)  # C (target-only member) also collapses to A
+    assert not _rel(b, c)
+    _resolved, detail = _row(qb)  # stored dup_of=C was RETARGETED to the cluster canonical
+    assert detail["auto_resolution"]["kind"] == "triage_duplicate"
+    assert detail["auto_resolution"]["dup_of"] == a
+    assert detail["auto_resolution"]["note"] == "cluster_canonicalized"
+    assert review_triage.apply_triage() == []
+
+
+def test_apply_triage_summary_target_errors_and_stays_open(kb):
+    x, qx = _unverified("p", "sum-x")
+    s = ingest("p", "summary", "Summary — t", "summary body", uri="sum-s")
+    _store(qx, "reject_duplicate", dup_of=s)  # summaries are superseded every refresh
+
+    out = dict(review_triage.apply_triage())
+    assert out[qx] == f"error: dup_of item {s} is a summary (unstable canonical)"
+    assert _row(qx)[0] is False  # row STAYS OPEN for a human
+    assert get_item(x).status == "active" and get_item(s).status == "active"
+    assert not _rel(x, s)  # no retirement recorded
+    assert dict(review_triage.apply_triage())[qx] == out[qx]  # re-run: same error, no churn
+
+
+def test_apply_triage_all_retired_cluster_closes_rows(kb):
+    a, qa = _unverified("p", "ret-a")
+    b = ingest("p", "note", "ret-b", "body ret-b", trust="unverified", uri="ret-b")
+    _store(qa, "reject_duplicate", dup_of=b)
+    with db.transaction() as conn:  # retire BOTH members out-of-band (kb_test-owned)
+        conn.execute("UPDATE items SET status = 'archived' WHERE id = ANY(%s)", ([a, b],))
+
+    out = dict(review_triage.apply_triage())
+    # no active member → no canonical: rows close as item_retired, nothing new retires
+    assert out[qa] == f"item {a} already retired; row closed"
+    resolved, detail = _row(qa)
+    assert resolved is True and detail["auto_resolution"]["kind"] == "item_retired"
+    assert get_item(a).status == "archived" and get_item(b).status == "archived"
+    assert not _rel(a, b)
+    assert review_triage.apply_triage() == []
+
+
+def test_apply_triage_mixed_batch_keep_and_noise_unaffected(kb):
+    keep, q_keep = _unverified("p", "mix-keep")
+    noise, q_noise = _unverified("p", "mix-noise")
+    a, qa = _unverified("p", "mix-a")
+    b, qb = _unverified("p", "mix-b")
+    _store(q_keep, "keep")
+    _store(q_noise, "reject_noise")
+    _store(qa, "reject_duplicate", dup_of=b)
+    _store(qb, "reject_duplicate", dup_of=a)
+
+    out = review_triage.apply_triage()
+    assert [q for q, _ in out] == sorted([q_keep, q_noise, qa, qb])  # ordered by queue id
+    res = dict(out)
+    assert res[q_keep].startswith("kept")
+    assert res[q_noise] == f"rejected item {noise} (archived)"
+    assert get_item(keep).status == "active" and get_item(keep).trust == "unverified"
+    assert get_item(noise).status == "archived"
+    assert get_item(a).status == "active" and get_item(b).status == "duplicate"
+    assert review_triage.apply_triage() == []  # second apply changes nothing
+
+
 # --- run_triage (the shared worker/CLI loop) ---------------------------------
 
 

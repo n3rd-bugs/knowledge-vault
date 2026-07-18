@@ -76,3 +76,17 @@
   expect_substr: ["ring buffer"]
   expect_rank_le: 5
   kwargs: {expand: true}
+
+# --- mined from access_log 2026-07-18 (kb eval mine; real search→get confirmations) ---
+- q: "supersede does not auto-close valid_to valid-time bitemporal as_of design decision"
+  expect_item_id: 775                                   # 3 confirmations
+- q: "extractor model selection qwen3 14b embedding bge-m3 choice rationale ollama"
+  expect_item_id: 313
+- q: "bare-metal redis GET benchmark verify-qemu zebu-layout UART hash pass fail known issue"
+  expect_item_id: 124
+- q: "upload markdown or HTML content as Google Doc, create_file textContent conversion, docx export best practice"
+  expect_item_id: 383
+- q: "stream push status sensor settings on-change realtime"
+  expect_item_id: 81
+- q: "mTLS fleet agent deferred config-sync"
+  expect_item_id: 68

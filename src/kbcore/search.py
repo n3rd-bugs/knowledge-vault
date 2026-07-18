@@ -16,6 +16,7 @@ import math
 from datetime import datetime
 from typing import Any
 
+from kbcore import rerank as rerank_mod
 from kbcore import scope, search_expand
 from kbcore.config import settings
 from kbcore.db import connect, transaction
@@ -158,6 +159,11 @@ def search(
         # neighbor) and the seed_floor stays on raw scores (un-boosted rank-1 can
         # seed; finding). Reuse the legs' connection — no extra connect (finding).
         fused = _apply_bonuses(conn, fused, boost_project, id_tokens, expansion_origin)
+        # Optional cross-encoder rerank of the top window (kb_rerank_url set):
+        # reorders only, fail-open, scores remapped so the order survives the
+        # _to_hits re-sort (see kbcore.rerank). Reuses the legs' connection.
+        if settings.kb_rerank_url and fused:
+            fused = rerank_mod.rerank_fused(conn, query, fused, settings.kb_rerank_top_n)
     # Materialize ALL fused candidates before truncating: the verified >=
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used

@@ -255,6 +255,46 @@ def test_policy_matrix(monkeypatch):
     assert report["rejected_reps"] == 2
 
 
+def test_secondary_judge_for_primary_singletons(monkeypatch):
+    """kb_ensemble_secondary_judge set: primary SINGLETONS get a cross-family
+    judge; a judge FAIL still survives (demote-to-review, flagged), and
+    corroborated primary items are never judged."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+    p_fail = _item("primary judged fail", "claim second rejects", RERANK_SPAN)
+    _install_extractors(
+        monkeypatch,
+        {"prime": [SHARED, P_ONLY, p_fail], "ex-a": [dict(SHARED)]},
+    )
+    judge_calls = _install_judge(monkeypatch, supported={"primary singleton"})
+
+    report = ensemble.run_ensemble(TEXT, "proj", "test://wpb2/secondary")
+
+    by_title = {s["item"]["title"]: s["extraction_pipeline"] for s in report["survivors"]}
+    # ALL three survive — a secondary-judge fail never drops a primary item.
+    assert set(by_title) == {"pool size decision", "primary singleton", "primary judged fail"}
+    # Corroborated primary rep: label stays 'primary-source' (pinned contract);
+    # corroboration only exempts it from the secondary judge.
+    assert by_title["pool size decision"]["verified_by"] == "primary-source"
+    assert by_title["primary singleton"]["verified_by"] == "secondary-judge"
+    assert by_title["primary judged fail"]["verified_by"] == "secondary-judge-failed"
+    judged = sorted(c["title"] for c in judge_calls)
+    assert judged == ["primary judged fail", "primary singleton"], (
+        "only primary SINGLETONS reach the secondary judge"
+    )
+    assert all(c["judge_model"] == "second" for c in judge_calls)
+
+
+def test_secondary_judge_unset_keeps_old_behavior(monkeypatch):
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    _install_extractors(monkeypatch, {"prime": [P_ONLY], "ex-a": []})
+    judge_calls = _install_judge(monkeypatch)
+    report = ensemble.run_ensemble(TEXT, "proj", "test://wpb2/secondary-off")
+    (surv,) = report["survivors"]
+    assert surv["extraction_pipeline"]["verified_by"] == "primary-source"
+    assert judge_calls == []
+
+
 def test_extra_model_failure_skipped_primary_failure_raises(monkeypatch):
     monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a,ex-b")
     _install_extractors(

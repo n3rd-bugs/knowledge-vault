@@ -1,0 +1,17 @@
+# kb-backup — nightly local pg_dump→zstd backup, plus optional age-encrypted
+# offsite push via rclone when KB_OFFSITE_ENABLED=true (PLAN.md §9 + §6d)
+# Install: bash scripts/install_systemd.sh (the .timer is installed but NOT enabled;
+# enable manually with: systemctl --user enable --now kb-backup.timer)
+[Unit]
+Description=Knowledge Vault nightly backup (local dump + optional encrypted offsite push)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+ExecStart=%h/kb/repo/scripts/backup.sh
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

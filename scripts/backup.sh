@@ -3,6 +3,10 @@
 #
 # Keeps 14 daily + 8 weekly (Monday) dumps. Reads KB_BACKUPS from .env (default
 # ~/kb/backups). Never prints secrets. Same-day re-runs overwrite (idempotent-ish).
+#
+# Offsite (PLAN.md §6d, opt-in): when KB_OFFSITE_ENABLED=true the finished dump
+# is age-ENCRYPTED locally and only the ciphertext is pushed via rclone — see
+# scripts/offsite.sh. Unset/false keeps this script purely local (no new deps).
 set -euo pipefail
 umask 077
 
@@ -58,3 +62,19 @@ for f in kb-*.sql.zst; do
 done
 
 echo "backup.sh: wrote ${OUT} ($(du -h "${OUT}" | cut -f1)); $(ls -1 kb-*.sql.zst | wc -l) dumps retained"
+
+# --- offsite push (PLAN.md §6d) ----------------------------------------------
+# Additive: with KB_OFFSITE_ENABLED unset/false nothing below runs and this
+# script behaves exactly as before. The local backup above is already complete;
+# an offsite failure logs + exits nonzero but never touches the local dumps.
+# offsite.sh encrypts LOCALLY with age (recipient KB_AGE_RECIPIENT) and pushes
+# ONLY the .age ciphertext to KB_RCLONE_REMOTE — plaintext never leaves the box.
+KB_OFFSITE_ENABLED="${KB_OFFSITE_ENABLED:-false}"
+if [[ "${KB_OFFSITE_ENABLED,,}" =~ ^(true|1|yes)$ ]]; then
+  if bash "${REPO_DIR}/scripts/offsite.sh" push "${OUT}"; then
+    echo "backup.sh: offsite push OK"
+  else
+    echo "backup.sh: local backup OK but OFFSITE PUSH FAILED (see offsite: lines above)" >&2
+    exit 1
+  fi
+fi

@@ -1,0 +1,12 @@
+# kb-backup.timer — run the backup nightly (PLAN.md §9 + §6d)
+[Unit]
+Description=Nightly Knowledge Vault backup
+
+[Timer]
+OnCalendar=*-*-* 03:15
+RandomizedDelaySec=1800
+Persistent=true
+Unit=kb-backup.service
+
+[Install]
+WantedBy=timers.target

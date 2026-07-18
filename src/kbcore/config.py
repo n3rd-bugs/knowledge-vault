@@ -113,6 +113,22 @@ class Settings(BaseSettings):
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")
+    # Encrypted offsite backups (PLAN.md §6d). Consumed by scripts/backup.sh /
+    # scripts/offsite.sh straight from .env; typed here so Python surfaces share
+    # the single documented config view. Off by default — backup.sh stays purely
+    # local until the owner flips the switch.
+    kb_offsite_enabled: bool = False
+    # rclone remote:path for the encrypted dumps (owner configures via `rclone
+    # config`, e.g. "gdrive:kb-backups"). No hardcoded remotes (CLAUDE.md).
+    kb_rclone_remote: str = ""
+    # age PUBLIC key ("age1..."): encryption recipient. Only ciphertext is ever
+    # uploaded; the matching private key stays OFF this box.
+    kb_age_recipient: str = ""
+    # Offsite retention: keep this many newest kb-*.sql.zst.age objects remote.
+    kb_offsite_keep: int = 30
+    # Path to an age IDENTITY (private key) file — needed only by
+    # `restore_test.sh --offsite`; in production it lives off-box.
+    kb_age_identity: str = ""
     kb_git_repos: str = ""
     kb_archive_after_days: int = 180
     kb_dup_threshold: float = 0.97

@@ -5,6 +5,12 @@
 # on 127.0.0.1:5599, asserts items+chunks counts are within 1% of the LIVE DB,
 # then destroys the container+volume. Prints PASS/FAIL; exits nonzero on FAIL.
 # Never echoes secrets.
+#
+# --offsite (PLAN.md §6d): instead of the local dump, fetch the newest encrypted
+# kb-*.sql.zst.age from KB_RCLONE_REMOTE and age-decrypt it with KB_AGE_IDENTITY
+# (private-key file — kept off-box in production, supplied only for the drill),
+# then run the same throwaway restore + 1% row-count check. Default (no flag)
+# stays the pure-local drill.
 set -uo pipefail
 umask 077
 
@@ -23,13 +29,34 @@ CONT="kb-restore-test"
 IMAGE="pgvector/pgvector:pg16"
 DBPASS="${KB_DB_PASSWORD:-restore-test}"
 
+MODE="local"
+case "${1:-}" in
+  --offsite) MODE="offsite" ;;
+  "") ;;
+  *) echo "restore_test: unknown argument '$1' (usage: restore_test.sh [--offsite])" >&2; exit 2 ;;
+esac
+
+TMP_FETCH=""
 fail() { echo "restore_test: FAIL — $*" >&2; cleanup; exit 1; }
-cleanup() { docker rm -fv "${CONT}" >/dev/null 2>&1 || true; }
+cleanup() {
+  docker rm -fv "${CONT}" >/dev/null 2>&1 || true
+  if [[ -n "${TMP_FETCH}" ]]; then rm -rf "${TMP_FETCH}"; fi
+}
 trap cleanup EXIT
 
-NEWEST="$(ls -1t "${KB_BACKUPS}"/kb-*.sql.zst 2>/dev/null | head -1)"
-[[ -n "${NEWEST}" ]] || fail "no backup found under ${KB_BACKUPS}"
-echo "restore_test: using $(basename "${NEWEST}")"
+if [[ "${MODE}" == "offsite" ]]; then
+  # offsite.sh fetch: rclone-pull the newest .age object + age-decrypt it; the
+  # decrypted dump path arrives on stdout (its logs go to stderr).
+  TMP_FETCH="$(mktemp -d)"
+  NEWEST="$(bash "${REPO_DIR}/scripts/offsite.sh" fetch "${TMP_FETCH}")" \
+    || fail "offsite fetch/decrypt failed"
+  [[ -s "${NEWEST}" ]] || fail "offsite fetch produced no dump"
+  echo "restore_test: using OFFSITE $(basename "${NEWEST}")"
+else
+  NEWEST="$(ls -1t "${KB_BACKUPS}"/kb-*.sql.zst 2>/dev/null | head -1)"
+  [[ -n "${NEWEST}" ]] || fail "no backup found under ${KB_BACKUPS}"
+  echo "restore_test: using $(basename "${NEWEST}")"
+fi
 
 cleanup
 docker run -d --name "${CONT}" \

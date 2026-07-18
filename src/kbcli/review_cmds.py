@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import typer
 
-from kbcore import render
+from kbcore import render, review_auto, review_triage
 from kbcore import review as review_mod
+from kbcore.config import settings
 from kbcore.errors import KBError
 
 review_app = typer.Typer(help="Review queue: promote/reject/supersede unverified items")
@@ -60,6 +61,96 @@ def review_supersede(
     except KBError as e:
         _fail(e)
     typer.echo(f"item {old_id} superseded by {new_item} (queue {queue_id} resolved)")
+
+
+@review_app.command("dismiss")
+def review_dismiss(queue_id: int = typer.Argument(...)) -> None:
+    """Close a queue row without touching its item (works for item-less rows too)."""
+    try:
+        review_mod.dismiss(queue_id)
+    except KBError as e:
+        _fail(e)
+    typer.echo(f"queue {queue_id} dismissed (item untouched)")
+
+
+@review_app.command("bulk")
+def review_bulk(
+    action: str = typer.Option(..., "--action", help="promote | reject | dismiss"),
+    ids: str = typer.Option("", "--ids", help='comma-separated queue ids, e.g. "1,2,3"'),
+    project: str | None = typer.Option(None, "--project", help="drain this project's open rows"),
+) -> None:
+    """Batch-drain open review rows by ids and/or project (owner tool, WP-1)."""
+    try:
+        queue_ids = [int(x) for x in ids.split(",") if x.strip()] or None
+    except ValueError:
+        _fail(KBError(f"--ids must be comma-separated integers, got {ids!r}"))
+    try:
+        results = review_auto.bulk_resolve(action, queue_ids=queue_ids, project=project)
+    except KBError as e:
+        _fail(e)
+    for qid, outcome in results:
+        typer.echo(f"[{qid}] {outcome}")
+    errs = sum(1 for _, o in results if o.startswith("error"))
+    typer.echo(
+        f"bulk {action}: {len(results) - errs} resolved, {errs} error(s), {len(results)} row(s)"
+    )
+
+
+@review_app.command("triage")
+def review_triage_run(
+    batch: int | None = typer.Option(
+        None, "--batch", help="max rows to triage this run (default: KB_REVIEW_TRIAGE_BATCH)"
+    ),
+) -> None:
+    """Ask the 14B for keep/reject suggestions on pending unverified extractions.
+
+    Explicit user-invoked GPU run — the Invariant-8 carve-out, sharing
+    review_triage.run_triage with the nightly ``review_triaged`` step. Stores
+    SUGGESTIONS only (owner decision 2026-07-18): nothing is archived until a
+    human runs ``kb review apply-triage``.
+    """
+    try:
+        stored = review_triage.run_triage(
+            settings.kb_review_triage_batch if batch is None else batch
+        )
+    except KBError as e:
+        _fail(e)
+    typer.echo(f"stored {stored} triage suggestion(s)")
+
+
+@review_app.command("apply-triage")
+def review_apply_triage(
+    actions: str = typer.Option(
+        "",
+        "--actions",
+        help='filter suggestion kinds, e.g. "keep,reject_noise" (default: all three)',
+    ),
+    project: str | None = typer.Option(None, "--project", help="only this project's rows"),
+    ids: str = typer.Option("", "--ids", help='comma-separated queue ids, e.g. "1,2,3"'),
+) -> None:
+    """Apply stored LLM triage suggestions in bulk (the explicit human step).
+
+    keep → row closes, item untouched; reject_noise → item archived;
+    reject_duplicate → item marked duplicate of the suggested canonical. All
+    status flips (Invariant 5); a row with a bad suggestion stays open.
+    """
+    try:
+        queue_ids = [int(x) for x in ids.split(",") if x.strip()] or None
+    except ValueError:
+        _fail(KBError(f"--ids must be comma-separated integers, got {ids!r}"))
+    action_set = {a.strip() for a in actions.split(",") if a.strip()} or None
+    try:
+        results = review_triage.apply_triage(
+            actions=action_set, project=project, queue_ids=queue_ids
+        )
+    except KBError as e:
+        _fail(e)
+    for qid, outcome in results:
+        typer.echo(f"[{qid}] {outcome}")
+    errs = sum(1 for _, o in results if o.startswith("error"))
+    typer.echo(
+        f"apply-triage: {len(results) - errs} applied, {errs} error(s), {len(results)} row(s)"
+    )
 
 
 @review_app.command("apply")

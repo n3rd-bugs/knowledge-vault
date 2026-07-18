@@ -100,6 +100,19 @@ class Settings(BaseSettings):
     # 2-night stable margin (owner refinement of verdict V4). Kill switches:
     kb_auto_supersede_doc_refresh: bool = True
     kb_auto_resolve_evidence: bool = True
+    # Review-queue hygiene (owner decision 2026-07-18, a bounded V4 refinement in
+    # the spirit of kb_auto_resolve_evidence): nightly quiet-expiry closes open
+    # unverified_extraction rows older than this many days whose item was NEVER
+    # recalled (zero access_log rows). Only the review ROW closes — the item
+    # stays active/unverified/searchable. Kill switch: 0 disables quiet-expiry.
+    kb_review_expire_days: int = 30
+    # WP-2 LLM triage (owner decision 2026-07-18): the nightly consolidation asks
+    # the 14B for a keep / reject_noise / reject_duplicate SUGGESTION per open
+    # unverified_extraction row (stored in review_queue.detail.triage); a human
+    # applies suggestions in bulk (kb review apply-triage / kb_review_bulk). The
+    # LLM never archives anything itself. This caps rows triaged per nightly
+    # run. Kill switch: 0 disables the nightly step.
+    kb_review_triage_batch: int = 50
     # Search-quality regression sentinel (§8): the nightly consolidation replays
     # the golden retrieval eval and flags a hit@5/MRR drop vs the prior run. Set
     # False to skip the eval entirely (kill switch).

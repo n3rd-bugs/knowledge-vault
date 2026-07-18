@@ -12,7 +12,17 @@ import logging
 
 from fastmcp.exceptions import ToolError
 
-from kbcore import compress, graph, ingest_queue, items, render, scope, stats
+from kbcore import (
+    compress,
+    graph,
+    ingest_queue,
+    items,
+    render,
+    review_auto,
+    review_triage,
+    scope,
+    stats,
+)
 from kbcore import review as review_mod
 from kbcore.errors import KBError
 from kbmcp import (
@@ -31,6 +41,21 @@ _REVIEW_LIST_DEFAULT = 25
 def _wrap(err: Exception) -> ToolError:
     log.exception("tool error")
     return ToolError(str(err))
+
+
+_BULK_LIST_CAP = 50
+
+
+def _render_bulk_outcomes(action: str, results: list[tuple[int, str]]) -> str:
+    """Compact per-row outcome listing, capped so a big batch can't blow context."""
+    if not results:
+        return f"{action}: no matching rows"
+    lines = [f"[{qid}] {outcome}" for qid, outcome in results[:_BULK_LIST_CAP]]
+    if len(results) > _BULK_LIST_CAP:
+        lines.append(f"…and {len(results) - _BULK_LIST_CAP} more")
+    errs = sum(1 for _, o in results if o.startswith("error"))
+    lines.append(f"{action}: {len(results) - errs} ok, {errs} error(s), {len(results)} row(s)")
+    return "\n".join(lines)
 
 
 def register(mcp) -> None:
@@ -90,8 +115,10 @@ def register(mcp) -> None:
     @mcp.tool(annotations=ANNOTATIONS_WRITE)
     def kb_review_resolve(queue_id: int, action: str, new_item_id: int | None = None) -> str:
         """Resolve one review-queue row. action='promote' (trust→verified),
-        'reject' (archive the item), or 'supersede' (retire the flagged item with
-        new_item_id — for contradictions)."""
+        'reject' (archive the item), 'supersede' (retire the flagged item with
+        new_item_id — for contradictions), or 'dismiss' (close the row, item
+        untouched — the only action that also works on item-less rows such as
+        the search-regression sentinel)."""
         try:
             scope.require_owner("kb_review_resolve")  # owner-only (v1), see kb_review_list
             if action == "promote":
@@ -103,7 +130,39 @@ def register(mcp) -> None:
                     raise ValueError("action='supersede' requires new_item_id")
                 old = review_mod.resolve_via_supersede(queue_id, new_item_id)
                 return f"item {old} superseded by {new_item_id}"
-            raise ValueError(f"unknown action {action!r}; one of promote|reject|supersede")
+            if action == "dismiss":
+                review_mod.dismiss(queue_id)
+                return f"queue row {queue_id} dismissed (item untouched)"
+            raise ValueError(f"unknown action {action!r}; one of promote|reject|supersede|dismiss")
+        except (KBError, ValueError) as e:
+            raise _wrap(e) from e
+
+    @mcp.tool(annotations=ANNOTATIONS_WRITE)
+    def kb_review_bulk(
+        action: str,
+        queue_ids: list[int] | None = None,
+        project: str | None = None,
+        actions: str | None = None,
+    ) -> str:
+        """Batch-resolve review-queue rows (owner only). action='promote'|'reject'|
+        'dismiss' drains the selected OPEN rows through the single-row primitives
+        (pass queue_ids and/or project — it never blankets the whole queue);
+        action='apply_triage' applies the stored nightly LLM triage suggestions
+        (owner decision 2026-07-18: the LLM only suggests — applying is this
+        explicit human action; every apply is a status flip, never a delete).
+        For apply_triage, 'actions' optionally filters which suggestion kinds
+        apply, comma-separated from keep,reject_noise,reject_duplicate; rows
+        with bad suggestions stay open with an error outcome."""
+        try:
+            scope.require_owner("kb_review_bulk")  # owner-only, see kb_review_list
+            if action == "apply_triage":
+                kinds = {a.strip() for a in (actions or "").split(",") if a.strip()} or None
+                results = review_triage.apply_triage(
+                    actions=kinds, project=project, queue_ids=queue_ids
+                )
+            else:
+                results = review_auto.bulk_resolve(action, queue_ids=queue_ids, project=project)
+            return _render_bulk_outcomes(action, results)
         except (KBError, ValueError) as e:
             raise _wrap(e) from e
 

@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from kbcore import consolidation, evidence, ingest_queue, llm
+from kbcore import consolidation, evidence, ingest_queue, llm, review_auto, review_triage
 from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
@@ -275,12 +275,15 @@ def main() -> dict[str, Any]:
             "queued_items_saved": 0,
             "doc_refresh_resolved": 0,
             "duplicates_marked": 0,
+            "review_moot_closed": 0,
+            "review_triaged": 0,
             "summaries_written": 0,
             "contradictions_queued": 0,
             "evidence_refreshed": 0,
             "evidence_auto_resolved": 0,
             "archived": 0,
             "reembedded": 0,
+            "review_expired": 0,
         }
 
         # Step 0: extract remote submissions BEFORE dedupe so the new items take
@@ -299,6 +302,20 @@ def main() -> dict[str, Any]:
         if settings.kb_auto_supersede_doc_refresh:
             _run_step(counts, "doc_refresh_resolved", lambda: _doc_refresh(projects))
         _run_step(counts, "duplicates_marked", lambda: sum(_dedupe(p) for p in projects))
+        # WP-1 (owner decision 2026-07-18): sweep review rows made moot by any
+        # retirement path — including this run's freshly-marked duplicates, which
+        # is why this sits right after the dedupe step. Status flips only.
+        _run_step(counts, "review_moot_closed", review_auto.close_moot_rows)
+        # WP-2 (owner decision 2026-07-18): the 14B TRIAGES pending unverified
+        # extractions — SUGGESTIONS only, stored in review_queue.detail.triage;
+        # a human applies them (kb review apply-triage / kb_review_bulk). Runs
+        # after the moot sweep so freshly-mooted rows never burn GPU budget.
+        # Sanctioned Invariant-8 call site; kill switch: batch knob = 0.
+        _run_step(
+            counts,
+            "review_triaged",
+            lambda: review_triage.run_triage(settings.kb_review_triage_batch),
+        )
         _run_step(counts, "summaries_written", lambda: _summaries(since))
         _run_step(
             counts, "contradictions_queued", lambda: sum(_contradictions(p) for p in projects)
@@ -320,6 +337,13 @@ def main() -> dict[str, Any]:
             ),
         )
         _run_step(counts, "reembedded", reembed_mod.reembed)
+        # WP-1 quiet-expiry: close never-recalled unverified rows past the age
+        # knob (kb_review_expire_days; 0 = kill switch). Item stays searchable.
+        _run_step(
+            counts,
+            "review_expired",
+            lambda: review_auto.expire_quiet_rows(settings.kb_review_expire_days),
+        )
 
         # Search-quality regression sentinel (§8): replay the golden eval, record
         # hit@5/MRR, flag a drop vs the previous run. Advisory — never aborts the

@@ -178,6 +178,16 @@ def render_review(entries: list[ReviewEntry]) -> str:
                 f"    suggested: supersede item {sugg['retire']} → keep item {sugg['keep']} "
                 f"(streak {d.get('suggestion_streak', 1)}; apply: kb review apply {e.queue_id})"
             )
+        tri = d.get("triage")
+        if isinstance(tri, dict):
+            # WP-2 nightly LLM triage SUGGESTION (owner decision 2026-07-18: the
+            # LLM suggests, a human applies). One compact line per open row.
+            dup = f" of item {tri['dup_of']}" if tri.get("dup_of") is not None else ""
+            why = tri.get("rationale") or ""
+            lines.append(
+                f"    triage: {tri.get('action', '?')}{dup} — {why} "
+                f"(apply: kb review apply-triage / kb_review_bulk)"
+            )
     return "\n".join(lines)
 
 

@@ -7,6 +7,7 @@ review`` workflow arrives in Phase 4. All SQL lives here (Invariant 2).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 import psycopg
@@ -195,6 +196,31 @@ def reject(queue_id: int) -> int:
         )
         conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
     return item_id
+
+
+def dismiss(queue_id: int) -> None:
+    """Close ANY open row, item untouched (owner decision 2026-07-18, Invariant 5).
+
+    The generic per-row drain promote/reject cannot be: it needs no item, so it
+    also closes item-less rows (the search_regression sentinel row previously
+    had no dismissing tool — known gap). Only ``resolved`` flips and ``detail``
+    gains an ``auto_resolution`` stamp; item status and source trust are never
+    touched.
+    """
+    with transaction() as conn:
+        row = conn.execute(
+            "SELECT resolved FROM review_queue WHERE id = %s FOR UPDATE", (queue_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"review queue row {queue_id} does not exist")
+        if row[0]:
+            raise InvalidOperation(f"review queue row {queue_id} is already resolved")
+        stamp = {"auto_resolution": {"kind": "dismissed", "at": datetime.now(UTC).isoformat()}}
+        conn.execute(
+            "UPDATE review_queue SET resolved = true, "
+            "detail = COALESCE(detail, '{}'::jsonb) || %s WHERE id = %s",
+            (Jsonb(stamp), queue_id),
+        )
 
 
 def resolve_via_supersede(queue_id: int, new_item_id: int) -> int:

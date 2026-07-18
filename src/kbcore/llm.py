@@ -338,3 +338,108 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
     if isinstance(val, str):
         return val.strip().lower() in ("true", "yes", "1")
     return bool(val)
+
+
+# --- Review-queue triage (WP-2, owner decision 2026-07-18) --------------------
+# The nightly 14B SUGGESTS a disposition per pending unverified extraction; a
+# human applies suggestions in bulk. The model never archives anything itself.
+
+TRIAGE_ACTIONS = ("keep", "reject_noise", "reject_duplicate")
+
+_TRIAGE_BODY_CAP = 2000  # chars of item body shown to the judge (short prompt)
+
+_TRIAGE_SYSTEM = (
+    "You triage ONE machine-extracted knowledge item that awaits human review. "
+    "Answer STRICT JSON only, shaped exactly like:\n"
+    '{"action": "keep", "dup_of": null, "rationale": "<one sentence>"}\n'
+    "Rules:\n"
+    '- action is one of: "keep", "reject_noise", "reject_duplicate".\n'
+    "- keep: durable, self-contained engineering knowledge (a decision, gotcha, "
+    "bug/fix pair, config, reusable snippet).\n"
+    "- reject_noise: chit-chat, transient status, tool output, or content that is "
+    "meaningless outside its original session.\n"
+    "- reject_duplicate: the SAME knowledge already exists in one of the listed "
+    "similar items; set dup_of to that item's integer id. dup_of MUST be one of "
+    "the listed ids — if none matches, use keep.\n"
+    "- If unsure, answer keep. rationale is one short sentence."
+)
+
+
+def _validate_triage(parsed: Any, similar_ids: set[int]) -> dict[str, Any] | None:
+    """Hard-validate a parsed triage verdict; ``None`` = no usable suggestion.
+
+    A stored suggestion later drives a bulk archive (once a HUMAN applies it),
+    so nothing loose survives: ``action`` must be in :data:`TRIAGE_ACTIONS`,
+    and a reject_duplicate's ``dup_of`` must be one of the ACTUALLY-PRESENTED
+    similar ids — a hallucinated id must never mark anything duplicate (returns
+    None rather than degrading). ``dup_of`` is meaningful only for
+    reject_duplicate and is nulled otherwise.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    action = str(parsed.get("action") or "").strip().lower()
+    if action not in TRIAGE_ACTIONS:
+        return None
+    dup_of: int | None = None
+    if action == "reject_duplicate":
+        raw = parsed.get("dup_of")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            try:  # tolerate a stringified int; anything else is unusable
+                raw = int(str(raw).strip())
+            except (TypeError, ValueError):
+                return None
+        if raw not in similar_ids:
+            return None
+        dup_of = raw
+    rationale = " ".join(str(parsed.get("rationale") or "").split())[:300]
+    return {"action": action, "dup_of": dup_of, "rationale": rationale}
+
+
+def triage_extraction(
+    item: dict[str, Any], similar: list[dict[str, Any]], usage_count: int
+) -> dict[str, Any] | None:
+    """One triage SUGGESTION for a pending unverified extraction, or ``None``.
+
+    Owner decision 2026-07-18: the LLM only suggests; applying is always an
+    explicit human action, so a malformed/hallucinated verdict returns None
+    (validated by :func:`_validate_triage`) instead of ever driving an archive.
+    ``similar`` entries are ``{id, title, similarity, status}`` dicts — the dup
+    candidates offered to the judge. Deterministic per-content seed via
+    :func:`_draw_seed`, so re-triaging the same row reproduces the same draw.
+    Unparseable output raises :class:`ExtractionFailed` (content-deterministic,
+    caller skips the row); connectivity failures surface as
+    :class:`ExtractorUnavailable` via ``_chat``.
+    """
+    title = str(item.get("title") or "")
+    body = str(item.get("body") or "")[:_TRIAGE_BODY_CAP]
+    tags = ", ".join(t for t in (item.get("tags") or []) if isinstance(t, str)) or "-"
+    sim_lines = (
+        "\n".join(
+            f"- id {s['id']}: {s['title']} (similarity {s['similarity']:.3f}, status {s['status']})"
+            for s in similar
+        )
+        or "(none)"
+    )
+    user = (
+        f"Item under review:\n"
+        f"type: {item.get('type')}\n"
+        f"project: {item.get('project')}\n"
+        f"title: {title}\n"
+        f"tags: {tags}\n"
+        f"body:\n{body}\n\n"
+        f"Times this item was recalled by a user: {usage_count}\n\n"
+        f"Similar existing items:\n{sim_lines}\n\n"
+        f"Answer with the JSON verdict."
+    )
+    content = _chat(
+        [{"role": "system", "content": _TRIAGE_SYSTEM}, {"role": "user", "content": user}],
+        json_format=True,
+        seed=_draw_seed(title, body, ",".join(str(s["id"]) for s in similar)),
+    )
+    try:
+        parsed = parse_model_json(content)
+    except (ValueError, TypeError) as e:
+        raise ExtractionFailed(
+            f"triage returned unparseable output: {e.__class__.__name__}: {e}"
+        ) from e
+    return _validate_triage(parsed, {s["id"] for s in similar})

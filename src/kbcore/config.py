@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     kb_embed_model: str = "bge-m3"
     kb_embed_dim: int = 1024
     kb_embed_device: str = "auto"
+    # Instruction prefix REQUIRED by instruction-aware embedders (qwen3-embedding)
+    # on the QUERY side only ("Instruct: ...\nQuery: <q>"); document/chunk
+    # embeddings stay plain. Empty = none (bge-m3). The exact prefix ships in
+    # .env alongside the model swap — code stays model-agnostic. Measured
+    # 2026-07-18 (MODEL_RESEARCH_2026-07 addendum): qwen3-embedding WITHOUT the
+    # prefix is WORSE than bge-m3; with it, hit@5 0.759 vs 0.724.
+    kb_embed_query_prefix: str = ""
     # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity,
     # 100% verbatim grounding. gemma3:12b is the approved fast fallback.
     kb_extract_model: str = "qwen3:14b"
@@ -96,6 +103,31 @@ class Settings(BaseSettings):
     # window with output headroom; KV cost at 16K ≈ +2-3GB (fits beside the
     # resident 14B). Raise only after checking VRAM headroom.
     kb_llm_num_ctx: int = 16384
+    # Quote repair (pipeline v2 WP-B1, owner decision 2026-07-18): an extracted
+    # quote that fails the exact substring check gets ONE fuzzy-relocation attempt
+    # (kbcore.quote_repair.find_span); the located TRUE span replaces the model's
+    # version when the difflib ratio clears this floor, so SEC-3's verbatim
+    # invariant holds by construction. Measured: 62% of ungrounded quotes locate
+    # at >= 0.95; usable-item survival 46% -> 92% for the incumbent extractor.
+    # Kill switch: 0 disables repair entirely (unrepaired quotes reject as before).
+    kb_quote_repair_min_ratio: float = 0.95
+    # Pipeline v2 ensemble (WP-B2, owner-approved 2026-07-18; measurements in
+    # MODEL_RESEARCH_2026-07.md addendum 2): comma-separated EXTRA extractor
+    # models run alongside the primary (e.g. "granite4.1:8b,gemma3:12b").
+    # Measured: models find DIFFERENT knowledge (only 29% of cross-model
+    # clusters were multi-model), so the pipeline UNIONs per-model output and
+    # verifies per item — never consensus voting, which would discard most
+    # knowledge; ensemble + quote repair yielded 4x quote-anchored knowledge
+    # units per session. Empty = pipeline v1 (single model), the safe default.
+    kb_extract_ensemble: str = ""
+    # Cross-model item-clustering cosine threshold for the converge step.
+    # 0.80 is the measured primary: 0.85 fragments same-fact clusters and
+    # 0.75 over-merges distinct facts (addendum 2 prototype).
+    kb_ensemble_cluster_threshold: float = 0.80
+    # Shadow mode: the ensemble runs and REPORTS (one log line per extraction +
+    # nightly counts) but ingests NOTHING — the v1 path's output stands. Flip
+    # false to let ensemble survivors ingest (the ensemble then replaces v1).
+    kb_ensemble_shadow: bool = True
     # Deep search (explicit user-invoked, local Ollama): empty -> extract model.
     kb_deep_model: str = ""
     kb_deep_max_items: int = 16
@@ -201,6 +233,11 @@ class Settings(BaseSettings):
     def web_allowed_emails(self) -> list[str]:
         """`KB_WEB_ALLOWED_EMAILS` parsed as a lowercased comma-separated list."""
         return [e.strip().lower() for e in self.kb_web_allowed_emails.split(",") if e.strip()]
+
+    @property
+    def extract_ensemble(self) -> list[str]:
+        """`KB_EXTRACT_ENSEMBLE` parsed as a comma-separated list of extra models."""
+        return [m.strip() for m in self.kb_extract_ensemble.split(",") if m.strip()]
 
 
 @lru_cache

@@ -136,18 +136,28 @@ SYSTEM_PROMPT = (
 )
 
 
-def extract_items(transcript_text: str) -> list[dict[str, Any]]:
+def extract_items(
+    transcript_text: str,
+    *,
+    model: str | None = None,
+    keep_alive: int | None = None,
+) -> list[dict[str, Any]]:
     """Call the extractor on a transcript and return the raw item dicts.
 
     The returned dicts are UNVALIDATED — the caller must verify each ``quote``
     is a verbatim substring of ``transcript_text`` before trusting the item.
+
+    ``model`` / ``keep_alive`` are additive overrides for the pipeline-v2
+    ensemble (WP-B2): extra extractors run with ``keep_alive=0`` so only the
+    primary stays resident (Invariant 8). Both default to the settings-driven
+    behavior — zero change when not passed.
     """
     if not transcript_text.strip():
         return []
     payload: dict[str, Any] = {
-        "model": settings.kb_extract_model,
+        "model": model or settings.kb_extract_model,
         "format": "json",
-        "keep_alive": _keep_alive(),
+        "keep_alive": _keep_alive() if keep_alive is None else keep_alive,
         "stream": False,
         # num_ctx MUST be explicit: Ollama's runtime default (4K) silently
         # truncates the transcript and caps output mid-JSON (done_reason=
@@ -344,6 +354,73 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
     if isinstance(val, str):
         return val.strip().lower() in ("true", "yes", "1")
     return bool(val)
+
+
+# --- Factored verifier (pipeline v2 WP-B1, owner decision 2026-07-18) ---------
+# The judge sees ONLY the transcript and the item's title/body — never the
+# grounding span, never which model produced the item. Factored setups measured
+# -77% hallucinated entities; our probe test: a qwen3:14b judge caught 6/6
+# fabricated items while approving the real ones (bench 2026-07-18).
+
+_VERIFY_SYSTEM = (
+    "You judge whether a knowledge item's claim is supported by a work transcript.\n"
+    "You are given the transcript and ONE item (its title and body).\n"
+    "Answer STRICT JSON only, shaped exactly like:\n"
+    '{"supported": true, "reason": "<one sentence>"}\n'
+    "Rules:\n"
+    "- supported is true only if the transcript contains evidence for the item's "
+    "claim (its identifiers, values, decisions, and causal statements).\n"
+    "- unsupported means the transcript does not contain evidence for the claim.\n"
+    "- reason is one short sentence."
+)
+
+
+def verify_item(
+    title: str,
+    body: str,
+    transcript: str,
+    *,
+    judge_model: str | None = None,
+    keep_alive: int | None = None,
+) -> dict[str, Any]:
+    """Factored support verdict for one extracted item: does the transcript back it?
+
+    Returns ``{"supported": bool, "reason": str}``. Strict parsing: malformed or
+    unparseable output — including a non-bool ``supported`` (the string "true", a
+    number) — raises :class:`ExtractionFailed`, NEVER coerced to a truthy verdict;
+    the caller isolates the item. Connectivity failures surface as
+    :class:`ExtractorUnavailable` via ``_chat``. Deterministic per-content seed
+    (:func:`_draw_seed`) so re-judging the same item reproduces the same draw;
+    ``judge_model``/``keep_alive`` default to the settings-driven behavior.
+    """
+    content = _chat(
+        [
+            {"role": "system", "content": _VERIFY_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Transcript:\n{transcript}\n\n"
+                    f"Item title: {title}\n"
+                    f"Item body: {body}\n\n"
+                    "Answer with the JSON verdict."
+                ),
+            },
+        ],
+        json_format=True,
+        model=judge_model,
+        keep_alive=keep_alive,
+        seed=_draw_seed(title, body),
+    )
+    try:
+        parsed = parse_model_json(content)
+    except (ValueError, TypeError) as e:
+        raise ExtractionFailed(
+            f"verifier returned unparseable output: {e.__class__.__name__}: {e}"
+        ) from e
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("supported"), bool):
+        raise ExtractionFailed("verifier verdict lacks a boolean 'supported' field")
+    reason = " ".join(str(parsed.get("reason") or "").split())
+    return {"supported": parsed["supported"], "reason": reason}
 
 
 # --- Review-queue triage (WP-2, owner decision 2026-07-18) --------------------

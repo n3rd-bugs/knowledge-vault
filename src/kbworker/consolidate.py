@@ -23,7 +23,7 @@ from kbcore.errors import EmbedderUnavailable, ExtractionFailed, ExtractorUnavai
 from kbcore.ingest import ingest
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
-from kbworker import eval_sentinel, sessions
+from kbworker import ensemble, eval_sentinel, sessions
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -273,6 +273,11 @@ def main() -> dict[str, Any]:
         counts: dict[str, Any] = {
             "queued_drained": 0,
             "queued_items_saved": 0,
+            # WP-B2 ensemble observability: pipeline mode this run ran under and
+            # the would-be survivors the shadow ensemble reported during the
+            # drain (0 unless mode == "shadow" and rows were drained).
+            "ensemble_mode": ensemble.mode(),
+            "ensemble_shadow_survivors": 0,
             "doc_refresh_resolved": 0,
             "duplicates_marked": 0,
             "review_moot_closed": 0,
@@ -289,8 +294,10 @@ def main() -> dict[str, Any]:
         # Step 0: extract remote submissions BEFORE dedupe so the new items take
         # part in this run's dedupe/summary/contradiction passes.
         def _drain() -> int:
+            ensemble.reset_shadow_counter()  # per-run shadow accumulator (WP-B2)
             drained, saved = _drain_ingest_queue()
             counts["queued_items_saved"] = saved
+            counts["ensemble_shadow_survivors"] = ensemble.shadow_survivor_total()
             return drained
 
         _run_step(counts, "queued_drained", _drain)

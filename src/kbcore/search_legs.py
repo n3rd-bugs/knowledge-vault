@@ -92,7 +92,9 @@ def _token_parts(token: str) -> list[str]:
 
 
 def _vector_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[int, str]]:
-    qvec = json.dumps(embed_mod.embed_one(query), separators=(",", ":"))
+    # embed_query, not embed_one: the QUERY side carries the instruction prefix
+    # required by instruction-aware embedders (asymmetric contract, embed.py).
+    qvec = json.dumps(embed_mod.embed_query(query), separators=(",", ":"))
     rows = conn.execute(
         f"""
         SELECT c.item_id, c.text

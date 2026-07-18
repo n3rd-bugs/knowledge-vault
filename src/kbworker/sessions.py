@@ -3,7 +3,8 @@
 ``ingest_session`` reads new bytes of a Claude Code ``.jsonl`` transcript from
 the last checkpoint, assembles the new user/assistant text, runs the extractor
 (kbcore.llm), and ingests only items whose ``quote`` is a verbatim substring of
-that text (SEC-3/ARCH-2 — everything else is dropped and counted). Survivors are
+that text (SEC-3/ARCH-2 — near-miss quotes get one fuzzy-relocation attempt via
+kbcore.quote_repair, everything else is dropped and counted). Survivors are
 ``trust='unverified'`` and land in the review queue (Verdict V4). All SQL is in
 kbcore; this module only orchestrates (Invariant 2).
 """
@@ -24,6 +25,7 @@ from kbcore.errors import InvalidOperation
 from kbcore.ingest import ingest_in
 from kbcore.locks import session_lock
 from kbcore.models import ITEM_TYPES, SessionSummary
+from kbcore.quote_repair import find_span
 from kbcore.review import queue_review_in
 from kbcore.scrub import scrub
 
@@ -181,6 +183,41 @@ def _code_ref(project: str, repo: str | None, commit: str | None) -> dict[str, s
     return ref
 
 
+def gate_quotes(
+    raw_items: list[dict[str, Any]], text: str, min_ratio: float
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any] | None]], int]:
+    """SEC-3 quote gate: exact substring → grounded; near-miss → ONE fuzzy
+    relocation attempt (repaired: the LOCATED span replaces the model quote);
+    anything else is dropped and counted.
+
+    Returns ``(survivors, rejected)`` where each survivor is ``(item, repair)`` —
+    ``repair`` is None for exact quotes, else the audit record ``{"ratio": r,
+    "model_quote": <original, scrubbed at store time>}``. This is THE quote gate,
+    shared by pipeline v1 and the WP-B2 ensemble (kbworker.ensemble) so the two
+    paths can never drift.
+    """
+    survivors: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    rejected = 0
+    for it in raw_items:
+        quote = it.get("quote")
+        if not isinstance(quote, str) or not quote:
+            rejected += 1  # SEC-3: no grounding quote at all
+            continue
+        if quote in text:
+            survivors.append((it, None))
+            continue
+        located = find_span(quote, text, min_ratio) if min_ratio > 0 else None
+        if located is None:
+            rejected += 1  # SEC-3: ungrounded and unrepairable — dropped
+            continue
+        span, ratio = located
+        # The LOCATED span IS a verbatim substring of the transcript, so the item
+        # proceeds without weakening SEC-3; the model's near-miss is kept only as
+        # audit metadata (scrubbed below — SEC-2 applies to hallucinated text too).
+        survivors.append(({**it, "quote": span}, {"ratio": round(ratio, 4), "model_quote": quote}))
+    return survivors, rejected
+
+
 def _ingest_and_queue(
     *,
     project: str,
@@ -228,31 +265,50 @@ def extract_and_ingest(
     extractor=None,
     extra_detail: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
-    """Extract → quote-validate → ingest, the core shared by file + queue paths.
+    """Extract → quote-validate/repair → ingest, the core shared by file + queue paths.
 
-    Runs ``extractor`` (the 14B) on ``text``, keeps only items whose ``quote`` is
-    a verbatim substring (SEC-3/ARCH-2), and ingests survivors as unverified
-    ``session`` items with a scrubbed ``meta.quote`` and a review-queue row.
-    Returns ``(saved, rejected)``. The extractor defaults to ``llm.extract_items``
-    resolved at CALL time (so tests can monkeypatch it), and is a parameter so
-    callers own when the GPU runs — enqueue never calls it, only the nightly drain.
+    Runs ``extractor`` (the 14B) on ``text`` and keeps items whose ``quote`` is a
+    verbatim substring (SEC-3/ARCH-2). A quote that fails the exact check gets ONE
+    fuzzy-relocation attempt (:func:`kbcore.quote_repair.find_span`, measured
+    survival 46%→92%); on success the item proceeds with the LOCATED span — itself
+    a verbatim substring, so SEC-3 holds by construction — and ``meta.quote_repair``
+    records the ratio plus the scrubbed original model quote for audit. Kill
+    switch: ``kb_quote_repair_min_ratio=0`` (unrepaired quotes reject as before).
+    Survivors ingest as unverified ``session`` items with a scrubbed ``meta.quote``
+    and a review-queue row. Returns ``(saved, rejected)``. The extractor defaults
+    to ``llm.extract_items`` resolved at CALL time (so tests can monkeypatch it),
+    and is a parameter so callers own when the GPU runs — enqueue never calls it,
+    only the nightly drain.
+
+    Pipeline v2 ensemble (WP-B2): with ``kb_extract_ensemble`` EMPTY (the
+    default) this is pipeline v1 exactly as above — no ensemble code runs or is
+    even imported. Non-empty + ``kb_ensemble_shadow`` (default true): v1 ingests
+    as today, then the ensemble computes and LOGS its counts, writing nothing
+    (any shadow failure is swallowed — it must never affect v1's outcome).
+    Non-empty + shadow false: the ensemble REPLACES v1 — survivors ingest via
+    :func:`_ingest_ensemble_survivors` and ``extractor`` is ignored (the
+    ensemble owns model selection).
     """
+    ensemble_on = bool(settings.extract_ensemble)
+    if ensemble_on and not settings.kb_ensemble_shadow:
+        from kbworker import ensemble  # lazy: the v1 path must not depend on it
+
+        report = ensemble.run_ensemble(
+            text, project, uri, code_ref=code_ref, branch=branch, extra_detail=extra_detail
+        )
+        return _ingest_ensemble_survivors(report, text)
+
     if extractor is None:
         extractor = llm.extract_items
     raw_items = extractor(text)
-    survivors: list[dict[str, Any]] = []
-    rejected = 0
-    for it in raw_items:
-        quote = it.get("quote")
-        if isinstance(quote, str) and quote and quote in text:
-            survivors.append(it)
-        else:
-            rejected += 1  # SEC-3: ungrounded item dropped
+    # (item, repair) pairs: repair is None for exact quotes, else the audit record
+    # {"ratio": r, "model_quote": <original, scrubbed at store time>}.
+    survivors, rejected = gate_quotes(raw_items, text, settings.kb_quote_repair_min_ratio)
 
     raw = text.encode("utf-8")
     detail = {"rejected_count": rejected, **(extra_detail or {})}
     saved = 0
-    for it in survivors:
+    for it, repair in survivors:
         type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
         title = (it.get("title") or "").strip() or "session note"
         body = (it.get("body") or "").strip()
@@ -264,6 +320,14 @@ def extract_and_ingest(
         # validated the pre-scrub quote against the text.
         scrubbed_quote, _ = scrub(it["quote"])
         meta: dict[str, Any] = {"quote": scrubbed_quote, "extractor": settings.kb_extract_model}
+        if repair is not None:
+            # Same scrub for the ORIGINAL model quote: a secret in a hallucinated
+            # quote must not become searchable either (SEC-2).
+            scrubbed_model_quote, _ = scrub(repair["model_quote"])
+            meta["quote_repair"] = {
+                "ratio": repair["ratio"],
+                "model_quote": scrubbed_model_quote,
+            }
         if branch:
             meta["branch"] = branch
         item_id = _ingest_and_queue(
@@ -275,6 +339,74 @@ def extract_and_ingest(
             tags=tags,
             meta=meta,
             code_ref=code_ref,
+            raw=raw,
+            detail=detail,
+        )
+        if item_id is not None:
+            saved += 1
+
+    if ensemble_on:  # shadow mode: v1 stood above; compute + LOG only, write nothing
+        from kbworker import ensemble
+
+        try:
+            report = ensemble.run_ensemble(
+                text, project, uri, code_ref=code_ref, branch=branch, extra_detail=extra_detail
+            )
+            ensemble.record_shadow(report, v1_saved=saved)
+        except Exception:  # noqa: BLE001 — shadow must never affect v1's outcome
+            logger.exception("ensemble shadow run failed; v1 result stands")
+    return saved, rejected
+
+
+def _ingest_ensemble_survivors(report: dict[str, Any], text: str) -> tuple[int, int]:
+    """Live-mode ensemble ingest: survivors flow through the SAME path as v1.
+
+    Same :func:`_ingest_and_queue` transaction (trust='unverified' + review row),
+    same scrub-before-store rules for the quote and the repaired model quote
+    (SEC-2), plus ``meta.extraction_pipeline`` recording provenance (found_by /
+    corroboration / quote_state / verified_by — WP-B2). ``rejected`` counts
+    unanchored ensemble items (the SEC-3 quote gate runs before any policy) plus
+    representatives that failed verification (judge-fail / judge-error).
+    Idempotent like v1: same window re-run dedupes on (kind, uri, content_hash).
+    """
+    raw = text.encode("utf-8")
+    rejected = report["unanchored"] + report["rejected_reps"]
+    detail = {"rejected_count": rejected, **(report.get("extra_detail") or {})}
+    branch = report.get("branch")
+    saved = 0
+    for surv in report["survivors"]:
+        it = surv["item"]
+        type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
+        title = (it.get("title") or "").strip() or "session note"
+        body = (it.get("body") or "").strip()
+        if not body:
+            continue
+        tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
+        # Same SEC-2 rules as v1: scrub the stored quote (and the model's
+        # near-miss original, below) so a secret never becomes searchable.
+        scrubbed_quote, _ = scrub(it["quote"])
+        meta: dict[str, Any] = {
+            "quote": scrubbed_quote,
+            "extractor": surv["model"],
+            "extraction_pipeline": surv["extraction_pipeline"],
+        }
+        if surv["repair"] is not None:
+            scrubbed_model_quote, _ = scrub(surv["repair"]["model_quote"])
+            meta["quote_repair"] = {
+                "ratio": surv["repair"]["ratio"],
+                "model_quote": scrubbed_model_quote,
+            }
+        if branch:
+            meta["branch"] = branch
+        item_id = _ingest_and_queue(
+            project=report["project"],
+            type_=type_,
+            title=title,
+            body=body,
+            uri=report["uri"],
+            tags=tags,
+            meta=meta,
+            code_ref=report.get("code_ref"),
             raw=raw,
             detail=detail,
         )

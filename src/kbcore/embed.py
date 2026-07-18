@@ -78,3 +78,22 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 
 def embed_one(text: str) -> list[float]:
     return embed_texts([text])[0]
+
+
+def embed_query(text: str) -> list[float]:
+    """Embed a USER QUERY, applying ``KB_EMBED_QUERY_PREFIX`` when configured.
+
+    Instruction-aware embedders (qwen3-embedding) are ASYMMETRIC: queries must
+    carry an instruction prefix while documents are embedded plain. Misapplying
+    it either way is a measured regression (MODEL_RESEARCH_2026-07 addendum:
+    without the query prefix qwen3-embedding retrieves worse than bge-m3;
+    prefixed documents break the contract the model was trained with). So:
+    every place a user query is embedded calls THIS; document/chunk/reembed
+    paths call embed_texts/embed_one directly and must NEVER get the prefix.
+
+    Routes through embed_one -> embed_texts by design — the test seams that
+    fake embed_texts (tests/conftest.py fake_embeddings, autouse) and inject
+    failures via embed_one intercept query embeds too. Asserted in
+    tests/test_embed_query_prefix.py; do not inline an HTTP call here.
+    """
+    return embed_one(settings.kb_embed_query_prefix + text)

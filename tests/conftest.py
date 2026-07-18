@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import random
 
 import pytest
@@ -15,10 +16,24 @@ from kbcore import db, embed
 from kbcore.config import settings
 from kbcore.migrate import migrate
 
+# Arm the connection-layer live-data guard for the WHOLE test process, at import
+# time before any fixture or DB check runs: db.connect() now REFUSES any 'public'
+# connection unless allow_public=True. This is the hard backstop that makes it
+# impossible for a stray/misordered test to TRUNCATE live data (it truncated the
+# live corpus twice via the schema-pointer window). Only the kb_test setup DDL
+# below is allowed to touch public, and it only creates/drops the kb_test schema.
+os.environ["KB_TEST_GUARD"] = "1"
+
 
 def _db_available() -> bool:
+    # The import-time reachability probe legitimately hits public (SELECT 1), so
+    # it opts in explicitly; it never writes.
     try:
-        return db.ping()
+        conn = db.connect(schema="public", allow_public=True)
+        try:
+            return conn.execute("SELECT 1").fetchone()[0] == 1
+        finally:
+            conn.close()
     except Exception:
         return False
 
@@ -83,36 +98,50 @@ def _force_test_schema():
         settings.kb_db_schema = original
 
 
+def _admin_ddl(sql: str) -> None:
+    """Run one autocommit DDL statement against public — the ONLY sanctioned
+    public access in the test process (creates/drops the kb_test schema; never
+    touches public DATA). Uses the schema param so the global pointer is never
+    flipped to 'public' (that flip was the truncation window)."""
+    conn = db.connect(schema="public", allow_public=True)
+    conn.autocommit = True
+    try:
+        conn.execute(sql)
+    finally:
+        conn.close()
+
+
 @pytest.fixture(scope="session")
 def kb_schema():
     """Session-scoped isolated schema kb_test with the full migrated layout."""
     if not DB_UP:
         pytest.skip("compose Postgres not reachable")
-    # Create the schema through a PUBLIC-targeted connection: db.connect() now
-    # refuses a MISSING non-public schema (it would otherwise fall through to live
-    # public data), so kb_test must exist before any kb_test-targeted connect.
-    settings.kb_db_schema = "public"
-    conn = db.connect()
-    conn.autocommit = True
-    conn.execute("DROP SCHEMA IF EXISTS kb_test CASCADE")
-    conn.execute("CREATE SCHEMA kb_test")
-    conn.close()
-    settings.kb_db_schema = "kb_test"
+    # kb_test must exist before any kb_test-targeted connect (db.connect refuses a
+    # missing non-public schema). Created via the sanctioned admin DDL path — the
+    # process-wide schema pointer stays 'kb_test' (set by _force_test_schema)
+    # throughout, so no window ever resolves a test connection to public.
+    _admin_ddl("DROP SCHEMA IF EXISTS kb_test CASCADE")
+    _admin_ddl("CREATE SCHEMA kb_test")
     try:
-        migrate()
+        migrate()  # targets settings.kb_db_schema == 'kb_test'
         yield
     finally:
-        settings.kb_db_schema = "public"
-        conn = db.connect()
-        conn.autocommit = True
-        conn.execute("DROP SCHEMA IF EXISTS kb_test CASCADE")
-        conn.close()
+        _admin_ddl("DROP SCHEMA IF EXISTS kb_test CASCADE")
 
 
 @pytest.fixture()
 def kb(kb_schema):
     """Function-scoped clean slate inside kb_test (truncate, keep layout)."""
     with db.transaction() as conn:
+        # Belt-and-suspenders: NEVER TRUNCATE unless we are provably inside
+        # kb_test. current_schema() is the first existing schema in search_path,
+        # so this aborts loudly rather than wiping live public data.
+        current = conn.execute("SELECT current_schema()").fetchone()[0]
+        if current != "kb_test":
+            raise RuntimeError(
+                f"live-data guard: refusing TRUNCATE, current_schema()={current!r} "
+                "is not 'kb_test'"
+            )
         conn.execute(
             """
             TRUNCATE access_log, review_queue, relations, entities, chunks, items,

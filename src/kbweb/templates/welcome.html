@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Welcome · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Getting started</h2>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Signed in as <span class="mono">{{ who }}</span>
+    {% if kind %}<span class="tag">{{ kind }}</span>{% endif %}</h3>
+  {% if owner_all %}
+  <p class="prov">Owner identity — every project in the vault is visible to you.</p>
+  {% elif granted %}
+  <p>Projects you can read (read-only):</p>
+  <div>{% for proj in granted %}<span class="tag">{{ proj }}</span> {% endfor %}</div>
+  {% else %}
+  <p class="prov">No projects have been shared with this account yet — ask the owner.</p>
+  {% endif %}
+</div>
+
+<h3>How to connect</h3>
+<ol class="steps">
+  <li><strong>claude.ai connector:</strong> Settings → Connectors →
+    <em>Add custom connector</em> → URL <span class="mono">{{ mcp_url }}</span>,
+    then <em>Sign in with Google</em> with this account's email.</li>
+  <li><strong>Web browsing:</strong> open <span class="mono">{{ web_url }}</span>
+    and click <em>Sign in with Google</em>.</li>
+  <li><strong>What you can do:</strong> search and read the projects listed above.
+    No writes, and no other projects are visible.</li>
+  <li>Access can be revoked by the owner at any time.</li>
+</ol>
+{% endblock %}

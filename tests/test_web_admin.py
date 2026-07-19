@@ -138,7 +138,8 @@ def test_grantee_admin_is_byte_identical_404_all_methods(app):
     g = _grantee_client(app, projects=("proj-a",))
     ghost = g.get("/definitely-not-a-route")
     assert ghost.status_code == 404
-    for path in ("/admin", "/admin/grant", "/admin/revoke", "/admin/shares", "/admin/x/y"):
+    paths = ("/admin", "/admin/grant", "/admin/revoke", "/admin/principal", "/admin/x/y")
+    for path in paths:
         for method in ("GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"):
             r = g.request(method, path)
             assert r.status_code == 404, f"grantee {method} {path} → {r.status_code}"

@@ -90,19 +90,20 @@ ASSET_V = _asset_version()
 
 
 def _identity_ctx(request: Request) -> dict[str, bool]:
-    """Template context: is the signed-cookie identity the OWNER?
+    """Template context: is the signed-cookie identity the OWNER / signed in?
 
-    Drives owner-only chrome (the /admin nav link) — a grantee must never even
-    see that the admin surface exists. Reuses the same signed-cookie identity
-    resolution the auth middleware uses (kbweb.auth.cookie_identity); a missing/
-    invalid cookie (e.g. the login page itself) is simply not the owner.
-    Display-only: route AUTHORIZATION is enforced server-side in
-    SessionAuthMiddleware + views_admin, never by this flag.
+    ``is_owner`` drives owner-only chrome (the /admin nav link) — a grantee must
+    never even see that the admin surface exists; ``signed_in`` drives chrome for
+    any authenticated principal (the /welcome nav link). Reuses the same
+    signed-cookie identity resolution the auth middleware uses
+    (kbweb.auth.cookie_identity); a missing/invalid cookie (e.g. the login page
+    itself) is simply anonymous. Display-only: route AUTHORIZATION is enforced
+    server-side in SessionAuthMiddleware + views_admin, never by these flags.
     """
     from kbweb import auth  # local import: ui must stay import-light for views
 
     identity = auth.cookie_identity(request.cookies.get(auth.COOKIE))
-    return {"is_owner": identity == auth.OWNER_IDENTITY}
+    return {"is_owner": identity == auth.OWNER_IDENTITY, "signed_in": identity is not None}
 
 
 def create_templates() -> Jinja2Templates:

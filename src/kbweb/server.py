@@ -3,12 +3,13 @@
 Views live in kbweb.views_search / views_items / views_meta (all GET); this
 module owns the session middleware, login (token + Google OAuth), error
 handlers and startup guards. NO KNOWLEDGE MUTATION by construction
-(Invariant 11, amended 2026-07-18): every data route is GET/HEAD and no kbweb
-module imports a kbcore knowledge-write function — a test asserts both
-mechanically. The sole mutating routes are the OWNER-ONLY authz-config actions
-in kbweb.views_admin (project-share grant/revoke); the session middleware
-walls the whole /admin* subtree off from non-owners with the byte-identical
-unknown-path 404. Run: ``python -m kbweb.server``.
+(Invariant 11, amended 2026-07-18, extended 2026-07-19): every data route is
+GET/HEAD and no kbweb module imports a kbcore knowledge-write function — a
+test asserts both mechanically. The sole mutating routes are the OWNER-ONLY
+authz-config actions in kbweb.views_admin (project-share grant/revoke +
+google-grantee creation, A11-2); the session middleware walls the whole
+/admin* subtree off from non-owners with the byte-identical unknown-path 404.
+Run: ``python -m kbweb.server``.
 """
 
 from __future__ import annotations

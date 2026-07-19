@@ -70,6 +70,10 @@ kb principal list
 If your Google OAuth app is still in **Testing** status, also add
 `alice@gmail.com` as a test user in the Google Cloud console — see §6.
 
+Prefer point-and-click? The web admin (§3c) can create the same `google`
+grantee — with its initial read-only shares and a ready-made invite email —
+without touching the CLI.
+
 ### 3b. Script / machine (bearer token)
 
 ```bash
@@ -84,15 +88,31 @@ now; it is not recoverable (use `kb principal rotate` if lost).
 
 ### 3c. Web admin
 
-An **owner-only** web admin at `https://web.example.com/admin` performs the
-same grant/revoke operations point-and-click: it lists every principal and
-their project grants, and offers forms to grant a project (read-only) or revoke
-one. It is visible and reachable **only** to the owner — a signed-in grantee
-gets a plain 404 (byte-identical to any unknown path, so the page's existence is
-never revealed), and the mutating actions are CSRF-protected. It is the sole
-mutating surface on the otherwise read-only web UI (Invariant 11 carve-out,
-scoped strictly to owner-only share authz). The `kb principal` CLI remains the
-full-power surface (create/rotate/expire live only there).
+An **owner-only** web admin at `https://web.example.com/admin` covers the
+human-collaborator flow point-and-click. It lists every principal and their
+project grants, and offers forms to grant a project (read-only) or revoke one.
+Since the 2026-07-19 extension (Invariant 11 carve-out, Amendment A11-2) it can
+also **create a `google` grantee**: one form takes the name (slug), their
+Google email, an optional note, and a multi-select of projects — the principal
+and its read-only initial shares land in a single submit (inputs are validated
+server-side; unknown project values are silently skipped).
+
+Each live google grantee then gets an **invite block** on its card: a
+`mailto:` link plus copyable plain text with a personalized getting-started
+guide (their project list, the connector URL, the web URL, what they can and
+can't do, and that access is revocable). The server sends **no** email — the
+link opens the owner's own mail client — and the text contains no secret by
+construction (a google grantee has none). Grantees themselves get a read-only
+`/welcome` page with the same steps, scoped to exactly their own grants.
+
+Every grant made here is `rw=false`. **Token principals and principal
+revoke / rotate / expiry remain CLI-only** — no secret ever transits a
+browser. The admin surface is visible and reachable **only** to the owner — a
+signed-in grantee gets a plain 404 (byte-identical to any unknown path, so the
+page's existence is never revealed), and the mutating actions are
+CSRF-protected. It is the sole mutating surface on the otherwise read-only web
+UI (Invariant 11 carve-out, scoped strictly to owner-only share admin). The
+`kb principal` CLI remains the full-power surface.
 
 ## 4. What the new person does
 
@@ -102,7 +122,8 @@ full-power surface (create/rotate/expire live only there).
   URL `https://kb.example.com/mcp`, and complete the Google sign-in with the
   granted email. The KB tools then appear scoped to their projects.
 - **Web UI:** open `https://web.example.com`, click *Sign in with Google*,
-  choose the granted email.
+  choose the granted email. `https://web.example.com/welcome` shows a
+  personalized getting-started page (their identity + granted projects).
 
 Signing in with a Google account that has no grants authenticates but resolves
 to an empty-grant identity: no data is visible and nothing leaks.

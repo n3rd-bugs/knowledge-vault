@@ -1,11 +1,16 @@
 """kbweb.views_admin — OWNER-ONLY project-share admin (the Inv. 11 carve-out).
 
-The ONLY mutating routes in the web UI (Invariant 11, amended 2026-07-18 —
-see ADVERSARIAL_REVIEW.md Amendment A11-1): authorization-config actions that
-grant / revoke a READ-ONLY project share via ``kbcore.principals.grant`` /
-``ungrant`` — ``rw=false`` is hardwired and the form field is never even read.
-NEVER knowledge mutation; NEVER principal lifecycle (create/revoke/rotate stay
-CLI-only). Do not broaden this module beyond share grant/revoke.
+The ONLY mutating routes in the web UI (Invariant 11, amended 2026-07-18,
+extended 2026-07-19 — see ADVERSARIAL_REVIEW.md Amendments A11-1/A11-2):
+authorization-config actions that (a) grant / revoke a READ-ONLY project share
+via ``kbcore.principals.grant`` / ``ungrant`` — ``rw=false`` is hardwired and
+the form field is never even read — and (b) create a ``kind='google'``
+email-identity grantee together with its initial read-only shares in one
+submit (owner decision 2026-07-19). NEVER knowledge mutation; NEVER a secret
+through the browser: the web cannot mint token principals (the kind is
+hardwired "google" and never read from the form), and principal revoke /
+rotate / expiry stay CLI-only. Do not broaden this module beyond share
+grant/revoke/create-google-grantee.
 
 Enforcement layers (each independently sufficient):
 1. ``SessionAuthMiddleware`` returns the router's byte-identical unknown-path
@@ -20,6 +25,7 @@ Enforcement layers (each independently sufficient):
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 from starlette.datastructures import FormData
@@ -29,9 +35,19 @@ from starlette.responses import RedirectResponse, Response
 from starlette.routing import Route
 
 from kbcore import principals, scope
+from kbcore.errors import InvalidOperation
 from kbcore.items import list_projects
-from kbweb import auth
+from kbweb import auth, views_admin_invite
 from kbweb.ui import templates
+
+# Server-side validation for the create-grantee form. The NAME renders into
+# HTML and the invite text; the EMAIL additionally rides inside a mailto: URL —
+# the conservative RFC-lite shape refuses header-injection material outright
+# (%0a/%0d, commas, semicolons, whitespace and control characters can't match).
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+$")
+_MAX_EMAIL_LEN = 254
+_MAX_NOTE_LEN = 200
 
 
 def _owner_or_404() -> None:
@@ -71,26 +87,41 @@ async def _authorized_form(request: Request) -> FormData:
     return form
 
 
-def admin_view(request: Request) -> Response:  # GET /admin
-    """Owner dashboard: principals + their grants, and the grant/revoke forms."""
-    _owner_or_404()
+def _admin_page(request: Request, *, error: str | None = None, status_code: int = 200) -> Response:
+    """Render the dashboard (also the re-render target for form errors — no
+    oracle concern: only the owner can ever see this page)."""
+    infos = principals.list_principals()
     return templates.TemplateResponse(
         request,
         "admin.html",
         {
-            "principals": principals.list_principals(),
+            "principals": infos,
             "projects": [p.name for p in list_projects()],
             "csrf": auth.issue_csrf(auth.OWNER_IDENTITY),
+            "invites": views_admin_invite.invite_blocks(infos),
+            "error": error,
         },
+        status_code=status_code,
     )
+
+
+def admin_view(request: Request) -> Response:  # GET /admin
+    """Owner dashboard: principals + grants, the create/grant/revoke forms, and
+    a copyable invite block per live google grantee."""
+    _owner_or_404()
+    return _admin_page(request)
 
 
 async def grant_share(request: Request) -> Response:  # POST /admin/grant
     form = await _authorized_form(request)
     name = str(form.get("name") or "").strip()
     project = str(form.get("project") or "").strip()
-    # rw is HARDWIRED false (owner decision): the web admin only ever creates
-    # read-only shares; no form field can change that.
+    # Only grant a project that actually exists (same wall as create_grantee) —
+    # an unknown string would otherwise upsert a dormant phantom grant that goes
+    # live if a project of that name is ever created. rw is HARDWIRED false
+    # (owner decision): the web admin only ever creates read-only shares.
+    if project not in {p.name for p in list_projects()}:
+        return _admin_page(request, error=f"unknown project {project!r}", status_code=400)
     principals.grant(name, project, rw=False)
     return RedirectResponse("/admin", status_code=303)
 
@@ -103,8 +134,47 @@ async def revoke_share(request: Request) -> Response:  # POST /admin/revoke
     return RedirectResponse("/admin", status_code=303)
 
 
+def _grantee_form_error(name: str, email: str, note: str) -> str | None:
+    """First validation failure of the create-grantee form, or None."""
+    if not _NAME_RE.fullmatch(name):
+        return "name must be a slug matching [a-z0-9][a-z0-9._-]{0,62}"
+    if len(email) > _MAX_EMAIL_LEN or not _EMAIL_RE.fullmatch(email):
+        return "email must be a plain address (no spaces, %, commas or semicolons)"
+    if len(note) > _MAX_NOTE_LEN:
+        return f"note must be {_MAX_NOTE_LEN} characters or fewer"
+    return None
+
+
+async def create_grantee(request: Request) -> Response:  # POST /admin/principal
+    """Create a google grantee + its initial READ-ONLY shares in one submit.
+
+    The kind is HARDWIRED "google" (owner decision 2026-07-19): the web never
+    mints a token principal — no secret may ever transit a browser — and a
+    forged ``kind`` form field is never even read. rw=False on every grant."""
+    form = await _authorized_form(request)
+    name = str(form.get("name") or "").strip()
+    email = str(form.get("email") or "").strip().lower()
+    note = str(form.get("note") or "").strip()
+    error = _grantee_form_error(name, email, note)
+    if error is not None:
+        return _admin_page(request, error=error, status_code=400)
+    try:
+        principals.create_principal(name, kind="google", email=email, note=note or None)
+    except InvalidOperation as e:  # e.g. duplicate name — re-render with the message
+        return _admin_page(request, error=str(e), status_code=400)
+    # Grant ONLY projects that actually exist (checked against list_projects,
+    # owner context) — arbitrary submitted strings are silently skipped.
+    known = {p.name for p in list_projects()}
+    for value in form.getlist("projects"):
+        project = str(value).strip()
+        if project in known:
+            principals.grant(name, project, rw=False)
+    return RedirectResponse("/admin", status_code=303)
+
+
 ROUTES = [
     Route("/admin", admin_view),
     Route("/admin/grant", grant_share, methods=["POST"]),
     Route("/admin/revoke", revoke_share, methods=["POST"]),
+    Route("/admin/principal", create_grantee, methods=["POST"]),
 ]

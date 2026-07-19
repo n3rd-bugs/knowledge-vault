@@ -88,6 +88,13 @@ def create_principal(
     with transaction() as conn:
         if conn.execute("SELECT 1 FROM principals WHERE name = %s", (name,)).fetchone():
             raise InvalidOperation(f"principal {name!r} already exists")
+        # Email uniqueness is also enforced by a DB constraint; pre-check it so a
+        # duplicate surfaces as a clean domain error (KBError) instead of a raw
+        # psycopg UniqueViolation that would escape the web view as a 500.
+        if email is not None and conn.execute(
+            "SELECT 1 FROM principals WHERE email = %s", (email,)
+        ).fetchone():
+            raise InvalidOperation(f"a principal with email {email!r} already exists")
         row = conn.execute(
             """
             INSERT INTO principals (name, kind, secret_hash, email, expires_at, note)

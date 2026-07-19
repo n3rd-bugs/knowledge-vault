@@ -127,3 +127,21 @@ write — so owner-session compromise was already total, and the new routes add 
 same-origin defenses that `/setup` never needed. Scope is frozen: share grant/revoke only —
 principal lifecycle (create/revoke/rotate) stays CLI-only, and any future mutating web route
 re-opens this review.
+
+---
+
+## Amendment A11-2 — carve-out extension: web creation of google grantees (2026-07-19)
+
+**Decision (owner, 2026-07-19):** the owner-only web admin additionally gains
+`POST /admin/principal` — creation of a `kind='google'` (email-identity) grantee together with
+its initial READ-ONLY project shares in one submit — plus a server-rendered INVITE block per live
+google grantee (a percent-encoded `mailto:` link and copyable getting-started text; the server
+sends NO email — the owner's own mail client does) and a read-only `/welcome` page for any
+signed-in principal (a grantee sees exactly its own grant list from scope, never a global project
+listing). Scope stays strictly share-admin: the web NEVER creates `kind='token'` principals — no
+secret may ever transit a browser, and a google grantee has no secret at all (the `kind` is
+hardwired server-side and never read from the form) — `rw=false` remains hardwired on every grant
+path, and principal revoke / rotate / expiry stay CLI-only. Non-owners still get the
+byte-identical unknown-path 404 for the whole `/admin*` subtree; the create form's inputs are
+validated server-side (slug name, RFC-lite email that rejects header-injection material, bounded
+note). Review pending.

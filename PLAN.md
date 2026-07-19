@@ -481,14 +481,18 @@ still sees everything.
 `:8803`; every app service binds a container-private network and requires the bearer (**Inv. 10** —
 no unauthenticated surface; the deliberate container `0.0.0.0` bind is gated behind an explicit
 `KB_ALLOW_ANY_BIND`, the default still refuses accidental host-public binds). The **web UI performs
-no knowledge mutation** (**Inv. 11**, amended 2026-07-18): items, sources, relations, review state —
+no knowledge mutation** (**Inv. 11**, amended 2026-07-18; extended 2026-07-19): items, sources,
+relations, review state —
 all knowledge — are never written from kbweb, which imports zero knowledge-write functions and
 serves data routes as GET/HEAD only. The SOLE permitted mutating routes are the OWNER-ONLY
-AUTHORIZATION-CONFIG actions `POST /admin/grant` and `POST /admin/revoke` (grant/revoke a read-only
-project share via `kbcore.principals.grant`/`ungrant`, always `rw=false`), gated on the OWNER
+AUTHORIZATION-CONFIG actions `POST /admin/grant`, `POST /admin/revoke` and — extension of
+2026-07-19 (owner decision) — `POST /admin/principal` (grant/revoke a read-only project share via
+`kbcore.principals.grant`/`ungrant`, always `rw=false`; create a `kind='google'` email grantee
+with read-only initial shares — never a token principal, so no secret ever transits a browser, and
+principal revoke/rotate/expiry stay CLI-only), gated on the OWNER
 identity (non-owners get the byte-identical 404 of an unknown path) and CSRF-protected. This
-carve-out must never be broadened beyond share grant/revoke (see ADVERSARIAL_REVIEW.md, Amendment
-A11-1). The REST facade is a write surface with the identical bearer. Offsite copies are
+carve-out must never be broadened beyond share grant/revoke/create-google-grantee (see
+ADVERSARIAL_REVIEW.md, Amendments A11-1/A11-2). The REST facade is a write surface with the identical bearer. Offsite copies are
 **encrypted at rest** and the age key never sits beside the ciphertext or in git (**Inv. 12**).
 
 **6a — REST facade (~1-2 h)** — ARCH-4; JSON API for non-MCP consumers and the backing of the

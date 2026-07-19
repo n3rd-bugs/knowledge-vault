@@ -18,6 +18,7 @@ from kbcore.errors import NotFound
 from kbcore.items import list_projects, timeline
 from kbcore.review import list_open_review
 from kbcore.stats import stats
+from kbweb import views_admin_invite
 from kbweb.charts import bar_rows, stacked_segments
 from kbweb.ui import templates
 
@@ -93,10 +94,35 @@ def setup_view(request: Request) -> Response:  # GET /setup — connect a target
     )
 
 
+def welcome_view(request: Request) -> Response:  # GET /welcome
+    """Getting-started page for ANY signed-in principal (grantee AND owner).
+
+    A pure read with NO oracle: a grantee's project list comes straight from its
+    own resolved scope (``scope.current().read_projects``) — nothing here can
+    list all projects for a non-owner. The owner just gets an "everything is
+    visible" note. Anonymous requests never reach this view: the session
+    middleware redirects them to /login like every other data route."""
+    p = scope.current()
+    mcp_url, web_url = views_admin_invite.public_urls()
+    return templates.TemplateResponse(
+        request,
+        "welcome.html",
+        {
+            "who": p.name,
+            "kind": p.kind or "",
+            "owner_all": p.is_owner,
+            "granted": sorted(p.read_projects),
+            "mcp_url": mcp_url,
+            "web_url": web_url,
+        },
+    )
+
+
 ROUTES = [
     Route("/projects", projects_view),
     Route("/project/{name}", project_view),
     Route("/stats", stats_view),
     Route("/review", review_view),
     Route("/setup", setup_view),
+    Route("/welcome", welcome_view),
 ]

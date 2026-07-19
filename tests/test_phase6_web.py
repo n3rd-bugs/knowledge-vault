@@ -99,10 +99,11 @@ def test_web_item_missing_is_404(client):
     assert client.get("/item/999999").status_code == 404
 
 
-# The Inv. 11 carve-out (amended 2026-07-18, ADVERSARIAL_REVIEW.md A11-1): the
-# ONLY mutating web routes — owner-only AUTHORIZATION-CONFIG actions (project-
-# share grant/revoke). Adding ANY other path here requires re-opening the review.
-ADMIN_MUTATING_ROUTES = {"/admin/grant", "/admin/revoke"}
+# The Inv. 11 carve-out (amended 2026-07-18 A11-1; extended 2026-07-19 A11-2,
+# ADVERSARIAL_REVIEW.md): the ONLY mutating web routes — owner-only
+# AUTHORIZATION-CONFIG actions (project-share grant/revoke + google-grantee
+# creation). Adding ANY other path here requires re-opening the review.
+ADMIN_MUTATING_ROUTES = {"/admin/grant", "/admin/revoke", "/admin/principal"}
 
 
 def test_web_no_knowledge_mutation(web_app):
@@ -136,21 +137,24 @@ def test_web_no_knowledge_mutation(web_app):
         assert not leaked, f"write name(s) {leaked} leaked into kbweb.{mod_info.name}"
 
     # (3) the carve-out stays CONFINED: authz mutation happens ONLY in
-    #     views_admin, and ONLY share grant/ungrant — principal lifecycle
-    #     (create/revoke/rotate) and rw=true grants are unreachable from the web.
+    #     views_admin, and ONLY share grant/ungrant + google-grantee creation
+    #     (A11-2, 2026-07-19). Token principals, principal revoke/rotate/expiry
+    #     and rw=true grants are unreachable from the web — no secret ever
+    #     transits a browser.
     from kbweb import views_admin
 
     admin_src = inspect.getsource(views_admin)
-    for forbidden in ("create_principal", "principals.revoke(", "rotate(", "rw=True"):
+    for forbidden in ("principals.revoke(", "rotate(", "mint_token", 'kind="token"', "rw=True"):
         assert forbidden not in admin_src, f"{forbidden!r} must not be reachable from the web admin"
     assert "rw=False" in admin_src, "the web admin must hardwire read-only grants"
+    assert 'kind="google"' in admin_src, "web principal creation must hardwire kind='google'"
+    assert 'form.get("kind"' not in admin_src, "the kind must never be read from the form"
     for mod_info in pkgutil.iter_modules(kbweb.__path__):
         if mod_info.name == "views_admin":
             continue
         src = inspect.getsource(importlib.import_module(f"kbweb.{mod_info.name}"))
-        assert "principals.grant(" not in src and "principals.ungrant(" not in src, (
-            f"authz mutation leaked into kbweb.{mod_info.name}"
-        )
+        for call in ("principals.grant(", "principals.ungrant(", "create_principal("):
+            assert call not in src, f"authz mutation {call!r} leaked into kbweb.{mod_info.name}"
 
 
 def test_admin_routes_unreachable_without_owner_identity(client):

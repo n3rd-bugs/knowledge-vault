@@ -3,8 +3,34 @@
 {% block content %}
 <h2>Project shares</h2>
 <p class="prov">Owner-only authorization config (Invariant 11 carve-out): grant or revoke
-  <strong>read-only</strong> project shares — every grant made here is rw=false.
-  Principals themselves (create / revoke / rotate) are managed via the CLI.</p>
+  <strong>read-only</strong> project shares, and create <strong>google</strong> (email-identity)
+  grantees — every grant made here is rw=false. Token principals and principal
+  revoke / rotate / expiry stay CLI-only; no secret ever transits the browser.</p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Create a google grantee (read-only)</h3>
+  <p class="prov">Binds a collaborator's Google email to a new principal; the selected
+    projects become read-only shares in the same step. An invite block appears on the
+    principal card below once created.</p>
+  <form method="post" action="/admin/principal">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div class="bar">
+      <input type="text" name="name" placeholder="name (slug, e.g. alice)" required>
+      <input type="email" name="email" placeholder="their Google email" required>
+      <input type="text" name="note" placeholder="note (optional)" maxlength="200">
+    </div>
+    {% if projects %}
+    <div style="margin:.5rem 0">
+      {% for proj in projects %}
+      <label style="margin-right:.8rem"><input type="checkbox" name="projects" value="{{ proj }}"> {{ proj }}</label>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <button type="submit">Create google grantee</button>
+  </form>
+</div>
 
 <div class="card">
   <h3 style="margin-top:.2rem">Grant a project (read-only)</h3>
@@ -23,7 +49,7 @@
     <button type="submit">Grant read-only</button>
   </form>
   {% else %}
-  <p class="prov">No live principals to grant to — create one with the CLI first.</p>
+  <p class="prov">No live principals to grant to — create one above (google) or with the CLI (token).</p>
   {% endif %}
 </div>
 
@@ -59,7 +85,30 @@
     {% else %}
     <p class="prov">no project grants</p>
     {% endif %}
+    {% if p.name in invites %}
+    <details style="margin-top:.6rem">
+      <summary>Invite</summary>
+      <p><a href="{{ invites[p.name].mailto }}">Open invite email in your mail client</a></p>
+      <textarea readonly rows="16" style="width:100%" class="invite-text">{{ invites[p.name].text }}</textarea>
+      <button type="button" class="copy-btn invite-copy" hidden>copy invite text</button>
+    </details>
+    {% endif %}
   </div>
   {% endfor %}
 </div>
+
+{# Progressive enhancement only: the mailto link and the selectable readonly
+   textarea work with JS off; the copy button is revealed (and wired) by JS. #}
+<script>
+  document.querySelectorAll(".invite-copy").forEach(function (btn) {
+    btn.hidden = false;
+    btn.addEventListener("click", function () {
+      var ta = btn.parentElement.querySelector("textarea.invite-text");
+      navigator.clipboard.writeText(ta.value).then(function () {
+        btn.textContent = "copied";
+        setTimeout(function () { btn.textContent = "copy invite text"; }, 1200);
+      });
+    });
+  });
+</script>
 {% endblock %}

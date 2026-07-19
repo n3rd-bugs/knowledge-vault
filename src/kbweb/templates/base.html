@@ -19,6 +19,7 @@
       <a href="/review">review</a>
       <a href="/stats">stats</a>
       <a href="/setup">setup</a>
+      {% if signed_in %}<a href="/welcome">welcome</a>{% endif %}
       {% if is_owner %}<a href="/admin">admin</a>{% endif %}
     </nav>
     <div class="head-right">

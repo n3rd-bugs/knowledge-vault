@@ -217,6 +217,26 @@ def supersede_cmd(
     typer.echo(f"item {old_id} superseded by {new_id}")
 
 
+@app.command("archive")
+def archive_cmd(
+    item_ids: list[int] = typer.Argument(..., help="item id(s) to archive"),
+    reason: str = typer.Option(..., "--reason", help="why (recorded in meta for audit)"),
+) -> None:
+    """Owner maintenance: archive item(s) (status flip, reversible — never a delete)."""
+    archived = skipped = 0
+    for item_id in item_ids:
+        try:
+            if items.archive_item(item_id, reason=reason):
+                typer.echo(f"item {item_id} archived")
+                archived += 1
+            else:
+                typer.echo(f"item {item_id} already non-active — skipped")
+                skipped += 1
+        except KBError as e:
+            typer.echo(f"item {item_id}: {e}")
+    typer.echo(f"archive: {archived} archived, {skipped} skipped, {len(item_ids)} requested")
+
+
 @app.command("link")
 def link_cmd(
     src: int = typer.Argument(..., help="source item id"),

@@ -244,6 +244,36 @@ def log_access(item_id: int, tool: str, query: str | None = None) -> None:
         )
 
 
+def archive_item(item_id: int, *, reason: str | None = None) -> bool:
+    """Owner maintenance: flip an ACTIVE item to ``status='archived'`` (Invariant 5).
+
+    A status flip, never a delete — the row, body, and any supersession trail
+    are preserved and the flip is reversible. Idempotent: an already-non-active
+    item returns False without churn. ``reason`` is recorded in ``meta`` for
+    audit. NotFound if the id does not exist. Owner-only surfaces call this for
+    one-off cleanup (retiring test fixtures, vendor-scan noise) that the
+    date-based nightly ``archive_stale`` never reaches.
+    """
+    with transaction() as conn:
+        row = conn.execute("SELECT status FROM items WHERE id = %s", (item_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"item {item_id} does not exist")
+        if row[0] != "active":
+            return False
+        conn.execute(
+            """
+            UPDATE items
+            SET status = 'archived', updated_at = now(),
+                meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                    'archived', jsonb_build_object(
+                        'at', %s::text, 'reason', %s::text))
+            WHERE id = %s AND status = 'active'
+            """,
+            (datetime.now(UTC).isoformat(), reason, item_id),
+        )
+    return True
+
+
 def find_by_title(title: str) -> int | None:
     """Oldest item id with exactly this title, or None (seed relation wiring)."""
     with connect() as conn:

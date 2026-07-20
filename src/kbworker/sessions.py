@@ -124,7 +124,14 @@ def assemble_transcript(data: bytes) -> str:
         if not line:
             continue
         try:
-            obj = json.loads(line)
+            # Decode to str before json.loads: handing raw bytes to json runs
+            # json.detect_encoding() on the first 4 bytes, which mis-guesses
+            # UTF-16/32 for a line with leading NULs (e.g. a corrupt/partial
+            # write) and raises UnicodeDecodeError — NOT a JSONDecodeError, so it
+            # would crash the whole ingest. Decoding as UTF-8 (the transcript's
+            # real encoding) first sidesteps the sniffer; a garbage line then
+            # fails as a normal JSONDecodeError and is skipped.
+            obj = json.loads(line.decode("utf-8", "replace"))
         except json.JSONDecodeError:
             continue
         if not isinstance(obj, dict):

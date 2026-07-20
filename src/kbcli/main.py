@@ -352,6 +352,55 @@ def ingest_repo_cmd(
         typer.echo(f"  + {uri}")
 
 
+@app.command("reprocess")
+def reprocess_cmd(
+    project: str | None = typer.Option(None, "--project", "-p", help="only this project"),
+    before: str | None = typer.Option(
+        None, "--before", help="only sources ingested before this ISO date/timestamp"
+    ),
+    extractor: str | None = typer.Option(
+        None, "--extractor", help="only items extracted by this model (meta.extractor)"
+    ),
+    limit: int | None = typer.Option(None, "--limit", help="cap the number of raws replayed"),
+    apply: bool = typer.Option(
+        False, "--apply", help="perform writes (default: shadow/dry-run, writes nothing)"
+    ),
+) -> None:
+    """Re-run the CURRENT extraction pipeline over retained session raws.
+
+    Invariant 8: this invokes the 14B extractor stack — a sanctioned,
+    owner-invoked path exactly like `kb ingest-session`. It NEVER supersedes or
+    deletes: improved/new extractions land as NEW unverified items with review
+    rows (the existing trust flow) and identical re-extractions dedupe to
+    no-ops; prior items stay untouched. Default is shadow (dry-run): it reports
+    what WOULD change and writes nothing — opt into writes with --apply.
+    """
+    from kbcore import reprocess as reprocess_mod
+
+    try:
+        summary = reprocess_mod.reprocess(
+            project=project, before=before, extractor=extractor, limit=limit, shadow=not apply
+        )
+    except KBError as e:
+        _fail(e)
+    mode = "apply" if apply else "shadow"
+    typer.echo(
+        f"reprocess ({mode}): {summary['sources_seen']} source(s) seen, "
+        f"{summary['errors']} error(s)"
+    )
+    if apply:
+        typer.echo(
+            f"  saved {summary['saved']} new unverified item(s) (review-queued); "
+            f"{summary['rejected']} rejected"
+        )
+    else:
+        typer.echo(
+            f"  would save {summary['would_save']} new item(s); "
+            f"{summary['dedup']} dedup no-op(s); {summary['rejected']} rejected"
+        )
+        typer.echo("  shadow run — nothing written; re-run with --apply to write")
+
+
 @app.command()
 def seed() -> None:
     """Ingest the seed corpus (idempotent — safe to re-run)."""

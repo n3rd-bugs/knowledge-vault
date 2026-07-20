@@ -63,6 +63,46 @@ done
 
 echo "backup.sh: wrote ${OUT} ($(du -h "${OUT}" | cut -f1)); $(ls -1 kb-*.sql.zst | wc -l) dumps retained"
 
+# --- raw archive: the retained ORIGINAL bytes under KB_RAW ---------------------
+# The pg_dump above captures the DB (including ingest_queue.content) but NOT the
+# content-addressed transcript/doc originals under KB_RAW, which are what
+# `kb reprocess` re-runs the extractor over. Without this they live on one disk
+# with no backup. Archived as a dated tar.zst so it rides the same retention +
+# offsite-encryption path as the dump; a distinct kb-raw-* family so the two
+# prune independently (14 daily + 8 weekly each).
+KB_RAW="${KB_RAW:-${HOME}/kb/raw}"
+KB_RAW="${KB_RAW/#\~/${HOME}}"
+RAW_OUT="${KB_BACKUPS}/kb-raw-${STAMP}.tar.zst"
+if [[ -d "${KB_RAW}" ]]; then
+  # -C so paths are relative to KB_RAW (portable restore); zstd via tar's filter.
+  tar -C "${KB_RAW}" -cf - . | zstd -9 -q -o "${RAW_OUT}.tmp" -f
+  mv -f "${RAW_OUT}.tmp" "${RAW_OUT}"
+  chmod 600 "${RAW_OUT}"
+  # prune the kb-raw-* family with the SAME 14-daily + 8-weekly rule as dumps
+  declare -A rkeep=()
+  rdaily=0
+  rweekly=0
+  while IFS= read -r f; do
+    [[ -n "${f}" ]] || continue
+    d="${f#kb-raw-}"; d="${d%.tar.zst}"
+    [[ "${d}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+    rdaily=$((rdaily + 1))
+    if (( rdaily <= 14 )); then rkeep["${f}"]=1; fi
+    if [[ "$(date -u -d "${d}" +%u 2>/dev/null || echo 0)" == "1" ]]; then
+      rweekly=$((rweekly + 1))
+      if (( rweekly <= 8 )); then rkeep["${f}"]=1; fi
+    fi
+  done < <(ls -1 kb-raw-*.tar.zst 2>/dev/null | sort -r)
+  for f in kb-raw-*.tar.zst; do
+    [[ -e "${f}" ]] || continue
+    [[ -n "${rkeep[${f}]:-}" ]] || rm -f -- "${f}"
+  done
+  echo "backup.sh: wrote ${RAW_OUT} ($(du -h "${RAW_OUT}" | cut -f1)); $(ls -1 kb-raw-*.tar.zst | wc -l) raw archives retained"
+else
+  echo "backup.sh: KB_RAW ${KB_RAW} absent — skipping raw archive"
+  RAW_OUT=""
+fi
+
 # --- offsite push (PLAN.md §6d) ----------------------------------------------
 # Additive: with KB_OFFSITE_ENABLED unset/false nothing below runs and this
 # script behaves exactly as before. The local backup above is already complete;
@@ -71,10 +111,20 @@ echo "backup.sh: wrote ${OUT} ($(du -h "${OUT}" | cut -f1)); $(ls -1 kb-*.sql.zs
 # ONLY the .age ciphertext to KB_RCLONE_REMOTE — plaintext never leaves the box.
 KB_OFFSITE_ENABLED="${KB_OFFSITE_ENABLED:-false}"
 if [[ "${KB_OFFSITE_ENABLED,,}" =~ ^(true|1|yes)$ ]]; then
+  offsite_fail=0
   if bash "${REPO_DIR}/scripts/offsite.sh" push "${OUT}"; then
-    echo "backup.sh: offsite push OK"
+    echo "backup.sh: offsite push OK (dump)"
   else
-    echo "backup.sh: local backup OK but OFFSITE PUSH FAILED (see offsite: lines above)" >&2
-    exit 1
+    echo "backup.sh: local backup OK but OFFSITE PUSH FAILED for the dump" >&2
+    offsite_fail=1
   fi
+  if [[ -n "${RAW_OUT}" ]]; then
+    if bash "${REPO_DIR}/scripts/offsite.sh" push "${RAW_OUT}"; then
+      echo "backup.sh: offsite push OK (raw)"
+    else
+      echo "backup.sh: local backup OK but OFFSITE PUSH FAILED for the raw archive" >&2
+      offsite_fail=1
+    fi
+  fi
+  (( offsite_fail == 0 )) || exit 1
 fi

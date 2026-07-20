@@ -264,8 +264,14 @@ def extract_and_ingest(
     branch: str | None = None,
     extractor=None,
     extra_detail: dict[str, Any] | None = None,
+    extra_meta: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """Extract → quote-validate/repair → ingest, the core shared by file + queue paths.
+
+    ``extra_detail`` reaches only the review-queue row's detail; ``extra_meta``
+    keys are additionally stamped into each saved ITEM's meta (setdefault —
+    pipeline-owned keys always win) so provenance like ``reprocessed_from``
+    (kbcore.reprocess) survives on the item after the review row resolves.
 
     Runs ``extractor`` (the 14B) on ``text`` and keeps items whose ``quote`` is a
     verbatim substring (SEC-3/ARCH-2). A quote that fails the exact check gets ONE
@@ -296,7 +302,7 @@ def extract_and_ingest(
         report = ensemble.run_ensemble(
             text, project, uri, code_ref=code_ref, branch=branch, extra_detail=extra_detail
         )
-        return _ingest_ensemble_survivors(report, text)
+        return _ingest_ensemble_survivors(report, text, extra_meta=extra_meta)
 
     if extractor is None:
         extractor = llm.extract_items
@@ -330,6 +336,8 @@ def extract_and_ingest(
             }
         if branch:
             meta["branch"] = branch
+        for k, v in (extra_meta or {}).items():
+            meta.setdefault(k, v)  # provenance stamp (kb reprocess); pipeline keys win
         item_id = _ingest_and_queue(
             project=project,
             type_=type_,
@@ -358,7 +366,9 @@ def extract_and_ingest(
     return saved, rejected
 
 
-def _ingest_ensemble_survivors(report: dict[str, Any], text: str) -> tuple[int, int]:
+def _ingest_ensemble_survivors(
+    report: dict[str, Any], text: str, extra_meta: dict[str, Any] | None = None
+) -> tuple[int, int]:
     """Live-mode ensemble ingest: survivors flow through the SAME path as v1.
 
     Same :func:`_ingest_and_queue` transaction (trust='unverified' + review row),
@@ -398,6 +408,8 @@ def _ingest_ensemble_survivors(report: dict[str, Any], text: str) -> tuple[int, 
             }
         if branch:
             meta["branch"] = branch
+        for k, v in (extra_meta or {}).items():
+            meta.setdefault(k, v)  # provenance stamp (kb reprocess); pipeline keys win
         item_id = _ingest_and_queue(
             project=report["project"],
             type_=type_,

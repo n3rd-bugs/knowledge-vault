@@ -217,6 +217,53 @@ def test_push_prunes_remote_to_offsite_keep(tmp_path):
     ]
 
 
+def test_raw_archive_pushes_and_prunes_as_its_own_family(tmp_path):
+    """The kb-raw-*.tar.zst archive rides the same encrypt+push path and prunes
+    INDEPENDENTLY of the dump family — neither evicts the other (backup gap fix
+    2026-07-19)."""
+    dump, remote, _, env = _setup(tmp_path)
+    raw = tmp_path / "kb-raw-2026-07-18.tar.zst"
+    raw.write_bytes(MARKER + os.urandom(2048))
+    # Pre-seed both families near the retention limit.
+    for day in ("01", "02", "03"):
+        (remote / f"kb-2026-06-{day}.sql.zst.age").write_bytes(b"old-dump")
+        (remote / f"kb-raw-2026-06-{day}.tar.zst.age").write_bytes(b"old-raw")
+    env["KB_OFFSITE_KEEP"] = "2"
+
+    assert _run_offsite(["push", str(dump)], env, tmp_path).returncode == 0
+    assert _run_offsite(["push", str(raw)], env, tmp_path).returncode == 0
+
+    objs = sorted(p.name for p in remote.iterdir())
+    # Each family independently kept to its 2 newest; the other family untouched.
+    assert objs == [
+        "kb-2026-06-03.sql.zst.age",
+        "kb-2026-07-18.sql.zst.age",
+        "kb-raw-2026-06-03.tar.zst.age",
+        "kb-raw-2026-07-18.tar.zst.age",
+    ], objs
+
+
+def test_fetch_raw_selects_the_raw_family(tmp_path):
+    """`fetch <dest> raw` pulls the newest raw archive; the default stays the dump."""
+    dump, remote, crypto, env = _setup(tmp_path)
+    raw = tmp_path / "kb-raw-2026-07-18.tar.zst"
+    raw.write_bytes(MARKER + os.urandom(2048))
+    assert _run_offsite(["push", str(dump)], env, tmp_path).returncode == 0
+    assert _run_offsite(["push", str(raw)], env, tmp_path).returncode == 0
+
+    dest = tmp_path / "restore"
+    dest.mkdir()
+    res = _run_offsite(["fetch", str(dest), "raw"], env, tmp_path)
+    assert res.returncode == 0, res.stderr
+    out = Path(res.stdout.strip())
+    assert out.name == "kb-raw-2026-07-18.tar.zst"
+    assert out.read_bytes() == raw.read_bytes()
+
+    # default (dump) unaffected
+    res2 = _run_offsite(["fetch", str(dest), "dump"], env, tmp_path)
+    assert Path(res2.stdout.strip()).name == "kb-2026-07-18.sql.zst"
+
+
 def test_fetch_roundtrip_byte_identical(tmp_path):
     dump, _, crypto, env = _setup(tmp_path)
     assert _run_offsite(["push", str(dump)], env, tmp_path).returncode == 0

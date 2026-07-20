@@ -42,8 +42,27 @@ KB_AGE_IDENTITY="${KB_AGE_IDENTITY/#\~/${HOME}}"   # expand a leading ~
 AGE_BIN="${KB_AGE_BIN:-age}"
 RCLONE_BIN="${KB_RCLONE_BIN:-rclone}"
 
-# Remote object naming (matches backup.sh's kb-YYYY-MM-DD.sql.zst + .age).
+# Remote object naming. The DB dump family (matches backup.sh's
+# kb-YYYY-MM-DD.sql.zst + .age) is the DEFAULT fetch target so restore-test and
+# existing tooling are unchanged. push/prune are ARTIFACT-FAMILY-AWARE: the raw
+# archive (kb-raw-YYYY-MM-DD.tar.zst.age) rides the SAME encrypt+push+prune
+# path, pruned independently of the dumps so neither family evicts the other.
 NAME_RE='^kb-[0-9]{4}-[0-9]{2}-[0-9]{2}\.sql\.zst\.age$'
+
+# Derive a family regex from an artifact basename by replacing its date with the
+# date pattern and anchoring +.age — e.g. kb-2026-07-18.sql.zst -> the dump
+# family, kb-raw-2026-07-18.tar.zst -> the raw family. Files of different
+# families never match each other, so prune_remote counts each family alone.
+family_re_for() {
+  local base="$1"
+  if [[ "${base}" =~ ^(.+)-[0-9]{4}-[0-9]{2}-[0-9]{2}(\..+)$ ]]; then
+    local prefix="${BASH_REMATCH[1]}" suffix="${BASH_REMATCH[2]}"
+    printf '^%s-[0-9]{4}-[0-9]{2}-[0-9]{2}%s\\.age$' \
+      "${prefix}" "${suffix//./\\.}"
+  else
+    die "cannot derive backup family from name: ${base}"
+  fi
+}
 
 log() { echo "offsite: $*" >&2; }
 die() { log "FAIL — $*"; exit 1; }
@@ -68,12 +87,13 @@ require_remote_config() {
 # (dates sort lexically, mirroring the local prune in backup.sh). Only objects
 # matching NAME_RE are ever deleted — anything else on the remote is untouched.
 prune_remote() {
+  local family_re="${1:-${NAME_RE}}"
   local listing f n=0
   listing="$("${RCLONE_BIN}" lsf --files-only "${KB_RCLONE_REMOTE}")" \
     || die "rclone lsf failed during remote prune"
   while IFS= read -r f; do
     [[ -n "${f}" ]] || continue
-    [[ "${f}" =~ ${NAME_RE} ]] || continue
+    [[ "${f}" =~ ${family_re} ]] || continue
     n=$((n + 1))
     if (( n > KB_OFFSITE_KEEP )); then
       "${RCLONE_BIN}" deletefile "${KB_RCLONE_REMOTE}/${f}" \
@@ -112,11 +132,20 @@ cmd_push() {
     || die "rclone copy failed (local backup is intact)"
   log "pushed ${name} -> ${KB_RCLONE_REMOTE}"
 
-  prune_remote
+  # Prune only THIS artifact's family (dumps and raw archives retain separately).
+  prune_remote "$(family_re_for "$(basename "${dump}")")"
 }
 
 cmd_fetch() {
   local dest="$1"
+  # Optional family regex — defaults to the DB dump (restore-test path unchanged).
+  # Pass 'raw' to fetch the newest raw archive instead.
+  local family_re="${NAME_RE}"
+  case "${2:-dump}" in
+    dump) family_re="${NAME_RE}" ;;
+    raw) family_re='^kb-raw-[0-9]{4}-[0-9]{2}-[0-9]{2}\.tar\.zst\.age$' ;;
+    *) family_re="$2" ;;  # an explicit regex, for forward-compat
+  esac
   [[ -d "${dest}" ]] || die "destination directory missing: ${dest}"
   [[ -n "${KB_AGE_IDENTITY}" ]] || die "KB_AGE_IDENTITY is empty (path to the age identity file)"
   [[ -f "${KB_AGE_IDENTITY}" ]] || die "age identity file not found: ${KB_AGE_IDENTITY}"
@@ -126,8 +155,8 @@ cmd_fetch() {
   local listing newest
   listing="$("${RCLONE_BIN}" lsf --files-only "${KB_RCLONE_REMOTE}")" \
     || die "rclone lsf failed for ${KB_RCLONE_REMOTE}"
-  newest="$(printf '%s\n' "${listing}" | grep -E "${NAME_RE}" | sort -r | head -1 || true)"
-  [[ -n "${newest}" ]] || die "no kb-*.sql.zst.age objects on ${KB_RCLONE_REMOTE}"
+  newest="$(printf '%s\n' "${listing}" | grep -E "${family_re}" | sort -r | head -1 || true)"
+  [[ -n "${newest}" ]] || die "no objects matching ${family_re} on ${KB_RCLONE_REMOTE}"
 
   "${RCLONE_BIN}" copy "${KB_RCLONE_REMOTE}/${newest}" "${dest}" \
     || die "rclone copy (fetch) failed"
@@ -148,10 +177,10 @@ case "${1:-}" in
     cmd_push "$2"
     ;;
   fetch)
-    [[ $# -eq 2 ]] || die "usage: offsite.sh fetch <dest-dir>"
-    cmd_fetch "$2"
+    [[ $# -ge 2 && $# -le 3 ]] || die "usage: offsite.sh fetch <dest-dir> [dump|raw]"
+    cmd_fetch "$2" "${3:-dump}"
     ;;
   *)
-    die "usage: offsite.sh {push <dump.sql.zst> | fetch <dest-dir>}"
+    die "usage: offsite.sh {push <artifact> | fetch <dest-dir> [dump|raw]}"
     ;;
 esac

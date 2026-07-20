@@ -40,6 +40,54 @@
   {{ bar_list(project_rows) }}
 </div>
 
+{# Phase-3 expansion (plan §5): every series below is computed by kbcore.stats
+   through the SAME project predicate as the counters above — a grantee's
+   numbers never include withheld projects. #}
+{% if week_rows %}
+<div class="card">
+  <h4 style="margin:.1rem 0 .4rem">items per week</h4>
+  {{ bar_list(week_rows) }}
+</div>
+{% endif %}
+{% if tag_rows %}
+<div class="card">
+  <h4 style="margin:.1rem 0 .4rem">tag landscape</h4>
+  {{ bar_list(tag_rows) }}
+</div>
+{% endif %}
+
+{# access_log analytics: OWNER-ONLY (usage is None for every grantee — the
+   section, its heading and its markup are entirely absent from their page). #}
+{% if usage %}
+<h3 id="usage">Usage (owner-only)</h3>
+<div class="kpi-grid">
+  <div class="kpi"><div class="n">{{ usage.events_total }}</div><div class="l">recall events</div></div>
+</div>
+<div class="grid-cards">
+  <div class="card">
+    <h4 style="margin:.1rem 0 .4rem">recalls per week</h4>
+    {{ bar_list(usage_week_rows) }}
+  </div>
+  <div class="card">
+    <h4 style="margin:.1rem 0 .4rem">by tool</h4>
+    {{ bar_list(usage_tool_rows) }}
+  </div>
+  <div class="card">
+    <h4 style="margin:.1rem 0 .4rem">by principal</h4>
+    {{ bar_list(usage_principal_rows) }}
+  </div>
+</div>
+<div class="card">
+  <h4 style="margin:.1rem 0 .4rem">most recalled items</h4>
+  {% if not usage.top_items %}<p class="prov">No recalls logged yet.</p>{% endif %}
+  <ul style="margin:.2rem 0; font-size:.9rem">
+    {% for t in usage.top_items %}
+    <li><a href="/item/{{ t.item_id }}">{{ t.title }}</a> <span class="prov">× {{ t.count }}</span></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <footer class="page">
   embed model <span class="mono">{{ s.embed_model }}</span>
   · last consolidation

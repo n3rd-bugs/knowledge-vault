@@ -313,7 +313,21 @@ def _owner(app) -> TestClient:
     return c
 
 
-READER_WALLED = ("/review", "/review/1", "/setup", "/setup/x", "/admin", "/admin/grant")
+READER_WALLED = (
+    "/review",
+    "/review/1",
+    "/setup",
+    "/setup/x",
+    "/admin",
+    "/admin/grant",
+    # Phase 3 zones: /jobs is owner-only (worker jobs run under implicit OWNER
+    # scope); /export.{csv,json} needs CAP_EXPORT, which NO role bundle carries.
+    "/jobs",
+    "/jobs/1",
+    "/export.csv",
+    "/export.json",
+    "/export.csv?q=spi",
+)
 
 
 def _guest_walled(world) -> tuple[str, ...]:
@@ -432,6 +446,8 @@ def test_nav_honesty_per_role(app, world):
         'href="/stats"',
         'href="/setup"',
         'href="/admin"',
+        'href="/jobs"',
+        'href="/export.csv',
     ):
         assert href not in home, f"guest chrome leaks {href}"
     assert 'href="/welcome"' in home
@@ -443,12 +459,27 @@ def test_nav_honesty_per_role(app, world):
     home = reader.get("/").text
     for href in ('href="/timeline"', 'href="/projects"', 'href="/stats"'):
         assert href in home
-    for href in ('href="/review"', 'href="/setup"', 'href="/admin"'):
+    for href in (
+        'href="/review"',
+        'href="/setup"',
+        'href="/admin"',
+        'href="/jobs"',
+        'href="/export.csv',
+    ):
         assert href not in home, f"reader chrome leaks {href} (the old 400-link bug)"
     assert 'href="/review"' not in reader.get("/stats").text, "stats KPI must not link /review"
+    # Phase 3: a capped-out reader's RESULTS page must not link the export zone.
+    results = reader.get("/", params={"q": "SPI mode"}).text
+    assert "seeded spi note" in results and 'href="/export.csv' not in results
 
     owner_home = _owner(app).get("/").text
-    for href in ('href="/timeline"', 'href="/review"', 'href="/setup"', 'href="/admin"'):
+    for href in (
+        'href="/timeline"',
+        'href="/review"',
+        'href="/setup"',
+        'href="/admin"',
+        'href="/jobs"',
+    ):
         assert href in owner_home, "owner chrome unchanged"
 
 

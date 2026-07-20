@@ -54,6 +54,6 @@ def test_archived_item_leaves_default_search():
     )
     assert any(h.item_id == iid for h in search("zzarchivetoken")), "active item is searchable"
     items.archive_item(iid, reason="cleanup")
-    assert not any(
-        h.item_id == iid for h in search("zzarchivetoken")
-    ), "archived item drops from default search"
+    assert not any(h.item_id == iid for h in search("zzarchivetoken")), (
+        "archived item drops from default search"
+    )

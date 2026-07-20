@@ -39,6 +39,17 @@ def bar_rows(
     return out
 
 
+def trend_rows(series: list[tuple[str, int]]) -> list[BarRow]:
+    """Chronological rows for a time series (Phase-3 stats expansion).
+
+    A trend keeps its OWN order — never re-sorted by magnitude like
+    :func:`bar_rows` (dataviz: time flows, ranks don't); pct scales vs the
+    busiest bucket. No links: a week label is not a navigable entity.
+    """
+    top = max((n for _, n in series), default=0) or 1
+    return [BarRow(label=lbl, count=n, pct=round(100 * n / top, 1)) for lbl, n in series]
+
+
 def stacked_segments(counts: dict[str, int], order: tuple[str, ...]) -> list[BarRow]:
     """Part-to-whole segments in a fixed semantic order (color follows the
     entity, never its rank); zero-count states are skipped; unknown states

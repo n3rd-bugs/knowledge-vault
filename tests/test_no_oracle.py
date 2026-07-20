@@ -88,10 +88,17 @@ def world():
 
 
 # --- reads: only granted projects are visible --------------------------------
+#
+# Parametrized over BOTH read tiers (Phase 3 AC, WEBUI_TIERED_ACCESS_PLAN §5):
+# capabilities gate FEATURES at the surfaces, but the ROW walls below must hold
+# identically for a 'guest' (caps={search}) and a 'reader' — a guest principal
+# is just a grantee with fewer features, never different data visibility.
+READ_ROLES = ("reader", "guest")
 
 
-def test_search_returns_only_granted(world):
-    g = _grantee("reader", {"a": False})
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_search_returns_only_granted(world, role):
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         hits = search("SPI mode 1", k=10)
     projects = {h.project for h in hits}
@@ -100,8 +107,9 @@ def test_search_returns_only_granted(world):
     assert world["b"] not in ids and world["c"] not in ids
 
 
-def test_get_withheld_is_byte_identical_notfound(world):
-    g = _grantee("reader", {"a": False})
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_get_withheld_is_byte_identical_notfound(world, role):
+    g = _grantee(role, {"a": False}, role=role)
     # Baseline: a genuinely-missing id raises this exact message for the owner.
     with pytest.raises(NotFound) as missing:
         get_item(9_999_999)
@@ -112,8 +120,9 @@ def test_get_withheld_is_byte_identical_notfound(world):
     assert str(withheld.value) == str(missing.value).replace("9999999", str(world["b"]))
 
 
-def test_timeline_withheld_is_notfound(world):
-    g = _grantee("reader", {"a": False})
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_timeline_withheld_is_notfound(world, role):
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         assert timeline("a")  # granted project → items
         with pytest.raises(NotFound):
@@ -122,10 +131,11 @@ def test_timeline_withheld_is_notfound(world):
             timeline("does-not-exist")  # truly absent → same error class
 
 
-def test_similar_excludes_withheld(world):
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_similar_excludes_withheld(world, role):
     _force_lead(world["a"], _vec(1.0))
     _force_lead(world["b"], _vec(1.0))  # force a & b to be nearest neighbours
-    g = _grantee("reader", {"a": False})
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         hits = graph.similar(world["a"], k=5)
         assert world["b"] not in {h.item_id for h in hits}
@@ -134,9 +144,10 @@ def test_similar_excludes_withheld(world):
             graph.similar(world["b"])
 
 
-def test_trace_walls_off_withheld(world):
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_trace_walls_off_withheld(world, role):
     graph.link(world["a"], "alternative_to", world["b"])  # cross-boundary (owner)
-    g = _grantee("reader", {"a": False})
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         tree = graph.trace("item", world["a"], depth=2)
 
@@ -153,17 +164,23 @@ def test_trace_walls_off_withheld(world):
             graph.trace("item", world["b"])  # withheld root looks absent
 
 
-def test_projects_and_stats_only_granted(world):
-    g = _grantee("reader", {"a": False})
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_projects_and_stats_only_granted(world, role):
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         assert {p.name for p in list_projects()} == {"a"}
         s = stats.stats()
         assert s["items_total"] == 1
         assert set(s["by_project"]) == {"a"}
+        # Phase-3 series stay inside the same wall: the whole-series sum equals
+        # the grantee's own by_project count — no unscoped residual (plan §5 AC).
+        assert sum(w["count"] for w in s["items_per_week"]) == 1
+        assert set(s["top_tags"]) == {"protocol:spi"} and s["top_tags"]["protocol:spi"] == 1
 
 
-def test_browse_hides_withheld(world):
-    g = _grantee("reader", {"a": False})
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_browse_hides_withheld(world, role):
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         refs = browse.item_refs([world["a"], world["b"], world["c"]])
         assert set(refs) == {world["a"]}, "withheld ids absent from item_refs"
@@ -173,17 +190,19 @@ def test_browse_hides_withheld(world):
         assert tags.get("protocol:spi") == 1  # only the granted item counted
 
 
-def test_relations_hide_withheld_endpoint(world):
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_relations_hide_withheld_endpoint(world, role):
     graph.link(world["a"], "fixes", world["b"])  # granted item → withheld item
-    g = _grantee("reader", {"a": False})
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         rels = get_item(world["a"]).relations
     leaked = [r for r in rels if world["b"] in (r.src_id, r.dst_id)]
     assert not leaked, "withheld item id leaked through a granted item's relation list"
 
 
-def test_empty_grant_sees_nothing(world):
-    g = _grantee("nobody", {})  # authenticated but no grants
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_empty_grant_sees_nothing(world, role):
+    g = _grantee("nobody", {}, role=role)  # authenticated but no grants
     with scope.use_principal(g):
         assert search("SPI mode 1", k=10) == []
         assert list_projects() == []
@@ -195,16 +214,18 @@ def test_empty_grant_sees_nothing(world):
 # --- graph expansion walling (search hops) -----------------------------------
 
 
-def test_graph_expansion_never_surfaces_withheld_neighbor(world):
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_graph_expansion_never_surfaces_withheld_neighbor(world, role):
     # a-item links to a b-item; expanding a's neighborhood must not pull the b-item.
     graph.link(world["a"], "depends_on", world["b"])
-    g = _grantee("reader", {"a": False})
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         hits = search("alpha widget SPI", hops=2, k=10)
     assert world["b"] not in {h.item_id for h in hits}, "expansion leaked a withheld neighbor"
 
 
-def test_withheld_item_is_never_a_relay_hop(world):
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_withheld_item_is_never_a_relay_hop(world, role):
     # X(granted a) — M(withheld b) — W(withheld c). W is reachable ONLY by relaying
     # through the withheld M, so expansion must surface NEITHER M NOR W: a withheld
     # node can neither be shown nor used to bridge to further items.
@@ -213,7 +234,7 @@ def test_withheld_item_is_never_a_relay_hop(world):
     m = world["b"]
     graph.link(x, "depends_on", m)
     graph.link(m, "depends_on", w)
-    g = _grantee("reader", {"a": False})
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         hits = {h.item_id for h in search("alpha relay origin", hops=3, k=10)}
     assert m not in hits, "a withheld neighbor must never surface"
@@ -305,7 +326,8 @@ def test_supersede_withheld_old_id_no_oracle(world):
         assert str(withheld.value) == str(missing.value).replace("9999999", str(world["b"]))
 
 
-def test_superseded_by_masked_when_successor_withheld(world):
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_superseded_by_masked_when_successor_withheld(world, role):
     """A denormalized cross-project supersession pointer must not leak the withheld
     successor's id or free-text reason through the scalar column (get_item AND search
     AND timeline). The reciprocal relation edge is already hidden; the scalar must
@@ -313,7 +335,7 @@ def test_superseded_by_masked_when_successor_withheld(world):
     a_item = world["a"]
     # Owner retires a shared 'a' item in favour of a withheld 'b' item.
     supersede(a_item, new_item_id=world["b"], reason="secret cross-project reason STD-9")
-    g = _grantee("reader", {"a": False})
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         d = get_item(a_item)
         assert d.superseded_by is None, "withheld successor id leaked via get_item scalar"
@@ -419,8 +441,9 @@ def test_review_queue_probe_no_project_name_oracle(world):
 # --- owner-only surfaces ------------------------------------------------------
 
 
-def test_require_owner_blocks_grantee(world):
-    g = _grantee("reader", {"a": False})
+@pytest.mark.parametrize("role", READ_ROLES)
+def test_require_owner_blocks_grantee(world, role):
+    g = _grantee(role, {"a": False}, role=role)
     with scope.use_principal(g):
         with pytest.raises(InvalidOperation):
             scope.require_owner("kb_review_list")

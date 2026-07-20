@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Jobs · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Worker jobs</h2>
+<p class="prov">Read-only status viewer (owner-only). Deep-search reports open through
+  their saved item — the job result body is never rendered here.</p>
+
+<div class="card">
+  <h4 style="margin:.1rem 0 .4rem">latest consolidation</h4>
+  {% if consolidation %}
+  <dl class="meta-grid">
+    <dt>request</dt><dd>#{{ consolidation.id }} <span class="badge {{ consolidation.status }}">{{ consolidation.status }}</span></dd>
+    <dt>requested by</dt><dd>{{ consolidation.requested_by }}</dd>
+    <dt>requested at</dt><dd>{% if consolidation.requested_at %}<time>{{ consolidation.requested_at[:19] }}</time>{% else %}—{% endif %}</dd>
+    <dt>started at</dt><dd>{% if consolidation.started_at %}<time>{{ consolidation.started_at[:19] }}</time>{% else %}—{% endif %}</dd>
+    <dt>finished at</dt><dd>{% if consolidation.finished_at %}<time>{{ consolidation.finished_at[:19] }}</time>{% else %}—{% endif %}</dd>
+  </dl>
+  {% else %}
+  <p class="prov">No consolidation has been requested yet.</p>
+  {% endif %}
+</div>
+
+<h3>Deep-search jobs</h3>
+{% if not jobs %}<p class="prov">No deep-search jobs yet — enqueue one with
+  <span class="mono">kb deep-search</span> or the <span class="mono">kb_deep_search</span> MCP tool.</p>{% endif %}
+{% for j in jobs %}
+<div class="card">
+  <div>
+    <span class="badge {{ j.status }}">{{ j.status }}</span>
+    <span class="prov">job #{{ j.id }} · requested by {{ j.requested_by }}</span>
+  </div>
+  <h4 style="margin:.3rem 0">{{ j.question }}</h4>
+  <p class="prov" style="margin:.2rem 0">
+    requested {% if j.requested_at %}<time>{{ j.requested_at[:19] }}</time>{% else %}—{% endif %}
+    {% if j.started_at %} · started <time>{{ j.started_at[:19] }}</time>{% endif %}
+    {% if j.finished_at %} · finished <time>{{ j.finished_at[:19] }}</time>{% endif %}
+  </p>
+  {% if j.report_item_id %}
+  <p style="margin:.2rem 0"><a href="/item/{{ j.report_item_id }}">open report item {{ j.report_item_id }}</a></p>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}

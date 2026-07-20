@@ -153,6 +153,40 @@ def finish_deep_search(job_id: int, result: dict[str, Any], ok: bool = True) -> 
         )
 
 
+def list_deep_search_jobs(limit: int = 20) -> list[dict[str, Any]]:
+    """Recent deep-search jobs — STATUS FIELDS ONLY, never the stored report text.
+
+    Read surface for the owner-only web /jobs viewer (WEBUI_TIERED_ACCESS_PLAN
+    §5 Phase 3): worker jobs run under implicit OWNER scope and ``result``
+    carries whole-KB synthesis, so this SELECT deliberately extracts only the
+    saved report's ITEM ID (``result->>'item_id'``) — a UI links through the
+    scope-gated ``/item/{id}`` read path and the report BODY never travels via
+    this function. Parameterized SELECT, newest first; ``limit`` is clamped so
+    a caller can never turn the list into a bulk dump.
+    """
+    lim = max(1, min(int(limit), 100))
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, question, status, requested_by, requested_at, started_at, "
+            "finished_at, (result->>'item_id')::bigint "
+            "FROM deep_search_jobs ORDER BY id DESC LIMIT %s",
+            (lim,),
+        ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "question": r[1],
+            "status": r[2],
+            "requested_by": r[3],
+            "requested_at": r[4].isoformat() if r[4] else None,
+            "started_at": r[5].isoformat() if r[5] else None,
+            "finished_at": r[6].isoformat() if r[6] else None,
+            "report_item_id": r[7],
+        }
+        for r in rows
+    ]
+
+
 def deep_search_status(job_id: int) -> dict[str, Any] | None:
     """A deep-search job's current state + stored result, for kb_deep_search_status."""
     with connect() as conn:

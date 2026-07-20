@@ -34,17 +34,31 @@ def public_urls() -> tuple[str, str]:
     )
 
 
-def invite_text(name: str, projects: Sequence[str]) -> str:
+def invite_text(name: str, projects: Sequence[str], role: str = "reader") -> str:
     """The plain-text invite for one google grantee (personalized, ~15 lines).
 
     Contains ONLY the principal name, its granted project list, the two public
     URLs and fixed prose — no token, no secret, nothing recoverable (asserted
     by tests). The recipient signs in with their own Google account.
+    ``role``-aware (Phase 3, plan §5): the what-you-can-do line reflects the
+    grantee's OWN tier — a guest reads a search-only description, never a
+    catalog of what other tiers could do.
     """
     mcp_url, web_url = public_urls()
     project_lines = "\n".join(f"  - {p}" for p in projects)
     if not project_lines:
         project_lines = "  (none yet — the owner will grant projects shortly)"
+    if role == "guest":
+        can_do = (
+            "3. You can search and open items in the projects listed above\n"
+            "   (search-only access). You cannot write or change anything, and\n"
+            "   no other projects are visible to you."
+        )
+    else:
+        can_do = (
+            "3. You can search and read the projects listed above. You cannot write or\n"
+            "   change anything, and no other projects are visible to you."
+        )
     return f"""Hi {name},
 
 You've been given READ-ONLY access to the Knowledge Vault. Projects you can read:
@@ -55,8 +69,7 @@ Getting started:
    {mcp_url}
    then complete "Sign in with Google" using THIS email address.
 2. In a browser: open {web_url} and click "Sign in with Google".
-3. You can search and read the projects listed above. You cannot write or
-   change anything, and no other projects are visible to you.
+{can_do}
 4. Access can be revoked by the owner at any time.
 
 Questions? Just reply to this email.
@@ -85,6 +98,6 @@ def invite_blocks(infos: Iterable[PrincipalInfo]) -> dict[str, dict[str, str]]:
     for p in infos:
         if p.kind != "google" or p.revoked_at is not None or not p.email:
             continue
-        text = invite_text(p.name, [project for project, _rw in p.grants])
+        text = invite_text(p.name, [project for project, _rw in p.grants], role=p.role)
         out[p.name] = {"text": text, "mailto": mailto_href(p.email, text)}
     return out

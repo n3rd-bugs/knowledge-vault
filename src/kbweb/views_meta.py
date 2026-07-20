@@ -17,9 +17,9 @@ from kbcore.config import settings
 from kbcore.errors import NotFound
 from kbcore.items import list_projects, timeline
 from kbcore.review import list_open_review
-from kbcore.stats import stats
+from kbcore.stats import stats, usage_stats
 from kbweb import views_admin_invite
-from kbweb.charts import bar_rows, stacked_segments
+from kbweb.charts import bar_rows, stacked_segments, trend_rows
 from kbweb.ui import templates
 
 _STATUS_ORDER = ("active", "superseded", "duplicate", "archived")
@@ -49,7 +49,14 @@ def project_view(request: Request) -> Response:  # GET /project/{name}
 
 
 def stats_view(request: Request) -> Response:  # GET /stats — the dashboard
+    """Corpus dashboard. Phase-3 expansion (plan §5): the new series come from
+    ``kbcore.stats.stats`` — every aggregate there composes the SAME
+    ``project_predicate`` as the original counters, so a grantee's trend and tag
+    numbers never include withheld projects. ``kbcore.stats.usage_stats``
+    (access_log analytics) is OWNER-ONLY and fetched only for the owner — a
+    grantee's page carries no usage section at all."""
     s = stats()
+    usage = usage_stats() if scope.current().is_owner else None
     return templates.TemplateResponse(
         request,
         "stats.html",
@@ -59,6 +66,16 @@ def stats_view(request: Request) -> Response:  # GET /stats — the dashboard
             "project_rows": bar_rows(s["by_project"], href_fmt="/project/{}"),
             "status_segs": stacked_segments(s["by_status"], _STATUS_ORDER),
             "trust_segs": stacked_segments(s["by_trust"], _TRUST_ORDER),
+            "week_rows": trend_rows([(w["week"], w["count"]) for w in s["items_per_week"]]),
+            "tag_rows": bar_rows(s["top_tags"], href_fmt="/tags/{}"),
+            "usage": usage,
+            "usage_week_rows": (
+                trend_rows([(w["week"], w["count"]) for w in usage["events_per_week"]])
+                if usage
+                else []
+            ),
+            "usage_tool_rows": bar_rows(usage["by_tool"]) if usage else [],
+            "usage_principal_rows": bar_rows(usage["by_principal"]) if usage else [],
         },
     )
 
@@ -115,6 +132,10 @@ def welcome_view(request: Request) -> Response:  # GET /welcome
             "owner_all": p.is_owner,
             "granted": sorted(p.read_projects),
             "caps": sorted(p.caps),
+            # Role-aware copy (Phase 3): the what-you-can-do line reflects THIS
+            # principal's tier — a guest reads a search-only description, never
+            # a catalog of features other tiers have.
+            "can_browse": p.has_cap(scope.CAP_BROWSE),
             "mcp_url": mcp_url,
             "web_url": web_url,
         },

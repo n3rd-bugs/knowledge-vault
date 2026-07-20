@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # docker-compose. Empty is safe-and-loud — servers that NEED it (Google
     # sign-in) refuse to start without it; surfaces that only display it degrade.
     kb_web_public_url: str = ""
+    # HARD row cap on the web /export.{csv,json} result set (tiered access,
+    # WEBUI_TIERED_ACCESS_PLAN §5 Phase 3): bounds the bulk-exfiltration
+    # economics of the CAP_EXPORT surface no matter what the client asks for.
+    kb_web_export_cap: int = 500
     # Containerized runs bind 0.0.0.0 (container-private, fronted by Traefik/TLS);
     # set true only there. The default still refuses accidental host-public binds.
     kb_allow_any_bind: bool = False

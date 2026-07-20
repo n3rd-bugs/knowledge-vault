@@ -29,8 +29,16 @@
     then <em>Sign in with Google</em> with this account's email.</li>
   <li><strong>Web browsing:</strong> open <span class="mono">{{ web_url }}</span>
     and click <em>Sign in with Google</em>.</li>
+  {# Role-aware (Phase 3): the line describes THIS principal's own tier only. #}
+  {% if owner_all %}
+  <li><strong>What you can do:</strong> everything — this is the owner identity.</li>
+  {% elif can_browse %}
   <li><strong>What you can do:</strong> search and read the projects listed above.
     No writes, and no other projects are visible.</li>
+  {% else %}
+  <li><strong>What you can do:</strong> search and open items in the projects listed
+    above — search-only access. No writes, and no other projects are visible.</li>
+  {% endif %}
   <li>Access can be revoked by the owner at any time.</li>
 </ol>
 {% endblock %}

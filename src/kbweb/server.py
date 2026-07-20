@@ -35,7 +35,15 @@ from kbcore import principals, scope
 from kbcore.config import settings
 from kbcore.errors import KBError, NotFound
 from kbmcp.server import _validate_runtime_config
-from kbweb import auth, views_admin, views_items, views_meta, views_search
+from kbweb import (
+    auth,
+    views_admin,
+    views_export,
+    views_items,
+    views_jobs,
+    views_meta,
+    views_search,
+)
 from kbweb.ui import STATIC_DIR, code_css, templates
 
 log = logging.getLogger("kbweb")
@@ -63,6 +71,14 @@ ROUTE_CAPS: dict[str, str] = {
     "/review": OWNER_ONLY,  # CAP_REVIEW_READ only after the Phase-4 detail-JSONB scrub
     "/setup": OWNER_ONLY,  # renders the MASTER bearer — permanently owner-only
     "/admin": OWNER_ONLY,  # the Inv. 11 authz carve-out (same wall as before)
+    # Phase 3 (plan §5): worker jobs run under implicit OWNER scope and their
+    # result JSONB carries whole-KB synthesis — owner-cap at launch.
+    "/jobs": OWNER_ONLY,
+    # Phase 3 (plan §3d/§6 Q4): export is in NO role bundle — owner + future
+    # named grants only. Both format paths are their own zone key (the zone is
+    # the leading path segment, and '.' is part of it).
+    "/export.csv": scope.CAP_EXPORT,
+    "/export.json": scope.CAP_EXPORT,
 }
 
 # Zones reachable WITHOUT a ROUTE_CAPS entry: the pre-auth surfaces (/login,
@@ -233,6 +249,8 @@ ROUTES = [
     *views_search.ROUTES,
     *views_items.ROUTES,
     *views_meta.ROUTES,
+    *views_jobs.ROUTES,
+    *views_export.ROUTES,
     # Owner-only authz-config carve-out (Inv. 11 amended) — the ONLY mutating routes.
     *views_admin.ROUTES,
 ]

@@ -140,7 +140,17 @@ READ_ALLOWLIST = {
     "items.get_item",
     "items.list_projects",
     "items.timeline",
+    # Phase 3 (read-feature surfacing, plan §5): STATUS-ONLY job reads for the
+    # owner-only /jobs viewer — list_deep_search_jobs is a parameterized SELECT
+    # that never fetches the report text; latest_consolidation_status is the
+    # existing poll read. Both pure reads (jobs' write surfaces — enqueue/claim/
+    # finish — stay in WRITE_NAMES and out of kbweb).
+    "jobs.latest_consolidation_status",
+    "jobs.list_deep_search_jobs",
     "models.ITEM_TYPES",
+    # Phase 3: the export view type-annotates/serializes the SearchHit result
+    # shape of search.search — a pydantic model, not a write surface.
+    "models.SearchHit",
     # views_admin authz-config carve-out (A11-1/A11-2) + login resolution
     "principals.PrincipalInfo",
     "principals.create_principal",
@@ -156,6 +166,9 @@ READ_ALLOWLIST = {
     # Phase 2 (tiered access): the ROUTE_CAPS zone table in kbweb.server names
     # the capability constants — pure read-only vocabulary, no write surface.
     "scope.CAP_BROWSE",
+    # Phase 3: CAP_EXPORT gates the GET-only /export.{csv,json} zone (plan §3d;
+    # in NO role bundle at launch) — a constant, not a write surface.
+    "scope.CAP_EXPORT",
     "scope.CAP_SEARCH",
     "scope.current",
     "scope.enter_server_mode",
@@ -163,6 +176,9 @@ READ_ALLOWLIST = {
     "scope.use_principal",
     "search.search",
     "stats.stats",
+    # Phase 3: access_log-derived analytics for the owner-only /stats section —
+    # a require_owner-walled pure read over access_log (never grantee-visible).
+    "stats.usage_stats",
 }
 
 _TRIPWIRE_MSG = (

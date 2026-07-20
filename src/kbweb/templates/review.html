@@ -51,13 +51,45 @@
       <span class="mono">kb review apply {{ e.queue_id }}</span>)</span>
   </p>
   {% endif %}
-  {% if e.detail %}
+  {# ENUMERATED known-safe fields ONLY — never a raw detail dump (Phase 3,
+     plan §5): the JSONB can carry cross-project titles/ids past the row gate,
+     so each rendered field is a conscious choice, and every id link re-gates
+     through the scope-checked /item/{id} read path. #}
+  {% if e.detail.triage %}
+  {% set tg = e.detail.triage %}
+  <div style="margin:.3rem 0">
+    <strong>Triage suggestion:</strong>
+    <span class="badge {% if tg.action == 'keep' %}verified{% endif %}">{{ tg.action }}</span>
+    {% if tg.action == 'reject_duplicate' and tg.dup_of %}
+    → duplicate of <a href="/item/{{ tg.dup_of }}">item {{ tg.dup_of }}</a>
+    {% endif %}
+    {% if tg.rationale %}<div class="prov" style="margin:.15rem 0">{{ tg.rationale }}</div>{% endif %}
+    <div class="prov">{% if tg.model %}model {{ tg.model }}{% endif %}
+      {% if tg.at %} · {{ tg.at[:19] }}{% endif %}</div>
+  </div>
+  {% endif %}
+  {% if e.detail.rejected_count is defined %}
   <dl class="meta-grid">
-    {% for k, v in e.detail.items() if k not in ('evidence', 'suggested_resolution') %}
-    <dt>{{ k }}</dt><dd>{{ v }}</dd>
-    {% endfor %}
+    <dt>rejected_count</dt><dd>{{ e.detail.rejected_count }}</dd>
   </dl>
   {% endif %}
+  {% if e.reason == 'search_regression' %}
+  <dl class="meta-grid">
+    {% if e.detail.baseline_hit_at_5 is defined %}<dt>hit@5</dt>
+    <dd>{{ e.detail.observed_hit_at_5 }} (baseline {{ e.detail.baseline_hit_at_5 }})</dd>{% endif %}
+    {% if e.detail.baseline_mrr is defined %}<dt>MRR</dt>
+    <dd>{{ e.detail.observed_mrr }} (baseline {{ e.detail.baseline_mrr }})</dd>{% endif %}
+    {% if e.detail.epsilon is defined %}<dt>epsilon</dt><dd>{{ e.detail.epsilon }}</dd>{% endif %}
+  </dl>
+  {% endif %}
+  {# Copyable OWNER commands — the resolution itself stays on the CLI/MCP
+     surface (Invariant 11: no web mutation, no resolve button until Phase 4). #}
+  <p class="prov" style="margin:.3rem 0 0">resolve via CLI:
+    {% if e.item_id %}<span class="mono">kb review promote {{ e.queue_id }}</span>
+    · <span class="mono">kb review reject {{ e.queue_id }}</span>
+    · {% endif %}<span class="mono">kb review dismiss {{ e.queue_id }}</span>
+    {%- if e.detail.triage %} · <span class="mono">kb review apply-triage --ids {{ e.queue_id }}</span>{% endif %}
+    {%- if e.detail.suggested_resolution %} · <span class="mono">kb review apply {{ e.queue_id }}</span>{% endif %}</p>
 </div>
 {% endfor %}
 {% endblock %}

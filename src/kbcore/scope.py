@@ -58,9 +58,22 @@ CAP_SAVE = "save"  # kb_save / kb_supersede / kb_link — ANDed with rw grants
 CAP_REVIEW_READ = "review_read"  # kb_review_list, /review — Phase 4, after the detail scrub
 CAP_REVIEW_RESOLVE = "review_resolve"  # kb_review_resolve / kb_review_bulk — Phase 4
 CAP_DEEP_SEARCH = "deep_search"  # the owner's GPU/14B (Invariant 8)
+# Bulk export of a scoped result set (web /export.{csv,json} — plan §3d).
+# Deliberately in NO role bundle at launch (plan §6 Q4: owner + named-grant
+# only): export changes the bulk-exfiltration economics of a read grant, so it
+# is opt-in per principal, never part of a default tier.
+CAP_EXPORT = "export"
 
 ALL_CAPS = frozenset(
-    {CAP_SEARCH, CAP_BROWSE, CAP_SAVE, CAP_REVIEW_READ, CAP_REVIEW_RESOLVE, CAP_DEEP_SEARCH}
+    {
+        CAP_SEARCH,
+        CAP_BROWSE,
+        CAP_SAVE,
+        CAP_REVIEW_READ,
+        CAP_REVIEW_RESOLVE,
+        CAP_DEEP_SEARCH,
+        CAP_EXPORT,
+    }
 )
 
 # Role → capability bundle, expanded at resolution time (principals._build_grantee).
@@ -68,7 +81,8 @@ ALL_CAPS = frozenset(
 # deliberately EXCLUDES the review caps until the review_queue.detail JSONB scrub
 # lands (Phase 4 hard precondition: detail can carry cross-project titles/ids past
 # the row-level gate) — a test pins this. No bundle grants CAP_DEEP_SEARCH (owner
-# GPU; flippable later without a migration). 'owner' is NOT a role: ownership is
+# GPU; flippable later without a migration) or CAP_EXPORT (owner + named-grant
+# only at launch, plan §6 Q4). 'owner' is NOT a role: ownership is
 # credential-derived (``is_owner``), never a DB row — migration 012's frozen CHECK
 # is the escalation firewall.
 ROLE_CAPS: dict[str, frozenset[str]] = {

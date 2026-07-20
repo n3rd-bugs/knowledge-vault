@@ -62,6 +62,13 @@
 {% endif %}
 {% endif %}
 {% if q and not hits %}<p>No results for "{{ q }}".</p>{% endif %}
+{# Export of the CURRENT result set — link gated by the SAME ROUTE_CAPS table
+   that walls the zone (nav honesty): no CAP_EXPORT, no link AND ghost-404. #}
+{% if q and hits and nav["/export.csv"] %}
+<p class="prov">export this result set:
+  <a href="/export.csv?{{ request.url.query }}">CSV</a> ·
+  <a href="/export.json?{{ request.url.query }}">JSON</a></p>
+{% endif %}
 {% if not q and top_tags %}
 <h4>browse by tag</h4>
 <p class="tag-cloud">

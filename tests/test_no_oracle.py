@@ -386,6 +386,31 @@ def test_find_duplicate_and_kb_save_dup_no_oracle(world):
         assert dup is None, "duplicate lookup leaked a withheld item id"
 
 
+def test_review_queue_probe_no_project_name_oracle(world):
+    """Resolving a review row whose item is WITHHELD must be byte-identical to a
+    missing queue id (Phase 1 fix: _queued_item_id gates readability BEFORE
+    writability — assert_writable's rejection embeds the project name, so
+    probing queue ids would otherwise enumerate withheld NDA project names)."""
+    from kbcore import review
+
+    nda = ingest("nda-withheld-client", "note", "secret finding", "secret NDA body")
+    # A contradiction row spanning granted + withheld (plan §5 Phase 1 AC).
+    qid = review.queue_review(nda, "contradiction", {"a_id": world["a"], "b_id": nda})
+    g = _grantee("resolver", {"a": True})
+    for resolve in (
+        review.promote,
+        review.reject,
+        lambda q: review.resolve_via_supersede(q, world["a"]),
+    ):
+        with scope.use_principal(g), pytest.raises(NotFound) as withheld:
+            resolve(qid)
+        with scope.use_principal(g), pytest.raises(NotFound) as missing:
+            resolve(9_999_999)
+        assert str(withheld.value) == str(missing.value).replace("9999999", str(qid))
+        assert "nda-withheld-client" not in str(withheld.value), "project name leaked"
+    assert review.promote(qid) == nda  # owner still resolves it (no regression)
+
+
 # --- owner-only surfaces ------------------------------------------------------
 
 

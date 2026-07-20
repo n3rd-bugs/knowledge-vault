@@ -156,6 +156,15 @@ def count_open_review() -> int:
 
 
 def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:
+    """Resolve a review-queue row to its item id, gating READABILITY first.
+
+    Readability BEFORE writability (supersede's ordering): ``assert_writable``'s
+    rejection embeds the PROJECT NAME, so probing queue ids would let a
+    non-owner resolver enumerate withheld (NDA) project names. A row whose item
+    the request cannot read must be byte-identical to a missing row — the SAME
+    "does not exist" NotFound, never a project-naming error (no-oracle
+    guarantee, WEBUI_TIERED_ACCESS_PLAN Phase 1).
+    """
     row = conn.execute(
         """
         SELECT rq.item_id, i.project
@@ -168,7 +177,9 @@ def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:
         raise NotFound(f"review queue row {queue_id} does not exist")
     if row[0] is None:
         raise InvalidOperation(f"review queue row {queue_id} has no associated item")
-    # Public-only instance: cannot resolve a review for a non-public item.
+    scope.assert_readable(row[1], f"review queue row {queue_id} does not exist")
+    # Readable now, so a write-rejection may safely name the project
+    # (public-only instance: cannot resolve a review for a non-public item).
     scope.assert_writable(row[1])
     return row[0]
 

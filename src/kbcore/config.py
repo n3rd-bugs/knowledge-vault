@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     kb_db_password: str = "change-me"
     kb_db_schema: str = "public"  # tests point this at kb_test (CLAUDE.md §Code style)
     kb_token: str = "change-me-long-random"
+    # Dedicated web signing secret (WEBUI_TIERED_ACCESS_PLAN Phase 1): when set,
+    # kbweb signs session cookies / CSRF tokens / OAuth-state with THIS secret
+    # instead of the master KB_TOKEN, so cookie forgery and API-master are no
+    # longer the same secret. Empty = fall back to KB_TOKEN (existing
+    # deployments keep working; setting it forces one clean re-login).
+    kb_web_signing_secret: str = ""
     kb_bind: str = "127.0.0.1"
     kb_port: int = 8321
     kb_rest_port: int = 8322

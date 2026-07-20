@@ -1,9 +1,12 @@
 """kbweb.auth — signed session cookies for the web UI (Phase 6b; Inv. 11 amended).
 
 Login checks the supplied token against ``settings.kb_token`` (constant-time)
-and, on success, issues an itsdangerous-signed cookie whose secret IS the token.
-Anonymous access is refused everywhere except /login and /static. Also home to
-the admin CSRF token (the owner-only authz carve-out's POST guard).
+and, on success, issues an itsdangerous-signed cookie. Every signer (session,
+CSRF, OAuth state) draws its secret from :func:`_signing_secret` —
+``KB_WEB_SIGNING_SECRET`` when set, else ``KB_TOKEN`` — so cookie forgery and
+API-master can be decoupled without breaking existing deployments. Anonymous
+access is refused everywhere except /login and /static. Also home to the admin
+CSRF token (the owner-only authz carve-out's POST guard).
 """
 
 from __future__ import annotations
@@ -34,9 +37,21 @@ _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
 
+def _signing_secret() -> str:
+    """The one secret behind EVERY web signer (session, CSRF, OAuth state).
+
+    ``KB_WEB_SIGNING_SECRET`` when set — decoupling cookie/CSRF forgery from
+    API-master, so a compromised web signing key can never authenticate against
+    the MCP/REST bearer check (Phase 1 hardening) — falling back to
+    ``KB_TOKEN`` when empty so existing deployments keep working until the
+    owner sets the dedicated secret (one forced re-login at rollout).
+    """
+    return settings.kb_web_signing_secret or settings.kb_token
+
+
 def _serializer() -> URLSafeTimedSerializer:
-    # Built per call so a rotated KB_TOKEN (or a test override) takes effect.
-    return URLSafeTimedSerializer(settings.kb_token, salt=_SALT)
+    # Built per call so a rotated secret (or a test override) takes effect.
+    return URLSafeTimedSerializer(_signing_secret(), salt=_SALT)
 
 
 # Cookie payload = the principal IDENTITY: "owner" for the owner (master token or
@@ -154,8 +169,8 @@ CSRF_MAX_AGE = 60 * 60 * 2  # 2 h — re-minted on every /admin render
 
 def _csrf_serializer() -> URLSafeTimedSerializer:
     # Distinct salt: an admin CSRF token must never validate as a session cookie
-    # or OAuth state (and vice versa).
-    return URLSafeTimedSerializer(settings.kb_token, salt=_CSRF_SALT)
+    # or OAuth state (and vice versa). Same secret source as every web signer.
+    return URLSafeTimedSerializer(_signing_secret(), salt=_CSRF_SALT)
 
 
 def issue_csrf(identity: str) -> str:
@@ -181,7 +196,7 @@ def csrf_ok(signed: str | None, identity: str) -> bool:
 
 def _state_serializer() -> URLSafeTimedSerializer:
     # Distinct salt from the session cookie so the two token classes never mix.
-    return URLSafeTimedSerializer(settings.kb_token, salt=_STATE_SALT)
+    return URLSafeTimedSerializer(_signing_secret(), salt=_STATE_SALT)
 
 
 def issue_state(state: str) -> str:

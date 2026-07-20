@@ -17,6 +17,9 @@ from kbcore.ingest import ingest
 TEST_TOKEN = "kbtest-" + "0" * 32
 
 # Every KB-mutating surface — none may be importable in the web module (Inv. 11).
+# Extended for the Phase-1 harness (WEBUI_TIERED_ACCESS_PLAN §5): the newer
+# write/GPU surfaces below joined kbcore after the original guard landed;
+# tests/test_web_caps.py asserts this set stays a superset of that expansion.
 WRITE_NAMES = {
     "ingest",
     "ingest_in",
@@ -33,6 +36,19 @@ WRITE_NAMES = {
     "record_contradiction",
     "backfill_entities",
     "extract_entities_in",
+    # Phase-1 expansion (2026-07-20): jobs / deep search / review resolution /
+    # triage / reprocess / item+project mutation.
+    "enqueue_deep_search",
+    "request_consolidation",
+    "deep_search",
+    "run_triage",
+    "store_triage",
+    "apply_triage",
+    "dismiss",
+    "bulk_resolve",
+    "reprocess",
+    "archive_item",
+    "set_project",
 }
 
 

@@ -89,21 +89,27 @@ def _asset_version() -> str:
 ASSET_V = _asset_version()
 
 
-def _identity_ctx(request: Request) -> dict[str, bool]:
-    """Template context: is the signed-cookie identity the OWNER / signed in?
+def _identity_ctx(request: Request) -> dict[str, object]:
+    """Template context: chrome flags from the LIVE resolved principal.
 
-    ``is_owner`` drives owner-only chrome (the /admin nav link) — a grantee must
-    never even see that the admin surface exists; ``signed_in`` drives chrome for
-    any authenticated principal (the /welcome nav link). Reuses the same
-    signed-cookie identity resolution the auth middleware uses
-    (kbweb.auth.cookie_identity); a missing/invalid cookie (e.g. the login page
-    itself) is simply anonymous. Display-only: route AUTHORIZATION is enforced
-    server-side in SessionAuthMiddleware + views_admin, never by these flags.
+    ``SessionAuthMiddleware`` binds the request's resolved principal onto
+    ``request.state``; ``nav`` maps each ROUTE_CAPS zone to whether THIS
+    principal holds its capability — the nav renders strictly from the same
+    table the middleware walls with, so a link can never outrun its wall and a
+    user never sees a hint for a zone they lack (no-oracle for features; fixes
+    the old bug where grantees saw review/setup links that 400'd). Pre-auth
+    requests (/login, /static) carry no principal — anonymous chrome, zero
+    links. Display-only: route AUTHORIZATION stays in SessionAuthMiddleware +
+    the in-view guards, never these flags (tiered access, plan §2).
     """
-    from kbweb import auth  # local import: ui must stay import-light for views
+    from kbweb.server import ROUTE_CAPS  # runtime import: server imports ui at load
 
-    identity = auth.cookie_identity(request.cookies.get(auth.COOKIE))
-    return {"is_owner": identity == auth.OWNER_IDENTITY, "signed_in": identity is not None}
+    p = getattr(request.state, "principal", None)
+    return {
+        "signed_in": p is not None,
+        "is_owner": p is not None and p.is_owner,
+        "nav": {zone: p is not None and p.has_cap(cap) for zone, cap in ROUTE_CAPS.items()},
+    }
 
 
 def create_templates() -> Jinja2Templates:

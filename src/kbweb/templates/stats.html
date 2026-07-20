@@ -9,9 +9,13 @@
   <div class="kpi"><div class="n">{{ s.chunks }}</div><div class="l">chunks</div></div>
   <div class="kpi"><div class="n">{{ s.entities }}</div><div class="l">entities</div></div>
   <div class="kpi"><div class="n">{{ s.relations }}</div><div class="l">relations</div></div>
+  {% if nav["/review"] %}
   <a class="kpi" href="/review" style="text-decoration:none">
     <div class="n">{{ s.review_queue_open }}</div><div class="l">review open →</div>
   </a>
+  {% else %}
+  <div class="kpi"><div class="n">{{ s.review_queue_open }}</div><div class="l">review open</div></div>
+  {% endif %}
   <div class="kpi"><div class="n">{{ s.ingest_queue_pending }}</div><div class="l">queue pending</div></div>
 </div>
 

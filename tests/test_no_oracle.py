@@ -39,8 +39,13 @@ def _force_lead(item_id: int, vec: str) -> None:
         )
 
 
-def _grantee(name: str, grants: dict[str, bool]) -> scope.Principal:
-    principals.create_principal(name, kind="token")
+def _grantee(name: str, grants: dict[str, bool], role: str = "reader") -> scope.Principal:
+    """A live token grantee. Since migration 012, WRITE-capable grantees carry
+    role='contributor' (the backfill: an existing rw-grantee could already
+    kb_save, so the migration seeds contributor — capabilities gate the write
+    FEATURE, rw grants keep gating the ROWS). Tests that model a working writer
+    pass role='contributor'; read-side tests keep the 'reader' default."""
+    principals.create_principal(name, kind="token", role=role)
     for project, rw in grants.items():
         principals.grant(name, project, rw=rw)
     p = principals.resolve_name(name)
@@ -219,7 +224,7 @@ def test_withheld_item_is_never_a_relay_hop(world):
 
 
 def test_write_requires_rw_grant(world):
-    g = _grantee("writer", {"a": True, "b": False})  # rw on a, read-only on b
+    g = _grantee("writer", {"a": True, "b": False}, role="contributor")  # rw on a, ro on b
     with scope.use_principal(g):
         assert ingest("a", "note", "new alpha", "written by grantee") is not None
         with pytest.raises(InvalidOperation):
@@ -234,7 +239,7 @@ def test_write_requires_rw_grant(world):
 def test_write_rejection_message_is_uniform(world):
     """The write-rejection wording must not distinguish read-only-grant vs
     no-grant vs nonexistent (no existence/permission oracle)."""
-    g = _grantee("writer", {"a": True, "b": False})
+    g = _grantee("writer", {"a": True, "b": False}, role="contributor")
 
     def normalized_reject(project: str) -> str:
         with scope.use_principal(g), pytest.raises(InvalidOperation) as ei:
@@ -248,7 +253,7 @@ def test_write_rejection_message_is_uniform(world):
 
 
 def test_link_dst_and_evidence_no_oracle(world):
-    g = _grantee("writer", {"a": True})
+    g = _grantee("writer", {"a": True}, role="contributor")
     with pytest.raises(NotFound) as missing:
         with scope.use_principal(g):
             graph.link(world["a"], "mentions", 9_999_999)  # truly missing dst
@@ -262,7 +267,7 @@ def test_link_dst_and_evidence_no_oracle(world):
 
 
 def test_supersede_withheld_replacement_no_oracle(world):
-    g = _grantee("writer", {"a": True})
+    g = _grantee("writer", {"a": True}, role="contributor")
     a2 = ingest("a", "note", "alpha v2 candidate", "alpha replacement body")
     with scope.use_principal(g):
         # a valid same-project supersede works
@@ -351,7 +356,7 @@ def test_ungrant_clears_principal_cache(world):
 def test_grantee_write_is_audited(world):
     """A grantee's writes are attributable: ingest and link stamp an access_log row
     bearing the grantee's principal name (owner/local writes stay unattributed)."""
-    g = _grantee("auditor", {"a": True})
+    g = _grantee("auditor", {"a": True}, role="contributor")
     with scope.use_principal(g):
         new_id = ingest("a", "note", "audited note", "written by grantee auditor", uri="aud")
         link_src = ingest("a", "note", "audited link src", "grantee link source body", uri="ls")
@@ -378,7 +383,7 @@ def test_find_duplicate_and_kb_save_dup_no_oracle(world):
         )
         == world["b"]
     )
-    g = _grantee("writer", {"a": True})
+    g = _grantee("writer", {"a": True}, role="contributor")
     with scope.use_principal(g):
         dup = find_duplicate(
             "beta NDA gotcha", "the beta client uses SPI mode 1 too", kind="manual", uri="b"
@@ -396,7 +401,7 @@ def test_review_queue_probe_no_project_name_oracle(world):
     nda = ingest("nda-withheld-client", "note", "secret finding", "secret NDA body")
     # A contradiction row spanning granted + withheld (plan §5 Phase 1 AC).
     qid = review.queue_review(nda, "contradiction", {"a_id": world["a"], "b_id": nda})
-    g = _grantee("resolver", {"a": True})
+    g = _grantee("resolver", {"a": True}, role="contributor")
     for resolve in (
         review.promote,
         review.reject,

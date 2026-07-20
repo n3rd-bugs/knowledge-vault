@@ -54,8 +54,12 @@
 </form>
 
 {% if submitted_empty %}
+{% if nav["/projects"] %}
 <p class="status">Enter a search phrase — or browse by
   <a href="/projects">project</a>, <a href="/timeline">timeline</a>, or a tag below.</p>
+{% else %}
+<p class="status">Enter a search phrase — or pick a tag below.</p>
+{% endif %}
 {% endif %}
 {% if q and not hits %}<p>No results for "{{ q }}".</p>{% endif %}
 {% if not q and top_tags %}

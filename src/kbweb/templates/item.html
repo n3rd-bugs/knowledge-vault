@@ -2,9 +2,9 @@
 {% block title %}{{ item.title }} · Knowledge Vault{% endblock %}
 {% block content %}
 <p class="prov">
-  <a href="/">← search</a> ·
+  <a href="/">← search</a>{% if nav["/similar"] %} ·
   <a href="/similar/{{ item.item_id }}">similar</a> ·
-  <a href="/trace/{{ item.item_id }}">trace</a>
+  <a href="/trace/{{ item.item_id }}">trace</a>{% endif %}
 </p>
 
 {# Provenance header — the SEC-3 sentence is pinned by tests; keep it verbatim. #}

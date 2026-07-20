@@ -49,6 +49,15 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+$
 _MAX_EMAIL_LEN = 254
 _MAX_NOTE_LEN = 200
 
+# Creation-time role allowlist (A11-2a clarification, WEBUI_TIERED_ACCESS_PLAN
+# §4/§6 Q6): the web form may assign only the LOW-PRIVILEGE bundles — the exact
+# structural parallel to the rw=False and kind="google" hardwiring above. Role
+# CHANGE and contributor/reviewer assignment stay CLI-only (`kb principal role`);
+# a trip-wire test pins the role-change service function out of every kbweb
+# module. A forged role=contributor/owner/anything-else POST re-renders a 400
+# and creates no row.
+_WEB_ROLE_ALLOWLIST = frozenset({"guest", "reader"})
+
 
 def _owner_or_404() -> None:
     """A non-owner must see the byte-identical 404 an unknown path yields.
@@ -134,7 +143,7 @@ async def revoke_share(request: Request) -> Response:  # POST /admin/revoke
     return RedirectResponse("/admin", status_code=303)
 
 
-def _grantee_form_error(name: str, email: str, note: str) -> str | None:
+def _grantee_form_error(name: str, email: str, note: str, role: str) -> str | None:
     """First validation failure of the create-grantee form, or None."""
     if not _NAME_RE.fullmatch(name):
         return "name must be a slug matching [a-z0-9][a-z0-9._-]{0,62}"
@@ -142,6 +151,10 @@ def _grantee_form_error(name: str, email: str, note: str) -> str | None:
         return "email must be a plain address (no spaces, %, commas or semicolons)"
     if len(note) > _MAX_NOTE_LEN:
         return f"note must be {_MAX_NOTE_LEN} characters or fewer"
+    if role not in _WEB_ROLE_ALLOWLIST:
+        # Only the owner can ever see this page, so naming the two permitted
+        # values leaks nothing (the grantee-facing wall is the byte-identical 404).
+        return "role must be guest or reader (other roles are CLI-only)"
     return None
 
 
@@ -150,16 +163,21 @@ async def create_grantee(request: Request) -> Response:  # POST /admin/principal
 
     The kind is HARDWIRED "google" (owner decision 2026-07-19): the web never
     mints a token principal — no secret may ever transit a browser — and a
-    forged ``kind`` form field is never even read. rw=False on every grant."""
+    forged ``kind`` form field is never even read. rw=False on every grant.
+    The role field is restricted to _WEB_ROLE_ALLOWLIST (A11-2a): a forged
+    elevated role is a 400 re-render, no row created."""
     form = await _authorized_form(request)
     name = str(form.get("name") or "").strip()
     email = str(form.get("email") or "").strip().lower()
     note = str(form.get("note") or "").strip()
-    error = _grantee_form_error(name, email, note)
+    # Absent/empty field defaults to 'reader' — parity with a pre-role form POST
+    # (zero behavior change for existing clients of this owner-only endpoint).
+    role = str(form.get("role") or "reader").strip()
+    error = _grantee_form_error(name, email, note, role)
     if error is not None:
         return _admin_page(request, error=error, status_code=400)
     try:
-        principals.create_principal(name, kind="google", email=email, note=note or None)
+        principals.create_principal(name, kind="google", email=email, note=note or None, role=role)
     except InvalidOperation as e:  # e.g. duplicate name — re-render with the message
         return _admin_page(request, error=str(e), status_code=400)
     # Grant ONLY projects that actually exist (checked against list_projects,

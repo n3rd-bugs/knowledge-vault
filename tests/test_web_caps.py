@@ -153,6 +153,10 @@ READ_ALLOWLIST = {
     "review.list_open_review",
     "scope.OWNER",
     "scope.Principal",
+    # Phase 2 (tiered access): the ROUTE_CAPS zone table in kbweb.server names
+    # the capability constants — pure read-only vocabulary, no write surface.
+    "scope.CAP_BROWSE",
+    "scope.CAP_SEARCH",
     "scope.current",
     "scope.enter_server_mode",
     "scope.require_owner",

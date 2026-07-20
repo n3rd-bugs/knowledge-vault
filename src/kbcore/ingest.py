@@ -167,6 +167,12 @@ def ingest_in(
         raise ValueError(f"unknown item type {type!r}")
     if kind not in SOURCE_KINDS:
         raise ValueError(f"unknown source kind {kind!r}")
+    # Tiered access (plan §2): the SAVE capability gates the write FEATURE; the
+    # rw grant below gates the ROWS — the walls AND. Per-principal-constant, so
+    # zero target-existence signal; a no-op for owner/CLI/worker (implicit OWNER)
+    # and for backfilled rw-grantees (contributors, migration 012) — a future
+    # reader/guest is now double-gated.
+    scope.require_cap(scope.CAP_SAVE)
     # Public-only instance: reject writes to non-public (or new, default-private)
     # projects. No-op on a full-access instance. Covers ingest/kb_save/summary/etc.
     scope.assert_writable(project)

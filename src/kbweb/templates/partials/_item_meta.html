@@ -1,7 +1,7 @@
 {# Item metadata sidebar — every field the plain-text render used to bury. #}
 <dl class="meta-grid card">
   <dt>project</dt>
-  <dd><a href="/project/{{ item.project }}">{{ item.project }}</a></dd>
+  <dd>{% if nav["/project"] %}<a href="/project/{{ item.project }}">{{ item.project }}</a>{% else %}{{ item.project }}{% endif %}</dd>
 
   <dt>trust · status</dt>
   <dd>

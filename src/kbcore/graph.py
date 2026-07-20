@@ -37,7 +37,10 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
         if src is None or not scope.project_readable(conn, src[0]):
             raise NotFound(f"item {src_item_id} does not exist")
         # Readable now, so a write-rejection may safely name the project (public-only:
-        # cannot write a relation from a non-public item).
+        # cannot write a relation from a non-public item). The SAVE capability gates
+        # the FEATURE before the rw grant gates the ROW (tiered access, plan §2) —
+        # per-principal-constant, so no target signal rides the ordering.
+        scope.require_cap(scope.CAP_SAVE)
         scope.assert_writable(src[0])
         dst = conn.execute("SELECT project FROM items WHERE id = %s", (dst_item_id,)).fetchone()
         # A dst the caller cannot read is indistinguishable from a missing one

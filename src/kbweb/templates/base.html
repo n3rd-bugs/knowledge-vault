@@ -11,16 +11,18 @@
 </head>
 <body>
   <header class="site">
+    {# Nav honesty (plan §2): every link is gated by the SAME ROUTE_CAPS table the
+       middleware walls with — no link/hint for a zone this principal lacks. #}
     <nav>
       <a class="brand" href="/">Knowledge Vault</a>
-      <a href="/">search</a>
-      <a href="/timeline">timeline</a>
-      <a href="/projects">projects</a>
-      <a href="/review">review</a>
-      <a href="/stats">stats</a>
-      <a href="/setup">setup</a>
+      {% if nav["/"] %}<a href="/">search</a>{% endif %}
+      {% if nav["/timeline"] %}<a href="/timeline">timeline</a>{% endif %}
+      {% if nav["/projects"] %}<a href="/projects">projects</a>{% endif %}
+      {% if nav["/review"] %}<a href="/review">review</a>{% endif %}
+      {% if nav["/stats"] %}<a href="/stats">stats</a>{% endif %}
+      {% if nav["/setup"] %}<a href="/setup">setup</a>{% endif %}
       {% if signed_in %}<a href="/welcome">welcome</a>{% endif %}
-      {% if is_owner %}<a href="/admin">admin</a>{% endif %}
+      {% if nav["/admin"] %}<a href="/admin">admin</a>{% endif %}
     </nav>
     <div class="head-right">
       <span class="ro-note">read-only</span>

@@ -38,17 +38,23 @@ def create(
         None, "--expires", help="ISO date/timestamp after which the credential stops working"
     ),
     note: str | None = typer.Option(None, "--note", help="free-text note"),
+    role: str = typer.Option(
+        "reader",
+        "--role",
+        help="capability bundle: guest, reader, contributor, reviewer (default reader)",
+    ),
 ) -> None:
     """Create a grantee. Prints a fresh kbg_ token ONCE for token grantees (only its
     hash is stored — it is never recoverable). --email makes a Google-identity
-    grantee instead (no token)."""
+    grantee instead (no token). --role picks the feature bundle (tiered access);
+    project grants still decide which rows are visible."""
     if email and token:
         _fail(KBError("pass --email OR --token, not both"))
     kind = "google" if email else "token"
     try:
         expires_at = parse_instant(expires, "--expires") if expires else None
         _pid, secret = principals.create_principal(
-            name, kind=kind, email=email, expires_at=expires_at, note=note
+            name, kind=kind, email=email, expires_at=expires_at, note=note, role=role
         )
     except (KBError, ValueError) as e:
         _fail(e)
@@ -88,6 +94,21 @@ def ungrant_cmd(
     except (KBError, ValueError) as e:
         _fail(e)
     typer.echo(f"removed {name}'s grant on {project}")
+
+
+@principal_app.command("role")
+def role_cmd(
+    name: str = typer.Argument(...),
+    role: str = typer.Argument(..., help="one of: guest, reader, contributor, reviewer"),
+) -> None:
+    """Change a grantee's role (feature bundle — tiered access, plan §2). CLI-only:
+    the web admin can only pick guest/reader at CREATION and never change a role.
+    Takes effect on the next request (principal cache flushed, parity with grant)."""
+    try:
+        principals.set_role(name, role)
+    except (KBError, ValueError) as e:
+        _fail(e)
+    typer.echo(f"set {name} role to {role}")
 
 
 @principal_app.command("revoke")
@@ -130,7 +151,7 @@ def list_cmd() -> None:
         grants = (
             ", ".join(f"{proj}{'(rw)' if rw else ''}" for proj, rw in p.grants) or "(no grants)"
         )
-        typer.echo(f"{p.name}  [{p.kind}:{ident}]  {status}")
+        typer.echo(f"{p.name}  [{p.kind}:{ident}]  role={p.role}  {status}")
         typer.echo(f"    grants: {grants}")
         if p.note:
             typer.echo(f"    note: {p.note}")

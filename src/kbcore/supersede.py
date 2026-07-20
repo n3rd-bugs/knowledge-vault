@@ -65,7 +65,10 @@ def supersede(
         if not scope.project_readable(conn, project):
             raise NotFound(f"item {old_id} does not exist")
         # Readable now, so a write-rejection may safely name it (public-only instance:
-        # cannot supersede an item in a non-public project).
+        # cannot supersede an item in a non-public project). The SAVE capability gates
+        # the FEATURE before the rw grant gates the ROW (tiered access, plan §2) —
+        # per-principal-constant, so no target signal rides the ordering.
+        scope.require_cap(scope.CAP_SAVE)
         scope.assert_writable(project)
         if status == "superseded":
             raise InvalidOperation(f"item {old_id} is already superseded")

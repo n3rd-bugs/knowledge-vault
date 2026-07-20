@@ -25,6 +25,16 @@ For a withheld target the predicates/asserts collapse to the byte-identical
 NotFound a truly-missing target raises — never "forbidden" — so there is NO
 existence leak. Every user value travels in ``params``; the SQL fragments are
 constant column references chosen by kbcore (CLAUDE.md: parameterized SQL only).
+
+**COMPOSITION CONTRACT (tiered access, WEBUI_TIERED_ACCESS_PLAN §2):** a third
+wall — capabilities — gates FEATURES, while project grants keep gating ROWS.
+``Principal.caps`` / ``has_cap`` / ``require_cap`` decide whether a principal may
+use a feature AT ALL (save, browse, deep search, …); ``project_predicate`` /
+``assert_readable`` / ``assert_writable`` decide which data that feature may
+touch. ``require_cap`` NEVER replaces the row walls — call sites keep both, and
+the checks AND (exactly like public_only × grants already do). A contributor
+without an rw grant still gets the uniform not-writable rejection; a reviewer
+with zero grants sees zero rows everywhere.
 """
 
 from __future__ import annotations
@@ -40,6 +50,34 @@ from kbcore.config import settings
 from kbcore.db import connect
 from kbcore.errors import InvalidOperation, NotFound
 
+# --- capability vocabulary (WEBUI_TIERED_ACCESS_PLAN §2) ----------------------
+
+CAP_SEARCH = "search"  # kb_search + kb_get; web /, /tags/{tag}, /item/{id}
+CAP_BROWSE = "browse"  # timeline/stats/projects/trace/similar (tools + views)
+CAP_SAVE = "save"  # kb_save / kb_supersede / kb_link — ANDed with rw grants
+CAP_REVIEW_READ = "review_read"  # kb_review_list, /review — Phase 4, after the detail scrub
+CAP_REVIEW_RESOLVE = "review_resolve"  # kb_review_resolve / kb_review_bulk — Phase 4
+CAP_DEEP_SEARCH = "deep_search"  # the owner's GPU/14B (Invariant 8)
+
+ALL_CAPS = frozenset(
+    {CAP_SEARCH, CAP_BROWSE, CAP_SAVE, CAP_REVIEW_READ, CAP_REVIEW_RESOLVE, CAP_DEEP_SEARCH}
+)
+
+# Role → capability bundle, expanded at resolution time (principals._build_grantee).
+# 'reader' == today's grantee surface (the behavior-preserving default). 'reviewer'
+# deliberately EXCLUDES the review caps until the review_queue.detail JSONB scrub
+# lands (Phase 4 hard precondition: detail can carry cross-project titles/ids past
+# the row-level gate) — a test pins this. No bundle grants CAP_DEEP_SEARCH (owner
+# GPU; flippable later without a migration). 'owner' is NOT a role: ownership is
+# credential-derived (``is_owner``), never a DB row — migration 012's frozen CHECK
+# is the escalation firewall.
+ROLE_CAPS: dict[str, frozenset[str]] = {
+    "guest": frozenset({CAP_SEARCH}),
+    "reader": frozenset({CAP_SEARCH, CAP_BROWSE}),
+    "contributor": frozenset({CAP_SEARCH, CAP_BROWSE, CAP_SAVE}),
+    "reviewer": frozenset({CAP_SEARCH, CAP_BROWSE, CAP_SAVE}),
+}
+
 
 @dataclass(frozen=True)
 class Principal:
@@ -48,7 +86,10 @@ class Principal:
     OWNER (``is_owner=True``) is unrestricted. A GRANTEE carries the explicit set
     of projects it may read (``read_projects``) and the subset it may write
     (``write_projects``, always ⊆ read_projects). ``name`` is the audit label
-    stamped into ``access_log.principal``.
+    stamped into ``access_log.principal``. ``caps`` is the AUTHORITATIVE feature
+    set (``role`` is its audit label): default-EMPTY so a construction site that
+    forgets expansion degrades to nothing, never to more (fail-closed — the
+    ``enter_server_mode`` philosophy).
     """
 
     name: str
@@ -56,10 +97,21 @@ class Principal:
     read_projects: frozenset[str] = field(default_factory=frozenset)
     write_projects: frozenset[str] = field(default_factory=frozenset)
     kind: str | None = None
+    role: str = "reader"
+    caps: frozenset[str] = field(default_factory=frozenset)
+
+    def has_cap(self, cap: str) -> bool:
+        """True when this principal may use the FEATURE named ``cap``.
+
+        Pure in-memory membership — no DB round trip, no timing oracle (the same
+        property :func:`assert_readable` documents). Short-circuits on
+        ``is_owner`` so a stale ``ALL_CAPS`` can never cost the owner a feature.
+        """
+        return self.is_owner or cap in self.caps
 
 
 # The implicit owner: the master KB_TOKEN and allowlisted owner emails resolve here.
-OWNER = Principal(name="owner", is_owner=True, kind="owner")
+OWNER = Principal(name="owner", is_owner=True, kind="owner", role="owner", caps=ALL_CAPS)
 
 # Sentinel distinct from any Principal: the ContextVar was NEVER set on this
 # request. Under server mode that is fail-closed (raise); otherwise → OWNER.
@@ -277,6 +329,19 @@ def require_owner(what: str = "this operation") -> None:
     """
     if not current().is_owner:
         raise InvalidOperation(f"{what} is available to the KB owner only")
+
+
+def require_cap(cap: str, what: str = "this operation") -> None:
+    """Guard a capability-gated FEATURE (tiered access, plan §2).
+
+    UNIFORM wording that NEVER names the missing capability — the tier ladder is
+    not enumerable through error text. Per-principal-constant (independent of any
+    target), so placing it before a row wall leaks zero target-existence signal.
+    Composes with — never replaces — ``project_predicate``/``assert_readable``/
+    ``assert_writable`` (the composition contract in the module docstring).
+    """
+    if not current().has_cap(cap):
+        raise InvalidOperation(f"{what} is not available with this credential")
 
 
 def log_write(conn: psycopg.Connection, item_id: int, tool: str) -> None:

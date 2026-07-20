@@ -7,8 +7,15 @@ handlers and startup guards. NO KNOWLEDGE MUTATION by construction
 GET/HEAD and no kbweb module imports a kbcore knowledge-write function — a
 test asserts both mechanically. The sole mutating routes are the OWNER-ONLY
 authz-config actions in kbweb.views_admin (project-share grant/revoke +
-google-grantee creation, A11-2); the session middleware walls the whole
-/admin* subtree off from non-owners with the byte-identical unknown-path 404.
+google-grantee creation, A11-2).
+
+Tiered access (WEBUI_TIERED_ACCESS_PLAN §2): the session middleware consults
+the declarative :data:`ROUTE_CAPS` zone table BEFORE routing and answers an
+under-capped principal with the router's byte-identical unknown-path 404 — a
+feature zone a principal lacks is indistinguishable from a path that never
+existed (the /admin wall generalized; /review and /setup moved here from their
+old explanatory 400). A startup assertion enforces default-deny: every
+registered route must carry a zone entry or be explicitly public.
 Run: ``python -m kbweb.server``.
 """
 
@@ -33,6 +40,57 @@ from kbweb.ui import STATIC_DIR, code_css, templates
 
 log = logging.getLogger("kbweb")
 
+# --- feature-zone wall (tiered access, WEBUI_TIERED_ACCESS_PLAN §2) -----------
+#
+# Leading path segment → capability required to ENTER the zone, consulted in
+# SessionAuthMiddleware.dispatch before routing. OWNER_ONLY is a sentinel no
+# ROLE_CAPS bundle ever contains — and 'owner' is not a storable role
+# (migration 012's CHECK) — so only ``is_owner`` passes ``has_cap`` for those
+# zones. The nav in templates/base.html renders from THIS table too (via
+# kbweb.ui._identity_ctx), so a link can never outrun its wall.
+OWNER_ONLY = "owner"
+
+ROUTE_CAPS: dict[str, str] = {
+    "/": scope.CAP_SEARCH,
+    "/tags": scope.CAP_SEARCH,
+    "/item": scope.CAP_SEARCH,
+    "/timeline": scope.CAP_BROWSE,
+    "/projects": scope.CAP_BROWSE,
+    "/project": scope.CAP_BROWSE,
+    "/stats": scope.CAP_BROWSE,
+    "/trace": scope.CAP_BROWSE,
+    "/similar": scope.CAP_BROWSE,
+    "/review": OWNER_ONLY,  # CAP_REVIEW_READ only after the Phase-4 detail-JSONB scrub
+    "/setup": OWNER_ONLY,  # renders the MASTER bearer — permanently owner-only
+    "/admin": OWNER_ONLY,  # the Inv. 11 authz carve-out (same wall as before)
+}
+
+# Zones reachable WITHOUT a ROUTE_CAPS entry: the pre-auth surfaces (/login,
+# /static, /auth/google) and /welcome (any authenticated principal's own
+# getting-started page — it renders only that principal's caps). Everything
+# else MUST appear in ROUTE_CAPS: the startup assertion enforces default-deny.
+PUBLIC_ZONES = frozenset({"/login", "/static", "/auth", "/welcome"})
+
+
+def _zone(path: str) -> str:
+    """The leading path segment ('/', '/tags', …) — the ROUTE_CAPS key."""
+    return path if path == "/" else "/" + path.split("/", 2)[1]
+
+
+def assert_route_caps_total(routes) -> None:
+    """Default-deny (plan §2): EVERY registered route needs a conscious tier
+    decision — a ROUTE_CAPS zone entry or membership in the explicit public set.
+    A new route without one refuses to serve instead of silently going open."""
+    missing = sorted(
+        {
+            route.path
+            for route in routes
+            if _zone(route.path) not in ROUTE_CAPS and _zone(route.path) not in PUBLIC_ZONES
+        }
+    )
+    if missing:
+        raise SystemExit(f"routes without a ROUTE_CAPS entry (default-deny): {missing}")
+
 
 def _principal_for_identity(identity: str | None) -> scope.Principal | None:
     """Re-resolve the cookie's identity to a LIVE principal on every request.
@@ -49,9 +107,9 @@ def _principal_for_identity(identity: str | None) -> scope.Principal | None:
 
 class SessionAuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except /login, /static,
-    /auth/google) and bind the resolved principal for the request (grantees see
-    only their granted projects in every view). Walls the owner-only /admin*
-    subtree off from non-owners with the router's byte-identical 404."""
+    /auth/google), wall capability zones (ROUTE_CAPS), and bind the resolved
+    principal for the request (grantees see only their granted projects in
+    every view; chrome reads the LIVE principal off request.state)."""
 
     async def dispatch(self, request, call_next):
         path = request.url.path
@@ -61,12 +119,18 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         principal = _principal_for_identity(identity)
         if principal is None:
             return RedirectResponse("/login", status_code=302)
-        if (path == "/admin" or path.startswith("/admin/")) and not principal.is_owner:
-            # The owner-only authz surface (Inv. 11 carve-out) must be
-            # INDISTINGUISHABLE from a nonexistent path for any grantee:
-            # answered BEFORE routing so no method probe can elicit a 405,
-            # byte-identical to the router's own unknown-path 404.
+        required = ROUTE_CAPS.get(_zone(path))
+        if required is not None and not principal.has_cap(required):
+            # A walled feature zone must be INDISTINGUISHABLE from a nonexistent
+            # path for an under-capped principal: answered BEFORE routing so no
+            # method probe can elicit a 405, byte-identical to the router's own
+            # unknown-path 404 — the no-oracle discipline extended from data
+            # existence to FEATURE existence (plan §2). Unknown zones fall
+            # through to the router's genuine 404 (same bytes).
             return PlainTextResponse("Not Found", status_code=404)
+        # The LIVE principal rides request.state so nav//welcome render from
+        # resolved caps, never from the cookie alone (kbweb.ui._identity_ctx).
+        request.state.principal = principal
         with scope.use_principal(principal):
             return await call_next(request)
 
@@ -176,6 +240,7 @@ ROUTES = [
 
 def build_app() -> Starlette:
     _validate_runtime_config()
+    assert_route_caps_total(ROUTES)  # default-deny: no route without a tier decision
     # Google sign-in builds its redirect_uri from KB_WEB_PUBLIC_URL (auth._redirect_uri);
     # an empty base yields a relative "/auth/google/callback" that Google rejects.
     # Refuse to serve the OAuth path misconfigured (no hardcoded host, CLAUDE.md).

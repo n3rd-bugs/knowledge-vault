@@ -20,6 +20,12 @@
       <input type="text" name="name" placeholder="name (slug, e.g. alice)" required>
       <input type="email" name="email" placeholder="their Google email" required>
       <input type="text" name="note" placeholder="note (optional)" maxlength="200">
+      {# Creation-time roles only (A11-2a): guest/reader — elevated roles and
+         role CHANGE are CLI-only (`kb principal role`). #}
+      <select name="role">
+        <option value="reader" selected>reader (search + browse)</option>
+        <option value="guest">guest (search only)</option>
+      </select>
     </div>
     {% if projects %}
     <div style="margin:.5rem 0">
@@ -61,6 +67,7 @@
     <h3 style="margin:.1rem 0 .3rem">{{ p.name }}</h3>
     <div>
       <span class="tag">{{ p.kind }}</span>
+      <span class="tag">{{ p.role }}</span>
       {% if p.email %}<span class="tag">{{ p.email }}</span>{% endif %}
       {% if p.revoked_at %}<span class="badge archived">revoked</span>{% endif %}
       {% if p.expires_at %}<span class="badge">expires {{ p.expires_at.date().isoformat() }}</span>{% endif %}

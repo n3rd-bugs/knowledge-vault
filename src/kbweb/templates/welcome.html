@@ -14,6 +14,12 @@
   {% else %}
   <p class="prov">No projects have been shared with this account yet — ask the owner.</p>
   {% endif %}
+  {# Per-tier (plan §2): ONLY this principal's own capabilities — never a
+     cross-tier catalog of what other roles could do. #}
+  {% if not owner_all and caps %}
+  <p>Features enabled for this account:
+    {% for c in caps %}<span class="tag">{{ c }}</span> {% endfor %}</p>
+  {% endif %}
 </div>
 
 <h3>How to connect</h3>

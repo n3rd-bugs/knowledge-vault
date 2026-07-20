@@ -14,6 +14,7 @@ constant-time comparison never collide.
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -21,7 +22,9 @@ from datetime import datetime
 
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
-from kbcore.scope import Principal
+from kbcore.scope import ROLE_CAPS, Principal
+
+log = logging.getLogger("kbcore.principals")
 
 TOKEN_PREFIX = "kbg_"
 _TOKEN_NBYTES = 32  # secrets.token_urlsafe(32) → ~43 chars, well over the 40 floor
@@ -44,6 +47,7 @@ class PrincipalInfo:
     id: int
     name: str
     kind: str
+    role: str  # capability bundle (migration 012) — see scope.ROLE_CAPS
     email: str | None
     created_at: datetime
     expires_at: datetime | None
@@ -62,15 +66,20 @@ def create_principal(
     email: str | None = None,
     expires_at: datetime | None = None,
     note: str | None = None,
+    role: str = "reader",
 ) -> tuple[int, str | None]:
     """Create a grantee. Returns ``(principal_id, plaintext_token | None)``.
 
     ``kind='token'`` mints a ``kbg_`` bearer and stores only its hash — the
     plaintext is returned ONCE and never recoverable. ``kind='google'`` binds a
     verified email (for the claude.ai connector / web UI) and returns no token.
+    ``role`` is the capability bundle (plan §2), validated against
+    :data:`kbcore.scope.ROLE_CAPS` — 'owner' is not creatable (never a row).
     """
     if kind not in ("token", "google"):
         raise InvalidOperation(f"unknown principal kind {kind!r}; one of token, google")
+    if role not in ROLE_CAPS:
+        raise InvalidOperation(f"unknown role {role!r}; one of {', '.join(sorted(ROLE_CAPS))}")
     if not name or not name.strip():
         raise InvalidOperation("principal name is required")
     name = name.strip()
@@ -91,17 +100,18 @@ def create_principal(
         # Email uniqueness is also enforced by a DB constraint; pre-check it so a
         # duplicate surfaces as a clean domain error (KBError) instead of a raw
         # psycopg UniqueViolation that would escape the web view as a 500.
-        if email is not None and conn.execute(
-            "SELECT 1 FROM principals WHERE email = %s", (email,)
-        ).fetchone():
+        if (
+            email is not None
+            and conn.execute("SELECT 1 FROM principals WHERE email = %s", (email,)).fetchone()
+        ):
             raise InvalidOperation(f"a principal with email {email!r} already exists")
         row = conn.execute(
             """
-            INSERT INTO principals (name, kind, secret_hash, email, expires_at, note)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO principals (name, kind, secret_hash, email, expires_at, note, role)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
-            (name, kind, secret_hash, email, expires_at, note),
+            (name, kind, secret_hash, email, expires_at, note, role),
         ).fetchone()
     return int(row[0]), token
 
@@ -185,12 +195,28 @@ def rotate(name: str) -> str:
     return token
 
 
+def set_role(name: str, role: str) -> None:
+    """Change ``name``'s role (capability bundle). CLI-only surface — the web
+    admin can never call this (a trip-wire test pins ``set_role`` out of kbweb).
+
+    Validated against :data:`kbcore.scope.ROLE_CAPS` ('owner' is unreachable —
+    never a row). Cache-flush parity with grant/ungrant/revoke: the change takes
+    effect on the next request instead of lagging up to the token cache TTL.
+    """
+    if role not in ROLE_CAPS:
+        raise InvalidOperation(f"unknown role {role!r}; one of {', '.join(sorted(ROLE_CAPS))}")
+    with transaction() as conn:
+        pid = _principal_id(conn, name)
+        conn.execute("UPDATE principals SET role = %s WHERE id = %s", (role, pid))
+    _clear_cache()
+
+
 def list_principals() -> list[PrincipalInfo]:
     """All principals with their grants — NEVER a secret (CLAUDE.md hygiene)."""
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, name, kind, email, created_at, expires_at, revoked_at, note
+            SELECT id, name, kind, role, email, created_at, expires_at, revoked_at, note
             FROM principals ORDER BY name
             """
         ).fetchall()
@@ -204,11 +230,12 @@ def list_principals() -> list[PrincipalInfo]:
             id=r[0],
             name=r[1],
             kind=r[2],
-            email=r[3],
-            created_at=r[4],
-            expires_at=r[5],
-            revoked_at=r[6],
-            note=r[7],
+            role=r[3],
+            email=r[4],
+            created_at=r[5],
+            expires_at=r[6],
+            revoked_at=r[7],
+            note=r[8],
             grants=tuple(grants.get(r[0], [])),
         )
         for r in rows
@@ -231,7 +258,7 @@ def _clear_cache() -> None:
     _cache.clear()
 
 
-def _build_grantee(conn, pid: int, name: str, kind: str) -> Principal:
+def _build_grantee(conn, pid: int, name: str, kind: str, role: str) -> Principal:
     read: set[str] = set()
     write: set[str] = set()
     for project, rw in conn.execute(
@@ -240,12 +267,20 @@ def _build_grantee(conn, pid: int, name: str, kind: str) -> Principal:
         read.add(project)
         if rw:
             write.add(project)
+    caps = ROLE_CAPS.get(role)
+    if caps is None:
+        # Schema/code skew (a role value this build does not know) serves the wall
+        # LOUDLY: zero capabilities — never a 500, never more access (plan §2).
+        log.warning("principal %r has unknown role %r; serving zero capabilities", name, role)
+        caps = frozenset()
     return Principal(
         name=name,
         is_owner=False,
         read_projects=frozenset(read),
         write_projects=frozenset(write),
         kind=kind,
+        role=role,
+        caps=caps,
     )
 
 
@@ -268,13 +303,14 @@ def resolve_token(token: str | None) -> Principal | None:
         return entry[0]
     with connect() as conn:
         row = conn.execute(
-            f"SELECT id, name, kind FROM principals WHERE secret_hash = %s AND {_live_where()}",  # noqa: S608 — _live_where() is a constant fragment
+            f"SELECT id, name, kind, role FROM principals "
+            f"WHERE secret_hash = %s AND {_live_where()}",  # noqa: S608 — _live_where() is a constant fragment
             (h,),
         ).fetchone()
         if row is None:
             _cache.pop(h, None)
             return None
-        principal = _build_grantee(conn, int(row[0]), row[1], row[2])
+        principal = _build_grantee(conn, int(row[0]), row[1], row[2], row[3])
     # Evict expired entries, then cache this positive result for the TTL window.
     from kbcore.config import settings
 
@@ -292,12 +328,12 @@ def resolve_name(name: str | None) -> Principal | None:
         return None
     with connect() as conn:
         row = conn.execute(
-            f"SELECT id, name, kind FROM principals WHERE name = %s AND {_live_where()}",  # noqa: S608 — constant fragment
+            f"SELECT id, name, kind, role FROM principals WHERE name = %s AND {_live_where()}",  # noqa: S608 — constant fragment
             (name,),
         ).fetchone()
         if row is None:
             return None
-        return _build_grantee(conn, int(row[0]), row[1], row[2])
+        return _build_grantee(conn, int(row[0]), row[1], row[2], row[3])
 
 
 def resolve_email(email: str | None) -> Principal | None:
@@ -311,10 +347,10 @@ def resolve_email(email: str | None) -> Principal | None:
     email = email.strip().lower()
     with connect() as conn:
         row = conn.execute(
-            f"SELECT id, name, kind FROM principals "
+            f"SELECT id, name, kind, role FROM principals "
             f"WHERE email = %s AND kind = 'google' AND {_live_where()}",  # noqa: S608 — constant fragment
             (email,),
         ).fetchone()
         if row is None:
             return None
-        return _build_grantee(conn, int(row[0]), row[1], row[2])
+        return _build_grantee(conn, int(row[0]), row[1], row[2], row[3])

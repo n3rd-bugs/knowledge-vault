@@ -100,8 +100,10 @@ def welcome_view(request: Request) -> Response:  # GET /welcome
     A pure read with NO oracle: a grantee's project list comes straight from its
     own resolved scope (``scope.current().read_projects``) — nothing here can
     list all projects for a non-owner. The owner just gets an "everything is
-    visible" note. Anonymous requests never reach this view: the session
-    middleware redirects them to /login like every other data route."""
+    visible" note. Per-tier (plan §2): ``caps`` is the principal's OWN
+    capability set — never a cross-tier catalog, so a guest learns nothing
+    about features other tiers have. Anonymous requests never reach this view:
+    the session middleware redirects them to /login like every other data route."""
     p = scope.current()
     mcp_url, web_url = views_admin_invite.public_urls()
     return templates.TemplateResponse(
@@ -112,6 +114,7 @@ def welcome_view(request: Request) -> Response:  # GET /welcome
             "kind": p.kind or "",
             "owner_all": p.is_owner,
             "granted": sorted(p.read_projects),
+            "caps": sorted(p.caps),
             "mcp_url": mcp_url,
             "web_url": web_url,
         },

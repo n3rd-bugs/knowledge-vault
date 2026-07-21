@@ -417,15 +417,30 @@ def test_review_queue_probe_no_project_name_oracle(world):
     """Resolving a review row whose item is WITHHELD must be byte-identical to a
     missing queue id (Phase 1 fix: _queued_item_id gates readability BEFORE
     writability — assert_writable's rejection embeds the project name, so
-    probing queue ids would otherwise enumerate withheld NDA project names)."""
+    probing queue ids would otherwise enumerate withheld NDA project names).
+
+    Post-A11-3 (FIX 3): reject / resolve_via_supersede still reach _queued_item_id,
+    so a withheld row is byte-identical NotFound to a missing one. promote is now
+    OWNER-ONLY, so a non-owner gets a constant, target-independent InvalidOperation
+    (itself no oracle) and can never escalate trust; only the owner promotes."""
     from kbcore import review
 
     nda = ingest("nda-withheld-client", "note", "secret finding", "secret NDA body")
     # A contradiction row spanning granted + withheld (plan §5 Phase 1 AC).
     qid = review.queue_review(nda, "contradiction", {"a_id": world["a"], "b_id": nda})
-    g = _grantee("resolver", {"a": True}, role="contributor")
+    # reject requires CAP_REVIEW_RESOLVE (no role bundle grants it — construct it)
+    # so the resolver reaches the project walls rather than the cap gate.
+    base = _grantee("resolver", {"a": True}, role="contributor")
+    g = scope.Principal(
+        name=base.name,
+        is_owner=False,
+        read_projects=base.read_projects,
+        write_projects=base.write_projects,
+        kind=base.kind,
+        role=base.role,
+        caps=base.caps | {scope.CAP_REVIEW_RESOLVE},
+    )
     for resolve in (
-        review.promote,
         review.reject,
         lambda q: review.resolve_via_supersede(q, world["a"]),
     ):
@@ -435,6 +450,14 @@ def test_review_queue_probe_no_project_name_oracle(world):
             resolve(9_999_999)
         assert str(withheld.value) == str(missing.value).replace("9999999", str(qid))
         assert "nda-withheld-client" not in str(withheld.value), "project name leaked"
+    # promote is owner-only: a non-owner gets the SAME constant error for the
+    # withheld and the missing qid (target-independent → no oracle, no project leak).
+    with scope.use_principal(g), pytest.raises(InvalidOperation) as w_prom:
+        review.promote(qid)
+    with scope.use_principal(g), pytest.raises(InvalidOperation) as m_prom:
+        review.promote(9_999_999)
+    assert str(w_prom.value) == str(m_prom.value)
+    assert "nda-withheld-client" not in str(w_prom.value), "project name leaked"
     assert review.promote(qid) == nda  # owner still resolves it (no regression)
 
 

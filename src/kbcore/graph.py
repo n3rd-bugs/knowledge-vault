@@ -47,6 +47,15 @@ def link(src_item_id: int, rel: str, dst_item_id: int, evidence_item: int | None
         # (no id oracle) — walls off both public-only and grantee scope.
         if dst is None or not scope.project_readable(conn, dst[0]):
             raise NotFound(f"item {dst_item_id} does not exist")
+        # FIX 4 (A11-3 finding 18): BOTH endpoints of a relation require WRITE — the
+        # src wall alone let a read-only-dst grantee write inbound edges into a
+        # project it cannot write. Readability was confirmed just above, so this
+        # write-rejection (which names the dst project) reveals nothing the caller
+        # cannot already see — a withheld dst already raised the byte-identical
+        # NotFound. evidence_item keeps read-suffices below: it only annotates the
+        # edge, not a project's graph structure. kbcore chokepoint (Invariant 2), so
+        # MCP kb_link inherits it too; owner short-circuits assert_writable.
+        scope.assert_writable(dst[0])
         # Same gate for evidence_item — else its FK to items() is an existence
         # oracle for arbitrary (incl. withheld) ids (review finding).
         if evidence_item is not None:

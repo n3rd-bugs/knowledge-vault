@@ -32,6 +32,37 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 
+def merge_redactions(dst: dict[str, int], src: dict[str, int]) -> None:
+    """Fold scrub counts from ``src`` into ``dst`` (accumulate per label).
+
+    Lets the ingest chokepoint accumulate redaction counts across every scrubbed
+    field (title, body, uri, tags, code_ref, meta) into one ``meta.redactions``.
+    """
+    for label, count in src.items():
+        dst[label] = dst.get(label, 0) + count
+
+
+def scrub_tree(value: object, redactions: dict[str, int]) -> object:
+    """Scrub every STRING leaf of a JSON-ish value (str / list / dict), folding
+    redaction counts into ``redactions``; non-string leaves pass through.
+
+    A11-3 finding 24 (the kbcore chokepoint, Invariant 2): the ingest path used to
+    scrub only title/body, so a secret pasted into a uri, a tag, or a code_ref/meta
+    string stored unredacted and rendered live in the owner's item/review views.
+    Recursing here lets ingest_in redact all of them at the single write point.
+    Deterministic ⇒ idempotent (a re-scrub of already-redacted text is a no-op).
+    """
+    if isinstance(value, str):
+        cleaned, red = scrub(value)
+        merge_redactions(redactions, red)
+        return cleaned
+    if isinstance(value, dict):
+        return {k: scrub_tree(v, redactions) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub_tree(v, redactions) for v in value]
+    return value
+
+
 def scrub(text: str) -> tuple[str, dict[str, int]]:
     """Redact secrets from *text*.
 

@@ -24,7 +24,7 @@ from kbcore.config import settings
 from kbcore.db import transaction
 from kbcore.errors import InvalidOperation
 from kbcore.models import ITEM_TYPES, SOURCE_KINDS, CodeRef
-from kbcore.scrub import scrub
+from kbcore.scrub import merge_redactions, scrub, scrub_tree
 
 
 def _as_utc(dt: datetime | None) -> datetime | None:
@@ -177,12 +177,34 @@ def ingest_in(
     # projects. No-op on a full-access instance. Covers ingest/kb_save/summary/etc.
     scope.assert_writable(project)
 
+    # FIX 1 (A11-3 findings 4/5/8/10/11/21) — the TRUST CHOKEPOINT (Invariant 2).
+    # A non-owner principal must NEVER cause sources.trust='verified': coerce here,
+    # immediately AFTER the require_cap/assert_writable gate and BEFORE the sources
+    # INSERT, regardless of the caller-passed value. This single kbcore point closes
+    # /save, the supersede new_body path (supersede -> ingest_in), and MCP
+    # kb_save/kb_supersede for rw token grantees. Owner keeps its explicit trust;
+    # CLI/worker run as implicit OWNER (scope non-server mode -> OWNER), unaffected.
+    if not scope.current().is_owner:
+        trust = "unverified"
+
     body = normalize(body)
     title = normalize_title(title)
     body, redactions = scrub(body)
     title, title_redactions = scrub(title)
-    for k, v in title_redactions.items():
-        redactions[k] = redactions.get(k, 0) + v
+    merge_redactions(redactions, title_redactions)
+    # FIX 2 (A11-3 finding 24) — extend the secret scrubber past title/body to the
+    # uri, every tag, and every code_ref/meta string leaf, at this same kbcore
+    # chokepoint (Invariant 2). Previously a token in a tag/uri/code_ref stored (and
+    # rendered) unredacted. uri is part of UNIQUE(kind,uri,content_hash), so scrub it
+    # BEFORE the hash/INSERT; scrub is deterministic so idempotency/dedupe hold.
+    uri = scrub_tree(uri, redactions)  # type: ignore[assignment]
+    if tags:
+        tags = scrub_tree(list(tags), redactions)  # type: ignore[assignment]
+    if code_ref is not None:
+        ref = code_ref if isinstance(code_ref, CodeRef) else CodeRef(**code_ref)
+        code_ref = CodeRef(**scrub_tree(ref.model_dump(), redactions))  # type: ignore[arg-type]
+    if meta:
+        meta = scrub_tree(meta, redactions)  # type: ignore[assignment]
     chash = content_hash(title, body, valid_from, valid_to)
 
     conn.execute("INSERT INTO projects (name) VALUES (%s) ON CONFLICT DO NOTHING", (project,))
@@ -257,6 +279,9 @@ def find_duplicate(
 
     title_n, _ = scrub(normalize_title(title))
     body_n, _ = scrub(normalize(body))
+    # uri is scrubbed at ingest before the sources INSERT (FIX 2), so the dedupe
+    # lookup must scrub it identically or a secret-bearing uri would never match.
+    uri, _ = scrub(uri)
     chash = content_hash(title_n, body_n, _as_utc(valid_from), _as_utc(valid_to))
     # Never hand back the id of an item the caller cannot read — kb_save's dup path
     # would otherwise turn a content match into an id/existence oracle for a

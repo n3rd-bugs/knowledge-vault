@@ -12,6 +12,14 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
+# age provides `age-keygen`, which the owner-only web backup-setup surface runs
+# in-container to generate the recovery keypair (kbcore.offsite_config). The
+# encryption itself runs HOST-side in scripts/offsite.sh. Placed before the deps
+# copy so it stays layer-cached across source changes.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends age \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install deps first (layer-cached), then the source. --no-dev: no pytest/ruff in the image.
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project

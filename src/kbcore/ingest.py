@@ -23,7 +23,7 @@ from kbcore import scope
 from kbcore.config import settings
 from kbcore.db import transaction
 from kbcore.errors import InvalidOperation
-from kbcore.models import ITEM_TYPES, SOURCE_KINDS, CodeRef
+from kbcore.models import ITEM_STATUSES, ITEM_TYPES, SOURCE_KINDS, CodeRef
 from kbcore.scrub import merge_redactions, scrub, scrub_tree
 
 
@@ -138,6 +138,7 @@ def ingest_in(
     kind: str = "manual",
     uri: str = "",
     trust: str = "verified",
+    status: str = "active",
     tags: list[str] | None = None,
     meta: dict[str, Any] | None = None,
     code_ref: CodeRef | dict | None = None,
@@ -152,6 +153,12 @@ def ingest_in(
     was true in the world, orthogonal to created_at (when the KB learned it). Both
     default NULL (unbounded / still true). Naive datetimes are coerced to UTC so
     the TIMESTAMPTZ columns stay tz-aware (Invariant 7).
+
+    ``status`` is the item's initial lifecycle state (default 'active'; owner/CLI/
+    worker never pass anything else). The quarantine value 'pending' is the
+    mechanism kbcore.web_write.save_for_review uses to hold a non-owner web save
+    out of retrieval until the owner promotes it (A11-3 finding 6) — validated here
+    against ITEM_STATUSES so no surface can insert an off-CHECK status.
     """
     valid_from = _as_utc(valid_from)
     valid_to = _as_utc(valid_to)
@@ -167,6 +174,8 @@ def ingest_in(
         raise ValueError(f"unknown item type {type!r}")
     if kind not in SOURCE_KINDS:
         raise ValueError(f"unknown source kind {kind!r}")
+    if status not in ITEM_STATUSES:
+        raise ValueError(f"unknown item status {status!r}")
     # Tiered access (plan §2): the SAVE capability gates the write FEATURE; the
     # rw grant below gates the ROWS — the walls AND. Per-principal-constant, so
     # zero target-existence signal; a no-op for owner/CLI/worker (implicit OWNER)
@@ -236,11 +245,22 @@ def ingest_in(
     item_id = conn.execute(
         """
         INSERT INTO items (source_id, project, type, title, body, tags, meta,
-                           valid_from, valid_to)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                           status, valid_from, valid_to)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
-        (source_id, project, type, title, body, tags or [], Jsonb(full_meta), valid_from, valid_to),
+        (
+            source_id,
+            project,
+            type,
+            title,
+            body,
+            tags or [],
+            Jsonb(full_meta),
+            status,
+            valid_from,
+            valid_to,
+        ),
     ).fetchone()[0]
 
     # The source splitter is only for actual raw source files (inbox drops,

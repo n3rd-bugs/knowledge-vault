@@ -193,16 +193,50 @@ def promote(queue_id: int) -> int:
     per-principal-constant (target-independent), so it leaks no existence oracle.
     CLI/worker run as implicit OWNER and MCP already require_owner; this makes a
     trust escalation from a non-owner impossible on EVERY surface, present or future.
+
+    QUARANTINE LIFECYCLE (A11-3 finding 6): when the promoted item is
+    status='pending' (a non-owner WEB save held out of retrieval), also flip it to
+    'active' in the SAME transaction — un-quarantine on promotion, so
+    pending+unverified becomes active+verified (visible) atomically. Non-pending
+    rows (e.g. automatic 'unverified_extraction') are unaffected: the guarded UPDATE
+    matches nothing and only the trust flip runs, exactly as before.
+
+    PROPOSED SUPERSESSION (kbcore.web_write.supersede_for_review): a web supersede
+    parks the REPLACEMENT as pending+queued and leaves the OLD item ACTIVE (so a
+    contributor can never hide verified knowledge behind an invisible pending item).
+    The actual supersession is deferred to owner promotion: when the row's ``detail``
+    carries ``proposed_supersede``, retire the old item with the now-active
+    replacement AFTER this transaction commits (a fresh supersede() transaction that
+    can see the just-promoted active replacement; owner scope short-circuits its caps).
     """
     scope.require_owner("promote")
     with transaction() as conn:
         item_id = _queued_item_id(conn, queue_id)
+        drow = conn.execute("SELECT detail FROM review_queue WHERE id = %s", (queue_id,)).fetchone()
+        detail = drow[0] if drow and isinstance(drow[0], dict) else {}
         conn.execute(
             "UPDATE sources SET trust = 'verified' "
             "WHERE id = (SELECT source_id FROM items WHERE id = %s)",
             (item_id,),
         )
+        # Un-quarantine: pending web save -> active. Guarded so a non-pending row
+        # (already-active extraction) is left exactly as it was (Invariant 5 flip).
+        conn.execute(
+            "UPDATE items SET status = 'active', updated_at = now() "
+            "WHERE id = %s AND status = 'pending'",
+            (item_id,),
+        )
         conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
+    proposed = detail.get("proposed_supersede") if isinstance(detail, dict) else None
+    if proposed is not None:
+        # Replacement is now active+verified; apply the deferred supersession of the
+        # old item under owner scope (its own transaction — the replacement is
+        # committed active above, so supersede's 'must be active' check passes).
+        supersede(
+            int(proposed),
+            new_item_id=item_id,
+            reason=detail.get("supersede_reason") or "review: promoted proposed supersession",
+        )
     return item_id
 
 

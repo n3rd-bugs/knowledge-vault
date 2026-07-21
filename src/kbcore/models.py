@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ITEM_TYPES = (
     "note",
@@ -23,6 +23,14 @@ ITEM_TYPES = (
     "summary",
     "report",
 )
+# Item statuses (mirror of the items.status CHECK — 001 + migration 013). 'pending'
+# is the quarantine state for a non-owner WEB-authored item: excluded from the
+# default search set until the owner promotes it (A11-3 finding 6).
+ITEM_STATUSES = ("active", "superseded", "archived", "duplicate", "pending")
+# Types a WEB contributor may author (A11-3 finding 7): ITEM_TYPES minus the
+# consolidation outputs, so a web save can never masquerade as pipeline-produced
+# 'summary'/'report'. Used by WebSaveRequest and kbcore.web_write.save_for_review.
+WEB_ITEM_TYPES = tuple(t for t in ITEM_TYPES if t not in ("summary", "report"))
 RELATIONS = (
     "depends_on",
     "part_of",
@@ -35,7 +43,13 @@ RELATIONS = (
     "alternative_to",
 )
 SOURCE_KINDS = ("manual", "chat", "file", "session", "git")
-REVIEW_REASONS = ("unverified_extraction", "contradiction", "dup_cluster", "search_regression")
+REVIEW_REASONS = (
+    "unverified_extraction",
+    "contradiction",
+    "dup_cluster",
+    "search_regression",
+    "web_contribution",
+)
 
 
 class CodeRef(BaseModel):
@@ -53,6 +67,38 @@ class CodeRef(BaseModel):
         lines = f":{self.lines}" if self.lines else ""
         sym = f" ({self.symbol})" if self.symbol else ""
         return f"↳ {self.repo}{at}:{self.path}{lines}{sym}"
+
+
+class WebSaveRequest(BaseModel):
+    """Closed request shape for a WEB contributor save (A11-3 finding 7).
+
+    ``extra='forbid'`` is the security boundary: a forged ``trust``/``kind``/``uri``/
+    ``raw``/``status``/``meta``/``is_source`` field FAILS validation instead of being
+    silently ignored, so a probing client cannot smuggle the review gate off. The
+    web layer (WP-2b) parses the POST form through this, then hands ONLY these fields
+    to kbcore.web_write.save_for_review — the trust/kind/status are hardwired in
+    kbcore, never accepted from the request (kbcore chokepoint, Invariant 2).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project: str
+    type: str
+    title: str
+    body: str
+    tags: list[str] = Field(default_factory=list)
+    code_ref: CodeRef | None = None
+    valid_from: datetime | None = None  # optional valid-time interval (WP1)
+    valid_to: datetime | None = None
+
+    @field_validator("type")
+    @classmethod
+    def _type_is_web_authorable(cls, v: str) -> str:
+        if v not in WEB_ITEM_TYPES:
+            raise ValueError(
+                f"unknown or non-web item type {v!r}; one of {', '.join(WEB_ITEM_TYPES)}"
+            )
+        return v
 
 
 class SearchHit(BaseModel):

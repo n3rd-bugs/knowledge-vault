@@ -95,6 +95,7 @@ def search(
     boost_project: str | None = None,
     include_superseded: bool = False,
     include_archived: bool = False,
+    include_pending: bool = False,
     as_of: datetime | None = None,
     hops: int | None = None,
     k: int = 8,
@@ -111,6 +112,13 @@ def search(
     scored by the seed that reaches it (hop-decayed). None (default) uses
     KB_GRAPH_EXPAND_HOPS; explicit 0 forces expansion OFF; >0 overrides — capped at
     GRAPH_MAX_HOPS so a misconfigured value can't explode the BFS.
+
+    include_pending (A11-3 finding 6): 'pending' (quarantined non-owner web saves)
+    is ABSENT from the default status set, so a forged web contribution is NEVER an
+    indirect prompt-injection channel into an agent session before review. This flag
+    surfaces pending items ONLY for the OWNER (an owner-side review convenience) —
+    a grantee passing it is a no-op, because the same quarantine bytes never reach
+    a non-owner even by request (owner-gated at this single chokepoint).
     """
     if hops is None:
         hops = settings.kb_graph_expand_hops
@@ -122,6 +130,8 @@ def search(
         statuses.append("superseded")
     if include_archived:
         statuses.append("archived")
+    if include_pending and scope.current().is_owner:
+        statuses.append("pending")
 
     where, params = _filters(project, domain, type, tags, statuses, as_of)
     # Visibility wall (public-only instance AND/OR grantee grants): restrict all

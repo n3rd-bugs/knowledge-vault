@@ -145,24 +145,37 @@ def kb_schema():
         _admin_ddl("DROP SCHEMA IF EXISTS kb_test CASCADE")
 
 
+_KB_TEST_TABLES = (
+    "access_log", "review_queue", "relations", "entities", "chunks", "items",
+    "sources", "projects", "session_checkpoints", "ingest_queue",
+    "principal_grants", "principals",
+)
+
+
 @pytest.fixture()
 def kb(kb_schema):
-    """Function-scoped clean slate inside kb_test (truncate, keep layout)."""
+    """Function-scoped clean slate inside kb_test (truncate, keep layout).
+
+    The TRUNCATE is FULLY SCHEMA-QUALIFIED (``kb_test.<table>``), the definitive
+    close of the third-incident truncation (2026-07-21): concurrent pytest
+    processes share one ``kb_test`` schema, and one process's session-teardown
+    ``DROP SCHEMA kb_test`` could fire between another's ``current_schema()``
+    check (passed — the schema still existed) and its TRUNCATE. With UNQUALIFIED
+    names the now-missing kb_test made ``TRUNCATE items`` resolve through the
+    ``search_path`` fallback to ``public.items`` and wipe live data. Qualifying
+    every table means a vanished kb_test makes ``TRUNCATE kb_test.items`` ERROR
+    ("relation does not exist") — loud, never a public write. The
+    current_schema() + pointer asserts stay as belt-and-suspenders.
+    """
+    schema = settings.kb_db_schema
+    if schema != "kb_test":  # the pointer must NEVER be public/anything-else here
+        raise RuntimeError(f"live-data guard: settings.kb_db_schema={schema!r} is not 'kb_test'")
     with db.transaction() as conn:
-        # Belt-and-suspenders: NEVER TRUNCATE unless we are provably inside
-        # kb_test. current_schema() is the first existing schema in search_path,
-        # so this aborts loudly rather than wiping live public data.
         current = conn.execute("SELECT current_schema()").fetchone()[0]
         if current != "kb_test":
             raise RuntimeError(
                 f"live-data guard: refusing TRUNCATE, current_schema()={current!r} is not 'kb_test'"
             )
-        conn.execute(
-            """
-            TRUNCATE access_log, review_queue, relations, entities, chunks, items,
-                     sources, projects, session_checkpoints, ingest_queue,
-                     principal_grants, principals
-                     RESTART IDENTITY CASCADE
-            """
-        )
+        qualified = ", ".join(f"{schema}.{t}" for t in _KB_TEST_TABLES)
+        conn.execute(f"TRUNCATE {qualified} RESTART IDENTITY CASCADE")  # noqa: S608 — schema const
     yield

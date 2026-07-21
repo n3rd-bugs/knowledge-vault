@@ -15,9 +15,7 @@
 {% for e in entries %}
 <div class="card">
   <div>
-    <span class="rel" style="border-color: var(--warn); color: var(--warn);
-                             font-size:.72rem; border:1px solid; border-radius:99px;
-                             padding:.02rem .5rem;">{{ e.reason }}</span>
+    <span class="badge reason">{{ e.reason }}</span>
     {% if e.trust %}<span class="badge {{ e.trust }}">{{ e.trust }}</span>{% endif %}
     {% if e.status and e.status != 'active' %}<span class="badge {{ e.status }}">{{ e.status }}</span>{% endif %}
     <span class="prov">queue #{{ e.queue_id }}</span>
@@ -95,8 +93,8 @@
   {% if can_resolve %}
   <form method="post" action="/resolve/{{ e.queue_id }}" style="display:inline; margin:.3rem 0 0">
     <input type="hidden" name="csrf" value="{{ resolve_csrf }}">
-    {% if e.item_id %}<button type="submit" name="action" value="reject">reject</button>{% endif %}
-    <button type="submit" name="action" value="dismiss">dismiss</button>
+    {% if e.item_id %}<button type="submit" name="action" value="reject" class="danger">reject</button>{% endif %}
+    <button type="submit" name="action" value="dismiss" class="secondary">dismiss</button>
   </form>
   {% endif %}
   {# Copyable OWNER commands — promote (trust escalation) is CLI/MCP-only. #}

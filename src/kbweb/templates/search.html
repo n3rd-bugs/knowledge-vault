@@ -1,8 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Search · Knowledge Vault{% endblock %}
 {% block content %}
-<form method="get" action="/" class="bar" style="flex-direction: column; align-items: stretch;">
-  <div style="display:flex; gap:.5rem; align-items:center;">
+<form method="get" action="/" class="search-hero">
+  <div class="search-row">
     <input type="search" name="q" value="{{ q }}" placeholder="search the knowledge base" autofocus>
     <button type="submit">Search</button>
   </div>
@@ -77,11 +77,15 @@
 {% endif %}
 {% for hit in hits %}
 <article class="hit">
-  <div class="prov">{{ hit.provenance_header() }}</div>
-  <h3>
-    <a href="/item/{{ hit.item_id }}">{{ hit.type }} · {{ hit.title }}</a>
+  <h3><a href="/item/{{ hit.item_id }}">{{ hit.title }}</a></h3>
+  {# Scannable badge row: project · type · trust — consistent pill styles. #}
+  <div class="hit-badges">
+    <span class="tag">{{ hit.project }}</span>
+    <span class="tag">{{ hit.type }}</span>
     <span class="badge {{ hit.trust }}">{{ hit.trust }}</span>
-  </h3>
+    {% if hit.status != 'active' %}<span class="badge {{ hit.status }}">{{ hit.status }}</span>{% endif %}
+  </div>
+  <div class="prov">{{ hit.provenance_header() }}</div>
   {% if hit.status != 'active' %}
     <div class="status">⚠ status={{ hit.status }}{% if hit.superseded_by %}
       → superseded by id {{ hit.superseded_by }}{% endif %}</div>

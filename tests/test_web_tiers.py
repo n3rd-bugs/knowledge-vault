@@ -514,6 +514,73 @@ def test_welcome_renders_own_caps_only(app, world):
     assert '<span class="tag">save</span>' not in t2
 
 
+# --- 6b. grouped-nav no-oracle (UX refactor 2026-07-21) -----------------------
+#
+# The flat nav row became three clusters (primary browse · actions · Owner ▾
+# dropdown). test_nav_honesty_per_role above still pins the per-link gates; these
+# pin the GROUPING property: a browse-only principal sees no action/owner links
+# AND no owner-group container markup (no empty "Owner" hint), while the owner
+# gets the labeled, JS-free <details> owner group.
+
+_NAV_ACTION_HREFS = ('href="/save"', 'href="/review"')
+_NAV_OWNER_HREFS = ('href="/setup"', 'href="/admin"', 'href="/backups"', 'href="/jobs"')
+# Markers unique to the Owner group container — present ⇒ the owner surface is
+# hinted at, so all must be absent for a non-owner (no empty container).
+_NAV_OWNER_GROUP_MARKERS = ("owner-menu", "owner-links", ">Owner<")
+
+
+def _assert_no_owner_group(html: str) -> None:
+    for marker in _NAV_OWNER_GROUP_MARKERS:
+        assert marker not in html, f"owner-group marker {marker!r} leaked to a non-owner"
+    for href in _NAV_OWNER_HREFS:
+        assert href not in html, f"owner link {href} leaked to a non-owner"
+
+
+def test_grouped_nav_guest_browse_only_no_actions_no_owner(app, world):
+    """A guest (search-only): the search link + the /welcome tier affordance, and
+    nothing else — no browse-secondary, no actions group, no owner group markup."""
+    home = _client(app, "guest", "gnav-guest", projects=("proj-a",)).get("/").text
+    for href in ('href="/projects"', 'href="/timeline"', 'href="/stats"'):
+        assert href not in home, f"guest sees browse link {href}"
+    for href in _NAV_ACTION_HREFS:
+        assert href not in home, f"guest sees action link {href}"
+    _assert_no_owner_group(home)
+    assert 'href="/welcome"' in home, "the tier/identity affordance must survive regrouping"
+
+
+def test_grouped_nav_reader_browse_group_only(app, world):
+    """A reader keeps the whole primary browse group but gets no actions and no
+    owner group (the old 400-link bug must not resurface under grouping)."""
+    home = _client(app, "reader", "gnav-reader", projects=("proj-a",)).get("/").text
+    for href in ('href="/projects"', 'href="/timeline"', 'href="/stats"'):
+        assert href in home, f"reader missing browse link {href}"
+    for href in _NAV_ACTION_HREFS:
+        assert href not in home, f"reader sees action link {href}"
+    _assert_no_owner_group(home)
+
+
+def test_grouped_nav_owner_group_absent_for_contributor_and_reviewer(app, world):
+    """Contributor/reviewer get the actions group but NEVER the owner group — no
+    empty 'Owner' container may hint at tools they cannot reach."""
+    for role in ("contributor", "reviewer"):
+        home = _client(app, role, f"gnav-{role}", projects=("proj-a",)).get("/").text
+        _assert_no_owner_group(home)
+    rev = _client(app, "reviewer", "gnav-rev", projects=("proj-a",)).get("/").text
+    assert 'href="/save"' in rev and 'href="/review"' in rev, "reviewer keeps its actions group"
+
+
+def test_grouped_nav_owner_sees_grouped_owner_tools(app, world):
+    """The owner gets the labeled, JS-free Owner ▾ <details> dropdown with every
+    owner tool tucked inside it, alongside the browse + actions groups."""
+    home = _owner(app).get("/").text
+    assert '<details class="owner-menu">' in home and "<summary>Owner</summary>" in home
+    assert "owner-links" in home
+    for href in _NAV_OWNER_HREFS:
+        assert href in home, f"owner missing owner-tool link {href}"
+    for href in ('href="/projects"', 'href="/timeline"', 'href="/stats"', *_NAV_ACTION_HREFS):
+        assert href in home, f"owner missing everyday link {href}"
+
+
 # --- 7. admin create-grantee role picker (A11-2a) -----------------------------
 
 

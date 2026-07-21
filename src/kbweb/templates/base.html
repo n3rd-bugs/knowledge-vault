@@ -11,21 +11,45 @@
 </head>
 <body>
   <header class="site">
-    {# Nav honesty (plan §2): every link is gated by the SAME ROUTE_CAPS table the
-       middleware walls with — no link/hint for a zone this principal lacks. #}
-    <nav>
+    {# Nav honesty (plan §2): EVERY link is gated by the SAME ROUTE_CAPS table the
+       middleware walls with — no link/hint for a zone this principal lacks. The
+       UX regrouping (browse / actions / Owner) keeps every gate; the whole Owner
+       group is rendered only when ≥1 owner link is present in nav (owner_nav),
+       so a non-owner never sees an empty "Owner" container hinting at it. #}
+    <div class="brand-block">
       <a class="brand" href="/">Knowledge Vault</a>
-      {% if nav["/"] %}<a href="/">search</a>{% endif %}
-      {% if nav["/timeline"] %}<a href="/timeline">timeline</a>{% endif %}
-      {% if nav["/projects"] %}<a href="/projects">projects</a>{% endif %}
-      {% if nav["/save"] %}<a href="/save">contribute</a>{% endif %}
-      {% if nav["/review"] %}<a href="/review">review</a>{% endif %}
-      {% if nav["/jobs"] %}<a href="/jobs">jobs</a>{% endif %}
-      {% if nav["/stats"] %}<a href="/stats">stats</a>{% endif %}
-      {% if nav["/setup"] %}<a href="/setup">setup</a>{% endif %}
-      {% if signed_in %}<a href="/welcome">welcome</a>{% endif %}
-      {% if nav["/admin"] %}<a href="/admin">admin</a>{% endif %}
-      {% if nav["/backups"] %}<a href="/backups">backups</a>{% endif %}
+      {% if signed_in %}
+      {# One-line tier context = the "signed in as …" affordance (links to /welcome),
+         pulled from this principal's own role + readable-project count (no secret). #}
+      <a class="tier" href="/welcome">{% if is_owner %}signed in as owner{% else
+        %}{{ role }} — {{ read_project_count }} project{{ 's' if read_project_count != 1 }}{% endif %}</a>
+      {% endif %}
+    </div>
+    <nav>
+      <div class="nav-group">
+        {% if nav["/"] %}<a href="/">search</a>{% endif %}
+        {% if nav["/projects"] %}<a href="/projects">projects</a>{% endif %}
+        {% if nav["/timeline"] %}<a href="/timeline">timeline</a>{% endif %}
+        {% if nav["/stats"] %}<a href="/stats">stats</a>{% endif %}
+      </div>
+      {% if nav["/save"] or nav["/review"] %}
+      <div class="nav-group actions">
+        {% if nav["/save"] %}<a href="/save">contribute</a>{% endif %}
+        {% if nav["/review"] %}<a href="/review">review</a>{% endif %}
+      </div>
+      {% endif %}
+      {% set owner_nav = nav["/setup"] or nav["/admin"] or nav["/backups"] or nav["/jobs"] %}
+      {% if owner_nav %}
+      <details class="owner-menu">
+        <summary>Owner</summary>
+        <div class="owner-links">
+          {% if nav["/setup"] %}<a href="/setup">setup</a>{% endif %}
+          {% if nav["/admin"] %}<a href="/admin">admin</a>{% endif %}
+          {% if nav["/backups"] %}<a href="/backups">backups</a>{% endif %}
+          {% if nav["/jobs"] %}<a href="/jobs">jobs</a>{% endif %}
+        </div>
+      </details>
+      {% endif %}
     </nav>
     <div class="head-right">
       {% if not nav["/save"] %}<span class="ro-note">read-only</span>{% endif %}

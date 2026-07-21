@@ -108,6 +108,13 @@ def _identity_ctx(request: Request) -> dict[str, object]:
     return {
         "signed_in": p is not None,
         "is_owner": p is not None and p.is_owner,
+        # Chrome-only tier line (UX refactor): the principal's OWN role label and
+        # the count of projects IT can read — both already surfaced verbatim on
+        # /welcome, so this reveals nothing new and no secret. Owner's
+        # read_projects is empty (unrestricted, not enumerated); the template
+        # shows "owner" for it instead of a count.
+        "role": p.role if p is not None else None,
+        "read_project_count": len(p.read_projects) if p is not None else 0,
         "nav": {zone: p is not None and p.has_cap(cap) for zone, cap in ROUTE_CAPS.items()},
     }
 

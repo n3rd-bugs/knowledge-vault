@@ -9,8 +9,8 @@
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
-<div class="card" style="border:2px solid var(--bad)">
-  <h3 style="margin:.1rem 0 .3rem; color:var(--bad)">⚠ What lives on this internet-facing box — read this</h3>
+<div class="callout danger">
+  <h3>⚠ What lives on this internet-facing box — read this</h3>
   <ul style="margin:.3rem 0 .2rem 1.1rem; line-height:1.5">
     <li><strong>The rclone credential DOES live here.</strong> It is needed to upload, so a
       compromise of this box exposes it — the attacker could read/write your backup remote.

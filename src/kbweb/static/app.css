@@ -82,26 +82,69 @@ main { max-width: 64rem; margin: 1.25rem auto 4rem; padding: 0 1rem; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 h1, h2, h3, h4 { line-height: 1.25; }
+/* Consistent page rhythm: direct-child headings share margins across pages so
+   templates feel like one system (card-internal headings keep their own tight
+   spacing). */
+main > h1 { font-size: 1.5rem; margin: .3rem 0 .9rem; }
+main > h2 { font-size: 1.3rem; margin: .3rem 0 .9rem; }
+main > h3 { font-size: 1.08rem; margin: 1.3rem 0 .5rem; }
+main > h4 { font-size: .95rem; margin: 1.1rem 0 .4rem; }
 code, .anchor, .mono { font-family: ui-monospace, "Cascadia Code", Menlo, monospace; }
 
 /* --- header ------------------------------------------------------------ */
 header.site {
-  position: sticky; top: 0; z-index: 10;
-  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
-  padding: .55rem 1rem;
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: .5rem 1.1rem; flex-wrap: wrap;
+  padding: .5rem 1rem;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
-header.site nav { display: flex; align-items: baseline; gap: .9rem; flex-wrap: wrap; }
+/* brand + one-line tier context, stacked at the left edge */
+.brand-block { display: flex; flex-direction: column; line-height: 1.15; }
+a.brand { color: var(--ink); font-weight: 650; font-size: 1.02rem; }
+a.brand:hover { text-decoration: none; }
+.tier { font-size: .72rem; color: var(--muted); }
+a.tier:hover { color: var(--accent); text-decoration: none; }
+
+/* grouped nav: primary (browse) · actions · Owner ▾ */
+header.site nav { display: flex; align-items: center; gap: .35rem 1.1rem; flex-wrap: wrap; }
+.nav-group { display: flex; align-items: center; gap: .9rem; flex-wrap: wrap; }
+.nav-group.actions { padding-left: 1.1rem; border-left: 1px solid var(--border); }
 header.site nav a { color: var(--ink-2); font-size: .92rem; }
-header.site nav a.brand { color: var(--ink); font-weight: 650; font-size: 1rem; }
 header.site nav a:hover { color: var(--accent); text-decoration: none; }
-.head-right { display: flex; align-items: center; gap: .6rem; }
+
+/* Owner tools — a JS-free <details> dropdown, tucked apart from the browse
+   surface so everyday links read clean. Absent entirely for non-owners. */
+details.owner-menu { position: relative; }
+details.owner-menu > summary {
+  list-style: none; cursor: pointer; color: var(--ink-2); font-size: .92rem;
+  display: inline-flex; align-items: center; gap: .25rem;
+}
+details.owner-menu > summary::-webkit-details-marker { display: none; }
+details.owner-menu > summary::after { content: "▾"; font-size: .7em; color: var(--muted); }
+details.owner-menu > summary:hover,
+details.owner-menu[open] > summary { color: var(--accent); }
+.owner-links {
+  position: absolute; right: 0; top: calc(100% + .45rem);
+  display: flex; flex-direction: column; gap: .1rem; min-width: 9rem;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; box-shadow: var(--shadow); padding: .35rem; z-index: 30;
+}
+.owner-links a { padding: .3rem .55rem; border-radius: 6px; white-space: nowrap; }
+.owner-links a:hover { background: var(--surface-2); color: var(--accent); text-decoration: none; }
+
+.head-right { display: flex; align-items: center; gap: .6rem; margin-left: auto; }
 .ro-note { font-size: .74rem; color: var(--muted); border: 1px solid var(--border);
            border-radius: 99px; padding: .1rem .55rem; }
 #theme-toggle {
   border: 1px solid var(--border); background: var(--surface-2); color: var(--ink-2);
   border-radius: 8px; padding: .2rem .5rem; cursor: pointer; font-size: .9rem;
+}
+
+/* --- focus visibility (a11y) — keyboard reach for nav, owner menu, forms --- */
+a:focus-visible, button:focus-visible, summary:focus-visible,
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
 }
 
 /* --- cards & lists ------------------------------------------------------ */
@@ -110,11 +153,27 @@ header.site nav a:hover { color: var(--accent); text-decoration: none; }
   border-radius: var(--radius); box-shadow: var(--shadow);
   padding: .8rem 1rem; margin: .7rem 0;
 }
-article.hit h3 { margin: .25rem 0 .3rem; font-size: 1.02rem; }
+article.hit { padding: .7rem 1rem .8rem; }
+article.hit h3 { margin: .1rem 0 .25rem; font-size: 1.04rem; }
+article.hit h3 a { color: var(--ink); }
+article.hit h3 a:hover { color: var(--accent); }
+.hit-badges { display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; margin: .1rem 0; }
 .prov { font-size: .76rem; color: var(--muted); overflow-wrap: anywhere; }
 .snippet { margin: .4rem 0 0; color: var(--ink-2); }
 .status { color: var(--warn); font-size: .82rem; margin-top: .2rem; }
 .anchor { font-size: .8rem; color: var(--ink-2); margin-top: .2rem; }
+
+/* --- callouts (consistent warnings across setup / backups / notices) ----- */
+.callout {
+  background: var(--surface); border: 1px solid var(--border);
+  border-left: 4px solid var(--muted); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: .75rem 1rem; margin: .7rem 0;
+}
+.callout > :first-child { margin-top: 0; }
+.callout > :last-child { margin-bottom: 0; }
+.callout.warn { border-left-color: var(--warn); }
+.callout.danger { border-left-color: var(--bad); }
+.callout.danger h3, .callout.danger h4 { color: var(--bad); }
 
 /* --- chips -------------------------------------------------------------- */
 .tag, .badge, .chip {
@@ -124,9 +183,22 @@ article.hit h3 { margin: .25rem 0 .3rem; font-size: 1.02rem; }
 .tag { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); }
 a.tag:hover { color: var(--accent); text-decoration: none; border-color: var(--accent); }
 .badge { border: 1px solid var(--border); color: var(--ink-2); }
-.badge.verified { color: var(--good); border-color: color-mix(in srgb, var(--good) 55%, transparent); }
-.badge.unverified { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
-.badge.superseded, .badge.archived { color: var(--muted); }
+/* trust + positive states */
+.badge.verified, .badge.active, .badge.done, .badge.completed {
+  color: var(--good); border-color: color-mix(in srgb, var(--good) 55%, transparent);
+}
+/* pending / in-flight / caution states */
+.badge.unverified, .badge.pending, .badge.queued, .badge.running {
+  color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+}
+/* neutral / retired states */
+.badge.superseded, .badge.archived, .badge.duplicate, .badge.revoked { color: var(--muted); }
+/* failure states */
+.badge.error, .badge.failed {
+  color: var(--bad); border-color: color-mix(in srgb, var(--bad) 55%, transparent);
+}
+/* review-queue reason label (contradiction / duplicate_suspect / …) */
+.badge.reason { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
 
 /* --- forms --------------------------------------------------------------- */
 input[type="text"], input[type="search"], input[type="password"], input[type="date"], select {
@@ -136,11 +208,32 @@ input[type="text"], input[type="search"], input[type="password"], input[type="da
 }
 input[type="search"], input[name="q"] { width: min(32rem, 70%); }
 button, .btn {
-  background: var(--accent); color: var(--accent-ink); border: none;
+  background: var(--accent); color: var(--accent-ink); border: 1px solid transparent;
   border-radius: 8px; padding: .45rem .9rem; font: inherit; cursor: pointer;
 }
 button:hover { filter: brightness(1.06); }
+/* lower-emphasis + destructive button variants (consistent intent signalling) */
+button.secondary, .btn.secondary {
+  background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); filter: none;
+}
+button.secondary:hover { color: var(--accent); border-color: var(--accent); filter: none; }
+button.danger, .btn.danger {
+  background: transparent; color: var(--bad);
+  border: 1px solid color-mix(in srgb, var(--bad) 55%, transparent);
+}
+button.danger:hover { background: color-mix(in srgb, var(--bad) 12%, transparent); filter: none; }
+/* copy/reveal/utility buttons read as secondary chrome (the code-block variant
+   under pre.hl below is more specific and still wins there). */
+.copy-btn { background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--border); }
+.copy-btn:hover { color: var(--accent); filter: none; }
 form.bar { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: .8rem 0 1rem; }
+
+/* --- search landing ------------------------------------------------------- */
+.search-hero { display: flex; flex-direction: column; align-items: stretch;
+               gap: .5rem; margin: 1.2rem 0 1.1rem; }
+.search-row { display: flex; gap: .5rem; align-items: stretch; }
+.search-row input[type="search"] { flex: 1 1 auto; width: auto; font-size: 1.05rem; padding: .62rem .8rem; }
+.search-row button { padding: .62rem 1.3rem; font-size: 1rem; white-space: nowrap; }
 details.filters { margin: .4rem 0 .8rem; }
 details.filters summary { cursor: pointer; color: var(--ink-2); font-size: .9rem; }
 details.filters .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));

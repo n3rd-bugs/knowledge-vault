@@ -18,6 +18,12 @@ SECURITY POSTURE — the whole point of this module:
   * Every write is atomic (temp + os.replace) and mode 0600. All paths come from
     kbcore.config.settings (no hardcoded paths). The age binary is invoked with a
     list argv, never shell=True.
+  * store_drive_token (owner decision 2026-07-21, EMAIL-CENTRIC web surface)
+    writes the owner's Google Drive OAuth token WRITE-ONLY into rclone.conf and
+    AUTO-SETS the remote so the owner never sees rclone/retention internals. The
+    refresh_token in that token is the crown-jewel backup secret: never returned,
+    never logged, never surfaced by read_status (which reports only the connected
+    email — non-secret — and a connected bool).
 """
 
 from __future__ import annotations
@@ -43,6 +49,9 @@ _AGE_IDENTITY_RE = re.compile(r"AGE-SECRET-KEY-[0-9A-Z]+")
 # charset admits no space, quote, $, ;, |, &, *, ? or backtick — nothing that
 # could inject when the host scripts `source` the resulting file.
 _RCLONE_REMOTE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}:[A-Za-z0-9._/-]*$")
+# Plain-address shape for the connected Google account email (non-secret, but
+# rendered into the UI and written to a companion file, so validate it).
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+$")
 
 # The ONLY keys write_config may ever emit (it is not a general env-write tool).
 _KEY_ENABLED = "KB_OFFSITE_ENABLED"
@@ -51,8 +60,21 @@ _KEY_RECIPIENT = "KB_AGE_RECIPIENT"
 _KEY_KEEP = "KB_OFFSITE_KEEP"
 _ALLOWED_KEYS = (_KEY_ENABLED, _KEY_REMOTE, _KEY_RECIPIENT, _KEY_KEEP)
 
-# Fixed filename for the pasted rclone credential inside kb_rclone_conf_dir.
+# Fixed filename for the rclone credential inside kb_rclone_conf_dir.
 _RCLONE_CRED_NAME = "rclone.conf"
+# Non-secret companion holding the connected Google account email (the UI shows
+# it; drive_connected() keys off its presence — it NEVER reads the credential).
+_DRIVE_EMAIL_NAME = "drive_account"
+
+# The one-click Drive connect (owner decision 2026-07-21) pins a fixed remote +
+# folder so the owner never sees KB_RCLONE_REMOTE. The rclone remote block written
+# by store_drive_token is named _DRIVE_REMOTE_NAME; backups target _DRIVE_REMOTE.
+_DRIVE_REMOTE_NAME = "gdrive"
+_DRIVE_FOLDER = "kb-backups"
+_DRIVE_REMOTE = f"{_DRIVE_REMOTE_NAME}:{_DRIVE_FOLDER}"
+# The rclone token JSON carries ONLY these standard OAuth fields (email is stored
+# separately in the companion — it must never leak into the credential file).
+_RCLONE_TOKEN_KEYS = ("access_token", "token_type", "refresh_token", "expiry")
 
 _KEEP_MIN, _KEEP_MAX = 1, 365
 
@@ -63,6 +85,10 @@ def _conf_path() -> Path:
 
 def _cred_path() -> Path:
     return Path(settings.kb_rclone_conf_dir) / _RCLONE_CRED_NAME
+
+
+def _drive_email_path() -> Path:
+    return Path(settings.kb_rclone_conf_dir) / _DRIVE_EMAIL_NAME
 
 
 def _atomic_write(path: Path, content: str, *, mode: int = 0o600, dir_mode: int = 0o700) -> None:
@@ -151,14 +177,37 @@ def rclone_cred_present() -> bool:
         return False
 
 
+def drive_connected() -> bool:
+    """True iff a Google Drive is connected as the backup target.
+
+    Keys off the non-secret email companion (written LAST by store_drive_token, so
+    its presence implies the token + remote are already in place) — it NEVER reads
+    the write-only rclone credential."""
+    p = _drive_email_path()
+    try:
+        return p.is_file() and p.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def drive_email() -> str:
+    """The connected Google account email (non-secret; shown in the UI), or ''.
+
+    Reads ONLY the companion file — never the rclone credential / refresh token."""
+    try:
+        return _drive_email_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def read_status() -> dict:
     """NON-SECRET offsite status for the web page. Returns NO secret, ever.
 
     enabled / rclone_remote (name) / age_recipient (the PUBLIC key — safe to
-    show) / keep are read from the conf file; rclone_cred_present is a boolean
-    (never the credential); the last_* / backup_count fields describe the local
-    dump directory. The rclone credential and the age private key are absent by
-    construction."""
+    show) / keep are read from the conf file; drive_connected + drive_email report
+    the one-click Drive connect (the refresh token is NEVER read back); the
+    last_* / backup_count fields describe the local dump directory. The rclone
+    credential and the age private key are absent by construction."""
     conf = _parse_conf()
     enabled = conf.get(_KEY_ENABLED, "false").strip().lower() in ("true", "1", "yes")
     try:
@@ -171,6 +220,8 @@ def read_status() -> dict:
         "age_recipient": conf.get(_KEY_RECIPIENT, ""),  # PUBLIC key — may show
         "keep": keep,
         "rclone_cred_present": rclone_cred_present(),
+        "drive_connected": drive_connected(),
+        "drive_email": drive_email(),  # non-secret; NEVER the token/refresh_token
         "last_local_backup": _newest_backup("kb-*.sql.zst"),
         "last_raw_archive": _newest_backup("kb-raw-*.tar.zst"),
         "backup_count": _backup_count("kb-*.sql.zst"),
@@ -276,6 +327,58 @@ def _looks_like_rclone_cred(cred: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def store_drive_token(token: dict, email: str) -> None:
+    """Store the owner's Google Drive OAuth token as the WRITE-ONLY rclone
+    credential and AUTO-WIRE the offsite remote to it (owner decision 2026-07-21,
+    the one-click email-centric web surface).
+
+    SECURITY: the refresh_token inside ``token`` is the crown-jewel backup secret.
+    It is written into rclone.conf (atomic, mode 0600) and is NEVER returned,
+    logged, or surfaced by read_status — which reports only the connected email
+    (non-secret) and a connected bool. The token dict is VALIDATED to carry a
+    refresh_token before ANY file is touched (a re-consent that returned none is
+    rejected). Least-privilege: the remote is pinned to the drive.file scope.
+
+    The rclone remote (``gdrive:kb-backups``) + a sensible retention are set here
+    (via write_config) so the owner never sees KB_RCLONE_REMOTE/KB_OFFSITE_KEEP;
+    the owner's enabled flag + any age recipient are preserved untouched. The
+    non-secret email is written to a companion file LAST, so drive_connected()
+    (which keys off it) can never report connected before the token is in place."""
+    if not isinstance(token, dict):
+        raise InvalidOperation("drive token must be an object")
+    if not str(token.get("refresh_token") or "").strip():
+        raise InvalidOperation("drive token is missing a refresh_token (re-consent required)")
+    email = (email or "").strip().lower()
+    if not _EMAIL_RE.fullmatch(email):
+        raise InvalidOperation("connected account email is not a valid address")
+    # rclone.conf: the drive.file remote + the offline token — write-only, 0600.
+    # The token JSON carries ONLY standard OAuth fields (email is NOT one of them).
+    token_json = json.dumps(
+        {k: token[k] for k in _RCLONE_TOKEN_KEYS if token.get(k)}, separators=(",", ":")
+    )
+    conf = (
+        f"[{_DRIVE_REMOTE_NAME}]\n"
+        "type = drive\n"
+        "scope = drive.file\n"
+        f"client_id = {settings.google_client_id}\n"
+        f"client_secret = {settings.google_client_secret}\n"
+        f"token = {token_json}\n"
+    )
+    _atomic_write(_cred_path(), conf)
+    # Auto-set the remote + retention, preserving enabled + any age recipient.
+    current = _parse_conf()
+    enabled = current.get(_KEY_ENABLED, "false").strip().lower() in ("true", "1", "yes")
+    age_recipient = current.get(_KEY_RECIPIENT, "")
+    try:
+        keep = int(current.get(_KEY_KEEP, str(settings.kb_offsite_keep)))
+    except ValueError:
+        keep = settings.kb_offsite_keep
+    write_config(
+        enabled=enabled, rclone_remote=_DRIVE_REMOTE, age_recipient=age_recipient, keep=keep
+    )
+    _atomic_write(_drive_email_path(), email + "\n")
 
 
 def clear_rclone_cred() -> None:

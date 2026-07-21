@@ -211,18 +211,21 @@ WRITE_ALLOWLIST = {
 }
 
 # OWNER-CONFIG ALLOWLIST (owner web backup-setup surface, 2026-07-21): the
-# offsite-backup HOST-CONFIG chokepoints kbweb.views_backup composes. These are
+# offsite-backup HOST-CONFIG chokepoints kbweb composes — read_status/write_config/
+# generate_age_keypair in kbweb.views_backup, and store_drive_token in the shared
+# OAuth callback (kbweb.server) that connects the owner's Google Drive. These are
 # NOT knowledge writes — they touch NO items/sources/relations/review state, only
 # the dedicated offsite conf file + the write-only rclone credential — so the
 # no-knowledge-mutation guard (test_phase6_web) stays green. They are owner-only
-# (ROUTE_CAPS OWNER_ONLY + _owner_or_404 + CSRF), the exact structural parallel to
-# the views_admin authz carve-out. Kept separate from READ/WRITE so a knowledge
-# write can never hide here: none of these is in WRITE_NAMES.
+# (ROUTE_CAPS OWNER_ONLY + _owner_or_404 + CSRF; the drive callback re-checks the
+# connecting principal is the owner), the exact structural parallel to the
+# views_admin authz carve-out. Kept separate from READ/WRITE so a knowledge write
+# can never hide here: none of these is in WRITE_NAMES.
 OWNER_CONFIG_ALLOWLIST = {
     "offsite_config.read_status",
     "offsite_config.write_config",
     "offsite_config.generate_age_keypair",
-    "offsite_config.store_rclone_cred",
+    "offsite_config.store_drive_token",
 }
 
 # The single module allowed to hold WRITE_ALLOWLIST symbols (all others: read-only).

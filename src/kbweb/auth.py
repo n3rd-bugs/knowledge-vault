@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
 import httpx
@@ -159,6 +160,113 @@ def email_allowed(email: str) -> bool:
     """True iff email is on the (non-empty) allowlist. Empty list ⇒ deny all."""
     allowed = settings.web_allowed_emails
     return bool(allowed) and email.lower() in allowed
+
+
+# --- Google Drive connect (owner's OWN Drive as the offsite backup target) -----
+#
+# Owner decision 2026-07-21: encrypted backups upload to the OWNER's Google Drive
+# via a ONE-CLICK OAuth connect that REUSES the sign-in OAuth client and the SAME
+# redirect_uri (_redirect_uri) — the callback tells drive-connect from sign-in by a
+# marker carried in the (signed-cookie-validated) OAuth state, so no new
+# Google-console redirect is needed. LEAST-PRIVILEGE: the Drive grant is
+# 'drive.file' (app-created files only — rclone can NEVER read the rest of the
+# user's Drive); 'openid email' rides along only to NAME the connected account in
+# the UI. access_type=offline + prompt=consent force Google to return a
+# refresh_token (needed for unattended nightly backups).
+_DRIVE_SCOPE = "openid email https://www.googleapis.com/auth/drive.file"
+_DRIVE_STATE_PREFIX = "drive."  # token_urlsafe never emits '.', so this cannot collide
+
+
+def new_oauth_state(*, drive: bool = False) -> str:
+    """A fresh random OAuth ``state`` nonce, MARKED for the drive-connect flow when
+    ``drive`` is set — the marker lets google_callback branch drive-connect vs
+    sign-in AFTER state_ok validates the signed state cookie (so the marker, riding
+    inside the value the cookie signs, is unforgeable)."""
+    nonce = secrets.token_urlsafe(24)
+    return f"{_DRIVE_STATE_PREFIX}{nonce}" if drive else nonce
+
+
+def state_is_drive(state: str | None) -> bool:
+    """True iff a state marks a drive-connect. Read ONLY after state_ok passes: the
+    signed state cookie is what makes the marker trustworthy (an attacker cannot
+    mint a cookie whose signed value carries the marker)."""
+    return bool(state) and state.startswith(_DRIVE_STATE_PREFIX)
+
+
+def google_drive_connect_url(state: str) -> str:
+    """Authorize URL to connect the owner's Google Drive as the backup target.
+
+    Reuses the sign-in OAuth client and the SAME redirect_uri as google_login_url
+    (no extra Google-console redirect). scope is least-privilege ``drive.file``
+    (app-created files only); access_type=offline + prompt=consent force a
+    refresh_token on first consent so rclone can refresh unattended."""
+    params = {
+        "client_id": settings.google_client_id,
+        "redirect_uri": _redirect_uri(),
+        "response_type": "code",
+        "scope": _DRIVE_SCOPE,
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+    }
+    return f"{_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def exchange_google_drive_code(code: str) -> dict | None:
+    """Swap a drive-connect auth code for the offline token bundle + connected email.
+
+    Returns ``{access_token, token_type, refresh_token, expiry, email}`` or None on
+    ANY failure (never raises). The refresh_token is the crown-jewel backup secret —
+    the caller stores it WRITE-ONLY in rclone.conf; it is never logged here. A
+    response WITHOUT a refresh_token (re-consent not forced) is treated as failure,
+    since unattended backups need one. The email (from userinfo, via the 'openid
+    email' scope) names WHICH account the UI displays."""
+    try:
+        with httpx.Client(timeout=_HTTP_TIMEOUT) as client:
+            token_resp = client.post(
+                _TOKEN_URL,
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": settings.google_client_id,
+                    "client_secret": settings.google_client_secret,
+                    "redirect_uri": _redirect_uri(),
+                },
+            )
+            token_resp.raise_for_status()
+            payload = token_resp.json()
+            access_token = payload.get("access_token")
+            refresh_token = payload.get("refresh_token")
+            if not access_token or not refresh_token:
+                return None
+            info_resp = client.get(
+                _USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}
+            )
+            info_resp.raise_for_status()
+            info = info_resp.json()
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        # The message names the exception class only — never the code or a token.
+        log.warning("google drive code exchange failed: %s: %s", e.__class__.__name__, e)
+        return None
+    email = info.get("email")
+    # Parity with the sign-in path (security review 2026-07-21): an unverified
+    # Google email must not name the backup account. Absent => trust (Google omits
+    # it for already-verified accounts); present => must be truthy.
+    if not email or not info.get("email_verified", True):
+        return None
+    try:
+        expires_in = int(payload.get("expires_in", 0))
+    except (TypeError, ValueError):
+        expires_in = 0
+    # rclone's token JSON wants an RFC3339 expiry (UTC — Invariant 7).
+    expiry = (datetime.now(UTC) + timedelta(seconds=expires_in)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "access_token": access_token,
+        "token_type": payload.get("token_type", "Bearer"),
+        "refresh_token": refresh_token,
+        "expiry": expiry,
+        "email": str(email).lower(),
+    }
 
 
 # --- Admin CSRF (the ONLY state-changing web forms — Inv. 11 carve-out) -------

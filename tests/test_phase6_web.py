@@ -136,7 +136,9 @@ ADMIN_MUTATING_ROUTES = {"/admin/grant", "/admin/revoke", "/admin/principal"}
 # HOST-CONFIG, never knowledge — these write the offsite conf file + the
 # write-only rclone credential (kbcore.offsite_config), touching NO
 # items/sources/relations/review state. Owner-gated exactly like /admin.
-BACKUP_CONFIG_ROUTES = {"/backups/config", "/backups/keygen", "/backups/rclone"}
+# /backups/connect is GET-only (it only STARTS the OAuth redirect), so it is not
+# a POST route here.
+BACKUP_CONFIG_ROUTES = {"/backups/config", "/backups/keygen"}
 
 
 def test_web_no_knowledge_mutation(web_app):

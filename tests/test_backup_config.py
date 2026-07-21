@@ -174,6 +174,77 @@ def test_read_status_reports_cred_presence_without_the_value(env):
     assert "private_key" not in str(status)
 
 
+# --- store_drive_token (write-only Google Drive credential, 2026-07-21) --------
+
+GOOD_TOKEN = {
+    "access_token": "ya29.access-token",
+    "token_type": "Bearer",
+    "refresh_token": "RT-SECRET-abc123",
+    "expiry": "2026-07-21T12:00:00Z",
+}
+
+
+@pytest.fixture()
+def google(monkeypatch):
+    """The reused sign-in OAuth client (its id/secret land in rclone.conf)."""
+    monkeypatch.setattr(settings, "google_client_id", "cid.apps.googleusercontent.com")
+    monkeypatch.setattr(settings, "google_client_secret", "client-secret")
+
+
+def test_store_drive_token_writes_rclone_conf_and_auto_sets_remote(env, google):
+    assert offsite_config.drive_connected() is False
+    ret = offsite_config.store_drive_token(GOOD_TOKEN, "owner@example.com")
+    assert ret is None, "store_drive_token must never return the token"
+    conf_file = env.rclone_dir / "rclone.conf"
+    assert conf_file.exists() and _mode(conf_file) == 0o600, "credential is write-only, 0600"
+    text = conf_file.read_text()
+    assert "[gdrive]" in text and "scope = drive.file" in text, "least-privilege drive remote"
+    assert "RT-SECRET-abc123" in text, "the token JSON (with refresh_token) is stored"
+    status = offsite_config.read_status()
+    assert status["drive_connected"] is True
+    assert status["drive_email"] == "owner@example.com"
+    assert status["rclone_remote"] == "gdrive:kb-backups", "remote auto-set (owner never sees it)"
+
+
+def test_read_status_never_surfaces_the_refresh_token(env, google):
+    offsite_config.store_drive_token(GOOD_TOKEN, "owner@example.com")
+    status = offsite_config.read_status()
+    assert "RT-SECRET-abc123" not in str(status)
+    assert "refresh_token" not in str(status), "read_status reports only presence + email"
+
+
+def test_store_drive_token_rejects_missing_refresh_token(env, google):
+    with pytest.raises(InvalidOperation):
+        offsite_config.store_drive_token({"access_token": "at"}, "owner@example.com")
+    assert offsite_config.drive_connected() is False
+    assert not (env.rclone_dir / "rclone.conf").exists(), "nothing written on a bad token"
+
+
+def test_store_drive_token_rejects_bad_email(env, google):
+    with pytest.raises(InvalidOperation):
+        offsite_config.store_drive_token(GOOD_TOKEN, "not-an-email")
+    assert not (env.rclone_dir / "rclone.conf").exists()
+
+
+def test_store_drive_token_never_leaks_email_into_the_token_field(env, google):
+    # Even if the token dict carries an 'email', it must not ride into the token JSON.
+    tok = dict(GOOD_TOKEN, email="leak@example.com")
+    offsite_config.store_drive_token(tok, "owner@example.com")
+    text = (env.rclone_dir / "rclone.conf").read_text()
+    token_line = next(ln for ln in text.splitlines() if ln.startswith("token = "))
+    assert "leak@example.com" not in token_line, "only OAuth fields belong in the token JSON"
+
+
+def test_store_drive_token_preserves_existing_recipient(env, google):
+    offsite_config.write_config(
+        enabled=False, rclone_remote="", age_recipient=STUB_RECIPIENT, keep=30
+    )
+    offsite_config.store_drive_token(GOOD_TOKEN, "owner@example.com")
+    status = offsite_config.read_status()
+    assert status["age_recipient"] == STUB_RECIPIENT, "connecting a Drive preserves the recipient"
+    assert status["rclone_remote"] == "gdrive:kb-backups"
+
+
 # --- generate_age_keypair (stubbed) -------------------------------------------
 
 
@@ -236,4 +307,6 @@ def test_read_status_defaults_on_fresh_install(env):
     assert status["rclone_remote"] == ""
     assert status["age_recipient"] == ""
     assert status["rclone_cred_present"] is False
+    assert status["drive_connected"] is False
+    assert status["drive_email"] == ""
     assert isinstance(status["keep"], int)

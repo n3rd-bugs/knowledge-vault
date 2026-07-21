@@ -26,7 +26,6 @@ Run: ``python -m kbweb.server``.
 from __future__ import annotations
 
 import logging
-import secrets
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -35,9 +34,9 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from kbcore import principals, scope
+from kbcore import offsite_config, principals, scope
 from kbcore.config import settings
-from kbcore.errors import KBError, NotFound
+from kbcore.errors import InvalidOperation, KBError, NotFound
 from kbmcp.server import _validate_runtime_config
 from kbweb import (
     auth,
@@ -230,7 +229,8 @@ def _issue_session(location: str, identity: str) -> RedirectResponse:
 async def google_login(request):  # GET /auth/google/login
     # Random per-request state, signed into a short-lived cookie; the same value
     # travels to Google in the URL and comes back in the callback (CSRF guard).
-    state = secrets.token_urlsafe(24)
+    # Unmarked (sign-in) state — the drive-connect flow marks its own.
+    state = auth.new_oauth_state()
     resp = RedirectResponse(auth.google_login_url(state), status_code=302)
     resp.set_cookie(
         auth.STATE_COOKIE,
@@ -245,10 +245,17 @@ async def google_login(request):  # GET /auth/google/login
 
 
 async def google_callback(request):  # GET /auth/google/callback
+    # Shared callback for BOTH OAuth flows on the SAME redirect_uri (owner decision
+    # 2026-07-21): a drive-connect marker in the signed state distinguishes
+    # connecting the owner's Google Drive (host-config write) from a plain sign-in.
     state = request.query_params.get("state") or ""
     code = request.query_params.get("code") or ""
     if not code or not auth.state_ok(request.cookies.get(auth.STATE_COOKIE), state):
         log.warning("google callback rejected: missing code or state mismatch")
+    elif auth.state_is_drive(state):
+        resp = _complete_drive_connect(request, code)
+        if resp is not None:
+            return resp
     else:
         email = auth.exchange_google_code(code)
         identity = None
@@ -264,9 +271,46 @@ async def google_callback(request):  # GET /auth/google/callback
             return resp
         log.warning("google callback rejected: email not allowed or exchange failed: %r", email)
     # Never surface the email/token to the client — a generic message only.
-    return templates.TemplateResponse(
+    # Clear the one-time OAuth-state cookie on EVERY failure path too (security
+    # review 2026-07-21 cookie-hygiene): only the success paths deleted it before.
+    resp = templates.TemplateResponse(
         request, "login.html", {"error": "Google sign-in was not accepted."}, status_code=403
     )
+    resp.delete_cookie(auth.STATE_COOKIE, path="/", secure=True)
+    return resp
+
+
+def _complete_drive_connect(request, code: str) -> Response | None:
+    """Owner-only Google Drive connect completion (owner decision 2026-07-21):
+    store the offline token as the WRITE-ONLY offsite backup credential and sign
+    the owner in.
+
+    SECURITY — a NON-OWNER must never connect a Drive. The gate is: the current
+    session is ALREADY the owner, OR the just-authenticated Google email is the
+    allowlisted owner (itself a valid owner sign-in). The token/refresh_token is
+    handed straight to offsite_config.store_drive_token (rclone.conf, 0600) and is
+    never logged or rendered. Returns a redirect on success, or None to fall
+    through to the callback's generic (secret-free) rejection page."""
+    token = auth.exchange_google_drive_code(code)
+    if not token:
+        log.warning("drive-connect rejected: token exchange failed")
+        return None
+    email = str(token.get("email") or "")
+    session_is_owner = auth.cookie_identity(request.cookies.get(auth.COOKIE)) == auth.OWNER_IDENTITY
+    if not (session_is_owner or auth.email_allowed(email)):
+        log.warning("drive-connect rejected: connecting principal is not the owner")
+        return None
+    try:
+        offsite_config.store_drive_token(token, email)
+    except InvalidOperation as e:
+        log.warning("drive-connect rejected: %s", e)  # message names no secret
+        return None
+    # The connect starts from the owner-only /backups page; sign the owner in (the
+    # allowlisted-email path is itself a valid owner Google sign-in) and return to
+    # the page with a success flag.
+    resp = _issue_session("/backups?connected=1", auth.OWNER_IDENTITY)
+    resp.delete_cookie(auth.STATE_COOKIE, path="/", secure=True)
+    return resp
 
 
 # --- error handlers -----------------------------------------------------------

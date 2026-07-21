@@ -90,13 +90,96 @@ def _visibility_gate() -> tuple[str, list]:
 
     Never list rows for items in projects the request cannot read (they leak
     withheld ids/titles/quotes). A NULL-item row → predicate not TRUE → dropped,
-    matching stats.review_open. NOTE: the review TOOLS are owner-only in v1 because
-    ``detail`` JSONB can carry cross-project titles/ids past this row-level gate
-    (see kbmcp.tools_phase5 / kbcli.review_cmds); this gate is defense-in-depth for
-    the row itself and for the read-only web /review view.
+    matching stats.review_open. The row-level gate is NOT sufficient on its own:
+    ``detail`` JSONB can carry cross-project titles/ids PAST it (a contradiction
+    row whose item is granted may still reference the conflicting item in a
+    withheld NDA project) — :func:`_scrub_detail` closes that for non-owners.
     """
     frag, params = scope.project_predicate("i.project")
     return (f"AND {frag}" if frag else "", params)
+
+
+# review_queue.detail JSONB keys that reference an ITEM id (must pass readability
+# for a non-owner, else the key/entry is dropped — no cross-project id oracle).
+_DETAIL_ID_KEYS = frozenset(
+    {"a_id", "b_id", "keep", "retire", "dup_of", "proposed_supersede", "item_id"}
+)
+
+
+class _DropSentinel:
+    """Marks a nested detail node that references a WITHHELD item — drop it whole."""
+
+
+_DROP = _DropSentinel()
+
+
+def _detail_ids(node: Any, out: set[int]) -> None:
+    """Collect every item-id reference anywhere in a detail tree (for one batched
+    readability check)."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in _DETAIL_ID_KEYS and isinstance(v, int) and not isinstance(v, bool):
+                out.add(v)
+            else:
+                _detail_ids(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _detail_ids(v, out)
+
+
+def _scrub_node(node: Any, readable: set[int], *, top: bool) -> Any:
+    """Project a detail node to the no-leak shape for a NON-OWNER reviewer.
+
+    An ALLOWLIST-by-construction projection (A11-3 deliverable 4): (1) every
+    ``title`` key is dropped — titles ride the scope-gated item JOIN, never raw
+    ``detail``; (2) an item-id-referencing key whose target is not readable is
+    dropped; (3) a NESTED dict (an evidence/suggestion/triage sub-object) that
+    references a withheld item is dropped WHOLE, so ``{side, trust}`` residue can't
+    imply a hidden item; (4) the TOP-LEVEL dict is never dropped whole (it would
+    also discard the safe fields) — only its withheld id keys are stripped. Owner
+    detail is returned verbatim by the caller (today's behavior, unchanged), so MCP
+    kb_review_list inherits the identical wall for grantee reviewers.
+    """
+    if isinstance(node, dict):
+        if not top:
+            for k, v in node.items():
+                if k in _DETAIL_ID_KEYS and isinstance(v, int) and v not in readable:
+                    return _DROP
+        out: dict[str, Any] = {}
+        for k, v in node.items():
+            if k == "title":
+                continue
+            if k in _DETAIL_ID_KEYS and isinstance(v, int) and not isinstance(v, bool):
+                if v in readable:
+                    out[k] = v
+                continue  # withheld id at top level: strip the key only
+            sv = _scrub_node(v, readable, top=False)
+            if sv is _DROP:
+                continue
+            out[k] = sv
+        return out
+    if isinstance(node, list):
+        res = []
+        for v in node:
+            sv = _scrub_node(v, readable, top=False)
+            if sv is _DROP:
+                continue
+            res.append(sv)
+        return res
+    return node
+
+
+def _scrub_detail(conn: psycopg.Connection, detail: dict[str, Any]) -> dict[str, Any]:
+    """The detail a NON-OWNER reviewer may see: cross-project ids/titles removed.
+
+    Owner callers skip this (verbatim detail). For a grantee, resolve every
+    id-reference against ``scope.readable_item_ids`` in ONE batched SELECT, then
+    project the tree — reused by the web /review cockpit AND MCP kb_review_list.
+    """
+    ids: set[int] = set()
+    _detail_ids(detail, ids)
+    readable = scope.readable_item_ids(conn, list(ids)) if ids else set()
+    return _scrub_node(detail, readable, top=True)
 
 
 def list_open_review(limit: int | None = None) -> list[ReviewEntry]:
@@ -109,6 +192,7 @@ def list_open_review(limit: int | None = None) -> list[ReviewEntry]:
     gate, gate_params = _visibility_gate()
     lim = "LIMIT %s" if limit is not None else ""
     params: list = [*gate_params, *([int(limit)] if limit is not None else [])]
+    is_owner = scope.current().is_owner
     with connect() as conn:
         rows = conn.execute(
             f"""
@@ -122,18 +206,26 @@ def list_open_review(limit: int | None = None) -> list[ReviewEntry]:
             """,  # noqa: S608 — gate/lim are constant fragments; values are parameterized
             params,
         ).fetchall()
-    return [
-        ReviewEntry(
-            queue_id=r[0],
-            reason=r[1],
-            item_id=r[2],
-            title=r[3],
-            status=r[4],
-            trust=r[5],
-            detail=r[6] if isinstance(r[6], dict) else {},
-        )
-        for r in rows
-    ]
+        entries = []
+        for r in rows:
+            raw = r[6] if isinstance(r[6], dict) else {}
+            # A11-3 deliverable 4: a NON-OWNER reviewer gets a scrubbed detail so a
+            # withheld project's title/id can never ride the JSONB past the row gate;
+            # the owner keeps today's verbatim detail. Scrub inside this connection so
+            # the batched readability check reuses the same scope predicate.
+            detail = raw if is_owner else _scrub_detail(conn, raw)
+            entries.append(
+                ReviewEntry(
+                    queue_id=r[0],
+                    reason=r[1],
+                    item_id=r[2],
+                    title=r[3],
+                    status=r[4],
+                    trust=r[5],
+                    detail=detail,
+                )
+            )
+    return entries
 
 
 def count_open_review() -> int:

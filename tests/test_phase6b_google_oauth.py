@@ -32,7 +32,7 @@ def app(monkeypatch):
 
 @pytest.fixture()
 def client(app):
-    return TestClient(app)
+    return TestClient(app, base_url="https://testserver")
 
 
 def _start_login(client) -> str:

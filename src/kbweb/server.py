@@ -1,13 +1,17 @@
-"""kbweb.server — web UI: app assembly + auth (PLAN.md §10, Inv. 11 amended).
+"""kbweb.server — web UI: app assembly + auth (PLAN.md §10, Inv. 11 amended A11-3).
 
 Views live in kbweb.views_search / views_items / views_meta (all GET); this
 module owns the session middleware, login (token + Google OAuth), error
-handlers and startup guards. NO KNOWLEDGE MUTATION by construction
-(Invariant 11, amended 2026-07-18, extended 2026-07-19): every data route is
-GET/HEAD and no kbweb module imports a kbcore knowledge-write function — a
-test asserts both mechanically. The sole mutating routes are the OWNER-ONLY
-authz-config actions in kbweb.views_admin (project-share grant/revoke +
-google-grantee creation, A11-2).
+handlers and startup guards. Knowledge mutation is CONFINED (Invariant 11,
+amended 2026-07-18/19, and A11-3 2026-07-21): the ONLY knowledge-write module is
+kbweb.views_write, which imports EXACTLY the composed kbcore chokepoints
+{web_write.save_for_review, web_write.supersede_for_review, graph.link,
+review.reject, review.dismiss} — every trust/quarantine/authz guarantee already
+lives in kbcore (Invariant 2). Web writes are capability-gated, project-scoped,
+forced ``trust='unverified'`` and quarantined from retrieval until an OWNER
+promotes; trust escalation (promote) stays owner-only and is never imported here.
+The owner-only authz-config actions in kbweb.views_admin (project-share
+grant/revoke + google-grantee creation, A11-2) remain authz, never knowledge.
 
 Tiered access (WEBUI_TIERED_ACCESS_PLAN §2): the session middleware consults
 the declarative :data:`ROUTE_CAPS` zone table BEFORE routing and answers an
@@ -43,6 +47,7 @@ from kbweb import (
     views_jobs,
     views_meta,
     views_search,
+    views_write,
 )
 from kbweb.ui import STATIC_DIR, code_css, templates
 
@@ -68,7 +73,17 @@ ROUTE_CAPS: dict[str, str] = {
     "/stats": scope.CAP_BROWSE,
     "/trace": scope.CAP_BROWSE,
     "/similar": scope.CAP_BROWSE,
-    "/review": OWNER_ONLY,  # CAP_REVIEW_READ only after the Phase-4 detail-JSONB scrub
+    # A11-3 confined web-write surface (amended Invariant 11): each mutating route
+    # is its OWN top-level zone so the Layer-1 byte-404 wall gates it at its WRITE
+    # capability BEFORE routing (finding 22) — never nested under /item or /review,
+    # which would gate a write below its real cap (a 400-vs-404 feature oracle).
+    "/save": scope.CAP_SAVE,  # POST contributor save (+ GET the Contribute form)
+    "/supersede": scope.CAP_SAVE,  # POST /supersede/{id} — quarantined proposal
+    "/link": scope.CAP_SAVE,  # POST /link/{id} — create a relation edge
+    "/resolve": scope.CAP_REVIEW_RESOLVE,  # POST /resolve/{qid} — reject/dismiss only
+    # /review is now a reviewer zone: the review_queue.detail scrub landed in
+    # kbcore.review (A11-3 deliverable 4), so a non-owner reviewer may LIST safely.
+    "/review": scope.CAP_REVIEW_READ,
     "/setup": OWNER_ONLY,  # renders the MASTER bearer — permanently owner-only
     "/admin": OWNER_ONLY,  # the Inv. 11 authz carve-out (same wall as before)
     # Phase 3 (plan §5): worker jobs run under implicit OWNER scope and their
@@ -121,13 +136,33 @@ def _principal_for_identity(identity: str | None) -> scope.Principal | None:
     return None
 
 
+# HSTS (A11-3 finding 23 / deliverable 6): Secure cookies stop cleartext REPLAY,
+# but only HSTS stops the browser's initial plaintext emission (and MITM phishing
+# of the login token) after the first visit — set on EVERY response, walls and
+# data pages alike, so it is never a distinguishing header (the ghost harness
+# compares body/status/content-type, not this).
+_HSTS = "max-age=31536000"
+
+
 class SessionAuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except /login, /static,
     /auth/google), wall capability zones (ROUTE_CAPS), and bind the resolved
     principal for the request (grantees see only their granted projects in
-    every view; chrome reads the LIVE principal off request.state)."""
+    every view; chrome reads the LIVE principal off request.state).
+
+    Also stashes the EXACT cookie identity string ('owner' / 'g:<name>') on
+    ``request.state.identity`` (A11-3 findings 13/19/25): the confined web-write
+    routes bind their CSRF token to THAT live value — never reconstructed, never
+    the OWNER_IDENTITY constant — so grantee A's token can authorize neither
+    grantee B nor the owner. Adds the Strict-Transport-Security header to every
+    response."""
 
     async def dispatch(self, request, call_next):
+        response = await self._dispatch(request, call_next)
+        response.headers.setdefault("Strict-Transport-Security", _HSTS)
+        return response
+
+    async def _dispatch(self, request, call_next):
         path = request.url.path
         if path == "/login" or path.startswith("/static") or path.startswith("/auth/google"):
             return await call_next(request)
@@ -144,9 +179,11 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
             # existence to FEATURE existence (plan §2). Unknown zones fall
             # through to the router's genuine 404 (same bytes).
             return PlainTextResponse("Not Found", status_code=404)
-        # The LIVE principal rides request.state so nav//welcome render from
-        # resolved caps, never from the cookie alone (kbweb.ui._identity_ctx).
+        # The LIVE principal + its cookie identity ride request.state: nav/welcome
+        # render from resolved caps (kbweb.ui._identity_ctx) and the write routes
+        # bind CSRF to `identity` (the exact signed cookie value, never rebuilt).
         request.state.principal = principal
+        request.state.identity = identity
         with scope.use_principal(principal):
             return await call_next(request)
 
@@ -177,8 +214,10 @@ def _issue_session(location: str, identity: str) -> RedirectResponse:
         auth.COOKIE,
         auth.issue_cookie(identity),
         httponly=True,
+        secure=True,  # __Host- prefix requires Secure + Path=/ + no Domain (finding 23)
         samesite="lax",
         max_age=auth.MAX_AGE,
+        path="/",
     )
     return resp
 
@@ -192,8 +231,10 @@ async def google_login(request):  # GET /auth/google/login
         auth.STATE_COOKIE,
         auth.issue_state(state),
         httponly=True,
+        secure=True,  # __Host- prefix (finding 23) — matches the delete_cookie below
         samesite="lax",
         max_age=auth.STATE_MAX_AGE,
+        path="/",
     )
     return resp
 
@@ -214,7 +255,7 @@ async def google_callback(request):  # GET /auth/google/callback
                 identity = auth.grantee_identity(grantee.name)
         if identity is not None:
             resp = _issue_session("/", identity)
-            resp.delete_cookie(auth.STATE_COOKIE)
+            resp.delete_cookie(auth.STATE_COOKIE, path="/", secure=True)
             return resp
         log.warning("google callback rejected: email not allowed or exchange failed: %r", email)
     # Never surface the email/token to the client — a generic message only.
@@ -251,7 +292,10 @@ ROUTES = [
     *views_meta.ROUTES,
     *views_jobs.ROUTES,
     *views_export.ROUTES,
-    # Owner-only authz-config carve-out (Inv. 11 amended) — the ONLY mutating routes.
+    # A11-3 confined knowledge-write surface (amended Invariant 11): capability-
+    # gated, project-scoped, forced-unverified + quarantined-until-owner-promote.
+    *views_write.ROUTES,
+    # Owner-only authz-config carve-out (Inv. 11 amended) — authz, never knowledge.
     *views_admin.ROUTES,
 ]
 

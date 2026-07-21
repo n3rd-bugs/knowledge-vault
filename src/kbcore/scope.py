@@ -78,18 +78,21 @@ ALL_CAPS = frozenset(
 
 # Role → capability bundle, expanded at resolution time (principals._build_grantee).
 # 'reader' == today's grantee surface (the behavior-preserving default). 'reviewer'
-# deliberately EXCLUDES the review caps until the review_queue.detail JSONB scrub
-# lands (Phase 4 hard precondition: detail can carry cross-project titles/ids past
-# the row-level gate) — a test pins this. No bundle grants CAP_DEEP_SEARCH (owner
-# GPU; flippable later without a migration) or CAP_EXPORT (owner + named-grant
-# only at launch, plan §6 Q4). 'owner' is NOT a role: ownership is
-# credential-derived (``is_owner``), never a DB row — migration 012's frozen CHECK
-# is the escalation firewall.
+# now carries the review caps: the review_queue.detail JSONB scrub landed in
+# kbcore.review.list_open_review (A11-3 deliverable 4 — an allowlist projection that
+# drops cross-project titles/ids past the row-level gate, inherited by MCP
+# kb_review_list too), so a non-owner reviewer may LIST + reject/dismiss its granted
+# rows. Trust escalation (promote) stays OWNER-ONLY at the kbcore chokepoint
+# (review.promote → require_owner), so CAP_REVIEW_RESOLVE never reaches 'verified'.
+# No bundle grants CAP_DEEP_SEARCH (owner GPU; flippable later without a migration)
+# or CAP_EXPORT (owner + named-grant only at launch, plan §6 Q4). 'owner' is NOT a
+# role: ownership is credential-derived (``is_owner``), never a DB row — migration
+# 012's frozen CHECK is the escalation firewall.
 ROLE_CAPS: dict[str, frozenset[str]] = {
     "guest": frozenset({CAP_SEARCH}),
     "reader": frozenset({CAP_SEARCH, CAP_BROWSE}),
     "contributor": frozenset({CAP_SEARCH, CAP_BROWSE, CAP_SAVE}),
-    "reviewer": frozenset({CAP_SEARCH, CAP_BROWSE, CAP_SAVE}),
+    "reviewer": frozenset({CAP_SEARCH, CAP_BROWSE, CAP_SAVE, CAP_REVIEW_READ, CAP_REVIEW_RESOLVE}),
 }
 
 

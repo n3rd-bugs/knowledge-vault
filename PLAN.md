@@ -481,18 +481,28 @@ still sees everything.
 `:8803`; every app service binds a container-private network and requires the bearer (**Inv. 10** —
 no unauthenticated surface; the deliberate container `0.0.0.0` bind is gated behind an explicit
 `KB_ALLOW_ANY_BIND`, the default still refuses accidental host-public binds). The **web UI performs
-no knowledge mutation** (**Inv. 11**, amended 2026-07-18; extended 2026-07-19): items, sources,
-relations, review state —
-all knowledge — are never written from kbweb, which imports zero knowledge-write functions and
-serves data routes as GET/HEAD only. The SOLE permitted mutating routes are the OWNER-ONLY
-AUTHORIZATION-CONFIG actions `POST /admin/grant`, `POST /admin/revoke` and — extension of
-2026-07-19 (owner decision) — `POST /admin/principal` (grant/revoke a read-only project share via
-`kbcore.principals.grant`/`ungrant`, always `rw=false`; create a `kind='google'` email grantee
-with read-only initial shares — never a token principal, so no secret ever transits a browser, and
-principal revoke/rotate/expiry stay CLI-only), gated on the OWNER
-identity (non-owners get the byte-identical 404 of an unknown path) and CSRF-protected. This
-carve-out must never be broadened beyond share grant/revoke/create-google-grantee (see
-ADVERSARIAL_REVIEW.md, Amendments A11-1/A11-2). The REST facade is a write surface with the identical bearer. Offsite copies are
+CONFINED, capability-gated knowledge writes** (**Inv. 11**, amended 2026-07-18; extended
+2026-07-19; **A11-3 2026-07-21**). Originally kbweb wrote NO knowledge; A11-3 relaxes this to a
+CONFINED write surface. kbweb's only knowledge-write module is `kbweb.views_write`, which imports
+EXACTLY the composed kbcore chokepoints `{web_write.save_for_review, web_write.supersede_for_review,
+graph.link, review.reject, review.dismiss}` — never raw ingest/supersede, never `promote`. Every
+guarantee lives in kbcore (**Inv. 2**): a non-owner web knowledge write is capability-gated
+(CAP_SAVE / CAP_REVIEW_RESOLVE zone walls), project-scoped (rw grant), forced `trust='unverified'`,
+and QUARANTINED (`status='pending'`, absent from the default search set) until an OWNER promotes —
+the web can never mint verified knowledge nor de-quarantine, and trust escalation (promote) is
+owner-only. supersede is a review PROPOSAL (the old item stays active until owner promote, so no
+verified knowledge is hidden behind a pending item). The web layer adds only: capability zone walls
+(each of `POST /save`, `/supersede/{id}`, `/link/{id}`, `/resolve/{qid}` a top-level zone), a CSRF
+token bound to the LIVE cookie identity (never the owner-identity constant), a closed request shape
+(`WebSaveRequest`, `extra='forbid'`), and a UNIFORM no-oracle error contract (NotFound →
+byte-identical unknown-path 404; InvalidOperation → a constant rejection that never names the
+project). Session/OAuth-state cookies are `__Host-`-prefixed + `Secure`; HSTS is set on every
+response. The OWNER-ONLY AUTHORIZATION-CONFIG routes `POST /admin/grant`, `POST /admin/revoke`,
+`POST /admin/principal` (read-only project shares via `kbcore.principals.grant`/`ungrant`, always
+`rw=false`; create a `kind='google'` email grantee — never a token principal, so no secret transits
+a browser; revoke/rotate/expiry CLI-only) stay authz-only, gated on the OWNER identity (non-owners
+get the byte-identical 404) and CSRF-protected. Neither surface may be broadened beyond its stated
+imports/routes (see ADVERSARIAL_REVIEW.md, Amendments A11-1/A11-2/A11-3). The REST facade is a write surface with the identical bearer. Offsite copies are
 **encrypted at rest** and the age key never sits beside the ciphertext or in git (**Inv. 12**).
 
 **6a — REST facade (~1-2 h)** — ARCH-4; JSON API for non-MCP consumers and the backing of the

@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Contribute · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Contribute knowledge</h2>
+
+{% if saved %}
+{# The pending-review confirmation (A11-3): a web contribution is quarantined
+   from retrieval and unverified until the OWNER promotes it. #}
+<div class="card" style="border-color: var(--ok, #2a7);">
+  <h3 style="margin-top:.2rem">Saved — pending owner review ✨</h3>
+  <p class="prov">Your contribution was recorded as <strong>unverified</strong> and is
+    held out of search until the owner reviews and promotes it. Trust escalation stays
+    owner-only. You can submit another below.</p>
+</div>
+{% endif %}
+
+<p class="prov">Contributions are capability-gated and project-scoped. Every web save is
+  forced <span class="mono">trust=unverified</span>, quarantined from retrieval, and queued
+  for owner review — it can never mint verified knowledge.</p>
+
+<form method="post" action="/save" class="card" style="display:flex; flex-direction:column; gap:.6rem;">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <label class="f">project
+    {% if writable %}
+    <select name="project" required>
+      {% for p in writable %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+    </select>
+    {% else %}
+    <input type="text" name="project" placeholder="project name" required>
+    {% endif %}
+  </label>
+  <label class="f">type
+    <select name="type" required>
+      {% for t in types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+    </select>
+  </label>
+  <label class="f">title
+    <input type="text" name="title" maxlength="200" required>
+  </label>
+  <label class="f">body
+    <textarea name="body" rows="8" required placeholder="Markdown supported. Raw HTML is escaped."></textarea>
+  </label>
+  <label class="f">tags
+    <input type="text" name="tags" placeholder="lang:python tool:pytest (space or comma separated)">
+  </label>
+  <div><button type="submit">Save for review</button></div>
+</form>
+{% endblock %}

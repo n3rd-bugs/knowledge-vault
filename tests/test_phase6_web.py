@@ -49,7 +49,18 @@ WRITE_NAMES = {
     "reprocess",
     "archive_item",
     "set_project",
+    # A11-3 (2026-07-21): the COMPOSED web-write chokepoints. Confined to
+    # kbweb.views_write (below); leaking into ANY other kbweb module still fails.
+    "save_for_review",
+    "supersede_for_review",
 }
+
+# A11-3: the ONLY kbweb module permitted to mutate knowledge, and the EXACT set of
+# write-surface functions it may reach (the confined-write allowlist, cross-checked
+# against WRITE_NAMES). Trust escalation (promote / ingest / supersede raw) is NOT
+# in it — importing any of those into the web fails this guard AND the allowlist test.
+CONFINED_WRITE_MODULE = "views_write"
+CONFINED_WRITE_NAMES = {"save_for_review", "supersede_for_review", "link", "reject", "dismiss"}
 
 
 @pytest.fixture()
@@ -63,7 +74,7 @@ def web_app(kb, monkeypatch):
 
 @pytest.fixture()
 def client(web_app):
-    return TestClient(web_app)
+    return TestClient(web_app, base_url="https://testserver")
 
 
 def _login(client) -> None:
@@ -123,24 +134,33 @@ ADMIN_MUTATING_ROUTES = {"/admin/grant", "/admin/revoke", "/admin/principal"}
 
 
 def test_web_no_knowledge_mutation(web_app):
-    # (1) every route is GET-only except /login (GET+POST for auth, NO kbcore
-    #     write) and the explicit owner-only authz allowlist; nothing anywhere
-    #     allows PUT/DELETE/PATCH. The /static Mount has no .methods attribute —
-    #     StaticFiles serves GET/HEAD only by construction.
+    # A11-3: the confined web-write routes are the EXACTLY four permitted mutating
+    # paths, each its own top-level zone. Derived from the module so a renamed route
+    # can't slip past this guard.
+    from kbweb import views_write
+
+    write_routes = {r.path for r in views_write.ROUTES}
+    assert write_routes == {"/save", "/supersede/{id:int}", "/link/{id:int}", "/resolve/{qid:int}"}
+
+    # (1) every route is GET-only except /login (auth), the owner-only authz
+    #     allowlist, and the A11-3 confined write routes; nothing anywhere allows
+    #     PUT/DELETE/PATCH. The /static Mount has no .methods — StaticFiles is GET/HEAD.
+    post_ok = {"/login"} | ADMIN_MUTATING_ROUTES | write_routes
     for route in web_app.routes:
         methods = set(getattr(route, "methods", None) or ())
         assert not (methods & {"PUT", "DELETE", "PATCH"}), f"{route.path} exposes a mutation verb"
-        if route.path == "/login" or route.path in ADMIN_MUTATING_ROUTES:
-            assert methods <= {"GET", "POST", "HEAD"}
+        if route.path in post_ok:
+            assert methods <= {"GET", "POST", "HEAD"}, f"{route.path}: {methods}"
         else:
             assert methods <= {"GET", "HEAD"}, f"{route.path} is not GET-only: {methods}"
-    # The POST-capable set is EXACTLY login + the allowlist — nothing may creep in.
+    # The POST-capable set is EXACTLY login + authz allowlist + confined writes.
     posters = {r.path for r in web_app.routes if "POST" in set(getattr(r, "methods", None) or ())}
-    assert posters == {"/login"} | ADMIN_MUTATING_ROUTES, f"unexpected POST routes: {posters}"
+    assert posters == post_ok, f"unexpected POST routes: {posters}"
 
-    # (2) EVERY kbweb module imports zero KNOWLEDGE-write functions — the
-    #     amendment did NOT relax this: authz config is not knowledge, and
-    #     items/sources/relations stay unreachable from the web tier.
+    # (2) EVERY kbweb module imports zero KNOWLEDGE-write functions — EXCEPT the
+    #     single confined module kbweb.views_write, which may reach ONLY the A11-3
+    #     allowlist {save_for_review, supersede_for_review, link, reject, dismiss}
+    #     and never promote/ingest/supersede (trust escalation is owner-only).
     import importlib
     import inspect
     import pkgutil
@@ -150,7 +170,16 @@ def test_web_no_knowledge_mutation(web_app):
     for mod_info in pkgutil.iter_modules(kbweb.__path__):
         mod = importlib.import_module(f"kbweb.{mod_info.name}")
         leaked = WRITE_NAMES & set(dir(mod))
-        assert not leaked, f"write name(s) {leaked} leaked into kbweb.{mod_info.name}"
+        if mod_info.name == CONFINED_WRITE_MODULE:
+            assert leaked == CONFINED_WRITE_NAMES, (
+                f"views_write write surface drifted: {leaked} != {CONFINED_WRITE_NAMES}"
+            )
+            for forbidden in ("promote", "ingest", "ingest_in", "supersede", "queue_review_in"):
+                assert forbidden not in dir(mod), (
+                    f"{forbidden} must never be reachable from the web"
+                )
+        else:
+            assert not leaked, f"write name(s) {leaked} leaked into kbweb.{mod_info.name}"
 
     # (3) the carve-out stays CONFINED: authz mutation happens ONLY in
     #     views_admin, and ONLY share grant/ungrant + google-grantee creation

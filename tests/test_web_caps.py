@@ -91,7 +91,7 @@ def _grantee_client(app, name: str = "probe", projects: tuple[str, ...] = ()) ->
     _pid, token = principals.create_principal(name, kind="token")
     for p in projects:
         principals.grant(name, p, rw=False)
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": token}).status_code == 200
     return c
 
@@ -116,7 +116,7 @@ def test_ghost_harness_is_not_vacuous(app):
 def test_ghost_harness_holds_for_unauthenticated_client(app):
     """Anonymous probes get the same login redirect for walled and absent paths
     (first-hop Location included) — no pre-auth existence oracle either."""
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     for path in ("/admin", "/admin/grant"):
         assert_ghost_identical(c, path)
 
@@ -132,6 +132,9 @@ READ_ALLOWLIST = {
     "browse.items_with_tag",
     "browse.list_tags",
     "config.settings",
+    # A11-3: DuplicateContent is caught by the confined write surface to render a
+    # constant (no-oracle) response — a domain-error class, not a write function.
+    "errors.DuplicateContent",
     "errors.InvalidOperation",
     "errors.KBError",
     "errors.NotFound",
@@ -148,6 +151,12 @@ READ_ALLOWLIST = {
     "jobs.latest_consolidation_status",
     "jobs.list_deep_search_jobs",
     "models.ITEM_TYPES",
+    # A11-3 confined web-write surface (kbweb.views_write): the closed request
+    # shape + vocabulary the /save and /link forms render/parse against — pure
+    # read constants/models, NOT write functions (those are in WRITE_ALLOWLIST).
+    "models.RELATIONS",
+    "models.WEB_ITEM_TYPES",
+    "models.WebSaveRequest",
     # Phase 3: the export view type-annotates/serializes the SearchHit result
     # shape of search.search — a pydantic model, not a write surface.
     "models.SearchHit",
@@ -169,6 +178,11 @@ READ_ALLOWLIST = {
     # Phase 3: CAP_EXPORT gates the GET-only /export.{csv,json} zone (plan §3d;
     # in NO role bundle at launch) — a constant, not a write surface.
     "scope.CAP_EXPORT",
+    # A11-3: capability constants naming the confined write / review zones in the
+    # ROUTE_CAPS wall + the in-view layer-2 backstops — constants, not surfaces.
+    "scope.CAP_REVIEW_READ",
+    "scope.CAP_REVIEW_RESOLVE",
+    "scope.CAP_SAVE",
     "scope.CAP_SEARCH",
     "scope.current",
     "scope.enter_server_mode",
@@ -181,9 +195,27 @@ READ_ALLOWLIST = {
     "stats.usage_stats",
 }
 
+# A11-3 CONFINED-WRITE ALLOWLIST (2026-07-21): the amendment relaxed Invariant 11
+# from "kbweb imports ZERO write functions" to "kbweb imports ONLY these composed
+# kbcore chokepoints, and ONLY from the confined module kbweb.views_write". Every
+# guarantee (forced-unverified, quarantine, project-scope, owner-only promote) lives
+# in kbcore; the web layer merely composes these five. Trust escalation (promote /
+# raw ingest / raw supersede) is DELIBERATELY absent — re-adding one fails this test.
+WRITE_ALLOWLIST = {
+    "web_write.save_for_review",
+    "web_write.supersede_for_review",
+    "graph.link",
+    "review.reject",
+    "review.dismiss",
+}
+
+# The single module allowed to hold WRITE_ALLOWLIST symbols (all others: read-only).
+_CONFINED_WRITE_FILE = "views_write.py"
+
 _TRIPWIRE_MSG = (
-    "new kbcore import into kbweb — add to READ_ALLOWLIST in this test "
-    "WITH the commit that justifies it (Invariant 11)."
+    "new kbcore import into kbweb — add to READ_ALLOWLIST (or, for a composed "
+    "write chokepoint into views_write only, WRITE_ALLOWLIST) WITH the commit "
+    "that justifies it (Invariant 11 / A11-3)."
 )
 
 
@@ -232,24 +264,51 @@ def test_every_kbweb_kbcore_import_is_allowlisted():
     per_file = _kbweb_kbcore_symbols()
     assert per_file, "discovery walked zero kbweb modules — harness broken, not clean"
     for fname, syms in sorted(per_file.items()):
-        unknown = sorted(syms - READ_ALLOWLIST)
+        unknown = sorted(syms - READ_ALLOWLIST - WRITE_ALLOWLIST)
         assert not unknown, f"{fname}: {unknown} — {_TRIPWIRE_MSG}"
+
+
+def test_write_functions_are_confined_to_views_write():
+    """A11-3: the WRITE_ALLOWLIST chokepoints may appear ONLY in kbweb.views_write.
+    Any other kbweb module importing a knowledge-write function fails closed — the
+    confinement is mechanical, not a convention."""
+    for fname, syms in sorted(_kbweb_kbcore_symbols().items()):
+        writes = sorted(syms & WRITE_ALLOWLIST)
+        if fname == _CONFINED_WRITE_FILE:
+            continue
+        assert not writes, f"{fname} imports confined write functions {writes} outside views_write"
+
+
+def test_promote_and_raw_ingest_never_allowlisted():
+    """The trust-escalation / raw-write surfaces are DELIBERATELY absent from BOTH
+    allowlists — a web promote/ingest/supersede must be impossible to import."""
+    forbidden = {
+        "review.promote",
+        "review.resolve_via_supersede",
+        "ingest.ingest",
+        "ingest.ingest_in",
+        "supersede.supersede",
+    }
+    both = READ_ALLOWLIST | WRITE_ALLOWLIST
+    assert not (forbidden & both), "a trust-escalation/raw-write surface was allowlisted"
 
 
 def test_allowlist_is_exactly_todays_surface():
     """No stale entries either: a symbol kbweb stopped using must LEAVE the
     allowlist, or it silently pre-authorizes a future re-import."""
     used = set().union(*_kbweb_kbcore_symbols().values())
-    stale = sorted(READ_ALLOWLIST - used)
+    stale = sorted((READ_ALLOWLIST | WRITE_ALLOWLIST) - used)
     assert not stale, f"allowlist entries no longer used by kbweb — prune them: {stale}"
 
 
-def test_allowlist_contains_no_write_names():
-    """The two guards must stay consistent: nothing allowlisted for the web may
-    be a known knowledge-write surface (test_phase6_web.WRITE_NAMES)."""
-    basenames = {s.rsplit(".", 1)[-1] for s in READ_ALLOWLIST}
-    overlap = sorted(basenames & WRITE_NAMES)
-    assert not overlap, f"READ_ALLOWLIST contains write surfaces: {overlap}"
+def test_read_allowlist_contains_no_write_names():
+    """The two guards must stay consistent: nothing in the READ allowlist may be a
+    known knowledge-write surface (test_phase6_web.WRITE_NAMES) — those live ONLY
+    in WRITE_ALLOWLIST, whose basenames are exactly a subset of WRITE_NAMES."""
+    read_basenames = {s.rsplit(".", 1)[-1] for s in READ_ALLOWLIST}
+    assert not (read_basenames & WRITE_NAMES), "READ_ALLOWLIST contains a write surface"
+    write_basenames = {s.rsplit(".", 1)[-1] for s in WRITE_ALLOWLIST}
+    assert write_basenames <= WRITE_NAMES, "a WRITE_ALLOWLIST entry is not a known write name"
 
 
 # --- 3. WRITE_NAMES expansion consistency -------------------------------------
@@ -283,6 +342,34 @@ def test_write_guard_covers_newer_write_functions():
         assert hasattr(importlib.import_module(module), name), (
             f"{module}.{name} does not exist — WRITE_NAMES guards a phantom"
         )
+
+
+# --- 4. stored-XSS template lint (A11-3 finding 26 / deliverable 7) -----------
+
+_TEMPLATES_DIR = _KBWEB_SRC / "templates"
+
+
+def _template_files() -> list[Path]:
+    return sorted(_TEMPLATES_DIR.rglob("*.html"))
+
+
+def test_no_template_bypasses_autoescape():
+    """Mechanical XSS pin: no template may use `| safe` or `Markup(` — the only
+    HTML that reaches the page must flow through the autoescaping `| markdown`
+    filter (html=False escapes raw HTML). A future resolve/item body rendered raw
+    would chain stored XSS into the owner's session — this fails CI first."""
+    files = _template_files()
+    assert files, "template lint walked zero files — harness broken"
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        assert "| safe" not in text, f"{path.name}: `| safe` bypasses autoescape (finding 26)"
+        assert "Markup(" not in text, f"{path.name}: `Markup(` bypasses autoescape (finding 26)"
+
+
+def test_item_body_renders_via_markdown_filter():
+    """The item body MUST render through the autoescaping markdown filter."""
+    item_html = (_TEMPLATES_DIR / "item.html").read_text(encoding="utf-8")
+    assert "item.body | markdown" in item_html, "item body must use the | markdown filter"
 
 
 # --- KB_WEB_SIGNING_SECRET decoupling (Phase 1 deliverable 2) -----------------

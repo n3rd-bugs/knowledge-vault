@@ -35,7 +35,7 @@ def app(kb, monkeypatch):
 
 @pytest.fixture()
 def owner(app):
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": TEST_TOKEN}).status_code == 200
     return c
 
@@ -45,7 +45,7 @@ def _grantee_client(app, name: str = "mallory", projects: tuple[str, ...] = ()) 
     _pid, token = principals.create_principal(name, kind="token")
     for p in projects:
         principals.grant(name, p, rw=False)
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": token}).status_code == 200
     return c
 
@@ -171,7 +171,7 @@ def test_grantee_never_sees_admin_link(app):
 
 
 def test_unauthenticated_admin_redirects_like_any_page(app):
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     for path, method in (("/admin", "get"), ("/admin/grant", "post"), ("/admin/revoke", "post")):
         r = getattr(c, method)(path, follow_redirects=False)
         assert r.status_code == 302 and r.headers["location"] == "/login"
@@ -226,6 +226,33 @@ def test_csrf_identity_binding_unit():
     assert not auth.csrf_ok(auth.issue_csrf("g:mallory"), auth.OWNER_IDENTITY)
     assert not auth.csrf_ok(None, auth.OWNER_IDENTITY)
     assert not auth.csrf_ok("", auth.OWNER_IDENTITY)
+
+
+def test_csrf_binds_to_the_exact_grantee_identity():
+    """A11-3 findings 13/25: a CSRF token is accepted ONLY for its minting identity.
+    Grantee A's token authorizes neither grantee B nor the owner, and vice-versa —
+    the binding is what makes the confined web-write routes safe for grantees."""
+    alice, bob = auth.grantee_identity("alice"), auth.grantee_identity("bob")
+    tok_alice = auth.issue_csrf(alice)
+    assert auth.csrf_ok(tok_alice, alice), "a grantee's own token must work"
+    assert not auth.csrf_ok(tok_alice, bob), "grantee A's token must fail for grantee B"
+    assert not auth.csrf_ok(tok_alice, auth.OWNER_IDENTITY), "grantee token must fail for owner"
+    tok_owner = auth.issue_csrf(auth.OWNER_IDENTITY)
+    assert not auth.csrf_ok(tok_owner, alice), "the owner's token must fail for a grantee"
+
+
+def test_owner_identity_constant_confined_to_views_admin():
+    """Trip-wire (finding 19.5): the OWNER_IDENTITY constant may be referenced by
+    the owner-only views_admin, never by the confined grantee-facing views_write —
+    which must bind CSRF to the LIVE identity (request.state.identity) only."""
+    import inspect
+
+    from kbweb import views_admin, views_write
+
+    assert "OWNER_IDENTITY" not in inspect.getsource(views_write), (
+        "views_write must never reference OWNER_IDENTITY — bind to the live identity"
+    )
+    assert "OWNER_IDENTITY" in inspect.getsource(views_admin), "views_admin binds owner CSRF"
 
 
 # --- same-origin defense layer ---------------------------------------------------

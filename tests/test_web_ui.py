@@ -25,7 +25,7 @@ def client(kb, monkeypatch):
     monkeypatch.setattr(settings, "kb_bind", "127.0.0.1")
     from kbweb.server import build_app
 
-    c = TestClient(build_app())
+    c = TestClient(build_app(), base_url="https://testserver")
     r = c.post("/login", data={"token": TEST_TOKEN})
     assert r.status_code == 200
     return c
@@ -72,7 +72,7 @@ def test_code_css_served_without_auth(kb, monkeypatch):
     monkeypatch.setattr(settings, "kb_bind", "127.0.0.1")
     from kbweb.server import build_app
 
-    c = TestClient(build_app())
+    c = TestClient(build_app(), base_url="https://testserver")
     r = c.get("/static/code.css")
     assert r.status_code == 200
     assert "text/css" in r.headers["content-type"]
@@ -298,7 +298,7 @@ def test_setup_page_never_leaks_token_unauthenticated(kb, monkeypatch):
     monkeypatch.setattr(cfg, "kb_bind", "127.0.0.1")
     from kbweb.server import build_app
 
-    c = TestClient(build_app())  # no login
+    c = TestClient(build_app(), base_url="https://testserver")  # no login
     r = c.get("/setup", follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/login"
     assert TEST_TOKEN not in r.text
@@ -307,7 +307,10 @@ def test_setup_page_never_leaks_token_unauthenticated(kb, monkeypatch):
     assert TEST_TOKEN not in r2.text
 
 
-def test_review_page_lists_entries_and_has_no_forms(client):
+def test_review_page_lists_entries_and_owner_sees_resolve_controls(client):
+    # `client` is the OWNER (CAP_REVIEW_RESOLVE): the A11-3 cockpit shows the
+    # reject/dismiss form (bound to a live-identity CSRF token) plus the copyable
+    # CLI commands. Promote is CLI-only — there is no web promote control.
     from kbcore.review import queue_review
 
     item = ingest("revweb", "note", "needs review title", "b", trust="unverified")
@@ -317,5 +320,10 @@ def test_review_page_lists_entries_and_has_no_forms(client):
     assert "needs review title" in r.text
     assert "unverified_extraction" in r.text
     assert "rejected_count" in r.text
-    # Read-only viewer: no write controls of any kind.
-    assert "<form" not in r.text
+    # Owner resolve controls: the confined reject/dismiss form + CSRF, no web promote.
+    assert "/resolve/" in r.text and "<form" in r.text
+    assert 'name="action" value="reject"' in r.text
+    assert 'name="action" value="dismiss"' in r.text
+    assert 'name="csrf"' in r.text
+    assert 'value="promote"' not in r.text, "promote must never be a web action"
+    assert "kb review promote" in r.text  # owner keeps the copyable CLI command

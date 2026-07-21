@@ -35,4 +35,41 @@
   </div>
 {% endfor %}
 {% endif %}
+
+{# A11-3 confined web-write forms — shown ONLY to a contributor with WRITE on this
+   item's project (can_write). A reader / read-only-grant principal sees neither.
+   supersede is a QUARANTINED proposal (owner promote applies the real supersession);
+   link creates a live edge. Both POST to the confined kbweb.views_write routes. #}
+{% if can_write %}
+<h4>contribute</h4>
+<div class="item-grid">
+  <form method="post" action="/supersede/{{ item.item_id }}" class="card"
+        style="display:flex; flex-direction:column; gap:.5rem;">
+    <strong>Propose a correction (supersede)</strong>
+    <input type="hidden" name="csrf" value="{{ write_csrf }}">
+    <label class="f">new body
+      <textarea name="new_body" rows="5" required placeholder="Markdown; raw HTML is escaped."></textarea>
+    </label>
+    <label class="f">reason
+      <input type="text" name="reason" placeholder="why this replaces the current item">
+    </label>
+    <div><button type="submit">Propose for review</button></div>
+    <span class="prov">Held unverified + quarantined; the original stays active until an owner promotes.</span>
+  </form>
+  <form method="post" action="/link/{{ item.item_id }}" class="card"
+        style="display:flex; flex-direction:column; gap:.5rem;">
+    <strong>Link to another item</strong>
+    <input type="hidden" name="csrf" value="{{ write_csrf }}">
+    <label class="f">relation
+      <select name="rel" required>
+        {% for rel in relations %}<option value="{{ rel }}">{{ rel }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="f">target item id
+      <input type="number" name="dst_id" min="1" required>
+    </label>
+    <div><button type="submit">Create link</button></div>
+  </form>
+</div>
+{% endif %}
 {% endblock %}

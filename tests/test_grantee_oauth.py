@@ -131,7 +131,7 @@ def app(world, monkeypatch):
 
 def _google_signin(app, monkeypatch, email: str):
     """Drive the real /auth/google flow with only the code exchange mocked."""
-    client = TestClient(app)
+    client = TestClient(app, base_url="https://testserver")
     monkeypatch.setattr(auth, "exchange_google_code", lambda code: email)
     r = client.get("/auth/google/login", follow_redirects=False)
     state = parse_qs(urlsplit(r.headers["location"]).query)["state"][0]

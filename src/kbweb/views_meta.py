@@ -1,12 +1,15 @@
-"""kbweb.views_meta — projects, dashboard, review viewer (read-only, Inv. 11).
+"""kbweb.views_meta — projects, dashboard, review cockpit (Inv. 11, amended A11-3).
 
-``list_open_review`` is a pure read (the review WRITE functions — promote,
-reject, resolve_via_supersede — are never imported here; the per-module
-write-name test enforces it).
+``list_open_review`` is a pure read. This module imports NO kbcore knowledge-write
+function (the per-module write-name test enforces it); the /review cockpit's
+reject/dismiss buttons POST to the CONFINED kbweb.views_write routes, whose caps
+and CSRF context come from :func:`views_write.review_resolve_ctx` (rendering, not
+mutation). The detail-JSONB scrub for non-owner reviewers lives in kbcore.review.
 """
 
 from __future__ import annotations
 
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
@@ -18,7 +21,7 @@ from kbcore.errors import NotFound
 from kbcore.items import list_projects, timeline
 from kbcore.review import list_open_review
 from kbcore.stats import stats, usage_stats
-from kbweb import views_admin_invite
+from kbweb import views_admin_invite, views_write
 from kbweb.charts import bar_rows, stacked_segments, trend_rows
 from kbweb.ui import templates
 
@@ -80,12 +83,22 @@ def stats_view(request: Request) -> Response:  # GET /stats — the dashboard
     )
 
 
-def review_view(request: Request) -> Response:  # GET /review — list only, no actions
-    # Owner-only (per-project sharing v1): review_queue.detail JSONB can carry
-    # cross-project titles/ids that the row-level scope gate does not cover, so a
-    # grantee must not see the review queue at all.
-    scope.require_owner("the review queue")
-    return templates.TemplateResponse(request, "review.html", {"entries": list_open_review()})
+def review_view(request: Request) -> Response:  # GET /review — cockpit (list + resolve buttons)
+    # A11-3 deliverable 4: no longer owner-only. The review_queue.detail JSONB scrub
+    # landed in kbcore.review.list_open_review (an allowlist projection that drops
+    # cross-project titles/ids for non-owners), so a reviewer may list its granted
+    # rows safely. CAP_REVIEW_READ gates the zone (SessionAuthMiddleware); this is
+    # the byte-404 layer-2 backstop (the views_export/_owner_or_404 pattern).
+    try:
+        if not scope.current().has_cap(scope.CAP_REVIEW_READ):
+            raise HTTPException(status_code=404)
+    except RuntimeError:  # unset principal under server mode — never assume owner
+        raise HTTPException(status_code=404) from None
+    return templates.TemplateResponse(
+        request,
+        "review.html",
+        {"entries": list_open_review(), **views_write.review_resolve_ctx(request)},
+    )
 
 
 def setup_view(request: Request) -> Response:  # GET /setup — connect a target machine

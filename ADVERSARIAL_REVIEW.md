@@ -145,3 +145,71 @@ path, and principal revoke / rotate / expiry stay CLI-only. Non-owners still get
 byte-identical unknown-path 404 for the whole `/admin*` subtree; the create form's inputs are
 validated server-side (slug name, RFC-lite email that rejects header-injection material, bounded
 note). Review pending.
+
+---
+
+## Amendment A11-3 — confined, capability-gated web KNOWLEDGE writes (2026-07-21)
+
+**Decision (owner, Branch B of `WEBUI_TIERED_ACCESS_PLAN`).** Invariant 11 is amended a third time:
+the web may now perform **capability-gated, project-scoped, review-gated KNOWLEDGE writes** — not
+just authz config. A prior full adversarial DESIGN review (`A11-3_WRITE_FORK_REVIEW.md`, 26
+findings) judged the naive fork UNSAFE and required the guarantees to move into **kbcore
+chokepoints** (Inv. 2) so no surface can bypass them. This amendment records the confined design
+that resulted and that every finding is addressed.
+
+**The confined design.** kbweb's only knowledge-write module is `kbweb.views_write`, importing
+EXACTLY `{web_write.save_for_review, web_write.supersede_for_review, graph.link, review.reject,
+review.dismiss}` — enforced by a **confined-write allowlist** test (importing `promote`, raw
+`ingest`, or raw `supersede` into any kbweb module fails CI). Four routes, each its own top-level
+zone so the Layer-1 byte-404 wall gates it at its WRITE capability BEFORE routing (finding 22):
+`POST /save` and `POST /supersede/{id}` (CAP_SAVE), `POST /link/{id}` (CAP_SAVE),
+`POST /resolve/{qid}` (CAP_REVIEW_RESOLVE, action ∈ {reject, dismiss} only). The web layer adds
+ONLY four things; every trust/authz guarantee already lives in kbcore.
+
+**The guarantees (all in kbcore — WP-1/WP-2a).**
+- *Forced unverified + quarantine (findings 4-8, 11, 21).* A non-owner web save lands
+  `trust='unverified'` **and** `status='pending'` — absent from the default search set — plus a
+  `'web_contribution'` review row, ATOMICALLY (`web_write.save_for_review`). `ingest_in` coerces
+  `trust='unverified'` for any non-owner at the single write point, so no surface (web, MCP, future)
+  can mint verified as a grantee. A poisoned "decision" is therefore **not** an indirect
+  prompt-injection channel: it never reaches `kb_search` until an OWNER promotes.
+- *Owner-only promote / SoD (findings 3, 9, 15).* `review.promote` calls `require_owner` at the
+  kbcore chokepoint; the trust escalation `unverified→verified` (and `pending→active`) is owner-only
+  and is NOT imported into kbweb — so the self-verification laundering loop
+  (save-unverified → self-promote) is structurally impossible. A web `promote` action maps to the
+  uniform 400 for an unknown action.
+- *Supersede is a PROPOSAL, not an act (findings 4, 5, 8, 10).* `web_write.supersede_for_review`
+  parks the REPLACEMENT as pending+unverified+queued and leaves the OLD item ACTIVE; the real
+  supersession is applied only at owner promote — a contributor can never hide verified knowledge
+  behind an invisible pending item.
+- *Walled resolve (findings 1, 2, 12, 14, 17, 20).* `review.reject`/`dismiss` carry
+  `require_cap(CAP_REVIEW_RESOLVE)` + readable-then-writable project walls; a non-owner may reject
+  only an `unverified`-source item; a withheld/missing/sentinel queue id all raise the
+  byte-identical `NotFound`.
+- *Link both-endpoints-writable (finding 18).* `graph.link` now requires WRITE on dst as well as
+  src (a read-only-dst grantee can no longer write inbound edges); documented: grantee links are
+  immediately live (no review analog).
+- *Detail-JSONB scrub (findings 12, 26; plan §3 reviewer precondition).* `review.list_open_review`
+  projects `detail` to an allowlist for non-owners — cross-project titles are dropped and every
+  id-reference must pass `readable_item_ids` — so MCP `kb_review_list` and the web /review cockpit
+  both inherit the wall. This unblocks the reviewer role: `ROLE_CAPS['reviewer']` now carries
+  CAP_REVIEW_READ + CAP_REVIEW_RESOLVE (a drift-pin test keeps those caps out of every other bundle).
+
+**What the web layer adds (findings 7, 13, 17, 19, 20, 22, 23, 25, 26).** (1) Capability zone walls
+(byte-identical unknown-path 404 for the under-capped, before routing). (2) A CSRF token bound to
+the LIVE cookie identity (`request.state.identity`, 'owner'/'g:<name>') — never reconstructed,
+never the owner-identity constant (a grep trip-wire pins that), so grantee A's token authorizes
+neither B nor the owner. (3) A closed request shape (`WebSaveRequest`, `extra='forbid'`) — a forged
+`trust`/`kind`/`uri`/`status` field is a uniform 400, never a silent smuggle. (4) A UNIFORM
+error contract — kbcore `NotFound` → the byte-identical unknown-path 404 (missing vs withheld
+indistinguishable); `InvalidOperation` → a CONSTANT rejection that never echoes the project name.
+Plus cookie hardening (`__Host-`-prefixed `Secure` session/OAuth-state cookies) and an HSTS header
+on every response, and a mechanical stored-XSS template lint (no `| safe`/`Markup(`; bodies render
+via the autoescaping `| markdown` filter).
+
+**Why this is tolerable on the NDA-fronting public surface.** The most phishable surface still
+cannot reach the `verified` tier or de-quarantine: an XSS bug, a stolen grantee cookie, or a
+middleware regression can now *propose* knowledge, but that knowledge is quarantined from every
+agent session until the owner reviews it — trust escalation remains a deliberate owner act. Scope is
+frozen to the five imports + four routes above; any further mutating web route or write import
+re-opens this review. Review pending.

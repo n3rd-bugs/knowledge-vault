@@ -9,14 +9,19 @@ from starlette.routing import Route
 from kbcore.browse import item_refs
 from kbcore.graph import similar, trace
 from kbcore.items import get_item, list_projects, timeline
+from kbweb import views_write
 from kbweb.ui import int_param, str_param, templates
 
 
 def item_view(request: Request) -> Response:  # GET /item/{item_id}
     item = get_item(int(request.path_params["item_id"]))
     other_ids = {r.dst_id if r.direction == "out" else r.src_id for r in item.relations}
+    # A11-3: the caps-gated supersede + link forms (context only — the mutation is
+    # confined to kbweb.views_write; a reader / no-write-grant principal sees neither).
     return templates.TemplateResponse(
-        request, "item.html", {"item": item, "refs": item_refs(other_ids)}
+        request,
+        "item.html",
+        {"item": item, "refs": item_refs(other_ids), **views_write.item_write_ctx(request, item)},
     )
 
 

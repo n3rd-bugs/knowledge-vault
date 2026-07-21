@@ -2,8 +2,14 @@
 {% block title %}Review queue · Knowledge Vault{% endblock %}
 {% block content %}
 <h2>Review queue</h2>
+{% if can_resolve %}
+<p class="prov">Reject or dismiss entries below. <strong>Promotion (trust escalation) stays
+  owner-only</strong> — there is no web promote. Reject archives an unverified item;
+  dismiss closes the row untouched. Both need a write grant on the item's project.</p>
+{% else %}
 <p class="prov">Read-only view. Resolve entries with the <span class="mono">kb review</span> CLI
   or the <span class="mono">kb_review_resolve</span> MCP tool.</p>
+{% endif %}
 
 {% if not entries %}<p>Nothing awaiting review. ✨</p>{% endif %}
 {% for e in entries %}
@@ -82,14 +88,26 @@
     {% if e.detail.epsilon is defined %}<dt>epsilon</dt><dd>{{ e.detail.epsilon }}</dd>{% endif %}
   </dl>
   {% endif %}
-  {# Copyable OWNER commands — the resolution itself stays on the CLI/MCP
-     surface (Invariant 11: no web mutation, no resolve button until Phase 4). #}
+  {# A11-3 confined resolve controls (reviewer+ with a write grant). reject/dismiss
+     only — promote is owner-only in kbcore and is NOT a web action. Each POSTs to
+     /resolve/{qid} with the live-identity CSRF token. Owners also keep the copyable
+     CLI commands (promote lives there). #}
+  {% if can_resolve %}
+  <form method="post" action="/resolve/{{ e.queue_id }}" style="display:inline; margin:.3rem 0 0">
+    <input type="hidden" name="csrf" value="{{ resolve_csrf }}">
+    {% if e.item_id %}<button type="submit" name="action" value="reject">reject</button>{% endif %}
+    <button type="submit" name="action" value="dismiss">dismiss</button>
+  </form>
+  {% endif %}
+  {# Copyable OWNER commands — promote (trust escalation) is CLI/MCP-only. #}
+  {% if is_owner %}
   <p class="prov" style="margin:.3rem 0 0">resolve via CLI:
     {% if e.item_id %}<span class="mono">kb review promote {{ e.queue_id }}</span>
     · <span class="mono">kb review reject {{ e.queue_id }}</span>
     · {% endif %}<span class="mono">kb review dismiss {{ e.queue_id }}</span>
     {%- if e.detail.triage %} · <span class="mono">kb review apply-triage --ids {{ e.queue_id }}</span>{% endif %}
     {%- if e.detail.suggested_resolution %} · <span class="mono">kb review apply {{ e.queue_id }}</span>{% endif %}</p>
+  {% endif %}
 </div>
 {% endfor %}
 {% endblock %}

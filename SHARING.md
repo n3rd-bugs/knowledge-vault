@@ -25,8 +25,38 @@ Hostnames below are placeholders — substitute your own deployment:
   projects exist (the "no-oracle" wall in `kbcore.scope`).
 - **Read-only by default.** A grant confers read access. A per-project `--rw`
   flag exists for the rare case a grantee should write to that one project
-  (write implies read); leave it off unless you have a concrete reason. The web
-  UI is read-only for everyone, owner included, regardless of grants.
+  (write implies read); leave it off unless you have a concrete reason.
+- **Capability roles gate FEATURES; grants gate ROWS (they AND).** Each grantee
+  has a `role` (`guest` < `reader` < `contributor` < `reviewer`) whose capability
+  bundle decides which features it may use at all — search, browse, **save**,
+  **review-resolve** — while grants keep deciding which projects it may touch.
+  Default `reader` is today's read-only surface. `contributor` adds web/MCP
+  **save** (ANDed with an `--rw` grant); `reviewer` adds listing and
+  reject/dismiss of the review queue. Set with `kb principal create --role ...`
+  or `kb principal role <name> <role>` (role change is CLI-only). The web UI is
+  read-only for `guest`/`reader`; contributors/reviewers get the confined write
+  surface below — but **trust escalation (promote) is always owner-only**.
+
+### Web contributions (A11-3) and the pending-review lifecycle
+
+A `contributor`/`reviewer` (or the owner) can write from the browser, but a
+non-owner web write is **capability-gated, project-scoped, forced
+`trust='unverified'`, and quarantined from retrieval until you promote it**:
+
+- **Contribute** (`/save`, and the supersede/link forms on `/item/{id}`) — a save
+  lands the item `status='pending'` + `unverified` with a `web_contribution`
+  review row, in one transaction. It is **absent from every `kb_search`** (owner
+  and grantee) until you promote — so a web contribution can never inject
+  content into an agent session before you have seen it. A web *supersede* is a
+  PROPOSAL: the original stays active until you promote the replacement.
+- **Review** (`/review`, reviewer+) — reject archives an unverified item; dismiss
+  closes the row untouched. Both need an `--rw` grant on the item's project.
+  There is **no web promote** — promoting a contribution to `verified`/`active`
+  stays CLI/MCP-only (`kb review promote <qid>`, owner). A reviewer's queue shows
+  only its granted rows, with cross-project titles/ids scrubbed from the detail.
+
+The web can never mint verified knowledge nor de-quarantine one; a stolen grantee
+cookie can at most *propose* content that waits for your review.
 
 ## 2. Two credential kinds — which one, for what
 
@@ -168,8 +198,13 @@ kb principal ungrant alice acme-infra   # remove one project, keep the rest
 
 ## 6. Security notes
 
-- **Read-only web UI.** The web app imports zero write functions; no grant can
-  make the browser a write surface.
+- **Confined web writes (A11-3).** The web's only knowledge-write module is
+  `kbweb.views_write`, importing exactly five composed kbcore chokepoints
+  (save-for-review, supersede-for-review, link, reject, dismiss) — never raw
+  ingest/supersede, never promote (a mechanical allowlist test enforces this).
+  A non-owner web write is forced `unverified` + quarantined until you promote,
+  so the browser can never mint verified knowledge nor reach an agent's search
+  before review. `guest`/`reader` grantees remain fully read-only.
 - **No-oracle guarantee.** A grantee probing a withheld project gets responses
   byte-identical to a nonexistent one — no revoked-vs-unknown, no
   granted-vs-hidden distinction, on any surface. Unknown and revoked bearer

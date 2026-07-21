@@ -40,7 +40,7 @@ def app(kb, monkeypatch):
 
 @pytest.fixture()
 def owner(app):
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": TEST_TOKEN}).status_code == 200
     return c
 
@@ -49,7 +49,7 @@ def _grantee_client(app, name: str = "mallory", projects: tuple[str, ...] = ()) 
     _pid, token = principals.create_principal(name, kind="token")
     for p in projects:
         principals.grant(name, p, rw=False)
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": token}).status_code == 200
     return c
 
@@ -272,7 +272,7 @@ def test_invite_degrades_to_placeholder_without_public_urls(kb, monkeypatch):
     from kbweb.server import build_app
 
     principals.create_principal("alice", kind="google", email="alice@client.example")
-    c = TestClient(build_app())
+    c = TestClient(build_app(), base_url="https://testserver")
     assert c.post("/login", data={"token": TEST_TOKEN}).status_code == 200
     r = c.get("/admin")
     assert r.status_code == 200 and "KB_PUBLIC_URL" in r.text
@@ -306,7 +306,7 @@ def test_welcome_google_grantee_via_oauth_identity(app):
     principals.grant("g-dev", "shared", rw=False)
     from kbweb import auth
 
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     c.cookies.set(auth.COOKIE, auth.issue_cookie(auth.grantee_identity("g-dev")))
     r = c.get("/welcome")
     assert r.status_code == 200 and "g-dev" in r.text and "shared" in r.text
@@ -320,5 +320,5 @@ def test_welcome_owner_renders_everything_visible_note(owner):
 
 
 def test_welcome_anonymous_redirects_to_login(app):
-    r = TestClient(app).get("/welcome", follow_redirects=False)
+    r = TestClient(app, base_url="https://testserver").get("/welcome", follow_redirects=False)
     assert r.status_code == 302 and r.headers["location"] == "/login"

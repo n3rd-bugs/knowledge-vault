@@ -22,12 +22,17 @@ from kbcore.config import settings
 
 log = logging.getLogger("kbweb.auth")
 
-COOKIE = "kb_session"
+# __Host- prefix (A11-3 finding 23 / deliverable 6): the browser itself then
+# ENFORCES Secure + Path=/ + no Domain on the write-authorizing session cookie, so
+# it can never be set over http nor scoped to a sibling host. The set_cookie/
+# delete_cookie call sites in kbweb.server pass secure=True to match; the old
+# unprefixed names fail to parse and force one clean re-login (no downgrade).
+COOKIE = "__Host-kb_session"
 _SALT = "kbweb-session"
 MAX_AGE = 60 * 60 * 12  # 12 hours
 
 # --- Google OAuth (additional sign-in path, gated by an email allowlist) ------
-STATE_COOKIE = "kb_oauth_state"
+STATE_COOKIE = "__Host-kb_oauth_state"
 _STATE_SALT = "kbweb-oauth-state"
 STATE_MAX_AGE = 600  # 10 minutes — the login→callback round trip is short
 _HTTP_TIMEOUT = httpx.Timeout(10.0, connect=5.0)  # short: no long-poll here

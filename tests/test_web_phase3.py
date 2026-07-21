@@ -67,13 +67,13 @@ def _client(app, role: str, name: str, projects: tuple[str, ...] = ()) -> TestCl
     _pid, token = principals.create_principal(name, kind="token", role=role)
     for p in projects:
         principals.grant(name, p, rw=False)
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": token}).status_code == 200
     return c
 
 
 def _owner(app) -> TestClient:
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": TEST_TOKEN}).status_code == 200
     return c
 
@@ -224,7 +224,7 @@ def test_export_ghost_without_cap_and_no_link(app, world):
         c = _client(app, role, f"exp-{role}", projects=("proj-a",))
         assert_ghost_identical(c, "/export.csv")
         assert_ghost_identical(c, "/export.json?q=spi")
-    anon = TestClient(app)
+    anon = TestClient(app, base_url="https://testserver")
     assert_ghost_identical(anon, "/export.csv")  # pre-auth parity: same login bounce
     o = _owner(app)
     results = o.get("/", params={"q": "SPI mode 1"}).text
@@ -347,11 +347,15 @@ def test_review_renders_triage_enumerated_never_raw_detail(app, world):
     assert "rejected_count" in page.text
     assert "NDA-SECRET-TITLE" not in page.text, "raw detail dump leaked an unenumerated value"
     assert "smuggled_cross_title" not in page.text, "raw detail dump leaked an unenumerated key"
-    # Copyable owner commands (resolution stays CLI/MCP — no web mutation).
+    # Owner keeps the copyable CLI commands (promote/trust escalation is CLI-only).
     assert f"kb review promote {qid}" in page.text
     assert f"kb review reject {qid}" in page.text
     assert f"kb review apply-triage --ids {qid}" in page.text
-    assert "<form" not in page.text, "the review viewer must stay control-free"
+    # A11-3: the cockpit now carries the confined reject/dismiss form for a
+    # resolve-capable principal (owner here) — but NEVER a web promote control.
+    assert f'action="/resolve/{qid}"' in page.text
+    assert 'name="action" value="reject"' in page.text
+    assert 'value="promote"' not in page.text, "promote must never be a web action"
 
 
 def test_review_contradiction_renders_evidence_and_apply_command(app, world):

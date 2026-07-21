@@ -261,7 +261,7 @@ def test_web_review_shows_evidence_block(kb, monkeypatch):
     )
     from kbweb.server import build_app
 
-    client = TestClient(build_app())
+    client = TestClient(build_app(), base_url="https://testserver")
     client.post("/login", data={"token": token})
     r = client.get("/review")
     assert r.status_code == 200
@@ -567,7 +567,7 @@ def test_web_review_shows_suggestion_block(kb, monkeypatch):
     )
     from kbweb.server import build_app
 
-    client = TestClient(build_app())
+    client = TestClient(build_app(), base_url="https://testserver")
     client.post("/login", data={"token": token})
     r = client.get("/review")
     assert r.status_code == 200

@@ -51,13 +51,32 @@ def test_role_caps_bundles_pinned():
     assert "owner" not in scope.ROLE_CAPS, "owner is credential-derived, never a role"
 
 
-def test_reviewer_excludes_review_caps_until_detail_scrub():
-    """HARD precondition (plan §3): review caps stay out of the reviewer bundle
-    until the review_queue.detail JSONB scrub lands (Phase 4) — flipping this
-    line without the scrub would leak cross-project titles/ids."""
-    assert scope.CAP_REVIEW_READ not in scope.ROLE_CAPS["reviewer"]
-    assert scope.CAP_REVIEW_RESOLVE not in scope.ROLE_CAPS["reviewer"]
-    assert scope.ROLE_CAPS["reviewer"] == scope.ROLE_CAPS["contributor"]
+def test_reviewer_bundle_now_carries_review_caps():
+    """A11-3 (2026-07-21): the review_queue.detail JSONB scrub landed in
+    kbcore.review.list_open_review, so the reviewer bundle now carries BOTH review
+    caps — a reviewer may list + reject/dismiss. Trust escalation (promote) stays
+    owner-only in kbcore.review, so CAP_REVIEW_RESOLVE never reaches 'verified'."""
+    assert scope.CAP_REVIEW_READ in scope.ROLE_CAPS["reviewer"]
+    assert scope.CAP_REVIEW_RESOLVE in scope.ROLE_CAPS["reviewer"]
+    assert scope.ROLE_CAPS["reviewer"] == frozenset(
+        {
+            scope.CAP_SEARCH,
+            scope.CAP_BROWSE,
+            scope.CAP_SAVE,
+            scope.CAP_REVIEW_READ,
+            scope.CAP_REVIEW_RESOLVE,
+        }
+    )
+
+
+def test_only_reviewer_bundle_holds_the_review_caps():
+    """Drift-pin (A11-3 finding 2): no OTHER role bundle may carry the review caps —
+    a future bundle edit cannot silently widen the trust-adjacent resolve surface."""
+    for role, caps in scope.ROLE_CAPS.items():
+        if role == "reviewer":
+            continue
+        assert scope.CAP_REVIEW_READ not in caps, f"{role} leaked CAP_REVIEW_READ"
+        assert scope.CAP_REVIEW_RESOLVE not in caps, f"{role} leaked CAP_REVIEW_RESOLVE"
 
 
 def test_no_bundle_grants_deep_search():
@@ -302,13 +321,13 @@ def _client(app, role: str | None, name: str, projects: tuple[str, ...] = ()) ->
     _pid, token = principals.create_principal(name, kind="token", **kwargs)
     for p in projects:
         principals.grant(name, p, rw=False)
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": token}).status_code == 200
     return c
 
 
 def _owner(app) -> TestClient:
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     assert c.post("/login", data={"token": TEST_TOKEN}).status_code == 200
     return c
 
@@ -356,7 +375,7 @@ def test_ghost_matrix_guest_and_reader_all_methods(app, world):
 def test_walled_zones_pre_auth_parity(app):
     """Anonymous probes: walled zones and the ghost bounce identically to /login
     (first-hop Location included) — no pre-auth feature oracle either."""
-    c = TestClient(app)
+    c = TestClient(app, base_url="https://testserver")
     for path in ("/review", "/setup", "/timeline", "/stats"):
         assert_ghost_identical(c, path)
 

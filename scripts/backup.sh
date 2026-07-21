@@ -27,7 +27,7 @@ fi
 # line-by-line, split on the FIRST '=', accept ONLY the four known keys, and
 # RE-VALIDATE each value (identical to kbcore.offsite_config.write_config), so no
 # newline/metachar/extra-var can ever execute or set anything unexpected.
-KB_OFFSITE_CONF="${KB_OFFSITE_CONF:-${HOME}/kb/offsite.env}"
+KB_OFFSITE_CONF="${KB_OFFSITE_CONF:-${HOME}/kb/webconf/offsite.env}"
 KB_OFFSITE_CONF="${KB_OFFSITE_CONF/#\~/${HOME}}"
 if [[ -f "${KB_OFFSITE_CONF}" ]]; then
   while IFS='=' read -r _k _v; do

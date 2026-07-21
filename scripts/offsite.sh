@@ -36,7 +36,7 @@ fi
 # Overlay the WEB-WRITTEN offsite config by strict ALLOWLIST PARSE — never
 # `source` it (2026-07-21 security review): only the four known keys, each
 # re-validated, so a kb-web-writable file can never inject an executable line.
-KB_OFFSITE_CONF="${KB_OFFSITE_CONF:-${HOME}/kb/offsite.env}"
+KB_OFFSITE_CONF="${KB_OFFSITE_CONF:-${HOME}/kb/webconf/offsite.env}"
 KB_OFFSITE_CONF="${KB_OFFSITE_CONF/#\~/${HOME}}"
 if [[ -f "${KB_OFFSITE_CONF}" ]]; then
   while IFS='=' read -r _k _v; do
@@ -49,7 +49,7 @@ if [[ -f "${KB_OFFSITE_CONF}" ]]; then
   done < "${KB_OFFSITE_CONF}"
 fi
 # Point rclone at the web-written credential dir (bind-mounted; kb-web wrote it).
-KB_RCLONE_CONF_DIR="${KB_RCLONE_CONF_DIR:-${HOME}/kb/rclone}"
+KB_RCLONE_CONF_DIR="${KB_RCLONE_CONF_DIR:-${HOME}/kb/webconf/rclone}"
 KB_RCLONE_CONF_DIR="${KB_RCLONE_CONF_DIR/#\~/${HOME}}"
 if [[ -f "${KB_RCLONE_CONF_DIR}/rclone.conf" ]]; then
   export RCLONE_CONFIG="${KB_RCLONE_CONF_DIR}/rclone.conf"

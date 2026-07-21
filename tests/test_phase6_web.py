@@ -132,6 +132,12 @@ def test_web_item_missing_is_404(client):
 # creation). Adding ANY other path here requires re-opening the review.
 ADMIN_MUTATING_ROUTES = {"/admin/grant", "/admin/revoke", "/admin/principal"}
 
+# Owner-only web backup-setup surface (owner decision 2026-07-21): mutating but
+# HOST-CONFIG, never knowledge — these write the offsite conf file + the
+# write-only rclone credential (kbcore.offsite_config), touching NO
+# items/sources/relations/review state. Owner-gated exactly like /admin.
+BACKUP_CONFIG_ROUTES = {"/backups/config", "/backups/keygen", "/backups/rclone"}
+
 
 def test_web_no_knowledge_mutation(web_app):
     # A11-3: the confined web-write routes are the EXACTLY four permitted mutating
@@ -143,9 +149,10 @@ def test_web_no_knowledge_mutation(web_app):
     assert write_routes == {"/save", "/supersede/{id:int}", "/link/{id:int}", "/resolve/{qid:int}"}
 
     # (1) every route is GET-only except /login (auth), the owner-only authz
-    #     allowlist, and the A11-3 confined write routes; nothing anywhere allows
-    #     PUT/DELETE/PATCH. The /static Mount has no .methods — StaticFiles is GET/HEAD.
-    post_ok = {"/login"} | ADMIN_MUTATING_ROUTES | write_routes
+    #     allowlist, the owner-only backup-config surface, and the A11-3 confined
+    #     write routes; nothing anywhere allows PUT/DELETE/PATCH. The /static Mount
+    #     has no .methods — StaticFiles is GET/HEAD.
+    post_ok = {"/login"} | ADMIN_MUTATING_ROUTES | BACKUP_CONFIG_ROUTES | write_routes
     for route in web_app.routes:
         methods = set(getattr(route, "methods", None) or ())
         assert not (methods & {"PUT", "DELETE", "PATCH"}), f"{route.path} exposes a mutation verb"

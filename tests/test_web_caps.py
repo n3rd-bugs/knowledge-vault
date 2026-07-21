@@ -210,6 +210,21 @@ WRITE_ALLOWLIST = {
     "review.dismiss",
 }
 
+# OWNER-CONFIG ALLOWLIST (owner web backup-setup surface, 2026-07-21): the
+# offsite-backup HOST-CONFIG chokepoints kbweb.views_backup composes. These are
+# NOT knowledge writes — they touch NO items/sources/relations/review state, only
+# the dedicated offsite conf file + the write-only rclone credential — so the
+# no-knowledge-mutation guard (test_phase6_web) stays green. They are owner-only
+# (ROUTE_CAPS OWNER_ONLY + _owner_or_404 + CSRF), the exact structural parallel to
+# the views_admin authz carve-out. Kept separate from READ/WRITE so a knowledge
+# write can never hide here: none of these is in WRITE_NAMES.
+OWNER_CONFIG_ALLOWLIST = {
+    "offsite_config.read_status",
+    "offsite_config.write_config",
+    "offsite_config.generate_age_keypair",
+    "offsite_config.store_rclone_cred",
+}
+
 # The single module allowed to hold WRITE_ALLOWLIST symbols (all others: read-only).
 _CONFINED_WRITE_FILE = "views_write.py"
 
@@ -265,7 +280,7 @@ def test_every_kbweb_kbcore_import_is_allowlisted():
     per_file = _kbweb_kbcore_symbols()
     assert per_file, "discovery walked zero kbweb modules — harness broken, not clean"
     for fname, syms in sorted(per_file.items()):
-        unknown = sorted(syms - READ_ALLOWLIST - WRITE_ALLOWLIST)
+        unknown = sorted(syms - READ_ALLOWLIST - WRITE_ALLOWLIST - OWNER_CONFIG_ALLOWLIST)
         assert not unknown, f"{fname}: {unknown} — {_TRIPWIRE_MSG}"
 
 
@@ -298,7 +313,7 @@ def test_allowlist_is_exactly_todays_surface():
     """No stale entries either: a symbol kbweb stopped using must LEAVE the
     allowlist, or it silently pre-authorizes a future re-import."""
     used = set().union(*_kbweb_kbcore_symbols().values())
-    stale = sorted((READ_ALLOWLIST | WRITE_ALLOWLIST) - used)
+    stale = sorted((READ_ALLOWLIST | WRITE_ALLOWLIST | OWNER_CONFIG_ALLOWLIST) - used)
     assert not stale, f"allowlist entries no longer used by kbweb — prune them: {stale}"
 
 

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Save your age private key · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Age keypair generated</h2>
+
+<div class="card" style="border:2px solid var(--bad)">
+  <h3 style="margin:.1rem 0 .3rem; color:var(--bad)">⚠ Save the PRIVATE key now — it is shown ONCE and never stored</h3>
+  <p class="prov">This private key is displayed a single time on this page. The Knowledge Vault
+    does <strong>not</strong> store it and cannot show it again. Copy it to a safe location on a
+    DIFFERENT machine (a workstation or a USB stick) — it is required only to <strong>restore</strong>
+    an encrypted backup. If you lose it, existing <span class="mono">*.age</span> backups become
+    permanently undecryptable.</p>
+  <p style="margin:.2rem 0 .1rem"><strong>Private identity (save this):</strong></p>
+  <pre class="hl"><code>{{ identity }}</code></pre>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Public recipient (already stored as the encryption target)</h3>
+  <p class="prov">The public recipient below has been saved to the offsite config as the age
+    encryption recipient — it is not a secret. Nothing more to do with it.</p>
+  <pre class="hl"><code>{{ recipient }}</code></pre>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Where to put the private key</h3>
+  <ol class="steps">
+    <li>On a machine that is <em>not</em> this server, save it to a file, mode 0600:
+      <pre class="hl">umask 077
+cat &gt; ~/kb-age.key   # paste the AGE-SECRET-KEY-… line above, then Ctrl-D</pre></li>
+    <li>Point restore drills at it via <span class="mono">KB_AGE_IDENTITY=/path/to/kb-age.key</span>
+      when you run <span class="mono">restore_test.sh --offsite</span>.</li>
+  </ol>
+  <p><a href="/backups">← back to backups</a></p>
+</div>
+{% endblock %}

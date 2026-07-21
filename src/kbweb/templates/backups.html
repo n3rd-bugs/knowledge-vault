@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Offsite backups · Knowledge Vault{% endblock %}
+{% block content %}
+<h2>Offsite backups</h2>
+<p class="prov">Owner-only host-config surface (owner override of the read-only web,
+  2026-07-21): encrypted offsite backups age-encrypt each dump <strong>locally</strong> and
+  upload <strong>only the ciphertext</strong> to your rclone remote. This page writes host
+  config to a dedicated file the backup scripts source — it never mutates knowledge.</p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<div class="card" style="border:2px solid var(--bad)">
+  <h3 style="margin:.1rem 0 .3rem; color:var(--bad)">⚠ What lives on this internet-facing box — read this</h3>
+  <ul style="margin:.3rem 0 .2rem 1.1rem; line-height:1.5">
+    <li><strong>The rclone credential DOES live here.</strong> It is needed to upload, so a
+      compromise of this box exposes it — the attacker could read/write your backup remote.
+      Prefer a <em>least-privilege service account</em> scoped to one Drive folder.</li>
+    <li><strong>The age PRIVATE key does NOT live here.</strong> Only the age <em>public</em>
+      recipient is stored; encryption is one-way on this box. Keep the private key OFF this
+      machine (a workstation / USB) — it is required only to <em>restore</em>.</li>
+    <li><strong>A box compromise exposes only ENCRYPTED backups.</strong> Without the off-box
+      private key the uploaded <span class="mono">*.age</span> ciphertext cannot be decrypted.</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Current status</h3>
+  <table class="endpoints">
+    <tr><td>Offsite</td><td><span class="badge {{ 'verified' if status.enabled else '' }}">{{ 'enabled' if status.enabled else 'disabled' }}</span></td></tr>
+    <tr><td>rclone remote</td><td><span class="mono">{{ status.rclone_remote or 'not set' }}</span></td></tr>
+    <tr><td>rclone credential</td><td>{% if status.rclone_cred_present %}<span class="mono">••• configured</span>{% else %}<span class="prov">not set</span>{% endif %}</td></tr>
+    <tr><td>age recipient (public)</td><td><span class="mono">{{ status.age_recipient or 'not set' }}</span></td></tr>
+    <tr><td>keep (newest N)</td><td>{{ status.keep }}</td></tr>
+    <tr><td>local dumps</td><td>{{ status.backup_count }}{% if status.last_local_backup %} · newest <span class="mono">{{ status.last_local_backup.name }}</span> ({{ '%.1f' | format(status.last_local_backup.size / 1048576) }} MB, {{ status.last_local_backup.mtime.strftime('%Y-%m-%d %H:%M UTC') }}){% endif %}</td></tr>
+    <tr><td>raw archive</td><td>{% if status.last_raw_archive %}<span class="mono">{{ status.last_raw_archive.name }}</span> ({{ status.last_raw_archive.mtime.strftime('%Y-%m-%d %H:%M UTC') }}){% else %}<span class="prov">none</span>{% endif %}</td></tr>
+  </table>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Backup settings</h3>
+  <form method="post" action="/backups/config">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <div style="margin:.4rem 0">
+      <label><input type="checkbox" name="enabled" value="on" {{ 'checked' if status.enabled else '' }}> enable offsite push</label>
+    </div>
+    <div style="margin:.4rem 0">
+      <label>rclone remote:path<br>
+        <input type="text" name="rclone_remote" value="{{ status.rclone_remote }}" placeholder="gdrive:kb-backups" style="min-width:22rem"></label>
+    </div>
+    <div style="margin:.4rem 0">
+      <label>age recipient (public key)<br>
+        <input type="text" name="age_recipient" value="{{ status.age_recipient }}" placeholder="age1… (or use ‘generate keypair’ below)" style="min-width:30rem"></label>
+    </div>
+    <div style="margin:.4rem 0">
+      <label>keep newest N offsite<br>
+        <input type="number" name="keep" value="{{ status.keep }}" min="1" max="365" style="width:6rem"></label>
+    </div>
+    <button type="submit">Save settings</button>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Generate an age keypair</h3>
+  <p class="prov">Generates a fresh keypair, stores the <strong>public</strong> recipient here, and
+    shows the <strong>private</strong> key <strong>once</strong> — it is never stored and never shown
+    again. Save it off this box immediately; you need it only to restore.</p>
+  <form method="post" action="/backups/keygen">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit">Generate keypair (shows private key once)</button>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">rclone credential</h3>
+  <p class="prov">Paste a Google service-account JSON <em>or</em> an <span class="mono">rclone.conf</span>
+    remote block (starting with <span class="mono">[remote]</span>). Stored write-only, mode 0600 —
+    it is never shown back to you. Replacing it overwrites the previous value.</p>
+  <form method="post" action="/backups/rclone">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <textarea name="rclone_cred" rows="6" style="width:100%" placeholder='{ "type": "service_account", … }   —or—   [gdrive]\ntype = drive\n…'></textarea>
+    <button type="submit">Store credential</button>
+  </form>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:.2rem">Host-side checklist (the one irreducible manual step)</h3>
+  <p class="prov">These run on the HOST, not here — the web cannot drive an OAuth browser
+    flow or write outside its bind-mounts:</p>
+  <ol class="steps">
+    <li><strong>If you are NOT using a service account</strong>, authorize rclone on the host once:
+      <pre class="hl">rclone config        # create the remote named above, complete the OAuth flow
+rclone lsd &lt;remote&gt;:  # smoke-test the remote is reachable</pre>
+      A service account pasted above needs no browser OAuth.</li>
+    <li><strong>Save the age private key OFF this box.</strong> After ‘generate keypair’, copy the
+      shown <span class="mono">AGE-SECRET-KEY-…</span> to a safe place on a DIFFERENT machine
+      (never commit it, never leave it here). Restore points <span class="mono">restore_test.sh
+      --offsite</span> at it via <span class="mono">KB_AGE_IDENTITY</span>.</li>
+    <li><strong>Enable + verify.</strong> Tick “enable offsite push”, save, then run a backup on the
+      host and confirm a <span class="mono">*.age</span> object lands on the remote:
+      <pre class="hl">make backup
+rclone lsf &lt;remote&gt;: | grep '\.age$'</pre></li>
+  </ol>
+</div>
+{% endblock %}

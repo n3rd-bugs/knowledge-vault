@@ -42,6 +42,7 @@ from kbmcp.server import _validate_runtime_config
 from kbweb import (
     auth,
     views_admin,
+    views_backup,
     views_export,
     views_items,
     views_jobs,
@@ -86,6 +87,10 @@ ROUTE_CAPS: dict[str, str] = {
     "/review": scope.CAP_REVIEW_READ,
     "/setup": OWNER_ONLY,  # renders the MASTER bearer — permanently owner-only
     "/admin": OWNER_ONLY,  # the Inv. 11 authz carve-out (same wall as before)
+    # Owner-only web backup-setup surface (owner decision 2026-07-21): an owner
+    # override of the read-only-web posture — writes HOST CONFIG (offsite backups),
+    # never knowledge. Same owner-only byte-404 wall as /admin.
+    "/backups": OWNER_ONLY,
     # Phase 3 (plan §5): worker jobs run under implicit OWNER scope and their
     # result JSONB carries whole-KB synthesis — owner-cap at launch.
     "/jobs": OWNER_ONLY,
@@ -297,6 +302,9 @@ ROUTES = [
     *views_write.ROUTES,
     # Owner-only authz-config carve-out (Inv. 11 amended) — authz, never knowledge.
     *views_admin.ROUTES,
+    # Owner-only backup-setup surface (owner decision 2026-07-21) — host config,
+    # never knowledge; secrets write-only, age private key shown once, never stored.
+    *views_backup.ROUTES,
 ]
 
 

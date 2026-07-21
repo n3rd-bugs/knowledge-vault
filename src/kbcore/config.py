@@ -205,6 +205,20 @@ class Settings(BaseSettings):
     # Path to an age IDENTITY (private key) file — needed only by
     # `restore_test.sh --offsite`; in production it lives off-box.
     kb_age_identity: str = ""
+    # --- Owner-only WEB backup-setup surface (owner decision 2026-07-21) --------
+    # The web /backups page (kbcore.offsite_config + kbweb.views_backup) writes
+    # offsite config to a DEDICATED file — NOT the main .env — as KEY=VALUE lines
+    # the host scripts (scripts/backup.sh + scripts/offsite.sh) can `source`. The
+    # conf file + the rclone-credential dir below are bind-mounted into kb-web
+    # ONLY (infra done by the main agent). The age PRIVATE key is never written to
+    # either: it is shown once by the web and stays OFF this box.
+    kb_offsite_conf: str = str(Path.home() / "kb" / "offsite.env")
+    # rclone credential store (a service-account JSON or an rclone.conf remote
+    # block), written WRITE-ONLY by store_rclone_cred; never read back by the web.
+    kb_rclone_conf_dir: str = str(Path.home() / "kb" / "rclone")
+    # age-keygen binary seam: a list-argv subprocess (never shell=True). Overridden
+    # in tests to a stub emitting a fixed keypair; prod default is the installed bin.
+    kb_age_bin: str = "age-keygen"
     kb_git_repos: str = ""
     kb_archive_after_days: int = 180
     kb_dup_threshold: float = 0.97

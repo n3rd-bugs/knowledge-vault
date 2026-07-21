@@ -21,6 +21,25 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 
+# Overlay the WEB-WRITTEN offsite config by strict ALLOWLIST PARSE — never
+# `source` it (2026-07-21 security review). kb-web bind-mounts this file and can
+# write it, so a malformed/injected line must be pure inert DATA here: we read
+# line-by-line, split on the FIRST '=', accept ONLY the four known keys, and
+# RE-VALIDATE each value (identical to kbcore.offsite_config.write_config), so no
+# newline/metachar/extra-var can ever execute or set anything unexpected.
+KB_OFFSITE_CONF="${KB_OFFSITE_CONF:-${HOME}/kb/offsite.env}"
+KB_OFFSITE_CONF="${KB_OFFSITE_CONF/#\~/${HOME}}"
+if [[ -f "${KB_OFFSITE_CONF}" ]]; then
+  while IFS='=' read -r _k _v; do
+    case "${_k}" in
+      KB_OFFSITE_ENABLED) [[ "${_v}" =~ ^(true|false|1|0|yes|no)$ ]] && KB_OFFSITE_ENABLED="${_v}" ;;
+      KB_RCLONE_REMOTE)   [[ "${_v}" =~ ^[A-Za-z0-9_-]{1,64}:[A-Za-z0-9._/-]*$ ]] && KB_RCLONE_REMOTE="${_v}" ;;
+      KB_AGE_RECIPIENT)   [[ "${_v}" =~ ^age1[0-9a-z]{58}$ ]] && KB_AGE_RECIPIENT="${_v}" ;;
+      KB_OFFSITE_KEEP)    [[ "${_v}" =~ ^[0-9]{1,3}$ ]] && KB_OFFSITE_KEEP="${_v}" ;;
+    esac
+  done < "${KB_OFFSITE_CONF}"
+fi
+
 KB_BACKUPS="${KB_BACKUPS:-${HOME}/kb/backups}"
 KB_BACKUPS="${KB_BACKUPS/#\~/${HOME}}"   # expand a leading ~
 mkdir -p "${KB_BACKUPS}"

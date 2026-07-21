@@ -126,6 +126,23 @@ services:
       # allowlist; the KB_TOKEN form login remains as an owner fallback.
       KB_WEB_PUBLIC_URL: "https://web.n3rd-bugs.dev"
       KB_WEB_ALLOWED_EMAILS: "mirzaon@gmail.com"
+      # Owner-only web backup-setup surface (A11-3 backup carve-out). The paths
+      # below are the CONTAINER side of the bind-mounts; the host backup scripts
+      # read the same files at ~/kb/{offsite.env,rclone,backups}. Mounted into
+      # kb-web ONLY (never kb-mcp-public) per the 2026-07-21 security review.
+      KB_OFFSITE_CONF: /config/offsite.env
+      KB_RCLONE_CONF_DIR: /config/rclone
+      KB_BACKUPS: /config/backups
+    volumes:
+      # RW: the web writes the non-secret offsite config + the rclone credential.
+      # The age PRIVATE key is NEVER stored here (generate_age_keypair shows it
+      # once and discards it), so a kb-web compromise yields only ENCRYPTED-backup
+      # Drive access, not decryptable data. The host SCRIPTS parse offsite.env
+      # with a strict allowlist (never `source` it) — review requirement.
+      - ${HOME}/kb/offsite.env:/config/offsite.env:rw
+      - ${HOME}/kb/rclone:/config/rclone:rw
+      # RO: status display only — the web never writes backups.
+      - ${HOME}/kb/backups:/config/backups:ro
     # Google sign-in makes outbound calls to oauth2.googleapis.com; kbnet's
     # embedded resolver can't reach the internet, so give it public DNS (same as
     # kb-cloudflared/kb-traefik). Without this the code exchange fails with

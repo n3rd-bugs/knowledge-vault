@@ -112,10 +112,13 @@ async def backups_keygen(request: Request) -> Response:  # POST /backups/keygen
     except InvalidOperation as e:
         return _backups_page(request, error=str(e), status_code=400)
     # Dedicated one-time page: the private identity appears here and NOWHERE else.
+    # no-store/no-cache (security review 2026-07-21): the crown-jewel private key
+    # must never be re-served from bfcache/Back-navigation or any shared cache.
     return templates.TemplateResponse(
         request,
         "backup_key.html",
         {"identity": identity, "recipient": recipient},
+        headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"},
     )
 
 

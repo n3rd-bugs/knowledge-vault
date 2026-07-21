@@ -33,6 +33,28 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 
+# Overlay the WEB-WRITTEN offsite config by strict ALLOWLIST PARSE — never
+# `source` it (2026-07-21 security review): only the four known keys, each
+# re-validated, so a kb-web-writable file can never inject an executable line.
+KB_OFFSITE_CONF="${KB_OFFSITE_CONF:-${HOME}/kb/offsite.env}"
+KB_OFFSITE_CONF="${KB_OFFSITE_CONF/#\~/${HOME}}"
+if [[ -f "${KB_OFFSITE_CONF}" ]]; then
+  while IFS='=' read -r _k _v; do
+    case "${_k}" in
+      KB_OFFSITE_ENABLED) [[ "${_v}" =~ ^(true|false|1|0|yes|no)$ ]] && KB_OFFSITE_ENABLED="${_v}" ;;
+      KB_RCLONE_REMOTE)   [[ "${_v}" =~ ^[A-Za-z0-9_-]{1,64}:[A-Za-z0-9._/-]*$ ]] && KB_RCLONE_REMOTE="${_v}" ;;
+      KB_AGE_RECIPIENT)   [[ "${_v}" =~ ^age1[0-9a-z]{58}$ ]] && KB_AGE_RECIPIENT="${_v}" ;;
+      KB_OFFSITE_KEEP)    [[ "${_v}" =~ ^[0-9]{1,3}$ ]] && KB_OFFSITE_KEEP="${_v}" ;;
+    esac
+  done < "${KB_OFFSITE_CONF}"
+fi
+# Point rclone at the web-written credential dir (bind-mounted; kb-web wrote it).
+KB_RCLONE_CONF_DIR="${KB_RCLONE_CONF_DIR:-${HOME}/kb/rclone}"
+KB_RCLONE_CONF_DIR="${KB_RCLONE_CONF_DIR/#\~/${HOME}}"
+if [[ -f "${KB_RCLONE_CONF_DIR}/rclone.conf" ]]; then
+  export RCLONE_CONFIG="${KB_RCLONE_CONF_DIR}/rclone.conf"
+fi
+
 KB_OFFSITE_ENABLED="${KB_OFFSITE_ENABLED:-false}"
 KB_RCLONE_REMOTE="${KB_RCLONE_REMOTE:-}"
 KB_AGE_RECIPIENT="${KB_AGE_RECIPIENT:-}"

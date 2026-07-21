@@ -247,6 +247,38 @@ def test_fix3_dismiss_withheld_row_is_byte_identical_notfound():
     assert _resolved(qb) is False and _resolved(sentinel) is False, "no withheld row flipped"
 
 
+def test_fix3_reject_item_less_row_is_byte_identical_notfound():
+    """FIX 1 (A11-3 reject-path item-less oracle): a non-owner reviewer's reject of an
+    item-less sentinel row, a nonexistent qid, and a withheld-project qid all raise the
+    BYTE-IDENTICAL NotFound — no existence oracle for the search_regression sentinel
+    (the NULL-item branch previously raised InvalidOperation → web 403 for ALL
+    principals, while missing/withheld rows 404'd). reject now inherits the byte-
+    identical 404 that dismiss already has. The OWNER still gets InvalidOperation on
+    the sentinel (behavior unchanged)."""
+    set_project("a", public=False)
+    set_project("b", public=False)
+    _ia, _qa = _unverified_row("a", "rkeep")
+    _ib, qb = _unverified_row("b", "rhidden")  # withheld project for the grantee
+    sentinel = queue_review(None, "search_regression", {"note": "hit@5 dropped"})
+    g = _grantee("rresolver", {"a": True}, extra_caps=frozenset({scope.CAP_REVIEW_RESOLVE}))
+    with scope.use_principal(g):
+        with pytest.raises(NotFound) as missing:
+            review.reject(9_999_999)
+        with pytest.raises(NotFound) as withheld:
+            review.reject(qb)
+        with pytest.raises(NotFound) as sent:
+            review.reject(sentinel)
+    # Byte-identical to the missing-row NotFound (only the qid differs) — the item-less
+    # sentinel and the withheld-project row are indistinguishable from a nonexistent one.
+    assert str(withheld.value) == str(missing.value).replace("9999999", str(qb))
+    assert str(sent.value) == str(missing.value).replace("9999999", str(sentinel))
+    assert _resolved(qb) is False and _resolved(sentinel) is False, "no row flipped"
+    # owner still gets InvalidOperation on the item-less sentinel (unchanged)
+    with pytest.raises(InvalidOperation):
+        review.reject(sentinel)
+    assert _resolved(sentinel) is False, "the sentinel is not resolved by the failed reject"
+
+
 def test_fix3_bulk_dismiss_under_grantee_inherits_walls_as_per_row_errors():
     set_project("a", public=False)
     set_project("b", public=False)

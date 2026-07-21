@@ -26,6 +26,7 @@ itsdangerous salt separation intact either way.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -353,17 +354,35 @@ def _template_files() -> list[Path]:
     return sorted(_TEMPLATES_DIR.rglob("*.html"))
 
 
+# FIX 5 (A11-3 template-lint regex): match `|safe` with ANY (or no) surrounding
+# whitespace and `Markup(` with any whitespace before the paren — a fixed `"| safe"`
+# substring missed `|safe` (no space), `|  safe` (multi-space), and `Markup (`. The
+# `\bsafe\b` word boundary keeps `known-safe` prose (no leading `|`) from tripping.
+_AUTOESCAPE_BYPASS_RE = re.compile(r"\|\s*safe\b|Markup\s*\(")
+
+
 def test_no_template_bypasses_autoescape():
-    """Mechanical XSS pin: no template may use `| safe` or `Markup(` — the only
-    HTML that reaches the page must flow through the autoescaping `| markdown`
-    filter (html=False escapes raw HTML). A future resolve/item body rendered raw
-    would chain stored XSS into the owner's session — this fails CI first."""
+    """Mechanical XSS pin: no template may bypass autoescape via `|safe` / `| safe` /
+    `Markup(` (any whitespace) — the only HTML that reaches the page must flow through
+    the autoescaping `| markdown` filter (html=False escapes raw HTML). A future
+    resolve/item body rendered raw would chain stored XSS into the owner's session —
+    this fails CI first. FIX 5 replaces the fixed substring that missed the no-space /
+    multi-space / `Markup (` variants."""
+    # the regex MUST catch a no-space `{{ x|safe }}` and its whitespace variants...
+    assert _AUTOESCAPE_BYPASS_RE.search("{{ x|safe }}")
+    assert _AUTOESCAPE_BYPASS_RE.search("{{ x |  safe }}")
+    assert _AUTOESCAPE_BYPASS_RE.search("Markup ( x )")
+    # ...and must NOT trip on the legitimate markdown filter or `known-safe` prose.
+    assert not _AUTOESCAPE_BYPASS_RE.search("{{ item.body | markdown }}")
+    assert not _AUTOESCAPE_BYPASS_RE.search("ENUMERATED known-safe fields ONLY")
     files = _template_files()
     assert files, "template lint walked zero files — harness broken"
     for path in files:
         text = path.read_text(encoding="utf-8")
-        assert "| safe" not in text, f"{path.name}: `| safe` bypasses autoescape (finding 26)"
-        assert "Markup(" not in text, f"{path.name}: `Markup(` bypasses autoescape (finding 26)"
+        hit = _AUTOESCAPE_BYPASS_RE.search(text)
+        assert hit is None, (
+            f"{path.name}: `{hit.group() if hit else ''}` bypasses autoescape (finding 26)"
+        )
 
 
 def test_item_body_renders_via_markdown_filter():

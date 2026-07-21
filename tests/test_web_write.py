@@ -405,12 +405,141 @@ def test_reviewer_review_detail_hides_withheld_project_ids(app):
     reviewer = principals.resolve_name("rev-scrub")
     with scope.use_principal(reviewer):
         entry = next(e for e in review.list_open_review() if e.reason == "contradiction")
-    assert entry.detail.get("a_id") == granted, "the readable id survives"
+    # A11-3 FIX 4 tightened the old blocklist to an ALLOWLIST: a contradiction detail
+    # carries only cross-project id refs + free-text evidence, NONE of which is on the
+    # reviewer allowlist, so the ENTIRE contradiction body is dropped for a non-owner
+    # (the former blocklist let the readable a_id + granted evidence entry through). No
+    # withheld id/title can ride the JSONB past the scope-gated row/item JOIN.
+    assert "a_id" not in entry.detail, "contradiction ids are not allowlisted (dropped)"
     assert "b_id" not in entry.detail, "the withheld b_id must be stripped"
-    ev_ids = {e.get("item_id") for e in entry.detail.get("evidence", [])}
-    assert ev_ids == {granted}, "the withheld evidence entry must be dropped whole"
-    for e in entry.detail.get("evidence", []):
-        assert "title" not in e, "detail titles are never emitted (they ride the item join)"
+    assert "evidence" not in entry.detail, "the free-text evidence array is dropped whole"
+    assert "in_favor_a" not in entry.detail and "weighted_a" not in entry.detail
+
+
+def test_review_detail_scrub_is_an_allowlist(app):
+    """FIX 4 (A11-3 deliverable 4): the non-owner detail scrub is an ALLOWLIST, not a
+    blocklist — a contradiction/triage row referencing a WITHHELD project shows a
+    reviewer NONE of that project's ids/titles/free-text, and a brand-new UNKNOWN
+    detail key is dropped for the reviewer while the OWNER still sees verbatim detail
+    (the distinguishing property a blocklist could never guarantee)."""
+    granted = ingest("proj-a", "note", "granted triage item", "granted body", trust="unverified")
+    withheld = ingest("nda-secret", "note", "Q-SECRET-TITLE", "withheld body")
+    review.queue_review(
+        granted,
+        "contradiction",
+        {
+            "rejected_count": 2,  # allowlisted, non-id → survives
+            "triage": {
+                "action": "reject_duplicate",  # allowlisted → survives
+                "dup_of": withheld,  # id ref into the WITHHELD project → dropped
+                "rationale": "Q-SECRET-RATIONALE",  # free text → dropped
+                "model": "qwen3",  # non-allowlisted triage key → dropped
+            },
+            "a_id": granted,  # not allowlisted → dropped (even though readable)
+            "b_id": withheld,  # withheld + not allowlisted → dropped
+            "evidence": [{"item_id": withheld, "title": "Q-SECRET-TITLE"}],  # dropped whole
+            "brand_new_future_key": "FUTURE-LEAK",  # unknown key → dropped for reviewer
+        },
+    )
+    reviewer = _make(app, "reviewer", "rev-allow", {"proj-a": True})  # grant on P, not Q
+    assert reviewer.get("/review").status_code == 200  # the reviewer may list the row
+    rp = principals.resolve_name("rev-allow")
+    with scope.use_principal(rp):
+        d = next(e for e in review.list_open_review() if e.item_id == granted).detail
+    # allowlisted, non-id keys survive
+    assert d.get("rejected_count") == 2
+    assert d.get("triage", {}).get("action") == "reject_duplicate"
+    # every trace of the withheld project Q is gone, plus all free-text and unknown keys
+    assert "Q-SECRET-TITLE" not in str(d)
+    assert "Q-SECRET-RATIONALE" not in str(d), "free-text rationale must be dropped"
+    assert "dup_of" not in d.get("triage", {}), "a withheld id ref is dropped"
+    assert "model" not in d.get("triage", {}), "a non-allowlisted triage key is dropped"
+    assert "a_id" not in d and "b_id" not in d and "evidence" not in d
+    assert "brand_new_future_key" not in d, "an unknown/future key is dropped for a reviewer"
+    # the OWNER still sees the verbatim detail (scrub skipped) — behavior unchanged
+    owner_detail = next(e for e in review.list_open_review() if e.item_id == granted).detail
+    assert owner_detail.get("brand_new_future_key") == "FUTURE-LEAK"
+    assert owner_detail.get("a_id") == granted
+    assert owner_detail.get("triage", {}).get("rationale") == "Q-SECRET-RATIONALE"
+
+
+def test_availability_error_is_constant_503_no_reflection(app, monkeypatch):
+    """FIX 2 (A11-3 availability-error reflection): an EmbedderUnavailable raised deep
+    in ingest's embed leg during /save must NOT reach server._bad_request (which
+    interpolates the raw exception message into a 400 body). The confined write surface
+    maps any residual availability KBError to a CONSTANT 503 reflecting no state."""
+    from kbcore.errors import EmbedderUnavailable
+
+    ingest("proj-a", "note", "anchor", "anchor body")
+    secret_msg = "ollama unreachable at 10.0.0.5:11434 model qwen3-embed"
+
+    def _boom(texts):
+        raise EmbedderUnavailable(secret_msg)
+
+    monkeypatch.setattr("kbcore.embed.embed_texts", _boom)
+    c = _make(app, "contributor", "c-avail", {"proj-a": True})
+    csrf = _csrf(c, "/save")  # GET renders the form (no embed) so the token still mints
+    r = c.post(
+        "/save",
+        data={
+            "csrf": csrf,
+            "project": "proj-a",
+            "type": "note",
+            "title": "availwibble",
+            "body": "b",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 503, "a residual availability KBError must map to 503, not 400"
+    assert secret_msg not in r.text, "the raw exception message must never be reflected"
+    assert "10.0.0.5" not in r.text and "ollama" not in r.text.lower()
+    with db.connect() as conn:
+        n = conn.execute("SELECT count(*) FROM items WHERE title='availwibble'").fetchone()[0]
+    assert n == 0, "the failed save must persist nothing (transaction rolled back)"
+
+
+def test_duplicate_save_is_byte_identical_to_fresh_save(app):
+    """FIX 3 (A11-3 global-dedupe cross-project oracle): a /save whose content already
+    exists in a DIFFERENT, WITHHELD project (global content-hash dedupe) must be
+    INDISTINGUISHABLE from a fresh unique save — same status, body, and Location — so a
+    contributor cannot detect that identical content exists somewhere they cannot read."""
+    # identical content seeded in a project the contributor cannot read; kind/uri match
+    # the web save's hardwired (manual, '') dedupe namespace, so the hashes collide.
+    dup_title, dup_body = "cross-project echo vornak", "echo body vornak"
+    ingest("nda-withheld", "note", dup_title, dup_body, kind="manual", uri="")
+    c = _make(app, "contributor", "c-dup", {"proj-a": True})
+    csrf = _csrf(c, "/save")
+    dup = c.post(
+        "/save",
+        data={
+            "csrf": csrf,
+            "project": "proj-a",
+            "type": "note",
+            "title": dup_title,
+            "body": dup_body,
+        },
+        follow_redirects=False,
+    )
+    fresh = c.post(
+        "/save",
+        data={
+            "csrf": csrf,
+            "project": "proj-a",
+            "type": "note",
+            "title": "unique fresh vornak2",
+            "body": "fresh body vornak2",
+        },
+        follow_redirects=False,
+    )
+    assert dup.status_code == fresh.status_code == 303, "duplicate must not be a distinct 200 page"
+    assert dup.headers["location"] == fresh.headers["location"] == "/save?saved=1"
+    assert dup.content == fresh.content, "duplicate body must be byte-identical to a fresh save"
+    # the withheld content was never surfaced: nothing created in the contributor's project
+    with db.connect() as conn:
+        n = conn.execute(
+            "SELECT count(*) FROM items WHERE title = %s AND project = 'proj-a'", (dup_title,)
+        ).fetchone()[0]
+    assert n == 0, "the duplicate save created nothing (global content-hash dedupe no-op)"
 
 
 # --- 5. cookie hardening + HSTS (finding 23) ----------------------------------

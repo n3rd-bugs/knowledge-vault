@@ -106,11 +106,17 @@ _DETAIL_ID_KEYS = frozenset(
 )
 
 
-class _DropSentinel:
-    """Marks a nested detail node that references a WITHHELD item — drop it whole."""
-
-
-_DROP = _DropSentinel()
+# review_queue.detail keys a NON-OWNER reviewer may see (A11-3 deliverable 4 / FIX 4
+# — an ALLOWLIST projection, replacing the former blocklist): only these known-safe
+# keys survive, so free-text (triage 'rationale', evidence text) and any unknown or
+# future key are DROPPED by default rather than riding a blocklist gap. Owner detail
+# is returned verbatim by the caller (today's behavior, unchanged), so MCP
+# kb_review_list inherits the identical wall for grantee reviewers.
+_ALLOWED_TOP_KEYS = frozenset({"rejected_count", "reason"})
+_ALLOWED_TRIAGE_KEYS = frozenset({"action", "dup_of"})  # dup_of is id-gated
+_ALLOWED_SUGGESTION_KEYS = frozenset({"keep", "retire"})  # both id-gated
+# search_regression sentinel metrics: pure numeric, carry no id / free-text.
+_SENTINEL_METRIC_PREFIXES = ("baseline_", "observed_", "floor_")
 
 
 def _detail_ids(node: Any, out: set[int]) -> None:
@@ -127,59 +133,63 @@ def _detail_ids(node: Any, out: set[int]) -> None:
             _detail_ids(v, out)
 
 
-def _scrub_node(node: Any, readable: set[int], *, top: bool) -> Any:
-    """Project a detail node to the no-leak shape for a NON-OWNER reviewer.
-
-    An ALLOWLIST-by-construction projection (A11-3 deliverable 4): (1) every
-    ``title`` key is dropped — titles ride the scope-gated item JOIN, never raw
-    ``detail``; (2) an item-id-referencing key whose target is not readable is
-    dropped; (3) a NESTED dict (an evidence/suggestion/triage sub-object) that
-    references a withheld item is dropped WHOLE, so ``{side, trust}`` residue can't
-    imply a hidden item; (4) the TOP-LEVEL dict is never dropped whole (it would
-    also discard the safe fields) — only its withheld id keys are stripped. Owner
-    detail is returned verbatim by the caller (today's behavior, unchanged), so MCP
-    kb_review_list inherits the identical wall for grantee reviewers.
-    """
-    if isinstance(node, dict):
-        if not top:
-            for k, v in node.items():
-                if k in _DETAIL_ID_KEYS and isinstance(v, int) and v not in readable:
-                    return _DROP
-        out: dict[str, Any] = {}
-        for k, v in node.items():
-            if k == "title":
-                continue
-            if k in _DETAIL_ID_KEYS and isinstance(v, int) and not isinstance(v, bool):
-                if v in readable:
-                    out[k] = v
-                continue  # withheld id at top level: strip the key only
-            sv = _scrub_node(v, readable, top=False)
-            if sv is _DROP:
-                continue
-            out[k] = sv
+def _allow_subobject(node: Any, allowed: frozenset[str], readable: set[int]) -> dict[str, Any]:
+    """Project a KNOWN detail sub-object (triage / suggested_resolution) to its
+    allowlisted keys, id-gating any id-reference against ``readable`` — a withheld
+    id ref is dropped so no cross-project id oracle survives (A11-3 FIX 4)."""
+    out: dict[str, Any] = {}
+    if not isinstance(node, dict):
         return out
-    if isinstance(node, list):
-        res = []
-        for v in node:
-            sv = _scrub_node(v, readable, top=False)
-            if sv is _DROP:
-                continue
-            res.append(sv)
-        return res
-    return node
+    for k, v in node.items():
+        if k not in allowed:
+            continue
+        if k in _DETAIL_ID_KEYS and isinstance(v, int) and not isinstance(v, bool):
+            if v in readable:
+                out[k] = v
+            continue  # withheld id: drop the key
+        out[k] = v
+    return out
+
+
+def _scrub_node(detail: dict[str, Any], readable: set[int]) -> dict[str, Any]:
+    """Project the TOP-LEVEL detail dict to the NON-OWNER allowlist (A11-3 FIX 4).
+
+    ALLOWLIST-by-construction (deliverable 4): only the known-safe top-level keys
+    (``rejected_count`` / ``reason``), the search_regression sentinel metric keys, and
+    the projected ``triage`` / ``suggested_resolution`` sub-objects survive. Every
+    other key — cross-project ``a_id`` / ``b_id``, the free-text ``evidence`` array,
+    triage ``rationale``, and any unknown/future key — is DROPPED, so a blocklist gap
+    can never leak a withheld title/id to a grantee reviewer. Every id-reference that
+    does survive must pass ``scope.readable_item_ids`` (batched by the caller).
+    """
+    out: dict[str, Any] = {}
+    for k, v in detail.items():
+        if k in _ALLOWED_TOP_KEYS or k == "epsilon" or k.startswith(_SENTINEL_METRIC_PREFIXES):
+            out[k] = v
+        elif k == "triage":
+            proj = _allow_subobject(v, _ALLOWED_TRIAGE_KEYS, readable)
+            if proj:
+                out[k] = proj
+        elif k == "suggested_resolution":
+            proj = _allow_subobject(v, _ALLOWED_SUGGESTION_KEYS, readable)
+            if proj:
+                out[k] = proj
+        # else: DROP — allowlist default-deny (unknown / free-text / withheld-id keys)
+    return out
 
 
 def _scrub_detail(conn: psycopg.Connection, detail: dict[str, Any]) -> dict[str, Any]:
-    """The detail a NON-OWNER reviewer may see: cross-project ids/titles removed.
+    """The detail a NON-OWNER reviewer may see: an ALLOWLIST projection (A11-3 FIX 4).
 
     Owner callers skip this (verbatim detail). For a grantee, resolve every
     id-reference against ``scope.readable_item_ids`` in ONE batched SELECT, then
-    project the tree — reused by the web /review cockpit AND MCP kb_review_list.
+    project the tree to the known-safe keys — reused by the web /review cockpit AND
+    MCP kb_review_list, so a future/unknown key never rides a blocklist gap.
     """
     ids: set[int] = set()
     _detail_ids(detail, ids)
     readable = scope.readable_item_ids(conn, list(ids)) if ids else set()
-    return _scrub_node(detail, readable, top=True)
+    return _scrub_node(detail, readable)
 
 
 def list_open_review(limit: int | None = None) -> list[ReviewEntry]:
@@ -268,6 +278,16 @@ def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:
     if row is None:
         raise NotFound(f"review queue row {queue_id} does not exist")
     if row[0] is None:
+        # FIX 1 (A11-3 reject-path item-less oracle): a NULL-item sentinel row must be
+        # BYTE-IDENTICAL to a missing/withheld row for a NON-OWNER — otherwise a
+        # non-owner reject (or any future non-owner promote) of an item-less
+        # search_regression sentinel qid raises InvalidOperation (→ web 403) while
+        # missing/withheld rows raise NotFound (→ 404), an existence oracle for those
+        # sentinel rows. The OWNER keeps today's behavior (can still see/act on
+        # sentinel rows), so reject AND promote now inherit the byte-identical 404
+        # that dismiss already has.
+        if not scope.current().is_owner:
+            raise NotFound(f"review queue row {queue_id} does not exist")
         raise InvalidOperation(f"review queue row {queue_id} has no associated item")
     scope.assert_readable(row[1], f"review queue row {queue_id} does not exist")
     # Readable now, so a write-rejection may safely name the project

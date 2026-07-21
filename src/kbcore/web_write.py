@@ -143,6 +143,13 @@ def supersede_for_review(
         if row is None:
             raise NotFound(f"item {old_id} does not exist")
         project, type_, title, tags, status, old_meta, old_vf, old_vt = row
+        # FIX 6 (A11-3 WEB_ITEM_TYPES on supersede): the replacement inherits the OLD
+        # item's type verbatim, and ingest_in validates only against the full
+        # ITEM_TYPES — so a contributor superseding a 'summary'/'report' would mint a
+        # pending item of that consolidation type. A web-authored replacement is never
+        # consolidation output, so coerce any non-web type to 'note' before ingest_in.
+        if type_ not in WEB_ITEM_TYPES:
+            type_ = "note"
         # A withheld old item must be byte-identical to a missing one (no existence /
         # project-name oracle): readability BEFORE writability, mirroring supersede().
         if not scope.project_readable(conn, project):

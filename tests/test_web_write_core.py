@@ -232,6 +232,31 @@ def test_supersede_for_review_reject_leaves_original_untouched():
     assert get_item(old).superseded_by is None
 
 
+def test_supersede_for_review_coerces_non_web_type_to_note():
+    """FIX 6 (A11-3 WEB_ITEM_TYPES on supersede): a web supersede inherits the OLD
+    item's type verbatim and passes it to ingest_in (which validates only against the
+    full ITEM_TYPES), so superseding a 'summary'/'report' would mint a pending item of
+    that consolidation type. A contributor's web-authored replacement is never
+    consolidation output, so the inherited non-web type is coerced to 'note'."""
+    set_project("a", public=False)
+    # an OWNER-authored 'summary' (a consolidation output type, not in WEB_ITEM_TYPES)
+    old = ingest(
+        "a",
+        "summary",
+        "consolidated digest gribban",
+        "digest body gribban",
+        trust="verified",
+        uri="old-gribban",
+    )
+    assert get_item(old).type == "summary"
+    g = _grantee("s6", {"a": True})
+    with scope.use_principal(g):
+        new_id, _qid = web_write.supersede_for_review(
+            old, new_body="hand-edited replacement gribban", reason="fixup"
+        )
+    assert get_item(new_id).type == "note", "a web supersede of a summary must land as a note"
+
+
 # --- include_pending is owner-only -------------------------------------------
 
 

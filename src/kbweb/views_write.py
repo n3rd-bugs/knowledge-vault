@@ -40,7 +40,7 @@ from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from kbcore import scope
-from kbcore.errors import DuplicateContent, InvalidOperation, NotFound
+from kbcore.errors import DuplicateContent, InvalidOperation, KBError, NotFound
 from kbcore.graph import link
 from kbcore.models import RELATIONS, WEB_ITEM_TYPES, WebSaveRequest
 from kbcore.review import dismiss, reject
@@ -110,6 +110,22 @@ _REJECT_BODY = (
 
 def _uniform_reject() -> Response:
     return HTMLResponse(_REJECT_BODY, status_code=403)
+
+
+# A CONSTANT 503 for a residual availability failure (EmbedderUnavailable /
+# ExtractorUnavailable / ExtractionFailed raised deep in ingest's embed leg — A11-3
+# FIX 2): the write routes must never fall through to server._bad_request, which
+# INTERPOLATES the raw exception message into the 400 body (reflecting internal
+# state, non-uniform). This body reflects nothing back to the client.
+_UNAVAILABLE_BODY = (
+    "<h1>Service temporarily unavailable</h1>"
+    "<p>This action could not be completed right now. Please try again.</p>"
+    "<p><a href='/'>search</a></p>"
+)
+
+
+def _unavailable() -> Response:
+    return HTMLResponse(_UNAVAILABLE_BODY, status_code=503)
 
 
 # A malformed/forged submission (WebSaveRequest validation, bad int) — a constant
@@ -204,11 +220,20 @@ async def save(request: Request) -> Response:  # GET renders the form, POST save
             req.project, req.type, req.title, req.body, tags=req.tags, code_ref=req.code_ref
         )
     except DuplicateContent:
-        return _save_page(request, saved=True)  # a benign no-op; nothing new to queue
+        # FIX 3 (A11-3 global-dedupe cross-project oracle): a content-hash duplicate —
+        # including one whose identical content lives in a WITHHELD project (dedupe is
+        # global) — must be INDISTINGUISHABLE from a fresh save, so return the SAME 303
+        # confirmation redirect, never a distinct 200 page a contributor could use to
+        # detect that the content already exists somewhere they cannot read.
+        return RedirectResponse("/save?saved=1", status_code=303)
     except NotFound:
         return _ghost_404()
     except InvalidOperation:
         return _uniform_reject()
+    except KBError:
+        # FIX 2: a residual availability KBError (embed leg) → CONSTANT 503, never the
+        # reflected message (must not fall through to server._bad_request).
+        return _unavailable()
     return RedirectResponse("/save?saved=1", status_code=303)
 
 
@@ -224,11 +249,15 @@ async def supersede_item(request: Request) -> Response:  # POST /supersede/{id}
     try:
         supersede_for_review(item_id, new_body=new_body, reason=reason)
     except DuplicateContent:
-        return _save_page(request, saved=True)
+        # FIX 3: byte-identical to a fresh save (same 303 confirmation) — no dedupe
+        # oracle, mirroring /save (a replacement dup could also collide cross-project).
+        return RedirectResponse("/save?saved=1", status_code=303)
     except NotFound:
         return _ghost_404()
     except InvalidOperation:
         return _uniform_reject()
+    except KBError:
+        return _unavailable()  # FIX 2: constant 503, never the reflected message
     return RedirectResponse("/save?saved=1", status_code=303)
 
 
@@ -248,6 +277,8 @@ async def link_item(request: Request) -> Response:  # POST /link/{id}
         return _ghost_404()
     except InvalidOperation:
         return _uniform_reject()
+    except KBError:
+        return _unavailable()  # FIX 2: constant 503, never fall through to _bad_request
     return RedirectResponse(f"/item/{src_id}", status_code=303)
 
 
@@ -269,6 +300,8 @@ async def resolve(request: Request) -> Response:  # POST /resolve/{qid} — reje
         return _ghost_404()
     except InvalidOperation:
         return _uniform_reject()
+    except KBError:
+        return _unavailable()  # FIX 2: constant 503, never fall through to _bad_request
     return RedirectResponse("/review", status_code=303)
 
 

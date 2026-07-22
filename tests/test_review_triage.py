@@ -432,4 +432,4 @@ def test_mcp_dismiss_itemless_row_and_bulk_apply_triage(kb):
 def test_toolset_version_bumped_for_new_tool():
     from kbmcp import KB_TOOLSET_VERSION
 
-    assert KB_TOOLSET_VERSION == "2026-07-18"  # kb_review_bulk + dismiss action
+    assert KB_TOOLSET_VERSION == "2026-07-22"  # kb_review_bulk + dismiss action

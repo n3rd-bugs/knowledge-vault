@@ -12,7 +12,7 @@ from typing import Any
 # server instructions, and kb_stats output, so a long-lived session can notice its
 # tools predate the server and reconnect. BUMP whenever a tool SCHEMA changes
 # (tool added/removed, or a param added/removed/retyped). Date form stays sortable.
-KB_TOOLSET_VERSION = "2026-07-18"
+KB_TOOLSET_VERSION = "2026-07-22"
 
 
 def toolset_footer() -> str:

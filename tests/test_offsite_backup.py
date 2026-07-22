@@ -124,6 +124,12 @@ def _transport(tmp_path: Path) -> dict:
 def _run_offsite(args: list[str], overrides: dict, tmp_path: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if not k.startswith("KB_")}
     env["KB_ENV_FILE"] = "/dev/null"  # never read the repo's real .env
+    # Isolate from the HOST's web-written backup config/creds too: the scripts now
+    # overlay ~/kb/webconf/offsite.env + rclone/ by DEFAULT (not an env var, so the
+    # KB_* strip above doesn't cover them). Point at a non-file / empty dir so a
+    # populated real webconf can never leak into a hermetic run.
+    env["KB_OFFSITE_CONF"] = "/dev/null"  # not a regular file -> the parser skips it
+    env["KB_RCLONE_CONF_DIR"] = str(tmp_path / "no-rclone")  # absent -> no RCLONE_CONFIG export
     env.setdefault("STUB_LOG", str(tmp_path / "stub.log"))
     env.update(overrides)
     return subprocess.run(

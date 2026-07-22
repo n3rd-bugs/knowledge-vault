@@ -28,6 +28,7 @@ services:
       KB_BIND: 0.0.0.0
       KB_PORT: "8321"
       KB_ALLOW_ANY_BIND: "true"
+      KB_WEB_ALLOWED_EMAILS: "mirzaon@gmail.com"  # owner promotion on any OAuth path (see kb-mcp-public)
     extra_hosts: ["host.docker.internal:host-gateway"]
     ports: ["127.0.0.1:8321:8321"]   # keep the existing local Claude Code registration working
     networks: [kbnet]
@@ -52,6 +53,12 @@ services:
       # (OAuth app in Testing mode → only the owner's Gmail can log in; the static
       # bearer is the owner's). Flip to "true" to re-enable the NDA allow-list.
       KB_OAUTH_ENABLED: "true"
+      # Owner recognition on the OAuth/connector path (fix 2026-07-22): an
+      # allowlisted Gmail is PROMOTED to the unrestricted OWNER. Without this the
+      # owner's Google sign-in resolves to a NO-GRANT non-owner and every write
+      # fails "project '…' is not writable with this credential" (the static
+      # bearer path still worked; OAuth did not). Must match kb-web's value.
+      KB_WEB_ALLOWED_EMAILS: "mirzaon@gmail.com"
       # Advertised OAuth issuer/endpoints MUST equal the public URL claude.ai uses.
       # claude.ai's broker refuses the non-standard :8803 port (ISP blocks inbound
       # 443), so the public front door is a Cloudflare Tunnel terminating at 443 on

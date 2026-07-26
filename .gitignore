@@ -46,3 +46,6 @@ logs/
 
 # hookrig build log (transient; kept only when an image build fails)
 tests/hookrig/.build.log
+
+# Windows test host credentials (WinRM) — never commit
+.windows

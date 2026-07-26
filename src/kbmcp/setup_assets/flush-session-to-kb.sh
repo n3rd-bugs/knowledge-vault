@@ -11,66 +11,300 @@
 # Installed by the `kb-session-flush` skill. See that skill's README for setup.
 set -uo pipefail
 
-[ -n "${KB_HOOK_GUARD:-}" ] && exit 0   # we were spawned by a KB hook — never recurse
+[ -n "${KB_HOOK_GUARD:-}" ] && exit 0 # we were spawned by a KB hook — never recurse
 CFG="$HOME/.claude/kb-flush.env"
 [ -f "$CFG" ] || exit 0
 # shellcheck disable=SC1090
 . "$CFG"
+
+# >>> KB PORTABLE BLOCK v1 — BYTE-IDENTICAL in install.sh, flush-session-to-kb.sh,
+# kb-session-brief.sh and kb-mcp-call.sh. tests/hookrig/cases/26 extracts it from
+# all four and diffs, so never hand-edit one copy. It exists because a locked-down
+# box (no sudo, no jq) used to be a dead end: install.sh aborted with "apt install
+# jq" and both hooks exited 0 in SILENCE, capturing nothing forever.
+# Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
+# detach command, and a JSON backend chain -- jq on PATH, a jq co-located with the
+# hooks, $KB_JQ, then python3 -- plus the loud, sudo-free failure when none exist.
+KB_UNAME=$(uname -s 2>/dev/null || echo unknown)
+kb_is_windows() { case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+
+# Native Windows path (C:\x or C:/x) -> POSIX. cygpath when it exists, else a
+# pure-shell fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
+# Bash without cygpath still resolves event paths. Anything else passes through.
+kb_winpath() {
+  case "${1:-}" in [A-Za-z]:\\* | [A-Za-z]:/*) ;; *)
+    printf '%s' "${1:-}"
+    return 0
+    ;;
+  esac
+  _kbp=""
+  if command -v cygpath >/dev/null 2>&1; then _kbp=$(cygpath -u "$1" 2>/dev/null) || _kbp=""; fi
+  if [ -z "$_kbp" ]; then
+    _kbp="/$(printf '%s' "$1" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$1" | cut -c3- | tr '\\' '/')"
+  fi
+  printf '%s' "$_kbp"
+}
+
+# POSIX path -> native, for values Claude Code hands to CreateProcess (the hook
+# command on Windows). cygpath -w when present; else derive from Git Bash's
+# EXEPATH; else the bare exe name, which Windows resolves through PATH.
+kb_nativepath() {
+  _kbn=""
+  if command -v cygpath >/dev/null 2>&1; then _kbn=$(cygpath -w "$1" 2>/dev/null) || _kbn=""; fi
+  if [ -z "$_kbn" ] && [ -n "${EXEPATH:-}" ]; then
+    case "$1" in */bash) _kbn="${EXEPATH%\\}\\usr\\bin\\bash.exe" ;; esac
+  fi
+  [ -n "$_kbn" ] || _kbn="$(basename "$1").exe"
+  printf '%s' "$_kbn"
+}
+
+kb_detach_cmd() { # setsid is absent on Git Bash -- nohup is the detach fallback
+  if command -v setsid >/dev/null 2>&1; then printf 'setsid'; else printf 'nohup'; fi
+}
+
+# A binary merely NAMED `timeout` is not enough: on Git Bash `command -v timeout`
+# resolves to C:\Windows\System32\timeout.exe -- a WAIT utility that cannot run a
+# command and errors on redirected stdin ("Input redirection is not supported").
+# Using it would make every bounded call a silent no-op. Trust a candidate only if
+# it behaves like GNU/BSD timeout: a coreutils --version, or a self-test that
+# really bounds a command with stdin redirected. Else gtimeout, else a perl
+# watchdog (Git Bash ships perl), else run unbounded rather than mis-invoke.
+_kb_timeout_ok() {
+  [ -n "${1:-}" ] || return 1
+  "$1" --version 2>/dev/null | grep -qi coreutils && return 0
+  "$1" 1 true </dev/null >/dev/null 2>&1
+}
+KB_TIMEOUT_BIN=""
+KB_TIMEOUT_PROBED=0
+kb_timeout() { # <seconds> cmd...
+  if [ "$KB_TIMEOUT_PROBED" = 0 ]; then
+    KB_TIMEOUT_PROBED=1
+    for _kbt in "$(command -v timeout 2>/dev/null || true)" "$(command -v gtimeout 2>/dev/null || true)"; do
+      [ -n "$_kbt" ] || continue
+      if _kb_timeout_ok "$_kbt"; then
+        KB_TIMEOUT_BIN="$_kbt"
+        break
+      fi
+    done
+  fi
+  _kbd="$1"
+  shift
+  if [ -n "$KB_TIMEOUT_BIN" ]; then
+    "$KB_TIMEOUT_BIN" "$_kbd" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e '
+      my $t = shift @ARGV;
+      my $pid = fork();
+      if (!defined $pid) { exit 127; }   # fork failed: bail, do NOT exec unbounded
+      if ($pid == 0)     { exec @ARGV or exit 127; }
+      my $to = 0;
+      local $SIG{ALRM} = sub { $to = 1; kill "TERM", $pid; };
+      alarm $t;
+      waitpid($pid, 0);
+      my $rc = $?;
+      alarm 0;
+      exit 124 if $to;
+      exit(($rc & 127) ? 128 + ($rc & 127) : ($rc >> 8));
+    ' "$_kbd" "$@"
+  else
+    "$@"
+  fi
+}
+
+# ---- JSON backend: jq on PATH -> jq beside the hooks -> $KB_JQ -> python3 ----
+# KB_JQ_DIR1/KB_JQ_DIR2 are the co-location dirs the caller sets before probing
+# (two separate vars, not a PATH-style list: a Windows path contains a colon).
+KB_JQ_BIN=""
+KB_PY_BIN=""
+KB_JSON_PROBED=0
+_kb_jq_ok() { [ -n "${1:-}" ] && [ -x "$1" ] && printf '{"a":1}' | "$1" -e . >/dev/null 2>&1; }
+kb_json_probe() {
+  if [ "$KB_JSON_PROBED" = 0 ]; then
+    KB_JSON_PROBED=1
+    for _kbj in "$(command -v jq 2>/dev/null || true)" "$(command -v jq.exe 2>/dev/null || true)" \
+      "${KB_JQ_DIR1:-}/jq" "${KB_JQ_DIR1:-}/jq.exe" "${KB_JQ_DIR2:-}/jq" "${KB_JQ_DIR2:-}/jq.exe" \
+      "${KB_JQ:-}"; do
+      if _kb_jq_ok "$_kbj"; then
+        KB_JQ_BIN="$_kbj"
+        break
+      fi
+    done
+    if [ -z "$KB_JQ_BIN" ]; then
+      for _kbp in python3 python; do
+        if command -v "$_kbp" >/dev/null 2>&1 && "$_kbp" -c 'import json' >/dev/null 2>&1; then
+          KB_PY_BIN="$_kbp"
+          break
+        fi
+      done
+    fi
+  fi
+  [ -n "$KB_JQ_BIN" ] || [ -n "$KB_PY_BIN" ]
+}
+
+kb_json_get() { # <key>; JSON object on stdin -> that top-level value (or nothing)
+  if [ -n "$KB_JQ_BIN" ]; then
+    "$KB_JQ_BIN" -r --arg k "$1" '.[$k] // empty' 2>/dev/null
+  else
+    "$KB_PY_BIN" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+v=d.get(sys.argv[1]) if isinstance(d,dict) else None
+if v is None: sys.exit(0)
+sys.stdout.write(v if isinstance(v,str) else json.dumps(v))' "$1" 2>/dev/null
+  fi
+}
+
+kb_json_valid() { # <file> -- is it parseable JSON?
+  if [ -n "$KB_JQ_BIN" ]; then
+    "$KB_JQ_BIN" -e . "$1" >/dev/null 2>&1
+  else
+    "$KB_PY_BIN" -c 'import json,sys
+json.load(open(sys.argv[1],encoding="utf-8"))' "$1" >/dev/null 2>&1
+  fi
+}
+
+# Build a flat JSON object: kb_json_build <outfile|-> [KEY TYPE VALUE]...
+# TYPE s=string  n=number/raw JSON  f=string read VERBATIM from a file (the
+# chunk path: a ~900 KB payload must never travel as an argv).
+kb_json_build() {
+  _kbo="$1"
+  shift
+  if [ -n "$KB_JQ_BIN" ]; then
+    _kba=()
+    _kbf='{}'
+    _kbi=0
+    while [ "$#" -ge 3 ]; do
+      _kbi=$((_kbi + 1))
+      case "$2" in
+        s) _kba+=(--arg "v$_kbi" "$3") ;;
+        n) _kba+=(--argjson "v$_kbi" "$3") ;;
+        f) _kba+=(--rawfile "v$_kbi" "$3") ;;
+      esac
+      _kbf="$_kbf + {\"$1\":\$v$_kbi}"
+      shift 3
+    done
+    if [ "$_kbo" = "-" ]; then
+      "$KB_JQ_BIN" -n "${_kba[@]}" "$_kbf"
+    else
+      "$KB_JQ_BIN" -n "${_kba[@]}" "$_kbf" >"$_kbo"
+    fi
+  else
+    "$KB_PY_BIN" -c 'import json,sys
+o=sys.argv[1]; a=sys.argv[2:]; d={}
+for i in range(0,len(a)-2,3):
+    k,t,v=a[i],a[i+1],a[i+2]
+    if t=="s": d[k]=v
+    elif t=="n": d[k]=json.loads(v)
+    elif t=="f": d[k]=open(v,encoding="utf-8",errors="replace").read()
+s=json.dumps(d,ensure_ascii=False)
+sys.stdout.write(s+"\n") if o=="-" else open(o,"w",encoding="utf-8").write(s+"\n")' "$_kbo" "$@"
+  fi
+}
+
+kb_urlencode() { # stdin -> percent-encoded (jq @uri / urllib.parse.quote agree)
+  if [ -n "$KB_JQ_BIN" ]; then
+    "$KB_JQ_BIN" -sRr @uri
+  else
+    "$KB_PY_BIN" -c 'import sys,urllib.parse
+sys.stdout.write(urllib.parse.quote(sys.stdin.read(),safe=""))'
+  fi
+}
+
+# The sudo-free remedy. NEVER says "apt install": the box that hits this has no
+# root. jq is one static file, so every option below is a plain file copy.
+kb_nojson_hint() {
+  printf '%s\n' \
+    "kb-session-flush: no JSON tool found -- the hooks need jq or python3, and this box has neither on PATH." \
+    "Fix it WITHOUT sudo (jq is a single self-contained binary -- github.com/jqlang/jq/releases:" \
+    "jq-linux-amd64, jq-macos-arm64, jq-windows-amd64.exe). Any ONE of:" \
+    "  1. put it in ~/.local/bin/jq and chmod +x it (add ~/.local/bin to PATH)" \
+    "  2. drop it next to the hooks: $HOME/.claude/hooks/jq   (jq.exe on Windows)" \
+    "  3. point KB_JQ at it anywhere:   export KB_JQ=/path/to/jq" \
+    "  4. or make any python3 reachable on PATH -- the hooks use it as a built-in fallback"
+}
+
+# A hook with no JSON backend cannot parse its event, but it must NOT die in
+# silence (the bug class of rig case 12): one rate-limited line an hour into the
+# flush log, phrased so the pre-brief's failure surfacing (which greps for
+# NOT CONFIGURED) lifts it into the next session.
+kb_nojson_warn() { # <tag: flush|brief|mcp-call>
+  _kbh="$HOME/.claude/hooks"
+  mkdir -p "$_kbh/state" 2>/dev/null || true
+  _kbs="$_kbh/state/.nojson-${1:-hook}.stamp"
+  _kbn=$(date +%s 2>/dev/null || echo 0)
+  case "$_kbn" in '' | *[!0-9]*) _kbn=0 ;; esac
+  _kbl=$(cat "$_kbs" 2>/dev/null || echo 0)
+  case "$_kbl" in '' | *[!0-9]*) _kbl=0 ;; esac
+  [ "$((_kbn - _kbl))" -ge 3600 ] || return 0
+  printf '%s\n' "$_kbn" >"$_kbs" 2>/dev/null || true
+  printf '%s %s NOT CONFIGURED: no JSON tool (jq or python3) on this box -- the KB hooks cannot parse Claude Code events, so this session was NOT captured. Fix without sudo: drop a static jq in ~/.local/bin or in %s, or set KB_JQ=/path/to/jq.\n' \
+    "$(date -Is 2>/dev/null || date)" "${1:-hook}" "$_kbh" >>"$_kbh/flush-session.log" 2>/dev/null || true
+}
+# <<< END KB PORTABLE BLOCK v1 <<<
+
 # Windows/Git Bash (KB item 496): a co-located jq (installer drops one next to
 # the hooks) must resolve even when Claude Code inherited a PATH without it.
-HOOKDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"; PATH="$HOOKDIR:$PATH"
-command -v jq >/dev/null 2>&1 || exit 0
-# setsid is absent on Git Bash — nohup is the detach fallback (item 496).
-DETACH="setsid"; command -v setsid >/dev/null 2>&1 || DETACH="nohup"
+# $0 itself may arrive as a native path, so normalise it before dirname.
+HOOKDIR="$(cd "$(dirname "$(kb_winpath "$0")")" 2>/dev/null && pwd)"
+PATH="$HOOKDIR:$PATH"
+KB_JQ_DIR1="$HOOKDIR"
+KB_JQ_DIR2="$HOME/.claude/hooks"
+# No JSON backend => we cannot parse the event at all. Do NOT exit in silence
+# (that was the case-12 bug class: a box captured nothing, forever, unlogged);
+# leave a rate-limited NOT CONFIGURED line the pre-brief will surface.
+kb_json_probe || {
+  kb_nojson_warn flush
+  exit 0
+}
+DETACH="$(kb_detach_cmd)"
 
 INPUT=$(cat)
-T=$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty')
-CWD=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
-SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
-EV=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // empty')
-# Native Windows event paths (C:\... or C:/...) must be cygpath'ed — basename
-# on a backslash path yields the whole drive path (item 496; two-alternative
-# case pattern required, the single bracket-class form does not match).
-case "$T" in
-  [A-Za-z]:\\*|[A-Za-z]:/*) T=$(cygpath "$T" 2>/dev/null || printf '%s' "$T") ;;
-esac
-case "$CWD" in
-  [A-Za-z]:\\*|[A-Za-z]:/*) CWD=$(cygpath "$CWD" 2>/dev/null || printf '%s' "$CWD") ;;
-esac
+T=$(printf '%s' "$INPUT" | kb_json_get transcript_path)
+CWD=$(printf '%s' "$INPUT" | kb_json_get cwd)
+SID=$(printf '%s' "$INPUT" | kb_json_get session_id)
+EV=$(printf '%s' "$INPUT" | kb_json_get hook_event_name)
+# Native Windows event paths (C:\... or C:/...) must be converted — basename on a
+# backslash path yields the whole drive path (item 496). kb_winpath uses cygpath
+# when present and a pure-shell C:\ -> /c/ fallback when it is not.
+T=$(kb_winpath "$T")
+CWD=$(kb_winpath "$CWD")
 [ -n "$T" ] && [ -f "$T" ] || exit 0
 
 # Project = the working repo's dir name, slugified (falls back to "sessions").
-PROJECT=$(basename "${CWD:-sessions}" | tr '[:upper:]' '[:lower:]' \
-  | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
+PROJECT=$(basename "${CWD:-sessions}" | tr '[:upper:]' '[:lower:]' |
+  tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
 [ -z "$PROJECT" ] && PROJECT=sessions
 # Git context for code_ref anchoring: kb_ingest_session accepts repo/branch/
 # commit and the drain stamps a code_ref from them. Local plumbing reads only
-# (ms-cheap, no network); a non-git CWD degrades silently to empty. GITCTX is
-# the ready-made JSON fragment the network arg builders merge in — empty
-# fields are OMITTED entirely (never sent as "").
+# (ms-cheap, no network); a non-git CWD degrades silently to empty. The network
+# arg builders append them as extra kb_json_build triples — empty fields are
+# OMITTED entirely (never sent as "").
 REPO=$(git -C "${CWD:-.}" remote get-url origin 2>/dev/null)
 [ -n "$REPO" ] || REPO=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null)
-REPO=${REPO%/}; REPO=${REPO%.git}; REPO=${REPO##*/}; REPO=${REPO##*:}
+REPO=${REPO%/}
+REPO=${REPO%.git}
+REPO=${REPO##*/}
+REPO=${REPO##*:}
 BRANCH=$(git -C "${CWD:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null)
-[ "$BRANCH" = "HEAD" ] && BRANCH=""   # detached HEAD names no branch
+[ "$BRANCH" = "HEAD" ] && BRANCH="" # detached HEAD names no branch
 COMMIT=$(git -C "${CWD:-.}" rev-parse --short HEAD 2>/dev/null)
-GITCTX=$(jq -n --arg r "$REPO" --arg b "$BRANCH" --arg c "$COMMIT" \
-  '(if $r != "" then {repo:$r} else {} end)
-   + (if $b != "" then {branch:$b} else {} end)
-   + (if $c != "" then {commit:$c} else {} end)')
-[ -n "$GITCTX" ] || GITCTX='{}'
 LOG="$HOME/.claude/hooks/flush-session.log"
-export T CWD SID PROJECT LOG REPO BRANCH COMMIT GITCTX
+export T CWD SID PROJECT LOG REPO BRANCH COMMIT
+# The detached child is a FRESH bash: hand it the JSON backend (which may be
+# python3, with no jq anywhere on the box) as exported vars + functions.
+export KB_JQ_BIN KB_PY_BIN KB_JSON_PROBED
+export -f kb_json_build kb_json_valid
 
 # Opportunistic housekeeping — bound our OWN state/log growth so a daily-driver
 # machine doesn't accumulate thousands of dead .offset files and an unrotated
 # multi-MB log. Cheap (runs before the detach) and scoped strictly to the hooks'
 # own dirs; never touches anything else.
-STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE" 2>/dev/null || true
+STATE="$HOME/.claude/hooks/state"
+mkdir -p "$STATE" 2>/dev/null || true
 find "$STATE" -name '*.offset' -mtime +30 -delete 2>/dev/null || true
 if [ -f "$LOG" ]; then
   LSIZE=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || wc -c <"$LOG" | tr -d " ")
-  case "$LSIZE" in ""|*[!0-9]*) LSIZE=0 ;; esac
+  case "$LSIZE" in "" | *[!0-9]*) LSIZE=0 ;; esac
   if [ "$LSIZE" -gt 1048576 ]; then
     tail -n 500 "$LOG" >"$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG" 2>/dev/null || rm -f "$LOG.t" 2>/dev/null
   fi
@@ -103,13 +337,14 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   # MCP or REMOTE: submit the delta over the network, CHUNKED. Large sessions
   # (up to 1 GB) are sent as sequential ≤900 KB windows cut at line boundaries;
   # the per-session byte offset advances after EACH accepted chunk, so a failure
-  # resumes mid-delta next firing. Chunks go via a temp file + jq --rawfile —
-  # passing the text as an argv (--arg) hits the kernel's ~128 KB per-argument
-  # limit long before 1 MB.
-  STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
+  # resumes mid-delta next firing. Chunks go via a temp file (kb_json_build's `f`
+  # type reads it verbatim) — passing the text as an argv would hit the kernel's
+  # ~128 KB per-argument limit long before 1 MB.
+  STATE="$HOME/.claude/hooks/state"
+  mkdir -p "$STATE"
   OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
   OFFF="$STATE/${OKEY:-default}.offset"
-  HELPER="$(dirname "$0")/kb-mcp-call.sh"
+  HELPER="$HOOKDIR/kb-mcp-call.sh"
   export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER EV
   "$DETACH" bash -c '
     CHUNK=900000; MAX_PER_FIRING=209715200   # 200 MB/firing; rest resumes next firing
@@ -120,6 +355,10 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
+    set --   # git context, appended to every request body; empty fields omitted
+    [ -n "$REPO" ] && set -- "$@" repo s "$REPO"
+    [ -n "$BRANCH" ] && set -- "$@" branch s "$BRANCH"
+    [ -n "$COMMIT" ] && set -- "$@" commit s "$COMMIT"
     while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$MAX_PER_FIRING" ]; do
       TMPC=$(mktemp) || { echo "$(date -Is) flush $PROJECT BUG: mktemp failed"; break; }
       tail -c +$((OFFSET+1)) "$T" | head -c "$CHUNK" >"$TMPC"
@@ -156,15 +395,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         # plaintext fallback keeps minimal systems working.
         if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
            && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" --argjson g "$GITCTX" \
-            "{project:\$p,transcript_gz:\$t,kind:\"session\"} + \$g" >"$TMPC.args"
+          kb_json_build "$TMPC.args" project s "$PROJECT" transcript_gz f "$TMPC.gz64" kind s session "$@"
           rm -f "$TMPC.gz64"
         else
           rm -f "$TMPC.gz64"
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" --argjson g "$GITCTX" \
-            "{project:\$p,transcript:\$t,kind:\"session\"} + \$g" >"$TMPC.args"
+          kb_json_build "$TMPC.args" project s "$PROJECT" transcript f "$TMPC" kind s session "$@"
         fi
-        if [ ! -s "$TMPC.args" ] || ! jq -e . "$TMPC.args" >/dev/null 2>&1; then
+        if [ ! -s "$TMPC.args" ] || ! kb_json_valid "$TMPC.args"; then
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
           rm -f "$TMPC.args" "$TMPC"; break
         fi
@@ -174,16 +411,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         BODYF="$TMPC.body"
         if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
            && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC.gz64" --argjson g "$GITCTX" \
-            "{project:\$p,kind:\"session\",transcript_gz:\$t} + \$g" >"$BODYF"
+          kb_json_build "$BODYF" project s "$PROJECT" kind s session transcript_gz f "$TMPC.gz64" "$@"
           rm -f "$TMPC.gz64"
         else
           rm -f "$TMPC.gz64"
-          BODYF="$TMPC.body"
-          jq -n --arg p "$PROJECT" --rawfile t "$TMPC" --argjson g "$GITCTX" \
-            "{project:\$p,kind:\"session\",transcript:\$t} + \$g" >"$BODYF"
+          kb_json_build "$BODYF" project s "$PROJECT" kind s session transcript f "$TMPC" "$@"
         fi
-        if [ ! -s "$BODYF" ] || ! jq -e . "$BODYF" >/dev/null 2>&1; then
+        if [ ! -s "$BODYF" ] || ! kb_json_valid "$BODYF"; then
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
           rm -f "$BODYF" "$TMPC"; break
         fi
@@ -225,7 +459,8 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # relays each chunk into kb_ingest_session. The MODEL is the data path, so
   # chunks are small (~24 KB echo fidelity) and each flush costs Claude usage —
   # bearer modes (MCP/REST) are the efficient path; this is the no-setup one.
-  STATE="$HOME/.claude/hooks/state"; mkdir -p "$STATE"
+  STATE="$HOME/.claude/hooks/state"
+  mkdir -p "$STATE"
   OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
   OFFF="$STATE/${OKEY:-default}.offset"
   export CLAUDE_BIN OFFF EV
@@ -302,7 +537,7 @@ else
   STAMP="$STATE/.notconfigured.stamp"
   NOW=$(date +%s 2>/dev/null || echo 0)
   LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
-  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  case "$LAST" in '' | *[!0-9]*) LAST=0 ;; esac
   if [ "$((NOW - LAST))" -ge 3600 ]; then
     printf '%s\n' "$NOW" >"$STAMP" 2>/dev/null || true
     echo "$(date -Is) flush $PROJECT NOT CONFIGURED: no transport in $CFG (set KB_DIR, or KB_MCP_URL/KB_REST_URL + KB_TOKEN, or KB_CONNECTOR=1) — this session was NOT captured" >>"$LOG"

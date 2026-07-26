@@ -15,8 +15,8 @@ recorded by writing it down — it is recorded by adding a case (see
 ```
 make hooktest                       # everything
 bash tests/hookrig/run.sh 05 07     # only cases whose name contains 05 or 07
-bash tests/hookrig/run.sh --clean   # also delete the built image afterwards
-KB_SKILL_DIR=contrib/claude/kb-session-flush bash tests/hookrig/run.sh
+bash tests/hookrig/run.sh --clean   # also delete the built image(s) afterwards
+KB_SKILL_DIR=~/.claude/skills/kb-session-flush bash tests/hookrig/run.sh   # test an INSTALLED copy
 ```
 
 Exit status is 0 only when every case passes (`XFAIL` — a pinned known defect —
@@ -29,8 +29,9 @@ counts as green; see [Known defect](#known-defect-xfail)).
 | `Dockerfile` | clean debian-slim image: bash, curl, jq, python3, git, gzip/coreutils, setsid. **No** Claude Code, **no** `uv`, **no** `kb` CLI — the build fails if any appear. Non-root `tester` with its own `HOME`. |
 | `stub_server.py` | dependency-free (stdlib) stub serving **both** transports and recording every request to JSONL. Decodes `transcript_gz` so assertions see the real payload bytes. |
 | `stub_contract.py` | the submission contract the stub enforces, mirrored from `kbcore`/`kbrest` with the source line cited against each constant — so a drift between stub and server is a reviewable diff, not a silently permissive test. |
-| `lib.sh` | assertions plus the fakes each transport precondition needs (`fake_uv`, `fake_claude`, `fake_claude_json`, `fake_kb_repo`) and the event builders. |
-| `run.sh` | builds the image, starts the stub, runs each case in a **fresh** container, prints the PASS/FAIL table, cleans up. |
+| `Dockerfile.<variant>` | a deliberately worse-equipped box, built FROM the base image, selected per case with a `# IMAGE: <variant>` header — see [Image variants](#image-variants). |
+| `lib.sh` | assertions plus the fakes each transport precondition needs (`fake_uv`, `fake_claude`, `fake_claude_json`, `fake_kb_repo`), the Windows fakes (`fake_uname_windows`, `fake_cygpath`, `fake_win32_timeout`, `record_nohup`, `expose_setsid`), `extract_block`, and the event builders. Uses `$RIG_JQ`/`$RIG_PY`, never a bare `jq`/`python3`. |
+| `run.sh` | builds the base image + every variant a case asks for, starts the stub, runs each case in a **fresh** container of its image, prints the PASS/FAIL table, cleans up. The skill under test defaults to the repo copy `contrib/claude/kb-session-flush` (override with `KB_SKILL_DIR`). |
 | `cases/*.sh` | one file per assertion group. Every case header names the KB fact it pins. |
 
 The stub speaks:
@@ -44,6 +45,9 @@ The stub speaks:
   (malformed body), `400` (empty transcript, over 1,000,000 bytes, bad kind,
   both transcript forms, undecodable gzip), else `202`
   `{queue_id,duplicate,requeued,permanently_failed}`.
+* `GET /api/search` — the REMOTE-mode recall endpoint, mirroring
+  `src/kbrest/server.py:93` / `SearchHit` closely enough to exercise the hook's
+  url-encoding and bullet formatting (bearer-gated: `401` without it).
 * `GET /__requests` (the JSONL record), `POST /__reset`, `GET /__health`.
 
 ## The hermetic guarantee
@@ -86,25 +90,51 @@ production, and a sub-agent once truncated the live schema. So:
 | `09_recall_noise_controls` | `kb-session-brief.sh` skips slash commands, <12-char prompts and stopword-only prompts ("Yes please review and update"), fires on a substantive one, suppresses a repeat within the 600 s window (normalised query), honours `KB_PROMPT_RECALL=0`; `SessionStart` briefs on `startup` but not `resume`/`compact` | — |
 | `10_never_silent_failure` | an unreachable MCP/REST endpoint → exit 0, empty stdout, an explanatory line in `flush-session.log`, offset untouched — and the next `SessionStart` surfaces that failure; garbage input is an inert no-op | — |
 | `11_guard_always_on` | `KB_HOOK_GUARD` is checked on line 14 of **both** hooks, before the config is even read: guarded firings do no work in **MCP and LOCAL** modes and on both brief events. Every assertion is paired with a positive control | correction to the inverted **885** |
-| `12_incomplete_config_silence` | **known defect**, see below | — |
+| `12_incomplete_config_silence` | an incomplete transport config (`KB_REST_URL`/`KB_MCP_URL` with an empty `KB_TOKEN`) logs a `NOT CONFIGURED` line instead of being a permanent silent no-op, and the next `SessionStart` surfaces it | **1174** |
+| `20_no_jq_python_fallback` *(image: `nojq`)* | a box with **no jq** (and no sudo): install succeeds on the **python3** backend, the mode chain (incl. MCP auto-discovery from `~/.claude.json`) still resolves, four events register, MCP **and** REST flushes really submit; and install.sh's jq merge vs its python merge produce a **byte-identical** `settings.json` from the same seeded input (foreign hooks, unicode, mixed types preserved) | **1173**, **1152** |
+| `21_no_json_tool_loud` *(image: `nojson`)* | **no jq and no python3**: install **fails loudly** with a sudo-free remedy (names `~/.local/bin`, the co-location path and `KB_JQ`; never `apt install`) and writes no `settings.json`; a flush **and** a brief fired in that state exit 0, print nothing, and each append a rate-limited `NOT CONFIGURED` line the pre-brief lifts into the next session | **1174** |
+| `22_colocated_jq_and_kb_jq` *(image: `nojson`)* | backend-chain links 2 and 3 on a box with no JSON tool at all: a jq **beside the hooks** and `KB_JQ=/path/to/jq` each make install + flush + recall work, and the installer propagates that jq into `~/.claude/hooks/` so the box survives losing `KB_JQ` | **496** |
+| `23_windows_simulation` *(image: `winsim`)* | faked `uname -s`=MINGW + `cygpath` + a Win32 `timeout.exe`: hooks register as `bash.exe` + `args[0]` for all four events (never a bare `.sh`), a `C:\Users\First Last\...` transcript/cwd converts and submits, the Win32 `timeout` is probed-then-**refused** (recall still returns hits), and detach falls back to `nohup` — with `setsid` restored as the positive control | **1153**, **496**, **1152** |
+| `24_paths_with_spaces` | a `HOME` **and** a project dir containing spaces: install, jq co-location, PreCompact flush, SessionEnd delta flush, offset file, per-prompt recall and pre-brief all work; `"kb hook rig"` slugifies to `kb-hook-rig` | — |
+| `25_no_cygpath_fallback` *(image: `winsim`)* | Windows **without cygpath**: the pure-shell `C:\` -> `/c/` conversion keeps the flush working, `install.sh` still registers a spawnable command (`$EXEPATH`-derived, else bare `bash.exe`), plus unit assertions on `kb_winpath` extracted from the *installed* hook | **1153** |
+| `26_portable_block_identity` | the shared portable block appears exactly once per script and is **byte-identical** across all four, is sourceable standalone, and its jq/python3 backends agree primitive by primitive (field read, object build incl. a file-sourced value, validation, URL encoding) | — |
+
+## Image variants
+
+Some facts can only be pinned on a differently-equipped box: one with no `jq`, or
+no `python3` either, or no `setsid`. A case declares that in its header:
+
+```sh
+# IMAGE: nojq
+```
+
+`run.sh` then builds `Dockerfile.<variant>` **FROM the base image**
+(`--build-arg BASE=…`) and runs that case in `kb-hookrig:1-<variant>`. No header
+line = the base image. An unknown variant aborts the run rather than silently
+falling back. `--clean` removes the variants too.
+
+| variant | what it removes | why it cannot be faked in `$HOME` |
+| --- | --- | --- |
+| `nojq` | `jq` (keeps `python3`) | `command -v jq` must really find nothing |
+| `nojson` | `jq` **and** `python3` | same, for both |
+| `winsim` | `setsid`; adds a writable `/c` and `/d` | `util-linux` is Essential (un-removable via apt), and a converted `C:\…` path must resolve to a real file |
+
+Each variant **moves** the tool to `/rigbin` instead of deleting it, and the
+image sets `RIG_JQ`/`RIG_PY` to those paths: `/rigbin` is on no `PATH`, so the
+harness can still build fixtures and assert while the code under test can find
+nothing. `lib.sh` therefore uses `$RIG_JQ`/`$RIG_PY` and never a bare `jq`.
+A case that deliberately re-exposes a tool (case 22 copying a jq next to the
+hooks, case 23's `expose_setsid` positive control) does it explicitly, in the
+case source.
 
 ## Known defect (XFAIL)
 
-`12_incomplete_config_silence` asserts the behaviour we *want* and currently
-fails, on purpose:
-
-> `install.sh`'s REMOTE fallback writes `KB_REST_URL=https://api.example.com` and
-> an **empty** `KB_TOKEN`, then tells the operator once, on stdout, to fill it in.
-> Until they do, every flush falls through `flush-session-to-kb.sh:58` (which
-> requires a non-empty `KB_TOKEN`), exits 0, and writes **nothing** to
-> `flush-session.log`. The pre-brief hook's failure surfacing greps that same log,
-> so it stays quiet too. The machine captures nothing, forever, with no signal
-> anywhere. The same hole exists for `KB_MCP_URL` with an empty token.
-
-It is marked `# EXPECT: xfail` in the case header, so the runner reports `XFAIL`
-and the suite stays green. **When the hook is fixed the case starts passing, the
-runner reports `XPASS` (a failure), and you delete the marker** — that is the
-moment the KB fact gets corrected too.
+There is currently none: `12_incomplete_config_silence` was the last one and is
+now a green regression gate (the hook logs `NOT CONFIGURED` and the pre-brief
+surfaces it). The mechanism stays available — mark a case `# EXPECT: xfail` and
+write the defect out in the header; when it starts passing the runner reports
+`XPASS` (a failure) and you delete the marker, which is the moment the KB fact
+gets corrected too.
 
 ## Adding a case
 
@@ -157,3 +187,66 @@ submission had succeeded. Whether the remaining chunks relay on the next firing
 (by design, per KB_CONNECTOR_MAX) or the detached relay was simply still in flight
 when the container exited is UNRESOLVED — do not claim connector chunking works
 until a case pins it.
+
+## The WINDOWS lane (opt-in, a REAL box over WinRM)
+
+The container has a `winsim` variant, but it *simulates* Windows: a stubbed
+`uname -s`, a shell-script `cygpath`, a hand-written `timeout.exe`. It pins the
+logic and cannot falsify the platform assumptions underneath it.
+`tests/hookrig/run-windows.sh` runs the **same skill and the same assertion
+library** (`lib.sh`, via the thin `winlib.sh` shim) on an actual Windows box:
+
+    make hooktest-win                       # all windows cases
+    bash tests/hookrig/run-windows.sh 02    # only matching cases
+    bash tests/hookrig/run-windows.sh --keep  # leave the remote sandbox for poking
+
+Credentials come from the repo-root `.windows` (gitignored):
+`WIN_IP` / `WIN_USER` / `WIN_PASSWORD`. They are never printed and never placed
+on a remote command line. Needs `pywinrm` on the driving host (`apt install
+python3-winrm`) and Git Bash at `C:\Program Files\Git\bin\bash.exe` on the target.
+
+Containment, which matters because this is somebody's real machine:
+
+* every case runs with `HOME` inside a per-run sandbox under the remote `%TEMP%`;
+* the host's real `%USERPROFILE%\.claude` is hashed before and after — a change
+  fails the run (the same tripwire the container lane gets for free);
+* the stub runs on the Windows box's own **loopback**, so the hooks under test
+  still talk to a hermetic KB. Only the control plane crosses the network;
+* teardown tree-kills the stub and removes the sandbox, and startup sweeps
+  sandboxes orphaned by a killed run (older than 6h, so it can never touch a
+  concurrent one).
+
+### What this lane caught that the simulation could not
+
+* **The `timeout.exe` trap is only reproducible on a specific PATH.** Git Bash
+  puts its own coreutils `/usr/bin/timeout` *ahead* of System32, so the default
+  Git Bash PATH does not reproduce the trap at all — but Claude Code spawns hooks
+  through CreateProcess with the system PATH, where System32 wins. Case 02 now
+  forces a System32-first PATH and asserts against the genuine Microsoft binary
+  (which really does answer `ERROR: Invalid syntax` instead of running the
+  command). Testing only the default PATH would have declared this safe while
+  shipping the exact configuration that breaks.
+* **`kb_timeout` memoises its choice in a global**, so probing it inside `$(...)`
+  discards the result and leaves any assertion about the chosen backend
+  inspecting an empty variable. Cases must probe in the current shell.
+* Project slugification is real and load-bearing on Windows: a cwd of
+  `C:\...\My Project` submits as `my-project`, and spaces in paths are the norm
+  there, not an edge case.
+
+### Rig-side traps worth remembering
+
+Three of these cost real debugging time and are designed around, not worked around:
+
+* `Start-Process` **blocks forever** under WinRM; a detached background process
+  needs `Win32_Process.Create`.
+* A case's stdout must be redirected to a FILE inside the wrapper. If it were a
+  PowerShell pipe, the hooks' detached `nohup` child would inherit the write
+  handle and `Out-String` would hang long after the case exited.
+* PowerShell's `-like` is a **wildcard** operator, not regex: `\\` there is two
+  literal characters. A cleanup filter written with escaped backslashes silently
+  matches nothing. Kill by PID — and with `taskkill /T`, because
+  `Win32_Process.Create` hands back the `cmd.exe` wrapper, not the python child.
+
+VERIFIED 2026-07-26 on Windows 11 Pro / Git Bash 5.2.26: 6 cases, 78 checks,
+green; run concurrently with three container lanes with zero interference and
+zero leaked resources on either side.

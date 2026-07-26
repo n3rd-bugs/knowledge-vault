@@ -56,6 +56,27 @@ Four modes, auto-detected by `install.sh` (in priority order):
   byte offset so each compaction submits only the new window. Config:
   `KB_REST_URL` + `KB_TOKEN` in `~/.claude/kb-flush.env`.
 
+## Requirements (NO sudo, ever)
+
+`bash`, `curl`, and **one JSON tool**. The scripts resolve it through a fallback
+chain, in this order (pinned by `tests/hookrig/cases/20`, `22`, `26`):
+
+1. `jq` on `PATH`
+2. a `jq` **co-located with the hooks** — `~/.claude/hooks/jq` (`jq.exe` on
+   Windows); the installer copies whichever jq it used to there, so the box keeps
+   working if `PATH` later loses it
+3. `KB_JQ=/path/to/jq` in the environment
+4. **`python3`** (stdlib `json` only) — a full fallback, not a degraded one:
+   every jq program in the skill, including the `settings.json` merge, has a
+   python twin that produces byte-identical output
+
+Nothing needs installing as root: jq is a single static binary, so dropping it in
+`~/.local/bin` (or beside the hooks, or anywhere `KB_JQ` points) is enough. If
+NEITHER jq nor python3 exists, `install.sh` stops with those instructions instead
+of a package-manager command, and a hook fired in that state writes a
+rate-limited `NOT CONFIGURED` line to `~/.claude/hooks/flush-session.log` — which
+the next session's pre-brief surfaces. A hook never dies silently.
+
 ## Steps
 
 1. Run the installer (it writes `~/.claude/hooks/flush-session-to-kb.sh`, creates
@@ -102,10 +123,19 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   block page. The gzip path is immune (base64 body). For kb_save/plaintext
   writes, add a WAF skip rule for the bearer-authed API routes.
 - **Windows / Git Bash** (item 496) — handled automatically by the installer and
-  hooks: `nohup` detach fallback (no `setsid`), hooks registered as
-  `bash.exe` + args (Claude Code on Windows spawns exe+args, not a shell), jq
-  co-located next to the hooks + PATH-prepended, and native `C:\...` event
-  paths converted with `cygpath` before use.
+  hooks, and simulated end to end by `tests/hookrig/cases/23` + `25`:
+  `nohup` detach fallback (no `setsid`), hooks registered as `bash.exe` + args
+  (Claude Code on Windows spawns exe+args, not a shell), jq co-located next to
+  the hooks + PATH-prepended, and native `C:\...` event paths converted before
+  use. Every one of those decisions lives in ONE shared block (`kb_is_windows`,
+  `kb_winpath`, `kb_nativepath`, `kb_detach_cmd`, `kb_timeout`, the JSON
+  backend) that is byte-identical in all four scripts. **cygpath is not
+  required**: `kb_winpath` falls back to the pure-shell mapping
+  (`C:\Users\First Last\p` -> `/c/Users/First Last/p`) and `kb_nativepath` falls
+  back to `$EXEPATH`, then to a bare `bash.exe` resolved through the Windows
+  PATH. Paths with SPACES are the norm there, so every path expansion in the
+  four scripts is quoted (`tests/hookrig/cases/24` drives install + flush +
+  recall through a `HOME` and a project dir that both contain spaces).
 - **macOS / BSD / Windows** — the brief+recall hook wraps every bounded search in a
   portable `kb_timeout`: it uses GNU `timeout` when present (Linux — unchanged),
   else `gtimeout` (Homebrew coreutils), else a built-in perl watchdog (perl ships

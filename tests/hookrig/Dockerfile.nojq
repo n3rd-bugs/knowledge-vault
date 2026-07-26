@@ -1,0 +1,28 @@
+# Variant image: a box with NO jq, but python3 present.
+#
+# This is the locked-down-machine case that used to be a dead end (install.sh
+# aborted with "need jq (apt install jq)" and both hooks exited 0 in silence).
+# Selected by a case header line `# IMAGE: nojq`; built by run.sh FROM the base
+# image, so the two stay in lockstep.
+#
+# jq is MOVED, not deleted: the RIG itself still needs it to assert (the case
+# scripts use $RIG_JQ), but /rigbin is deliberately NOT on any PATH, so nothing
+# under test can find it. Only a case that deliberately copies it (case 22's
+# co-located jq / KB_JQ override) can put it back in reach.
+ARG BASE=kb-hookrig:1
+FROM ${BASE}
+
+USER root
+RUN mkdir -p /rigbin \
+    && mv "$(command -v jq)" /rigbin/jq \
+    && /rigbin/jq --version >/dev/null \
+    && if command -v jq >/dev/null 2>&1; then \
+         echo "BUILD ABORTED: jq is still on PATH; the nojq variant proves nothing"; exit 1; \
+       fi \
+    && python3 -c 'import json' \
+    && chown -R tester:tester /rigbin
+
+USER tester
+ENV RIG_JQ=/rigbin/jq
+WORKDIR /home/tester
+CMD ["bash"]

@@ -1,7 +1,7 @@
-.PHONY: up down migrate test hooktest lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
+.PHONY: up down migrate test hooktest hooktest-win lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
 
 help:
-	@echo "targets: up down migrate test hooktest lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
+	@echo "targets: up down migrate test hooktest hooktest-win lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
 
 up:
 	docker compose --env-file .env up -d
@@ -26,6 +26,14 @@ test:
 # the live KB, the live DB, or the host's ~/.claude. No `uv`/DB needed.
 hooktest:
 	bash tests/hookrig/run.sh
+
+# The REAL-Windows lane: the same skill and the same assertion library, run on
+# an actual Windows box over WinRM (Git Bash, genuine System32 timeout.exe, real
+# cygpath/EXEPATH, .exe JSON tools, CRLF risk). Opt-in: needs a reachable host
+# and a gitignored .windows with WIN_IP/WIN_USER/WIN_PASSWORD. Sandboxed under
+# the remote TEMP dir with a tripwire on the host's real ~/.claude.
+hooktest-win:
+	bash tests/hookrig/run-windows.sh
 
 lint:
 	uv run ruff check --fix .

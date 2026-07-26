@@ -11,6 +11,13 @@
 STUB="${STUB:-http://hookrig-stub:8000}"
 RIG_TOKEN="${RIG_TOKEN:-kbrig_0000000000000000000000000000}"
 SKILL="${SKILL:-/skill}"
+# The RIG's own JSON tools. On the base image these are the PATH jq/python3; on
+# the nojq/nojson image variants the image sets them to /rigbin/... -- a location
+# deliberately NOT on any PATH, so the harness can still build fixtures and
+# assert on a box where the code UNDER TEST can find no JSON tool at all.
+# Everything in this file must use these, never a bare `jq`/`python3`.
+RIG_JQ="${RIG_JQ:-jq}"
+RIG_PY="${RIG_PY:-python3}"
 FAILURES=0
 CHECKS=0
 
@@ -59,14 +66,15 @@ finish() {
 }
 
 # ------------------------------------------------------------------- stub side
-stub_reset() { curl -sS -X POST "$STUB/__reset" >/dev/null; }
-stub_requests() { curl -sS "$STUB/__requests"; }
+RIG_CURL="${RIG_CURL:-curl}"
+stub_reset() { "$RIG_CURL" -sS -X POST "$STUB/__reset" >/dev/null; }
+stub_requests() { "$RIG_CURL" -sS "$STUB/__requests"; }
 stub_count() { # jq-filter -> count of matching records
-  stub_requests | jq -c "select($1)" 2>/dev/null | wc -l | tr -d ' '
+  stub_requests | "$RIG_JQ" -c "select($1)" 2>/dev/null | wc -l | tr -d ' '
 }
 stub_total() { stub_requests | grep -c . || true; }
 stub_field() { # jq-filter jq-expr -> values, one per line
-  stub_requests | jq -r "select($1) | $2"
+  stub_requests | "$RIG_JQ" -r "select($1) | $2"
 }
 
 wait_stub() { # min-records [timeout-s] -- wait for the DETACHED hook child to land
@@ -93,10 +101,17 @@ wait_log() { # pattern [timeout-s]
 settle() { sleep 1.5; } # let a detached child that should do NOTHING prove it
 
 # ------------------------------------------------------------------- host side
+# Where clean-room HOMEs live and what PATH a case starts with. Defaults are the
+# container's; the WINDOWS lane (run-windows.sh) overrides both so the SAME
+# assertions run against real Git Bash, where HOME lives under the user profile
+# and PATH must keep the Windows entries that make jq/python/curl resolvable.
+RIG_HOMEBASE="${RIG_HOMEBASE:-/home/tester}"
+RIG_BASEPATH="${RIG_BASEPATH:-/usr/local/bin:/usr/bin:/bin}"
+
 new_home() { # name -- pristine HOME so every install is clean-room
-  export HOME="/home/tester/$1"
+  export HOME="$RIG_HOMEBASE/$1"
   mkdir -p "$HOME/bin" "$HOME/work"
-  export PATH="$HOME/bin:/usr/local/bin:/usr/bin:/bin"
+  export PATH="$HOME/bin:$RIG_BASEPATH"
   export LOGF="$HOME/.claude/hooks/flush-session.log"
   export HOOKS="$HOME/.claude/hooks"
   export CFG="$HOME/.claude/kb-flush.env"
@@ -154,9 +169,84 @@ fake_claude_json() { # the MCP precondition: the REAL connector export shape
 EOF
 }
 
+# ------------------------------------------- windows (Git Bash) simulation fakes
+# Used by cases 23 and 25. These are the parts of Windows a case CAN fake from
+# its own $HOME (they land in $HOME/bin, which new_home puts first on PATH). The
+# two parts it cannot -- no setsid on PATH, and a writable /c so that a converted
+# C:\ path resolves to a real file -- come from Dockerfile.winsim.
+fake_uname_windows() { # `uname -s` -> MINGW64_NT-10.0, exactly like Git Bash
+  cat >"$HOME/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) echo "MINGW64_NT-10.0-22631" ;;
+  *) exec /usr/bin/uname "$@" ;;
+esac
+EOF
+  chmod +x "$HOME/bin/uname"
+}
+
+fake_cygpath() { # the real Git Bash mapping: C:\ <-> /c/, bash under Program Files
+  cat >"$HOME/bin/cygpath" <<'EOF'
+#!/usr/bin/env bash
+echo "cygpath $*" >>"$HOME/cygpath.calls"
+mode=-u; p=""
+for a in "$@"; do case "$a" in -u | -w) mode=$a ;; *) p=$a ;; esac; done
+if [ "$mode" = -w ]; then
+  case "$p" in
+    /usr/bin/bash | /bin/bash) printf '%s\n' 'C:\Program Files\Git\usr\bin\bash.exe' ;;
+    /c/*) printf 'C:%s\n' "$(printf '%s' "${p#/c}" | tr '/' '\\')" ;;
+    *) printf 'C:\\Program Files\\Git%s\n' "$(printf '%s' "$p" | tr '/' '\\')" ;;
+  esac
+else
+  printf '/%s%s\n' "$(printf '%s' "$p" | cut -c1 | tr '[:upper:]' '[:lower:]')" \
+    "$(printf '%s' "$p" | cut -c3- | tr '\\' '/')"
+fi
+EOF
+  chmod +x "$HOME/bin/cygpath"
+}
+
+fake_win32_timeout() { # C:\Windows\System32\timeout.exe -- a WAIT command that
+  # cannot run a program and rejects redirected stdin. Every invocation is
+  # recorded so a case can prove the hooks never used it AS a GNU timeout.
+  cat >"$HOME/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+echo "timeout $*" >>"$HOME/win-timeout.calls"
+if [ ! -t 0 ]; then
+  echo "ERROR: Input redirection is not supported, exiting the process immediately." >&2
+  exit 1
+fi
+echo "Waiting for ${1:-0} seconds, press a key to continue ..."
+exit 0
+EOF
+  chmod +x "$HOME/bin/timeout"
+}
+
+record_nohup() { # log which detach command the hook actually chose
+  cat >"$HOME/bin/nohup" <<'EOF'
+#!/usr/bin/env bash
+echo "nohup $*" >>"$HOME/detach.calls"
+exec /usr/bin/nohup "$@"
+EOF
+  chmod +x "$HOME/bin/nohup"
+}
+expose_setsid() { # POSITIVE CONTROL: put setsid back (winsim parks it in /rigbin)
+  cat >"$HOME/bin/setsid" <<'EOF'
+#!/usr/bin/env bash
+echo "setsid $*" >>"$HOME/detach.calls"
+exec /rigbin/setsid "$@"
+EOF
+  chmod +x "$HOME/bin/setsid"
+}
+
+# Extract the shared portable block out of a skill script so its helpers can be
+# unit-tested directly (and diffed across the four copies).
+extract_block() { # script-path outfile
+  sed -n '/^# >>> KB PORTABLE BLOCK/,/^# <<< END KB PORTABLE BLOCK/p' "$1" >"$2"
+}
+
 # ------------------------------------------------------------------ transcripts
 mk_transcript() { # path n-lines [tag]
-  python3 - "$1" "$2" "${3:-line}" <<'EOF'
+  "$RIG_PY" - "$1" "$2" "${3:-line}" <<'EOF'
 import json, sys
 path, n, tag = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 with open(path, "w", encoding="utf-8") as fh:
@@ -166,7 +256,7 @@ EOF
 }
 
 mk_big_transcript() { # path total-bytes -- ragged line lengths so the 900000
-  python3 - "$1" "$2" <<'EOF'
+  "$RIG_PY" - "$1" "$2" <<'EOF'
 import json, sys
 path, target = sys.argv[1], int(sys.argv[2])
 # byte window NEVER lands on a line boundary by luck
@@ -197,14 +287,14 @@ fire_guarded() { # like fire(), but with KB_HOOK_GUARD exported for that firing 
 }
 
 flush_event() { # transcript cwd session-id [event]
-  jq -nc --arg t "$1" --arg c "$2" --arg s "$3" --arg e "${4:-PreCompact}" \
+  "$RIG_JQ" -nc --arg t "$1" --arg c "$2" --arg s "$3" --arg e "${4:-PreCompact}" \
     '{transcript_path:$t,cwd:$c,session_id:$s,hook_event_name:$e}'
 }
 prompt_event() { # prompt cwd
-  jq -nc --arg p "$1" --arg c "$2" \
+  "$RIG_JQ" -nc --arg p "$1" --arg c "$2" \
     '{hook_event_name:"UserPromptSubmit",prompt:$p,cwd:$c,session_id:"rig"}'
 }
 start_event() { # source cwd
-  jq -nc --arg s "$1" --arg c "$2" \
+  "$RIG_JQ" -nc --arg s "$1" --arg c "$2" \
     '{hook_event_name:"SessionStart",source:$s,cwd:$c,session_id:"rig"}'
 }

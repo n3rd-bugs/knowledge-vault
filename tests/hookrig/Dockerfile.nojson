@@ -1,0 +1,33 @@
+# Variant image: NO jq and NO python3 -- the box where the hooks have no JSON
+# backend at all. Pins the LOUD failure (install) and the NOT CONFIGURED log line
+# (hooks), i.e. that this box is never a silent no-op.
+#
+# Both interpreters are MOVED to /rigbin (never on PATH) so the rig can still
+# build fixtures and assert with $RIG_JQ / $RIG_PY while nothing under test can
+# reach them. python3 is relocated with its real interpreter binary plus a tiny
+# exec wrapper; the build fails if the relocated interpreter cannot import json.
+ARG BASE=kb-hookrig:1
+FROM ${BASE}
+
+USER root
+RUN set -e; \
+    mkdir -p /rigbin; \
+    mv "$(command -v jq)" /rigbin/jq; \
+    PY="$(readlink -f "$(command -v python3)")"; \
+    mv "$PY" "/rigbin/$(basename "$PY")"; \
+    rm -f /usr/bin/python3 /usr/bin/python; \
+    printf '#!/bin/sh\nexec /rigbin/%s "$@"\n' "$(basename "$PY")" >/rigbin/python3; \
+    chmod 0755 /rigbin/python3; \
+    /rigbin/jq --version >/dev/null; \
+    /rigbin/python3 -c 'import json,sys; sys.stdout.write(json.dumps({"ok":1}))'; \
+    if command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 \
+       || command -v python >/dev/null 2>&1; then \
+      echo "BUILD ABORTED: a JSON tool is still on PATH; the nojson variant proves nothing"; exit 1; \
+    fi; \
+    chown -R tester:tester /rigbin
+
+USER tester
+ENV RIG_JQ=/rigbin/jq \
+    RIG_PY=/rigbin/python3
+WORKDIR /home/tester
+CMD ["bash"]

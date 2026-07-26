@@ -1,0 +1,30 @@
+# Variant image: the two things a Windows/Git-Bash box differs in that a case
+# script CANNOT fake from inside $HOME.
+#
+#  1. NO setsid. Git Bash has no setsid, so the flush hook must detach with
+#     nohup. util-linux is an Essential Debian package (it cannot be apt-removed),
+#     so the binary is moved out of PATH into /rigbin -- from which a case can
+#     re-expose it through $HOME/bin as the POSITIVE CONTROL.
+#  2. A WRITABLE /c. Git Bash maps C:\ to /c/, which is exactly what cygpath -u
+#     and the hooks' pure-shell fallback produce; the fixtures (transcripts, a
+#     project dir, a HOME with a space in it) must therefore really live under
+#     /c/Users/... for the converted path to resolve.
+#
+# Everything else about Windows -- `uname -s` reporting MINGW64_NT-10.0, cygpath
+# itself, and a PATH `timeout` that behaves like the Win32 WAIT command -- is
+# faked per case in $HOME/bin, where it is visible in the case source.
+ARG BASE=kb-hookrig:1
+FROM ${BASE}
+
+USER root
+RUN set -e; \
+    mkdir -p /rigbin /c/Users /d; \
+    mv "$(command -v setsid)" /rigbin/setsid; \
+    if command -v setsid >/dev/null 2>&1; then \
+      echo "BUILD ABORTED: setsid is still on PATH; the nohup fallback would never be exercised"; exit 1; \
+    fi; \
+    chown -R tester:tester /rigbin /c /d
+
+USER tester
+WORKDIR /home/tester
+CMD ["bash"]

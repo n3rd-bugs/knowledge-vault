@@ -130,7 +130,9 @@ both directions:
 
 ## Steps (a Claude Code client can perform these directly)
 
-1. Check `jq` is installed: `command -v jq` (else `sudo apt install jq`).
+1. Check you have a JSON tool: `command -v jq || command -v python3`. **No sudo
+   needed** — the scripts fall back to `python3`, and jq (a single static binary)
+   is picked up from `PATH`, from `~/.claude/hooks/jq`, or from `$KB_JQ`.
 2. Write the four files below to `~/.claude/kb-setup/`.
 3. **REMOTE machines only** (skip if `install.sh` reports LOCAL or MCP) — create
    `~/.claude/kb-flush.env`, then `chmod 600` it. {remote_hint}

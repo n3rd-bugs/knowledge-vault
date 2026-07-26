@@ -138,8 +138,51 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/__reset":
             State.reset()
             self._send(200, b"reset\n", "text/plain")
+        elif path == "/api/search":
+            self._rest_search()
         else:
             self._done({"transport": "http", "method": "GET", "path": path}, 404, {"error": "?"})
+
+    def _rest_search(self) -> None:
+        """GET /api/search -- the REMOTE-mode recall endpoint.
+
+        Mirrors src/kbrest/server.py:93 (a list of SearchHit, src/kbcore/models.py
+        :104) closely enough for the ONE thing the hook does with it: format each
+        row as a bullet. Only the fields kb-session-brief.sh reads are asserted on
+        (type/project/trust/title/snippet); the rest are present so the payload is
+        shaped like the real one. Bearer-gated exactly like the ingest route.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        qs = parse_qs(urlparse(self.path).query)
+        rec: dict[str, Any] = {
+            "transport": "rest",
+            "method": "GET",
+            "path": "/api/search",
+            "auth": self._auth(),
+            "query": (qs.get("q") or [""])[0],
+            "k": (qs.get("k") or [""])[0],
+        }
+        if rec["auth"] != "ok":
+            self._done(rec, 401, {"error": "unauthorized"})
+            return
+        k = int(rec["k"] or 3)
+        hits = [
+            {
+                "item_id": 1000 + i,
+                "title": f"REST hit {i}",
+                "type": "decision" if i % 2 == 0 else "gotcha",
+                "project": "kb-system",
+                "status": "active",
+                "trust": "verified" if i % 2 == 0 else "unverified",
+                "tags": ["lang:python"],
+                "created_at": "2026-07-26T00:00:00+00:00",
+                "snippet": f"snippet {i} \u2014 unicode, spaces and a / slash",
+                "score": 1.0 - (i / 100),
+            }
+            for i in range(max(1, min(k, 5)))
+        ]
+        self._done(rec, 200, hits)
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]

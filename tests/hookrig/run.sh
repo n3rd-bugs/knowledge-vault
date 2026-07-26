@@ -3,8 +3,14 @@
 #
 #   bash tests/hookrig/run.sh                 # build + run every case
 #   bash tests/hookrig/run.sh 05 07           # run only matching cases
-#   KB_SKILL_DIR=contrib/claude/kb-session-flush bash tests/hookrig/run.sh
-#   bash tests/hookrig/run.sh --clean         # also drop the built image
+#   KB_SKILL_DIR=~/.claude/skills/kb-session-flush bash tests/hookrig/run.sh
+#   bash tests/hookrig/run.sh --clean         # also drop the built image(s)
+#
+# IMAGE VARIANTS: a case that needs a differently-equipped box declares it in its
+# header with `# IMAGE: <variant>`; run.sh then builds tests/hookrig/Dockerfile.
+# <variant> FROM the base image and runs that case in it. No header = the base
+# image. Variants live in one place (the Dockerfile) so "what this box lacks" is
+# reviewable, and a case cannot silently depend on an image nobody built.
 #
 # GUARANTEES (see README.md):
 #   * every case runs in a FRESH container with its own HOME -- the host's
@@ -16,10 +22,24 @@
 set -uo pipefail
 
 RIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SKILL_DIR="${KB_SKILL_DIR:-$HOME/.claude/skills/kb-session-flush}"
+# The skill under test defaults to the REPO copy (contrib/ is canonical -- see
+# Makefile sync-assets), so `make hooktest` always tests what is committed. Point
+# KB_SKILL_DIR at ~/.claude/skills/kb-session-flush to test an installed copy.
+REPO_SKILL="$(cd "$RIG_DIR/../.." && pwd)/contrib/claude/kb-session-flush"
+SKILL_DIR="${KB_SKILL_DIR:-$REPO_SKILL}"
 IMAGE="${KB_HOOKRIG_IMAGE:-kb-hookrig:1}"
-NET="kb-hookrig-net"
-STUB_CT="kb-hookrig-stub"
+# Per-run unique names. Two rigs on one host (two devs, or CI shards) MUST NOT
+# collide — and worse, must not CLEAN UP each other: with fixed names one run's
+# trap removed another run's stub mid-flight ("No such container: kb-hookrig-stub").
+# Found by running three instances concurrently.
+RUNID="$$-$(date +%s)-${RANDOM:-0}"
+NET="kb-hookrig-net-$RUNID"
+STUB_CT="kb-hookrig-stub-$RUNID"
+BUILD_LOG="${TMPDIR:-/tmp}/kb-hookrig-build-$RUNID.log"
+# Image tags are shared on purpose (deterministic from the Dockerfiles, so a
+# concurrent run can reuse them), but two docker builds racing on the same tag
+# thrash the builder — serialise just the build phase when flock is available.
+BUILD_LOCK="${TMPDIR:-/tmp}/kb-hookrig-build.lock"
 # Fake, shaped like a real bearer -- the rig must never carry a live token.
 RIG_TOKEN="kbrig_0000000000000000000000000000"
 CLEAN_IMAGE=0
@@ -29,7 +49,7 @@ for a in "$@"; do
   case "$a" in
     --clean) CLEAN_IMAGE=1 ;;
     -h | --help)
-      sed -n '2,20p' "$0"
+      sed -n '2,21p' "$0"
       exit 0
       ;;
     *) FILTERS+=("$a") ;;
@@ -62,10 +82,22 @@ host_fingerprint() {
 }
 HOST_BEFORE="$(host_fingerprint)"
 
+# Image variants requested by case headers (`# IMAGE: nojq`), deduped.
+VARIANTS=$(sed -n 's/^# IMAGE: *//p' "$RIG_DIR"/cases/*.sh 2>/dev/null | tr -d ' \r' | sort -u)
+image_for() { # case-path -> the image that case runs in
+  local v
+  v=$(sed -n 's/^# IMAGE: *//p' "$1" | head -1 | tr -d ' \r')
+  if [ -n "$v" ]; then printf '%s-%s' "$IMAGE" "$v"; else printf '%s' "$IMAGE"; fi
+}
+
 cleanup() {
   docker rm -f "$STUB_CT" >/dev/null 2>&1
   docker network rm "$NET" >/dev/null 2>&1
-  [ "$CLEAN_IMAGE" = 1 ] && docker rmi -f "$IMAGE" >/dev/null 2>&1
+  rm -f "$BUILD_LOG"
+  if [ "$CLEAN_IMAGE" = 1 ]; then
+    for v in $VARIANTS; do docker rmi -f "$IMAGE-$v" >/dev/null 2>&1; done
+    docker rmi -f "$IMAGE" >/dev/null 2>&1
+  fi
   return 0
 }
 trap cleanup EXIT INT TERM
@@ -75,15 +107,35 @@ printf '\n== kb hook rig ==\n'
 printf 'skill under test : %s\n' "$SKILL_DIR"
 printf 'image            : %s\n' "$IMAGE"
 
+# Serialise the build phase across concurrent rigs (no-op without flock).
+exec 9>"$BUILD_LOCK" 2>/dev/null || true
+command -v flock >/dev/null 2>&1 && flock 9 2>/dev/null || true
+
 printf '\n-- building the test image\n'
-docker build -t "$IMAGE" "$RIG_DIR" >"$RIG_DIR/.build.log" 2>&1 || {
-  tail -25 "$RIG_DIR/.build.log"
-  die "image build failed (full log: $RIG_DIR/.build.log)"
+
+docker build -t "$IMAGE" "$RIG_DIR" >"$BUILD_LOG" 2>&1 || {
+  tail -25 "$BUILD_LOG"
+  die "image build failed (full log: $BUILD_LOG)"
 }
-rm -f "$RIG_DIR/.build.log"
+rm -f "$BUILD_LOG"
 printf '   ok\n'
 
+for v in $VARIANTS; do
+  [ -f "$RIG_DIR/Dockerfile.$v" ] || die "a case asks for image variant '$v' but $RIG_DIR/Dockerfile.$v does not exist"
+  printf -- '-- building the %s image variant\n' "$v"
+  docker build -f "$RIG_DIR/Dockerfile.$v" --build-arg "BASE=$IMAGE" -t "$IMAGE-$v" "$RIG_DIR" \
+    >"$BUILD_LOG" 2>&1 || {
+    tail -25 "$BUILD_LOG"
+    die "variant build failed: $v (full log: $RIG_DIR/.build.log)"
+  }
+  rm -f "$BUILD_LOG"
+  printf '   ok (%s)\n' "$IMAGE-$v"
+done
+
+command -v flock >/dev/null 2>&1 && flock -u 9 2>/dev/null || true   # builds done; let other rigs build
+
 printf -- '-- creating the isolated network (--internal: no egress)\n'
+
 docker network create --internal "$NET" >/dev/null || die "could not create $NET"
 
 printf -- '-- starting the stub KB server\n'
@@ -122,7 +174,12 @@ for case_path in "${CASES[@]}"; do
   xfail=0
   grep -q '^# EXPECT: xfail' "$case_path" && xfail=1
 
-  printf '\n== %s ==\n' "$name"
+  case_image="$(image_for "$case_path")"
+  if [ "$case_image" = "$IMAGE" ]; then
+    printf '\n== %s ==\n' "$name"
+  else
+    printf '\n== %s ==  [image: %s]\n' "$name" "${case_image##*:}"
+  fi
   t0=$(date +%s)
   docker run --rm --network "$NET" \
     --add-host kb.n3rd-bugs.dev:127.0.0.1 \
@@ -130,7 +187,7 @@ for case_path in "${CASES[@]}"; do
     --add-host web.n3rd-bugs.dev:127.0.0.1 \
     -v "$SKILL_DIR:/skill:ro" -v "$RIG_DIR:/rig:ro" \
     -e "STUB=http://hookrig-stub:8000" -e "RIG_TOKEN=$RIG_TOKEN" -e "SKILL=/skill" \
-    "$IMAGE" bash "/rig/cases/$name.sh"
+    "$case_image" bash "/rig/cases/$name.sh"
   rc=$?
   t1=$(date +%s)
 

@@ -126,3 +126,34 @@ moment the KB fact gets corrected too.
 If a new case fails because the **hook** is wrong, do not weaken the assertion.
 Either fix the hook, or mark the case `# EXPECT: xfail` with the defect written
 out in the header — and say so in the KB.
+
+## The CONNECTOR lane (opt-in, NOT hermetic)
+
+`tests/hookrig/run-connector.sh` is the one lane that cannot be stubbed: CONNECTOR
+mode relays through a headless `claude -p` and the KB tool lives on the SERVER side
+of the claude.ai account, so proving it works means real egress, real Claude usage,
+and a real row in the LIVE ingest queue. It is therefore NOT part of `make hooktest`
+and refuses to run without `KB_HOOKRIG_LIVE=1`.
+
+    KB_HOOKRIG_LIVE=1 bash tests/hookrig/run-connector.sh
+
+Containment: a disposable project (`kb-hookrig-live`), and the script DELETES the
+queue rows it creates so the nightly drain can never mint knowledge from a test.
+It also asserts afterwards that the project owns zero knowledge items.
+
+Requirements: a `claude` binary (found the same way install.sh finds it) and
+`~/.claude/.credentials.json`, both mounted read-only. It runs on the rig image —
+the container is non-root, so packages must be baked in at build time, not apt-got
+at runtime.
+
+VERIFIED 2026-07-26: install selects CONNECTOR from a mounted binary alone; the
+relay reaches the claude.ai KB connector and a real submission lands in the live
+ingest queue (23,827 bytes); the offset advances (resume-not-resend); cleanup
+leaves nothing behind.
+
+OPEN / not yet pinned: on a 57 KB transcript only the FIRST ~24 KB chunk landed
+inside the wait window and the flush log was empty at that point, though the
+submission had succeeded. Whether the remaining chunks relay on the next firing
+(by design, per KB_CONNECTOR_MAX) or the detached relay was simply still in flight
+when the container exited is UNRESOLVED — do not claim connector chunking works
+until a case pins it.

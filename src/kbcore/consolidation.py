@@ -12,6 +12,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import psycopg
+
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.errors import NotFound
@@ -168,19 +170,62 @@ def tags_needing_summary(since: datetime | None, min_new: int = 3) -> list[tuple
     return [(p, tag, int(n)) for p, tag, n in rows]
 
 
+# Trust ranking for the summary provenance stamp: the WEAKEST source governs.
+_TRUST_RANK = {"verified": 2, "unverified": 1}
+# meta keys that disqualify an item from FEEDING a summary (audit 2026-07-26).
+SUMMARY_EXCLUDING_META = ("unresolved_refs", "aspirational")
+
+
 def active_items_with_tag(project: str, tag: str) -> list[dict[str, Any]]:
-    """Source items (id/title/body) feeding a topic summary — never summaries."""
+    """Source items (id/title/body/trust) feeding a topic summary — never summaries.
+
+    ``status = 'active'`` already keeps quarantined ('pending') and rejected
+    ('archived') extractions out (verified 2026-07-26 — unchanged).
+
+    FIX 5 (audit 2026-07-26) adds a CONTENT exclusion: an item that the pipeline
+    itself flagged is not fit to be restated as a topic conclusion. Summaries are
+    read as authoritative — one audited summary even ADDED a fabrication on top of
+    unverified leaves — so an item carrying ``meta.unresolved_refs`` (invented
+    identifiers, kbcore.ref_check) or an aspirational marker never feeds one. The
+    item stays fully active and searchable; only its promotion into a synthesized
+    conclusion is blocked. ``jsonb_exists`` is used instead of the ``?`` operator
+    so the key name rides as a normal parameter (Invariant 2: parameterized SQL).
+    """
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, title, body FROM items
-            WHERE project = %s AND status = 'active'
-              AND type NOT IN ('summary', 'report') AND %s = ANY(tags)
-            ORDER BY id
+            SELECT i.id, i.title, i.body, COALESCE(s.trust, 'verified')
+            FROM items i LEFT JOIN sources s ON s.id = i.source_id
+            WHERE i.project = %s AND i.status = 'active'
+              AND i.type NOT IN ('summary', 'report') AND %s = ANY(i.tags)
+              AND NOT jsonb_exists_any(COALESCE(i.meta, '{}'::jsonb), %s)
+            ORDER BY i.id
             """,
-            (project, tag),
+            (project, tag, list(SUMMARY_EXCLUDING_META)),
         ).fetchall()
-    return [{"id": r[0], "title": r[1], "body": r[2]} for r in rows]
+    return [{"id": r[0], "title": r[1], "body": r[2], "trust": r[3]} for r in rows]
+
+
+def _min_source_trust(conn: psycopg.Connection, item_ids: list[int]) -> str:
+    """The WEAKEST trust across a summary's sources ('unverified' when unknown).
+
+    A summary is only as good as its worst leaf, and the audit found summaries
+    built from unverified extractions being read as authoritative. Stamping the
+    minimum makes that visible at retrieval time instead of implicit.
+    """
+    if not item_ids:
+        return "unverified"
+    rows = conn.execute(
+        """
+        SELECT COALESCE(s.trust, 'verified') FROM items i
+        LEFT JOIN sources s ON s.id = i.source_id
+        WHERE i.id = ANY(%s)
+        """,
+        (item_ids,),
+    ).fetchall()
+    if not rows:
+        return "unverified"
+    return min((r[0] for r in rows), key=lambda t: _TRUST_RANK.get(t, 0))
 
 
 def open_review_count() -> int:
@@ -265,8 +310,16 @@ def create_summary(project: str, topic: str, body: str, source_item_ids: list[in
     ``derived_from`` to every source id; a prior active summary for the same
     (project, topic) is superseded, never edited (Invariant 1). The timestamped
     source uri makes the refresh a new item even if the body is byte-identical.
+
+    FIX 5 (audit 2026-07-26): the summary carries its PROVENANCE — ``source_ids``
+    and ``source_trust``, the MINIMUM trust across those sources. Summaries built
+    from unverified leaves were being read as authoritative (one restated a
+    fabricated response contract as "Testing confirmed"), and the summary's own
+    ``trust='unverified'`` did not distinguish "auto-generated from verified
+    knowledge" from "auto-generated from unreviewed extractions". Now it does.
     """
     ts = datetime.now(UTC)
+    ids = list(dict.fromkeys(source_item_ids))
     with transaction() as conn:
         new_id = ingest_in(
             conn,
@@ -278,11 +331,17 @@ def create_summary(project: str, topic: str, body: str, source_item_ids: list[in
             uri=f"summary:{project}:{topic}:{ts.isoformat()}",
             trust="unverified",
             tags=[topic],
-            meta={"topic": topic, "consolidation": True, "extractor": settings.kb_extract_model},
+            meta={
+                "topic": topic,
+                "consolidation": True,
+                "extractor": settings.kb_extract_model,
+                "source_ids": ids,
+                "source_trust": _min_source_trust(conn, ids),
+            },
         )
         if new_id is None:  # unreachable with the timestamped uri, but be explicit
             raise NotFound("summary source collided unexpectedly")
-        for sid in dict.fromkeys(source_item_ids):
+        for sid in ids:
             conn.execute(
                 """
                 INSERT INTO relations (project, src_kind, src_id, rel, dst_kind, dst_id)

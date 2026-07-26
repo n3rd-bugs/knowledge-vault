@@ -44,7 +44,7 @@ from typing import Any
 
 import zstandard
 
-from kbcore import llm
+from kbcore import llm, session_noise
 from kbcore.config import settings
 from kbcore.db import connect
 from kbcore.errors import InvalidOperation, NotFound
@@ -190,7 +190,7 @@ def _shadow_counts(text: str, existing: set[str], project: str, uri: str) -> tup
         candidates = [s["item"] for s in report["survivors"]]
         rejected = report["unanchored"] + report["rejected_reps"]
     else:
-        survivors, rejected = gate_quotes(
+        survivors, rejected, _reasons = gate_quotes(
             llm.extract_items(text), text, settings.kb_quote_repair_min_ratio
         )
         candidates = [it for it, _repair in survivors]
@@ -200,6 +200,8 @@ def _shadow_counts(text: str, existing: set[str], project: str, uri: str) -> tup
         body = (it.get("body") or "").strip()
         if not body:
             continue
+        if session_noise.noise_reason(title, body) is not None:
+            continue  # mirrors the mint-time noise skip (audit 2026-07-26 FIX 7)
         title_s, _ = scrub(normalize_title(title))
         body_s, _ = scrub(normalize(body))
         hashes.add(content_hash(title_s, body_s))

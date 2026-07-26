@@ -503,6 +503,15 @@ def triage_extraction(
         )
         or "(none)"
     )
+    # Audit 2026-07-26 FIX 2: identifiers the item cites that resolve to nothing
+    # (kbcore.ref_check) — the strongest machine-checkable confabulation signal.
+    unresolved = ", ".join(str(r) for r in (item.get("unresolved_refs") or []))
+    unresolved_line = (
+        f"Identifiers cited by this item that do NOT exist in the repo, the installed "
+        f"hooks, or the config: {unresolved}\n\n"
+        if unresolved
+        else ""
+    )
     user = (
         f"Item under review:\n"
         f"type: {item.get('type')}\n"
@@ -510,6 +519,7 @@ def triage_extraction(
         f"title: {title}\n"
         f"tags: {tags}\n"
         f"body:\n{body}\n\n"
+        f"{unresolved_line}"
         f"Times this item was recalled by a user: {usage_count}\n\n"
         f"Similar existing items:\n{sim_lines}\n\n"
         f"Answer with the JSON verdict."

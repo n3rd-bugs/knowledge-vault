@@ -43,6 +43,10 @@ def pending_triage(limit: int) -> list[dict[str, Any]]:
     access_log count — the judge weighs whether the knowledge was ever recalled.
     One parameterized query; ``limit`` bounds the nightly GPU spend (``<= 0``
     returns nothing — the kill switch rides the batch knob).
+
+    ``unresolved_refs`` (audit 2026-07-26 FIX 2) rides along so the judge sees the
+    identifiers the item cites that resolve to NOTHING — the single strongest
+    machine-checkable signal that an otherwise-plausible extraction is confabulated.
     """
     if limit <= 0:
         return []
@@ -50,7 +54,8 @@ def pending_triage(limit: int) -> list[dict[str, Any]]:
         rows = conn.execute(
             """
             SELECT rq.id, i.id, i.project, i.type, i.title, i.body, i.tags,
-                   (SELECT count(*) FROM access_log al WHERE al.item_id = i.id)
+                   (SELECT count(*) FROM access_log al WHERE al.item_id = i.id),
+                   COALESCE(i.meta, '{}'::jsonb)
             FROM review_queue rq
             JOIN items i ON i.id = rq.item_id
             WHERE rq.resolved = false
@@ -71,6 +76,9 @@ def pending_triage(limit: int) -> list[dict[str, Any]]:
                 "title": r[4],
                 "body": r[5],
                 "tags": list(r[6] or []),
+                "unresolved_refs": list(
+                    (r[8] or {}).get("unresolved_refs") or [] if isinstance(r[8], dict) else []
+                ),
             },
             "usage_count": int(r[7]),
         }

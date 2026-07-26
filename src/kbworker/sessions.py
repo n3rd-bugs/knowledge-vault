@@ -17,14 +17,16 @@ import os
 from pathlib import Path
 from typing import Any
 
-from kbcore import llm
+from kbcore import extract_hygiene, llm
 from kbcore.checkpoints import get_checkpoint, set_checkpoint
 from kbcore.config import settings
 from kbcore.db import transaction
 from kbcore.errors import InvalidOperation
+from kbcore.extract_hygiene import Hygiene
 from kbcore.ingest import ingest_in
 from kbcore.locks import session_lock
 from kbcore.models import ITEM_TYPES, SessionSummary
+from kbcore.quote_modality import is_aspirational
 from kbcore.quote_repair import find_span
 from kbcore.review import queue_review_in
 from kbcore.scrub import scrub
@@ -175,54 +177,95 @@ def assemble_text(data: bytes | str, kind: str = "session") -> str:
     return assembled if assembled.strip() else plain
 
 
-def _code_ref(project: str, repo: str | None, commit: str | None) -> dict[str, str] | None:
-    """Stamp a code anchor from the session's git context (§7.2, DATA-9).
+def _session_provenance(repo: str | None, commit: str | None) -> dict[str, str]:
+    """Git provenance for a session WINDOW, as meta — never a code_ref (§7.2, DATA-9).
 
-    ``commit`` + ``repo`` are what matter; path is ``.`` because a session spans
-    a working tree, not one file.
+    FIX 6 (audit 2026-07-26): this used to stamp ``{"repo": X, "path": "."}`` on
+    every session item. A session spans a working tree, not one file, so the path
+    was always ``.`` — a repo-ROOT anchor that RENDERS like a verifiable citation
+    (``↳ repo@commit:.``, CodeRef.render) while pointing at nothing. 8+ items in
+    the audited sample carried it. The repo/commit provenance is genuinely useful,
+    so it survives as plain meta, which no surface presents as a code anchor.
     """
-    if not repo and not commit:
-        return None
-    name = os.path.basename(repo.rstrip("/")) if repo else project
-    ref = {"repo": name, "path": "."}
+    out: dict[str, str] = {}
+    if repo:
+        out["session_repo"] = os.path.basename(repo.rstrip("/")) or repo
     if commit:
-        ref["commit"] = commit
-    return ref
+        out["session_commit"] = commit
+    return out
+
+
+MAX_GATE_REASONS = 20  # rejection/skip reasons kept in review_queue.detail
+
+
+def _record_reason(sink: list[dict[str, str]], item: dict[str, Any], reason: str) -> None:
+    """Append one auditable (title, reason) pair, bounded and SEC-2 scrubbed.
+
+    The title comes from the MODEL, so it gets the same scrub as any stored
+    text — a secret must not become searchable via a rejection record either.
+    """
+    if len(sink) >= MAX_GATE_REASONS:
+        return
+    title, _ = scrub(str(item.get("title") or "")[:80])
+    sink.append({"title": title, "reason": reason})
 
 
 def gate_quotes(
     raw_items: list[dict[str, Any]], text: str, min_ratio: float
-) -> tuple[list[tuple[dict[str, Any], dict[str, Any] | None]], int]:
-    """SEC-3 quote gate: exact substring → grounded; near-miss → ONE fuzzy
-    relocation attempt (repaired: the LOCATED span replaces the model quote);
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any] | None]], int, list[dict[str, str]]]:
+    """SEC-3 quote gate + the MODALITY gate: exact substring → grounded; near-miss
+    → ONE fuzzy relocation attempt (repaired: the LOCATED span replaces the model
+    quote); a quote that states INTENT rather than observation → rejected;
     anything else is dropped and counted.
 
-    Returns ``(survivors, rejected)`` where each survivor is ``(item, repair)`` —
-    ``repair`` is None for exact quotes, else the audit record ``{"ratio": r,
-    "model_quote": <original, scrubbed at store time>}``. This is THE quote gate,
-    shared by pipeline v1 and the WP-B2 ensemble (kbworker.ensemble) so the two
-    paths can never drift.
+    Returns ``(survivors, rejected, rejections)`` where each survivor is
+    ``(item, repair)`` — ``repair`` is None for exact quotes, else the audit
+    record ``{"ratio": r, "model_quote": <original, scrubbed at store time>}`` —
+    and ``rejections`` is the bounded, scrubbed ``[{title, reason}]`` audit trail
+    that rides the review-queue detail. This is THE quote gate, shared by pipeline
+    v1 and the WP-B2 ensemble (kbworker.ensemble) so the two paths can never drift.
+
+    MODALITY (FIX 1, audit 2026-07-26): verbatim-substring grounding proves a
+    quote was SAID, not that it was OBSERVED. A session's plan ("Ensure the hook
+    returns a JSON response", "**Expected Results**: …") grounds perfectly and was
+    stored as established fact — item 1073 asserted a ``{"status":"ok"}`` response
+    contract present in NO code path, which consolidation then restated as
+    "Testing confirmed". :func:`kbcore.quote_modality.is_aspirational` runs on the
+    FINAL (exact or repaired) span, so a repair can neither introduce nor launder
+    a plan quote, and a hit rejects the item exactly like an ungrounded one.
     """
     survivors: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    rejections: list[dict[str, str]] = []
     rejected = 0
     for it in raw_items:
         quote = it.get("quote")
         if not isinstance(quote, str) or not quote:
             rejected += 1  # SEC-3: no grounding quote at all
+            _record_reason(rejections, it, "no grounding quote")
             continue
+        repair: dict[str, Any] | None = None
         if quote in text:
-            survivors.append((it, None))
+            final = quote
+        else:
+            located = find_span(quote, text, min_ratio) if min_ratio > 0 else None
+            if located is None:
+                rejected += 1  # SEC-3: ungrounded and unrepairable — dropped
+                _record_reason(rejections, it, "ungrounded quote (unrepairable)")
+                continue
+            span, ratio = located
+            # The LOCATED span IS a verbatim substring of the transcript, so the
+            # item proceeds without weakening SEC-3; the model's near-miss is kept
+            # only as audit metadata (scrubbed at store time — SEC-2 applies to
+            # hallucinated text too).
+            final = span
+            repair = {"ratio": round(ratio, 4), "model_quote": quote}
+        modality = is_aspirational(final)
+        if modality is not None:
+            rejected += 1  # FIX 1: grounded, but a PLAN — never established fact
+            _record_reason(rejections, it, f"aspirational quote — {modality}")
             continue
-        located = find_span(quote, text, min_ratio) if min_ratio > 0 else None
-        if located is None:
-            rejected += 1  # SEC-3: ungrounded and unrepairable — dropped
-            continue
-        span, ratio = located
-        # The LOCATED span IS a verbatim substring of the transcript, so the item
-        # proceeds without weakening SEC-3; the model's near-miss is kept only as
-        # audit metadata (scrubbed below — SEC-2 applies to hallucinated text too).
-        survivors.append(({**it, "quote": span}, {"ratio": round(ratio, 4), "model_quote": quote}))
-    return survivors, rejected
+        survivors.append((it if repair is None else {**it, "quote": final}, repair))
+    return survivors, rejected, rejections
 
 
 def _ingest_and_queue(
@@ -261,6 +304,101 @@ def _ingest_and_queue(
         if item_id is not None:
             queue_review_in(conn, item_id, "unverified_extraction", detail)
     return item_id
+
+
+def _mint_entries(
+    entries: list[dict[str, Any]],
+    *,
+    project: str,
+    uri: str,
+    text: str,
+    code_ref: dict[str, str] | None,
+    branch: str | None,
+    extra_meta: dict[str, Any] | None,
+    base_detail: dict[str, Any],
+    gate_rejections: list[dict[str, str]],
+) -> int:
+    """Apply the post-extraction hygiene chokepoint, then ingest the survivors.
+
+    ONE mint path for pipeline v1 AND the WP-B2 ensemble (each entry is
+    ``{item, repair, meta_seed}``; ``meta_seed`` carries the per-pipeline meta —
+    v1's extractor name, or the ensemble's model + ``extraction_pipeline``), so
+    the audit fixes can never apply to only one of the two paths — the same
+    no-drift property :func:`gate_quotes` gives the quote gate.
+
+    Every rule lives in :func:`kbcore.extract_hygiene.evaluate` (project reroute,
+    tag-bleed, unresolved refs, phantom code_ref, noise skip). TWO PASSES on
+    purpose: the run-level counts (noise skips, quote rejections) must be
+    identical on every review row this window writes, so all verdicts are computed
+    before the first row is inserted. Returns the number of items saved.
+    """
+    raw = text.encode("utf-8")
+    planned: list[tuple[dict[str, Any], Hygiene, str, str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for entry in entries:
+        it = entry["item"]
+        type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
+        title = (it.get("title") or "").strip() or "session note"
+        body = (it.get("body") or "").strip()
+        if not body:
+            continue
+        tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
+        hygiene = extract_hygiene.evaluate(
+            project=project, title=title, body=body, tags=tags, code_ref=code_ref
+        )
+        if hygiene.noise_reason is not None:
+            _record_reason(skipped, it, hygiene.noise_reason)
+            continue
+        planned.append((entry, hygiene, type_, title, body))
+
+    detail = dict(base_detail)
+    if gate_rejections:
+        detail["quote_rejections"] = gate_rejections
+    if skipped:
+        detail["noise_skipped"] = len(skipped)
+        detail["noise_detail"] = skipped
+
+    saved = 0
+    for entry, hygiene, type_, title, body in planned:
+        it, repair = entry["item"], entry["repair"]
+        # Scrub the quote before storing it in meta: a secret in the source must
+        # not become searchable via meta.quote (SEC-2). Grounding already
+        # validated the pre-scrub quote against the text.
+        scrubbed_quote, _ = scrub(it["quote"])
+        meta: dict[str, Any] = {"quote": scrubbed_quote, **entry["meta_seed"]}
+        if repair is not None:
+            # Same scrub for the ORIGINAL model quote: a secret in a hallucinated
+            # quote must not become searchable either (SEC-2).
+            scrubbed_model_quote, _ = scrub(repair["model_quote"])
+            meta["quote_repair"] = {
+                "ratio": repair["ratio"],
+                "model_quote": scrubbed_model_quote,
+            }
+        if branch:
+            meta["branch"] = branch
+        meta.update(hygiene.meta())  # rerouted_from / dropped_tags / unresolved_refs
+        for k, v in (extra_meta or {}).items():
+            meta.setdefault(k, v)  # provenance stamp (kb reprocess); pipeline keys win
+        item_detail = detail
+        if hygiene.unresolved_refs:
+            # FIX 2: the reviewer AND the triage LLM must see the invented
+            # identifiers; the item itself is kept intact (flag, never destroy).
+            item_detail = {**detail, "unresolved_refs": list(hygiene.unresolved_refs)}
+        item_id = _ingest_and_queue(
+            project=hygiene.project,
+            type_=type_,
+            title=title,
+            body=body,
+            uri=uri,
+            tags=hygiene.tags,
+            meta=meta,
+            code_ref=hygiene.code_ref,
+            raw=raw,
+            detail=item_detail,
+        )
+        if item_id is not None:
+            saved += 1
+    return saved
 
 
 def extract_and_ingest(
@@ -316,49 +454,23 @@ def extract_and_ingest(
     raw_items = extractor(text)
     # (item, repair) pairs: repair is None for exact quotes, else the audit record
     # {"ratio": r, "model_quote": <original, scrubbed at store time>}.
-    survivors, rejected = gate_quotes(raw_items, text, settings.kb_quote_repair_min_ratio)
-
-    raw = text.encode("utf-8")
-    detail = {"rejected_count": rejected, **(extra_detail or {})}
-    saved = 0
-    for it, repair in survivors:
-        type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
-        title = (it.get("title") or "").strip() or "session note"
-        body = (it.get("body") or "").strip()
-        if not body:
-            continue
-        tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
-        # Scrub the quote before storing it in meta: a secret in the source must
-        # not become searchable via meta.quote (SEC-2). Grounding above already
-        # validated the pre-scrub quote against the text.
-        scrubbed_quote, _ = scrub(it["quote"])
-        meta: dict[str, Any] = {"quote": scrubbed_quote, "extractor": settings.kb_extract_model}
-        if repair is not None:
-            # Same scrub for the ORIGINAL model quote: a secret in a hallucinated
-            # quote must not become searchable either (SEC-2).
-            scrubbed_model_quote, _ = scrub(repair["model_quote"])
-            meta["quote_repair"] = {
-                "ratio": repair["ratio"],
-                "model_quote": scrubbed_model_quote,
-            }
-        if branch:
-            meta["branch"] = branch
-        for k, v in (extra_meta or {}).items():
-            meta.setdefault(k, v)  # provenance stamp (kb reprocess); pipeline keys win
-        item_id = _ingest_and_queue(
-            project=project,
-            type_=type_,
-            title=title,
-            body=body,
-            uri=uri,
-            tags=tags,
-            meta=meta,
-            code_ref=code_ref,
-            raw=raw,
-            detail=detail,
-        )
-        if item_id is not None:
-            saved += 1
+    survivors, rejected, rejections = gate_quotes(
+        raw_items, text, settings.kb_quote_repair_min_ratio
+    )
+    saved = _mint_entries(
+        [
+            {"item": it, "repair": repair, "meta_seed": {"extractor": settings.kb_extract_model}}
+            for it, repair in survivors
+        ],
+        project=project,
+        uri=uri,
+        text=text,
+        code_ref=code_ref,
+        branch=branch,
+        extra_meta=extra_meta,
+        base_detail={"rejected_count": rejected, **(extra_detail or {})},
+        gate_rejections=rejections,
+    )
 
     if ensemble_on:  # shadow mode: v1 stood above; compute + LOG only, write nothing
         from kbworker import ensemble
@@ -386,51 +498,28 @@ def _ingest_ensemble_survivors(
     representatives that failed verification (judge-fail / judge-error).
     Idempotent like v1: same window re-run dedupes on (kind, uri, content_hash).
     """
-    raw = text.encode("utf-8")
     rejected = report["unanchored"] + report["rejected_reps"]
-    detail = {"rejected_count": rejected, **(report.get("extra_detail") or {})}
-    branch = report.get("branch")
-    saved = 0
-    for surv in report["survivors"]:
-        it = surv["item"]
-        type_ = it.get("type") if it.get("type") in ITEM_TYPES else "note"
-        title = (it.get("title") or "").strip() or "session note"
-        body = (it.get("body") or "").strip()
-        if not body:
-            continue
-        tags = [t for t in (it.get("tags") or []) if isinstance(t, str)]
-        # Same SEC-2 rules as v1: scrub the stored quote (and the model's
-        # near-miss original, below) so a secret never becomes searchable.
-        scrubbed_quote, _ = scrub(it["quote"])
-        meta: dict[str, Any] = {
-            "quote": scrubbed_quote,
-            "extractor": surv["model"],
-            "extraction_pipeline": surv["extraction_pipeline"],
-        }
-        if surv["repair"] is not None:
-            scrubbed_model_quote, _ = scrub(surv["repair"]["model_quote"])
-            meta["quote_repair"] = {
-                "ratio": surv["repair"]["ratio"],
-                "model_quote": scrubbed_model_quote,
+    saved = _mint_entries(
+        [
+            {
+                "item": surv["item"],
+                "repair": surv["repair"],
+                "meta_seed": {
+                    "extractor": surv["model"],
+                    "extraction_pipeline": surv["extraction_pipeline"],
+                },
             }
-        if branch:
-            meta["branch"] = branch
-        for k, v in (extra_meta or {}).items():
-            meta.setdefault(k, v)  # provenance stamp (kb reprocess); pipeline keys win
-        item_id = _ingest_and_queue(
-            project=report["project"],
-            type_=type_,
-            title=title,
-            body=body,
-            uri=report["uri"],
-            tags=tags,
-            meta=meta,
-            code_ref=report.get("code_ref"),
-            raw=raw,
-            detail=detail,
-        )
-        if item_id is not None:
-            saved += 1
+            for surv in report["survivors"]
+        ],
+        project=report["project"],
+        uri=report["uri"],
+        text=text,
+        code_ref=report.get("code_ref"),
+        branch=report.get("branch"),
+        extra_meta=extra_meta,
+        base_detail={"rejected_count": rejected, **(report.get("extra_detail") or {})},
+        gate_rejections=list(report.get("gate_rejections") or []),
+    )
     return saved, rejected
 
 
@@ -533,9 +622,10 @@ def ingest_session(
             transcript_text,
             project,
             uri,
-            code_ref=_code_ref(project, repo, commit),
+            code_ref=None,  # FIX 6: a session window anchors no FILE (_session_provenance)
             branch=branch,
             extra_detail={"offset_range": f"{offset}-{new_offset}"},
+            extra_meta=_session_provenance(repo, commit),
         )
         set_checkpoint(key, new_offset)
         return SessionSummary(

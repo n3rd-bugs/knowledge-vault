@@ -124,8 +124,11 @@ def test_drain_extracts_grounded_marks_rows_and_is_noop_second_time(kb, monkeypa
     for meta, trust, _uri in items:
         assert trust == "unverified" and "quote" in meta
     session_item = next(m for m, _t, uri in items if uri.startswith("queue:session:"))
-    assert session_item["code_ref"]["repo"] == "motor-ctl"
-    assert session_item["code_ref"]["commit"] == "abc1234"
+    # FIX 6 (audit 2026-07-26): the drain no longer mints a {"path": "."} code_ref
+    # for a queued window; repo/commit survive as meta provenance instead.
+    assert "code_ref" not in session_item, "no phantom repo-root anchor"
+    assert session_item["session_repo"] == "motor-ctl"
+    assert session_item["session_commit"] == "abc1234"
 
     with db.connect() as conn:
         details = [

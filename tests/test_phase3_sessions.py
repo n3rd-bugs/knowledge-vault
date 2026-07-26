@@ -100,10 +100,13 @@ def test_hallucinated_quote_rejected_grounded_saved(tmp_path, monkeypatch):
     assert item.meta["quote"] == "the DRV8706 needs CPHA=1"
     assert item.meta["extractor"] == settings.kb_extract_model
     assert item.meta.get("branch") == "main"
-    assert item.code_ref is not None
-    assert item.code_ref.repo == "motor-ctl"  # basename of --repo
-    assert item.code_ref.path == "."
-    assert item.code_ref.commit == "a1b2c3d"
+    # FIX 6 (audit 2026-07-26): a session spans a working TREE, not one file, so it
+    # gets no code anchor at all. The old {"repo": X, "path": "."} rendered as a
+    # verifiable citation while pointing at nothing; the git context that IS useful
+    # now rides plain meta, which no surface presents as a code_ref.
+    assert item.code_ref is None, "no phantom repo-root anchor"
+    assert item.meta["session_repo"] == "motor-ctl"  # basename of --repo
+    assert item.meta["session_commit"] == "a1b2c3d"
 
     with db.connect() as conn:
         queue = conn.execute("SELECT item_id, reason, detail FROM review_queue").fetchall()

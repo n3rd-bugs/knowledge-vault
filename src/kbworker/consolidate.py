@@ -67,15 +67,18 @@ def _drain_ingest_queue() -> tuple[int, int]:
         try:
             text = sessions.assemble_text(row["content"], row["kind"])
             meta = row["meta"] or {}
-            code_ref = sessions._code_ref(row["project"], meta.get("repo"), meta.get("commit"))
             uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
             saved, rejected = sessions.extract_and_ingest(
                 text,
                 row["project"],
                 uri,
-                code_ref=code_ref,
+                # FIX 6 (audit 2026-07-26): a queued session/memory window anchors
+                # no FILE — repo/commit ride the item meta as provenance instead of
+                # a phantom {"path": "."} code_ref.
+                code_ref=None,
                 branch=meta.get("branch"),
                 extra_detail={"ingest_queue_id": row["id"], "source": row["kind"]},
+                extra_meta=sessions._session_provenance(meta.get("repo"), meta.get("commit")),
             )
             ingest_queue.mark_extracted(row["id"], saved, rejected)
             drained += 1

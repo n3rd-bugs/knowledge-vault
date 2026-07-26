@@ -37,7 +37,7 @@ from typing import Any
 from kbcore import embed, llm
 from kbcore.config import settings
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
-from kbworker.sessions import gate_quotes
+from kbworker.sessions import MAX_GATE_REASONS, gate_quotes
 
 logger = logging.getLogger("kbworker.ensemble")
 
@@ -186,14 +186,19 @@ def run_ensemble(
     entries: list[dict[str, Any]] = []
     candidates: dict[str, int] = {}
     usable: dict[str, int] = {}
+    gate_rejections: list[dict[str, str]] = []
     unanchored = 0
     for m in [primary, *extras]:
         if m not in per_model:
             continue  # failed extra — already logged and counted
-        gated, dropped = gate_quotes(per_model[m], text, min_ratio)
+        # Same gate as v1, including the FIX-1 modality check; its per-item
+        # reasons ride the report so the ingest side can put them in the review
+        # detail (audit 2026-07-26).
+        gated, dropped, rejections = gate_quotes(per_model[m], text, min_ratio)
         candidates[m] = len(per_model[m])
         usable[m] = len(gated)
         unanchored += dropped
+        gate_rejections.extend({**r, "model": m} for r in rejections)
         entries.extend({"item": it, "repair": repair, "model": m} for it, repair in gated)
 
     threshold = settings.kb_ensemble_cluster_threshold
@@ -284,6 +289,7 @@ def run_ensemble(
         "candidates": candidates,
         "usable": usable,
         "unanchored": unanchored,
+        "gate_rejections": gate_rejections[:MAX_GATE_REASONS],
         "clusters": len(clusters),
         "cluster_detail": cluster_detail,
         "corroborated": corroborated,

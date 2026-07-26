@@ -43,3 +43,6 @@ cloudflared.env
 
 # Local logs may contain hostnames / pasted tokens — never commit
 logs/
+
+# hookrig build log (transient; kept only when an image build fails)
+tests/hookrig/.build.log

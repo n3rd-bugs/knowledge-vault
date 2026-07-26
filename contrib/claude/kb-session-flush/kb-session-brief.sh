@@ -187,7 +187,7 @@ if [ "$MODE" = "brief" ]; then
     # later " ok bytes=" (the retry drained) means the failure is stale and must
     # not resurface as noise every session (regression the recall-noise fix hit).
     RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
-      /FAILED|BUG:|http=[45][0-9][0-9]/ { fail=$0; failn=NR; next }
+      /FAILED|BUG:|NOT CONFIGURED|http=[45][0-9][0-9]/ { fail=$0; failn=NR; next }
       / (ok|partial) bytes=/ {
         # Belt and braces (HIGH-1): a summary whose (offset X/Y) shows X<Y is an
         # INCOMPLETE drain — count it as a failure even if the matching FAILED line

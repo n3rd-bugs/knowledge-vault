@@ -290,5 +290,22 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     # Terminal event, fully drained: drop this session'"'"'s offset file.
     [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
   ' </dev/null >>"$LOG" 2>&1 &
+else
+  # NO transport is configured (no KB_DIR, no KB_MCP_URL/KB_REST_URL+KB_TOKEN, no
+  # CONNECTOR). Without this branch the hook fell off the end and exited 0 in
+  # SILENCE: the machine captured nothing, forever, with no signal anywhere —
+  # and because the SessionStart pre-brief surfaces failures by grepping THIS
+  # log, its warning stayed silent too. That breaks the skill's own
+  # never-silent-failure guarantee. Found by tests/hookrig case 12.
+  # Rate-limited to one line an hour so a deliberately-unconfigured box does not
+  # spam the log on every PreCompact + SessionEnd.
+  STAMP="$STATE/.notconfigured.stamp"
+  NOW=$(date +%s 2>/dev/null || echo 0)
+  LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  if [ "$((NOW - LAST))" -ge 3600 ]; then
+    printf '%s\n' "$NOW" >"$STAMP" 2>/dev/null || true
+    echo "$(date -Is) flush $PROJECT NOT CONFIGURED: no transport in $CFG (set KB_DIR, or KB_MCP_URL/KB_REST_URL + KB_TOKEN, or KB_CONNECTOR=1) — this session was NOT captured" >>"$LOG"
+  fi
 fi
 exit 0

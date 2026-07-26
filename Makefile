@@ -1,7 +1,7 @@
-.PHONY: up down migrate test lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
+.PHONY: up down migrate test hooktest lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
 
 help:
-	@echo "targets: up down migrate test lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
+	@echo "targets: up down migrate test hooktest lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
 
 up:
 	docker compose --env-file .env up -d
@@ -20,6 +20,12 @@ migrate:
 
 test:
 	uv run pytest
+
+# Hermetic containerised rig for the Claude Code session hooks (tests/hookrig).
+# Talks only to a stub it starts on an --internal docker network; never touches
+# the live KB, the live DB, or the host's ~/.claude. No `uv`/DB needed.
+hooktest:
+	bash tests/hookrig/run.sh
 
 lint:
 	uv run ruff check --fix .

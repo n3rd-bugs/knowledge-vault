@@ -178,13 +178,37 @@ def _or_coverage_rows(
             FROM unnest(%s::text[]) t
         ),
         stats AS (SELECT count(*)::float AS n_items FROM items),
+        -- DROP THE STOPWORDS. The 'simple' config keeps them (deliberately —
+        -- it also keeps Urdu and identifiers), so a natural-language prompt like
+        -- "how does the retry backoff work in this service" carries lexemes that
+        -- match nearly EVERY chunk. Their IDF weight ln(1 + N/df) tends to zero,
+        -- so they cannot change the ranking, but the join below has to visit
+        -- every row they match: measured 22.9s versus 0.8s for the same query
+        -- with stopwords removed by hand. Filtering by df is language-agnostic —
+        -- it needs no stopword list and adapts to whatever this corpus finds
+        -- common. Keep the rarest few if EVERY lexeme is common, so a query made
+        -- entirely of frequent words still returns something.
+        sel AS (
+            SELECT tq, df FROM tok
+             WHERE df <= GREATEST(8, ((SELECT n_items FROM stats) / 3)::bigint)
+             ORDER BY df
+             LIMIT %s
+        ),
+        selected AS (
+            SELECT * FROM sel
+            UNION ALL
+            SELECT tq, df FROM (
+                SELECT tq, df FROM tok ORDER BY df LIMIT 3
+            ) fallback
+            WHERE NOT EXISTS (SELECT 1 FROM sel)
+        ),
         cov AS (
             SELECT item_id, count(*) AS n, sum(w) AS wsum, min(df) AS min_df
             FROM (
-                SELECT DISTINCT c.item_id, tok.tq::text AS lex, tok.df,
+                SELECT DISTINCT c.item_id, t.tq::text AS lex, t.df,
                        ln(1.0 + (SELECT n_items FROM stats)
-                                / GREATEST(tok.df, 1)) AS w
-                FROM chunks c JOIN tok ON c.tsv @@ tok.tq
+                                / GREATEST(t.df, 1)) AS w
+                FROM chunks c JOIN selected t ON c.tsv @@ t.tq
             ) m
             GROUP BY item_id
         )
@@ -200,7 +224,7 @@ def _or_coverage_rows(
         ORDER BY cov.wsum DESC, ts_rank_cd(c.tsv, q) DESC
         LIMIT {CANDIDATES}
         """,
-        [lexemes, " OR ".join(lexemes), *params],
+        [lexemes, MAX_OR_LEXEMES, " OR ".join(lexemes), *params],
     ).fetchall()
 
 

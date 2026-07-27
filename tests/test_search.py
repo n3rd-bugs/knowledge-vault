@@ -42,3 +42,51 @@ def test_the_or_fallback_still_finds_a_rare_term_in_a_noisy_query(kb):
     assert any("Zylophonic" in h.title for h in hits), (
         "the rare anchor was lost — the lexeme cap is discarding signal, not noise"
     )
+
+
+def test_a_natural_language_query_is_not_dominated_by_its_stopwords(kb):
+    """Latency scaled with STOPWORD COUNT, not query length.
+
+    The 'simple' tsquery config keeps stopwords deliberately (it also keeps Urdu
+    and identifiers), so "how does the retry backoff work in this service"
+    carried lexemes matching nearly every chunk. Their IDF weight ln(1 + N/df)
+    tends to zero — they cannot change the ranking — but the coverage join had to
+    visit every row they matched: 22.9s against 0.8s for the same query with
+    stopwords removed by hand, while the recall hook's budget is 6s.
+
+    The earlier MAX_OR_LEXEMES cap did NOT fix this: a 14-word question is
+    already under the cap, so it never engaged. This asserts the df FILTER, the
+    thing that actually removes the work.
+    """
+    from kbcore import search_legs
+
+    src = search_legs._or_coverage_rows.__doc__ or ""
+    import inspect
+
+    body = inspect.getsource(search_legs._or_coverage_rows)
+    assert "df <=" in body, (
+        "the high-df lexeme filter is gone — a natural-language query will again "
+        "join on words that match the whole corpus"
+    )
+    assert "NOT EXISTS (SELECT 1 FROM sel)" in body, (
+        "the all-common fallback is gone — a query made entirely of frequent "
+        "words would return nothing at all"
+    )
+    assert src is not None
+
+
+def test_a_query_of_only_common_words_still_returns_something(kb):
+    """Filtering high-df lexemes must not empty the result set for a question
+    that happens to be made entirely of frequent words."""
+    from kbcore import search as search_mod
+    from kbcore.ingest import ingest
+
+    for i in range(3):
+        ingest(
+            "common-proj",
+            "note",
+            f"How does the thing work {i}",
+            "It works by doing the thing that the other thing does.",
+        )
+    hits = search_mod.search("how does the it work", k=5)
+    assert hits, "an all-common query returned nothing — the fallback is not firing"

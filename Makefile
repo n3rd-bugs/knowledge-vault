@@ -1,7 +1,7 @@
-.PHONY: up down migrate test hooktest hooktest-win lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
+.PHONY: up down migrate deploy test hooktest hooktest-win lint eval mcp worker consolidate backup restore-test seed reembed sync-assets help
 
 help:
-	@echo "targets: up down migrate test hooktest hooktest-win lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
+	@echo "targets: up down migrate deploy test hooktest hooktest-win lint eval mcp worker consolidate backup restore-test seed reembed sync-assets"
 
 up:
 	docker compose --env-file .env up -d
@@ -24,6 +24,24 @@ test:
 # Hermetic containerised rig for the Claude Code session hooks (tests/hookrig).
 # Talks only to a stub it starts on an --internal docker network; never touches
 # the live KB, the live DB, or the host's ~/.claude. No `uv`/DB needed.
+# Build + restart the KB services. Uses the LEGACY builder deliberately.
+#
+# This host runs AdGuard Home on *:53, so /etc/resolv.conf is `nameserver
+# 127.0.0.1` (KB item 859, sungrow). BuildKit copies that verbatim into the
+# build container's network namespace, where nothing is listening, and every
+# image pull dies with `lookup ghcr.io on 127.0.0.1: i/o timeout`. The legacy
+# builder works because Docker substitutes a public resolver for a loopback
+# nameserver — the same fallback KB 859 documents for normal containers.
+#
+# The permanent fix is an explicit `"dns"` in /etc/docker/daemon.json (point it
+# at the LAN address AdGuard listens on, so builds keep ad-blocking), but that
+# needs a dockerd restart, which bounces every container on this box.
+deploy:
+	docker pull ghcr.io/astral-sh/uv:latest
+	DOCKER_BUILDKIT=0 docker compose build kb-mcp kb-rest
+	docker compose up -d kb-mcp kb-mcp-public kb-rest
+	@echo "deployed — verify: curl -o /dev/null -w '%{http_code}\\n' https://api.<host>/api/stats  (expect 401)"
+
 hooktest:
 	bash tests/hookrig/run.sh
 

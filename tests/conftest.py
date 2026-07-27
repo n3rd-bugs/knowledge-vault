@@ -146,10 +146,42 @@ def kb_schema():
 
 
 _KB_TEST_TABLES = (
-    "access_log", "review_queue", "relations", "entities", "chunks", "items",
-    "sources", "projects", "session_checkpoints", "ingest_queue",
-    "principal_grants", "principals", "enrolment_codes",
+    "access_log",
+    "review_queue",
+    "relations",
+    "entities",
+    "chunks",
+    "items",
+    "sources",
+    "projects",
+    "session_checkpoints",
+    "ingest_queue",
+    "principal_grants",
+    "principals",
+    "enrolment_codes",
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_raw_store(tmp_path_factory, monkeypatch):
+    """Point KB_RAW at a per-session temp dir instead of the real ~/kb/raw.
+
+    Two reasons, both learned the hard way:
+
+    * The archive is CONTENT-ADDRESSED and archive_raw never overwrites an
+      existing blob. So a blob written by a buggy run is reused by every later
+      run, and a bug outlives the code that caused it — a NUL-byte document was
+      "failing" long after the fix, because the test kept reading the mangled
+      blob from before it.
+    * Tests were writing into the production raw store, which is tarred into
+      every off-site backup. Test fixtures do not belong in the owner's backups,
+      and this is the same class of mistake as the live-schema truncations this
+      repo has already suffered.
+    """
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_raw", tmp_path_factory.mktemp("kb_raw"))
+    yield
 
 
 @pytest.fixture()

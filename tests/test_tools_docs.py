@@ -121,13 +121,15 @@ def test_the_archive_itself_preserves_every_byte_value():
         path.unlink(missing_ok=True)
 
 
-@pytest.mark.xfail(
-    reason="a document containing a NUL byte does not survive put_document intact; "
-    "archive_raw is exact (test above), so the loss is in the document path. "
-    "Recorded rather than hidden — binary WITH NUL is not yet supported.",
-    strict=True,
-)
 def test_a_document_containing_NUL_round_trips(kb, as_owner):
+    """Every byte value, NUL included, survives put_document.
+
+    This was briefly recorded as an xfail. It was never a defect: the raw store
+    is content-addressed and archive_raw deliberately never overwrites, so a
+    blob written by an EARLIER, buggy run was being reused forever. The test was
+    reading a stale artifact. See the KB_RAW isolation in conftest, which is the
+    actual fix — without it a bug can outlive the code that caused it.
+    """
     raw = bytes(range(256))
     doc = documents.put_document("proj", "withnul.bin", content=raw)
     assert documents.read_raw(doc.source_id) == raw

@@ -205,13 +205,58 @@ kb principal ungrant alice acme-infra   # remove one project, keep the rest
   A non-owner web write is forced `unverified` + quarantined until you promote,
   so the browser can never mint verified knowledge nor reach an agent's search
   before review. `guest`/`reader` grantees remain fully read-only.
+## 2.5 Enrolment codes
+
+A machine sets itself up by redeeming a **one-time code** (`kbe_…`) rather than
+by having a bearer pasted into it:
+
+```bash
+export KB_ENROL_CODE=kbe_…            # from kb_setup; single use, ~15 min
+export KB_REST_URL=https://api.<host>
+mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+  curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
+done
+bash install.sh
+```
+
+Why a code rather than the credential: `kb_setup` answers into a chat
+transcript, and the session hooks flush transcripts **into the KB**, which is
+then backed up off-site. A live bearer sent that way is durable in three places
+at once. A code is single-use and short-lived, so after redemption the
+transcript holds a dead string.
+
+| Property | Behaviour |
+| --- | --- |
+| Authority | Never more than the identity that asked. Owner → `KB_TOKEN`; grantee → a fresh per-machine `kbg_` with exactly their grants; ungranted identity → no code at all |
+| Lifetime | ~15 min (clamped to 60), max 5 unredeemed per identity |
+| Single use | One atomic `UPDATE … WHERE redeemed_at IS NULL`; two racing redemptions cannot both win |
+| At rest | SHA-256 only (`enrolment_codes.code_hash`); plaintext shown once |
+| Refusals | Unknown / malformed / expired / already-used are **byte-identical** — no oracle |
+| Authentication | A `kbe_` code authenticates as an identity with **no projects and no capabilities**, so `POST /api/enrol` needs no auth exemption and every other route sees a caller that can read and write nothing |
+| Revocation | Expire the row, or let the TTL lapse; the nightly pass sweeps dead rows |
+
+A code is a credential and is redacted on ingest like any other (`kbe_`/`kbg_`
+both match the scrubber).
+
 - **No-oracle guarantee.** A grantee probing a withheld project gets responses
   byte-identical to a nonexistent one — no revoked-vs-unknown, no
   granted-vs-hidden distinction, on any surface. Unknown and revoked bearer
   tokens get the same 401.
-- **Master key stays with the owner.** Sharing never involves handing out
-  `KB_TOKEN`. Secrets are never stored (token hash only) and never printed by
-  `kb principal list`; the plaintext appears exactly once, at create/rotate.
+- **Master key stays with the owner — for SHARING.** No act of sharing hands out
+  `KB_TOKEN`: a grantee always gets their own `kbg_` token. Secrets are never
+  stored (token hash only) and never printed by `kb principal list`; the
+  plaintext appears exactly once, at create/rotate.
+
+  **The one exception is enrolment, and it is the OWNER'S OWN machines.** An
+  enrolment code issued to the owner redeems to `KB_TOKEN` itself, so that a
+  machine can capture sessions in projects that do not exist yet — a fixed-grant
+  token cannot express that and fails the moment a session runs in a new
+  directory. A code issued to a GRANTEE never does this: it mints a fresh
+  per-machine `kbg_` principal carrying exactly that grantee's grants. See
+  [§2.5](#25-enrolment-codes). Practical consequence: the master key is only as
+  revocable as your ability to rotate it everywhere, so treat an owner enrolment
+  as "this machine is now trusted like the KB host".
 - **Audit.** Grantee reads are attributed by name in `access_log.principal`
   (NULL = owner/legacy).
 - **One manual step that is NOT code:** the Google OAuth app must be

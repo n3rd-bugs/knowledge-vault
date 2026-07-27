@@ -30,6 +30,12 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # captured verbatim into the KB by the session hooks. Any credential this
     # system MINTS must be redactable by this system.
     ("kb_token", re.compile(r"kbg_[A-Za-z0-9\-_]{20,}")),
+    # ...and the ENROLMENT code, for the same reason. It is printed into a
+    # kb_setup reply, and the hooks flush that transcript into the KB and then
+    # off-site — so until it is redeemed it is a live credential heading for
+    # durable storage. Adding kbg_ without kbe_ left the newer of the two
+    # credentials this system mints unredactable.
+    ("kb_enrol_code", re.compile(r"kbe_[A-Za-z0-9\-_]{20,}")),
     ("jwt", re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+")),
     (
         "credential",

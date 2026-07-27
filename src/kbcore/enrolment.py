@@ -260,6 +260,33 @@ def _unique_machine_name(issued_to: str, label: str) -> str:
     return f"{base}-{secrets.token_hex(3)}"
 
 
+def is_live_code(code: str | None) -> bool:
+    """True only for a code that exists, is unredeemed and has not expired.
+
+    The bearer layer needs this because a PREFIX is not a credential. An earlier
+    version of resolve_bearer returned an authenticated principal for anything
+    starting with ``kbe_``, which satisfied the bearer gate (CLAUDE.md rule 6)
+    with four known characters. The identity it granted held no projects and no
+    capabilities, so nothing could be read — but "authenticates with no secret"
+    is not a state this system may be in, and it made the document-staging
+    endpoints reachable without a credential.
+
+    Deliberately no cache: a code is single-use and short-lived, so the window
+    a cache would optimise is the window in which correctness matters most.
+    """
+    if not _looks_like_code(code):
+        return False
+    with transaction() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM enrolment_codes
+             WHERE code_hash = %s AND redeemed_at IS NULL AND expires_at > now()
+            """,
+            (_hash(str(code)),),
+        ).fetchone()
+    return row is not None
+
+
 def sweep_expired(older_than_days: int = 30) -> int:
     """Drop long-dead codes. Returns how many rows went.
 

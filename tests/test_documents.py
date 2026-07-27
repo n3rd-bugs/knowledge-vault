@@ -191,3 +191,31 @@ def test_writing_a_document_needs_write_access_to_the_project(kb, as_owner):
     reader = scope.Principal(name="reader", read_projects=frozenset({"proj"}))
     with scope.use_principal(reader), pytest.raises(KBError):
         documents.put_document("proj", "nope.txt", content=b"x")
+
+
+def test_extract_true_actually_queues_the_document(kb, as_owner):
+    """extract=True shipped as an unconditional TypeError — enqueue takes
+    source_uri, not uri — because nothing exercised it. It was raised AFTER the
+    document was committed, so the caller lost the source_id of a document that
+    had in fact been stored."""
+    from kbcore import ingest_queue
+
+    raw = b"a finding worth mining\n" * 20
+    doc = documents.put_document("proj", "mine-me.txt", content=raw, extract=True)
+    assert doc.extracted is True, "the document was not queued for extraction"
+    assert doc.source_id, "the caller must still learn where the document went"
+
+    pending = ingest_queue.list_pending(limit=50) if hasattr(ingest_queue, "list_pending") else None
+    if pending is not None:
+        assert any(doc.uri == getattr(r, "source_uri", None) for r in pending)
+
+
+def test_a_failed_extraction_does_not_lose_the_stored_document(kb, as_owner, monkeypatch):
+    """Storing and mining are separate promises; failing the second must not
+    look like failing the first."""
+    monkeypatch.setattr(
+        documents, "_extract_document", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    doc = documents.put_document("proj", "still-stored.txt", content=b"kept\n", extract=True)
+    assert doc.extracted is False
+    assert documents.read_raw(doc.source_id) == b"kept\n"

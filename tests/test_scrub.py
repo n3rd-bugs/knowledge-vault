@@ -51,15 +51,21 @@ def test_our_own_minted_bearer_is_redacted():
     prose — exactly how a setup flow would hand one to a user — was captured
     verbatim into the KB by the session hooks that flush every transcript.
     """
+
+    for tok in ("kbg_" + "A" * 43, "kbe_" + "B" * 32):
+        _assert_redacted(tok)
+
+
+def _assert_redacted(tok: str) -> None:
     from kbcore.scrub import scrub
 
-    tok = "kbg_" + "A" * 43
     for text in (
         tok,
         f"your token is {tok} keep it safe",
         f"KB_TOKEN={tok}",
         f'{{"KB_TOKEN": "{tok}"}}',
         f"export KB_TOKEN='{tok}'",
+        f"export KB_ENROL_CODE={tok}",
     ):
         out, red = scrub(text)
         assert tok not in out, f"the minted bearer survived ingest in: {text[:40]!r}"

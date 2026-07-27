@@ -50,6 +50,11 @@ log = logging.getLogger("kbcore.documents")
 MAX_INLINE_BYTES = 900_000
 # A staged upload that nobody finalises is abandoned scratch, not data.
 STAGING_TTL_HOURS = 24
+# Ceilings. The raw store is tarred into every off-site backup, so unbounded
+# uploads are unbounded backups; and a single chunk larger than this is a client
+# bug rather than a legitimate request.
+MAX_CHUNK_BYTES = 4_000_000
+MAX_DOCUMENT_BYTES = 200_000_000
 # How much of the document goes into the registration item's body. Enough to
 # recognise it in a search result; never enough to duplicate the archive.
 PREVIEW_BYTES = 2_000
@@ -78,16 +83,24 @@ def _staging_dir() -> Path:
 
 
 def _staging_path(upload_id: str) -> Path:
-    """Resolve a staging file, refusing anything that escapes the directory.
+    """Resolve THIS principal's staging file, refusing anything that escapes.
 
-    ``upload_id`` comes from a caller, so it is validated against a strict
-    pattern AND the resolved path is confirmed to sit inside the staging dir —
-    a name like ``../../etc/passwd`` must never become a write target.
+    Two separate protections:
+
+    * ``upload_id`` comes from a caller, so it is validated against a strict
+      pattern AND the resolved path is confirmed to sit inside the staging dir —
+      ``../../etc/passwd`` must never become a write target.
+    * The filename is namespaced by the CALLER. The id alone is caller-chosen in
+      one global directory, so one principal could stage bytes under an id
+      another principal then finalised into their own project and read back — a
+      project-wall breach through a filesystem key. Owning the namespace makes
+      that unreachable rather than merely unlikely.
     """
     if not _UPLOAD_ID_RE.match(upload_id or ""):
         raise InvalidOperation("upload_id must be 1-64 chars of [A-Za-z0-9._-]")
+    who = hashlib.sha256(scope.current().name.encode()).hexdigest()[:16]
     d = _staging_dir()
-    path = (d / f"{upload_id}.part").resolve()
+    path = (d / f"{who}-{upload_id}.part").resolve()
     if path.parent != d.resolve():
         raise InvalidOperation("invalid upload_id")
     return path
@@ -102,8 +115,21 @@ def stage_chunk(upload_id: str, data: bytes, *, offset: int) -> int:
     silently corrupt document — the same guarantee the transcript flush gets
     from its per-session offset file.
     """
+    # Staging WRITES to the KB's disk, so it needs the same authority as any
+    # other write. Without this the endpoint was reachable by anything that
+    # satisfied the bearer gate — including, until it was fixed, an identity
+    # holding no credential at all.
+    scope.require_cap(scope.CAP_SAVE, "stage a document")
+    if len(data) > MAX_CHUNK_BYTES:
+        raise InvalidOperation(f"chunk is {len(data)} bytes; the cap is {MAX_CHUNK_BYTES}")
     path = _staging_path(upload_id)
     have = path.stat().st_size if path.exists() else 0
+    if have + len(data) > MAX_DOCUMENT_BYTES:
+        # A bounded archive is a recoverable one: everything here is tarred into
+        # every off-site backup.
+        raise InvalidOperation(
+            f"document would exceed the {MAX_DOCUMENT_BYTES}-byte limit for one upload"
+        )
     if offset != have:
         if offset < have and offset + len(data) <= have:
             return have  # already staged: an idempotent retry, not an error
@@ -229,7 +255,14 @@ def put_document(
 
     extracted = False
     if extract:
-        extracted = _extract_document(project, uri, raw)
+        # The document is already stored; a failure to ALSO queue it for
+        # extraction must not look like a failure to store it.
+        try:
+            extracted = _extract_document(project, uri, raw)
+        except Exception:  # noqa: BLE001 - reported, never fatal to the store
+            log.warning(
+                "document %s stored but could not be queued for extraction", uri, exc_info=True
+            )
 
     log.info(
         "document stored: %s (%d bytes, source=%s, extract=%s)", uri, len(raw), source_id, extract
@@ -254,7 +287,11 @@ def _extract_document(project: str, uri: str, raw: bytes) -> bool:
     from kbcore import ingest_queue
 
     text = raw.decode("utf-8", errors="replace")
-    res = ingest_queue.enqueue(project, text, kind="session", uri=uri)
+    # The parameter is source_uri, not uri. This was an unconditional TypeError
+    # raised AFTER the document was committed and its staging file removed, and
+    # it is not a KBError — so a stack trace escaped to the client and the caller
+    # never learned the source_id of a document that had in fact been stored.
+    res = ingest_queue.enqueue(project, text, kind="session", source_uri=uri)
     return res.id is not None
 
 
@@ -279,6 +316,11 @@ def read_raw(source_id: int, *, start: int = 0, end: int | None = None) -> bytes
         raise NotFound(f"no source {source_id}")
     project, raw_path = row[0], row[1]
     scope.assert_readable(project, f"no source {source_id}")
+    # Reading a whole archived blob returns the ORIGINAL bytes — a strictly
+    # larger primitive than search, and one CAP_EXPORT exists to gate. No role
+    # bundle carries it, so this is owner-only by construction until a role is
+    # deliberately given export rights.
+    scope.require_cap(scope.CAP_EXPORT, "read archived raw content")
     if not raw_path:
         raise NotFound(f"source {source_id} has no archived raw content")
     data = _read_blob(Path(raw_path))

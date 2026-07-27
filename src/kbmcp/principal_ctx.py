@@ -64,7 +64,12 @@ def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
     # code for its real credential, WITHOUT the bearer check being disabled for
     # an unauthenticated path (CLAUDE.md rule 6). Every other route sees an
     # identity that can read nothing and write nothing, which is what it is.
-    if str(tok).startswith(enrolment.CODE_PREFIX):
+    # A PREFIX IS NOT A CREDENTIAL. This used to return a principal on the
+    # `kbe_` prefix alone, which satisfied the bearer gate with four known
+    # characters — the identity carried no authority, but "authenticates with no
+    # secret" is not a state this system may be in (CLAUDE.md rule 6). The code
+    # must be a live, unredeemed, unexpired row before it authenticates at all.
+    if enrolment.is_live_code(tok):
         return scope.Principal(name=ENROLLING_NAME, is_owner=False)
     return None
 

@@ -15,7 +15,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from kbcore import consolidation, evidence, ingest_queue, llm, review_auto, review_triage
+from kbcore import (
+    consolidation,
+    documents,
+    enrolment,
+    evidence,
+    ingest_queue,
+    llm,
+    review_auto,
+    review_triage,
+)
 from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
@@ -326,6 +335,13 @@ def main() -> dict[str, Any]:
             "review_triaged",
             lambda: review_triage.run_triage(settings.kb_review_triage_batch),
         )
+        # Housekeeping for the two non-knowledge stores this system creates.
+        # Both sweeps existed with NO call site, so their TTLs were fiction:
+        # abandoned upload parts accumulated in the raw volume (which is tarred
+        # into every off-site backup) and spent enrolment rows grew forever.
+        # Neither touches knowledge, so neither is an Invariant-5 concern.
+        _run_step(counts, "upload_parts_swept", documents.sweep_staging)
+        _run_step(counts, "enrolment_codes_swept", enrolment.sweep_expired)
         _run_step(counts, "summaries_written", lambda: _summaries(since))
         _run_step(
             counts, "contradictions_queued", lambda: sum(_contradictions(p) for p in projects)

@@ -141,6 +141,26 @@ fi
 step "and the session goes on to complete rather than stalling"
 assert_eq "$S3" "$OFFD" "the whole transcript drained despite the duplicate reply"
 
+step "but a FAILURE that merely MENTIONS a duplicate must NOT advance the offset"
+# The order of the case arms is the whole guarantee here: this reply contains
+# "duplicate", and if the duplicate arm were matched first it would advance the
+# offset over bytes the server never stored — silent, permanent loss on the one
+# transport that cannot re-send them.
+new_home conndupefail
+fake_claude_relay
+cfg_connector
+install_hooks >/dev/null
+W3B="$HOME/work/dupefail"
+mkdir -p "$W3B"
+mk_transcript "$W3B/t.jsonl" 40 dupefail
+export KB_CONNECTOR_CHUNK=20000 KB_CONNECTOR_MAX=240000 KB_CONNECTOR_SESSION_MAX=2000000
+export KB_RIG_FAIL_AT=1 KB_RIG_FAIL_MODE="FAILED: error while checking for a duplicate"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$W3B/t.jsonl" "$W3B" dupefail-1)"
+wait_log "chunk FAILED" 45 || fail "the failure was not logged"
+settle
+unset KB_RIG_FAIL_AT KB_RIG_FAIL_MODE
+assert_eq "0" "$(read_offset)" "a FAILED reply mentioning 'duplicate' did not advance the offset"
+
 # ==================================== 3. a shrunk transcript recovers
 new_home connshrink
 fake_claude_relay

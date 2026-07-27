@@ -75,7 +75,11 @@ tokens are long-lived and refresh silently.
 | `kb_review_list()` / `kb_review_resolve(queue_id, action)` | Triage the unverified/contradiction queue |
 | `kb_ingest_session(project, transcript, kind?, repo?, branch?, commit?)` | **Submit a conversation or memory dump** (see §6) |
 | `kb_consolidate()` | Request an on-demand nightly refine pass (dedupe, summaries, contradictions, archive, re-embed) |
-| `kb_setup(rest_url?)` | Returns a ready-to-apply guide + scripts to install the Claude Code session hooks (see §6) |
+| `kb_setup(rest_url?, include_scripts?)` | Returns a short setup guide **plus a one-time enrolment code** so a machine credentials itself (see §6). The hook scripts are fetched, not embedded — pass `include_scripts=true` only for a machine with no HTTP access to the KB |
+| `kb_put_doc(project, name, content?/content_b64?, upload_id?, note?, tags?, extract?)` | **Store a RAW document for reference** — a spec, config, log or dataset from the workspace. Archived verbatim and replayable forever; `extract=true` also mines it into knowledge. Returns the `source_id` other items cite |
+| `kb_put_doc_chunk(upload_id, offset, content?/content_b64?)` | Stage one chunk of a document larger than ~900 KB, then finalise with `kb_put_doc(upload_id=…)` |
+| `kb_read_raw(source_id, start?, end?)` | Read the original bytes behind a source — how a `raw_ref` citation gets **checked** rather than trusted (owner-only: `CAP_EXPORT`) |
+| `kb_describe_raw(source_id)` | Size, line count and digest of a source's raw content, without transferring it |
 
 Item types: `note`, `decision`, `spec`, `snippet`, `bug`, `gotcha`, `pattern`, `runbook`, `qa`,
 `config` (plus machine-generated `summary` / `report`). Every search/get result carries a
@@ -104,6 +108,10 @@ curl -H "$H" -H 'Content-Type: application/json' -X POST \
 ```
 Read: `GET /api/{search,items/{id},projects,timeline,similar/{id},trace/{node_id},stats,review}`.
 Write: `POST /api/{items,items/{id}/supersede,links,review/{queue_id}/resolve,ingest-session}`.
+Enrolment: `POST /api/enrol` (redeem a one-time `kbe_` code for this machine's own credential) and
+`GET /api/setup/{name}` (fetch one of the four hook scripts). Both are reachable with an unredeemed
+enrolment code as the bearer, because a new machine holds nothing else; a GET does **not** spend the
+code. See [SHARING.md §2.5](SHARING.md#25-enrolment-codes).
 No token → 401; unsupported method → 405. OpenAPI at `/docs`. (Deep search is available via MCP and
 the CLI; it is intentionally not a REST endpoint because a run can take minutes.)
 
@@ -141,17 +149,47 @@ curl -H "Authorization: Bearer <KB_TOKEN>" -H 'Content-Type: application/json' -
 
 ### Claude Code session hooks (both directions)
 
-The easiest install is to ask a connected Claude Code to run **`kb_setup`** — the MCP tool returns
-the scripts + an idempotent installer and can lay them down on whatever machine it's running on.
-Equivalently, an installable skill wires a machine's Claude Code sessions to the KB in **both
-directions** — run its `install.sh` (auto-detects LOCAL vs REMOTE mode and writes `~/.claude/kb-flush.env`):
+Ask a connected Claude Code to run **`kb_setup`**. It returns a short guide and a **one-time
+enrolment code**; the machine then fetches the scripts and credentials itself (see
+[SHARING.md §2.5](SHARING.md#25-enrolment-codes)) — no bearer is ever pasted by hand:
+
+```bash
+export KB_ENROL_CODE=kbe_…   KB_REST_URL=https://api.<host>
+mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+  curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
+done
+bash install.sh
+```
+
+`install.sh` registers **four** events and auto-detects the transport, first match winning:
+**LOCAL** (a KB repo + `uv`) → **MCP** (a bearer-registered KB server in `~/.claude.json`) →
+**CONNECTOR** (any `claude` binary) → **REMOTE** (the fallback). Note CONNECTOR outranks REMOTE on
+essentially every machine, so to get bearer REMOTE mode write `~/.claude/kb-flush.env` *before*
+running the installer — an existing config is never overwritten.
 
 - **Flush out** (`PreCompact` + `SessionEnd`): the session's new transcript delta is enqueued to the
-  KB before every compaction — never blocking, never using the GPU at capture time.
-- **Brief in** (`SessionStart`): when a new session starts (startup or `/clear`), a quick KB search
-  seeded by the repo's recent commit subjects is injected into Claude's starting context, so it
-  begins already aware of prior decisions and gotchas. Fails silently — a briefing never breaks a
-  session.
+  KB before every compaction — never blocking, never using the GPU at capture time. Deltas are sent
+  as line-aligned chunks with a per-session offset, so a failure resumes rather than re-sends;
+  verified end to end at **100 MB** (117 chunks, byte-identical, ~145 s).
+- **Brief in** (`SessionStart`, matcher `startup|clear`): a quick KB search seeded by the repo's
+  recent commit subjects is injected into Claude's starting context. Fails silently — a briefing
+  never breaks a session.
+- **Per-prompt recall** (`UserPromptSubmit`): each substantive prompt also gets a KB search seeded by
+  the prompt itself. Self-throttling; `KB_RECALL=0` turns just this off.
+
+**Verifying it works.** Every outcome is a line in `~/.claude/hooks/flush-session.log` — the hooks
+always exit 0, so the log is the only signal. Look for `local … ok bytes=` (LOCAL),
+`flush … ok bytes=` (MCP **and** REMOTE — they share a branch) or `connector … ok bytes=`
+(CONNECTOR). `partial … will resume` means more follows; `NOT CONFIGURED` and `NOT CAPTURED` are the
+loud failures.
+
+**CONNECTOR does not scale.** It relays one model call per ~24 KB, so a large session is capped by
+`KB_CONNECTOR_SESSION_MAX` (2 MB): above it only the most recent bytes are relayed and the rest is
+dropped with a `NOT CAPTURED` line naming the transcript so you can re-ingest it. Use a bearer
+transport for big sessions — it chunks at 900 KB with no model in the path. Tunables:
+`KB_FLUSH_CHUNK`, `KB_FLUSH_MAX`, `KB_CONNECTOR_CHUNK`, `KB_CONNECTOR_MAX`,
+`KB_CONNECTOR_SESSION_MAX`.
 
 ## 7. Web UI (read-only)
 
@@ -177,6 +215,43 @@ Strictly read-only by construction — the browser can never write.
 `backfill-entities`, `reembed`, `migrate`, `consolidate-now`, `consolidate-status`.
 (History browsing lives in the `kb_timeline` MCP tool and the web UI `/timeline` — there is no
 `kb timeline` CLI command.)
+
+## 8.5 Raw data: what is kept, and re-running the pipeline over it
+
+**Everything a session or document submits is kept in raw form, indefinitely.** Nothing in the
+automatic paths deletes it:
+
+| Layer | What it holds |
+| --- | --- |
+| `ingest_queue.content` | the submission exactly as received. Draining only flips `status`; the row and its content stay |
+| `$KB_RAW/<project>/<sha256>.zst` | the original bytes, zstd-compressed, content-addressed on the hash of the **original** (not the scrubbed body), so two documents that scrub alike cannot overwrite each other |
+| `sources.raw_path` → `items.source_id` | every item traces back to the source, and the source to its blob |
+
+Which kinds carry a blob: `session`, `git` (repo docs), and `file` — which includes every document
+submitted with `kb_put_doc`. `chat` and `manual` items do **not** archive raw, so they cannot be
+replayed.
+
+**Re-running a better pipeline over it** — the reason retention matters:
+
+```bash
+kb reprocess --project myproj          # shadow: reports what WOULD change, writes nothing
+kb reprocess --project myproj --apply  # re-extract with the CURRENT pipeline
+```
+
+It never supersedes or deletes: improved extractions land as **new unverified items with review
+rows**, identical ones dedupe to no-ops, and each carries `meta.reprocessed_from`. Filters:
+`--before`, `--extractor` (target one old model), `--limit`. Eligible sources are sessions plus
+submitted documents; repo docs and manual items are excluded because their body already *is* their
+content, so replaying could only duplicate it.
+
+**Citing a region.** An item's `raw_ref` (`{source_id, start, end, line_start?}`) says which bytes of
+which raw source a claim came from. It is validated at ingest — the source must exist, be readable,
+hold raw content, and the range must fall inside it — so a citation can be *followed* with
+`kb_read_raw` and checked, rather than trusted.
+
+**Operationally:** the raw store grows without bound by design. It is included in the off-site backup
+(`kb-raw-*.tar.zst`, age-encrypted), so a restore that skips it loses every original. Watch its size
+alongside the database.
 
 ## 9. How the KB refines itself (nightly)
 
@@ -233,6 +308,13 @@ watcher + daily repo-docs scan, and the nightly consolidation on a timer).
   decisively-corroborated (2-night stable) cases only; everything is a reversible supersession, never
   a delete; both tiers have kill switches. See §9.
 - The large extractor runs only in the nightly pass or explicit user-invoked runs (GPU courtesy).
+- **Enrolment codes** (`kbe_…`) let a machine credential itself without a bearer being pasted
+  anywhere: single-use, ~15 min, SHA-256 at rest, refusals byte-identical, and they authenticate as
+  an identity with no projects and no capabilities. An **owner's** code redeems to `KB_TOKEN`
+  itself — treat enrolling a machine as trusting it like the KB host. A grantee's mints a fresh
+  per-machine token instead. See [SHARING.md §2.5](SHARING.md#25-enrolment-codes).
+- Reading whole archived originals (`kb_read_raw`) requires `CAP_EXPORT`, which no role bundle
+  carries — it is owner-only unless deliberately granted.
 - **Recommended hardening:** a per-project `projects.public` allow-list so NDA/client projects can be
   withheld from the public surface while local/REST keeps full access.
 

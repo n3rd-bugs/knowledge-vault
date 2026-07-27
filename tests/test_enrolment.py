@@ -183,14 +183,19 @@ def test_ttl_is_clamped(kb, as_owner):
 # ------------------------------------------------------- bearer resolution
 
 
-def test_an_enrolment_code_authenticates_as_a_ZERO_authority_identity():
+def test_an_enrolment_code_authenticates_as_a_ZERO_authority_identity(kb, as_owner):
     """The code has to authenticate — otherwise /api/enrol would need the bearer
     check disabled for an unauthenticated path, which CLAUDE.md rule 6 forbids.
     What it must NOT do is carry any authority of its own.
+
+    It must be a REAL issued code: this test previously used mint_code(), which
+    only generates a string and stores nothing, and it passed — which is how the
+    prefix-only bypass survived review.
     """
     from kbmcp import principal_ctx
 
-    p = principal_ctx.resolve_bearer("Bearer " + enrolment.mint_code())
+    issued = enrolment.create_code()
+    p = principal_ctx.resolve_bearer("Bearer " + issued.code)
     assert p is not None
     assert p.name == principal_ctx.ENROLLING_NAME
     assert p.is_owner is False
@@ -203,3 +208,49 @@ def test_garbage_still_fails_to_authenticate():
 
     assert principal_ctx.resolve_bearer("Bearer nonsense") is None
     assert principal_ctx.resolve_bearer("") is None
+
+
+def test_a_PREFIX_is_not_a_credential(kb, as_owner):
+    """The bearer gate must not be satisfiable by knowing four characters.
+
+    resolve_bearer used to return an authenticated principal for anything
+    starting with `kbe_`. The identity it granted held no projects and no
+    capabilities, so nothing could be read — but "authenticates with no secret"
+    is not a state this system may be in (CLAUDE.md rule 6), and it made the
+    document-staging endpoints reachable without a credential. Verified live
+    against production before the fix: `Bearer kbe_x` returned HTTP 200.
+    """
+    from kbmcp import principal_ctx
+
+    for fake in ("kbe_", "kbe_x", "kbe_totally-made-up-not-a-real-code", "kbe_" + "0" * 40):
+        assert principal_ctx.resolve_bearer(f"Bearer {fake}") is None, (
+            f"{fake!r} authenticated without being a real code"
+        )
+
+    # A genuine, live code still authenticates — as the narrowest identity.
+    issued = enrolment.create_code()
+    p = principal_ctx.resolve_bearer(f"Bearer {issued.code}")
+    assert p is not None and p.name == principal_ctx.ENROLLING_NAME
+    assert not p.read_projects and not p.caps
+
+
+def test_a_spent_or_expired_code_stops_authenticating(kb, as_owner, monkeypatch):
+    """Authentication and redemption must agree: once a code is used or has
+    expired it is not a credential for anything, including reaching the route
+    that would tell it so."""
+    from kbcore.config import settings
+    from kbmcp import principal_ctx
+
+    monkeypatch.setattr(settings, "kb_token", "master-secret-for-test")
+    spent = enrolment.create_code()
+    assert principal_ctx.resolve_bearer(f"Bearer {spent.code}") is not None
+    enrolment.redeem(spent.code)
+    assert principal_ctx.resolve_bearer(f"Bearer {spent.code}") is None
+
+    stale = enrolment.create_code()
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE enrolment_codes SET expires_at = %s WHERE code_hash = %s",
+            (datetime.now(UTC) - timedelta(minutes=1), enrolment._hash(stale.code)),
+        )
+    assert principal_ctx.resolve_bearer(f"Bearer {stale.code}") is None

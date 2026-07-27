@@ -310,7 +310,12 @@ export -f kb_timeout _kb_timeout_ok
 kb_take_lock() { # <lockpath> -- 0 = we own it, 1 = someone else is draining
   _kbl="$1"
   if command -v flock >/dev/null 2>&1; then
-    exec 9>"$_kbl" 2>/dev/null || return 0
+    # BRACES MATTER. `exec 9>f 2>/dev/null` applies BOTH redirections to the
+    # shell permanently, so the whole drain's stderr went to /dev/null for the
+    # rest of the run — silencing exactly the diagnostics this file exists to
+    # preserve. Scoping the 2>/dev/null to the group keeps fd 9 open and stderr
+    # intact.
+    { exec 9>"$_kbl"; } 2>/dev/null || return 0
     flock -n 9 2>/dev/null || return 1
     return 0
   fi
@@ -385,7 +390,10 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     CHUNK="$KB_FLUSH_CHUNK"; MAX_PER_FIRING="$KB_FLUSH_MAX"   # rest resumes next firing
     [ "$EV" = "SessionEnd" ] && MAX_PER_FIRING=1099511627776   # terminal firing: drain all
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
-    kb_take_lock "$OFFF.lock" || exit 0   # another firing is already draining this session
+    if ! kb_take_lock "$OFFF.lock"; then
+      [ "$EV" = "SessionEnd" ] && echo "$(date -Is) flush $PROJECT NOT CAPTURED: the final firing could not take the session lock (another drain was still running) — re-ingest $T if this session matters"
+      exit 0
+    fi
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac   # empty/corrupt offset -> restart
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
@@ -521,7 +529,14 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   "$DETACH" bash -c '
     export KB_HOOK_GUARD=1   # children (claude -p) must not re-trigger KB hooks
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
-    kb_take_lock "$OFFF.lock" || exit 0   # another firing is already draining this session
+    # Losing the lock mid-session is fine (the other firing is draining). On the
+    # TERMINAL firing it is not: there is no next firing, so whatever the winner
+    # does not reach is lost — and staying silent lets its " ok bytes=" line be
+    # read as a fully captured session.
+    if ! kb_take_lock "$OFFF.lock"; then
+      [ "$EV" = "SessionEnd" ] && echo "$(date -Is) connector $PROJECT NOT CAPTURED: the final firing could not take the session lock (another drain was still running), so any remaining bytes were not relayed — re-ingest $T if this session matters"
+      exit 0
+    fi
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
@@ -594,18 +609,29 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       # vector (LOW-2). Strip control chars + backticks, cap at 200 chars.
       OUTLOG=$(printf "%s" "$OUT" | tr -d "[:cntrl:]\140" | cut -c1-200)
       case "$OUT" in
-        # The server dedupes on content hash and answers "duplicate — already
-        # queued", which carries NO digits — so this used to fall through to the
-        # "no id" failure branch and break WITHOUT advancing. Replaying an
-        # already-accepted chunk (after a crash, a zero-length offset file, or an
-        # overlapping firing) then re-sent the same bytes forever: a permanent,
-        # self-perpetuating stall. A duplicate means the bytes ARE in the queue,
-        # which is exactly what advancing the offset records. Matched FIRST so it
-        # cannot be captured by the failure patterns below.
-        *DUPLICATE*|*[Dd]uplicate*|*already\ queued*)
-          OFFSET=$((OFFSET + BYTES)); printf "%s" "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
+        # FAILURE IS CHECKED FIRST. This block used to sit above the failure
+        # patterns and match any reply CONTAINING "duplicate", so a reply like
+        # "FAILED: error while checking for a duplicate" advanced the offset over
+        # bytes the server never stored — silent, permanent loss on the transport
+        # where nothing can re-send them.
         *[Ff][Aa][Ii][Ll]*|*[Ee]rror*|*NOTOOL*|*unavailable*)
           echo "$(date -Is) connector $PROJECT chunk FAILED ($OUTLOG) at offset $OFFSET — will resume"; break ;;
+        # The server dedupes on content hash and answers that the chunk was
+        # already queued, which carries NO digits — so without this it fell to
+        # the "no id" branch and broke WITHOUT advancing, re-sending the same
+        # bytes forever after any replay (a crash, a zero-length offset file, an
+        # overlapping firing). A duplicate means the bytes ARE in the queue.
+        # ORDER is what makes this safe, not narrowness. This block used to sit
+        # ABOVE the failure patterns and match any reply containing "duplicate",
+        # so "FAILED: error while checking for a duplicate" advanced the offset
+        # over bytes the server never stored. With failures matched first, that
+        # reply can no longer reach here, and the phrasing can stay tolerant.
+        # The model is asked for the single word DUPLICATE but may echo the
+        # server phrase "duplicate - already queued" instead, and rejecting that
+        # would reinstate the permanent stall this branch exists to prevent.
+        # (No apostrophes in here: the whole drain is one single-quoted bash -c.)
+        *[Dd][Uu][Pp][Ll][Ii][Cc][Aa][Tt][Ee]*|*already\ queued*)
+          OFFSET=$((OFFSET + BYTES)); printf "%s" "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
         *[0-9]*) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
         *) echo "$(date -Is) connector $PROJECT chunk FAILED (no id: $OUTLOG) at offset $OFFSET — will resume"; break ;;
       esac

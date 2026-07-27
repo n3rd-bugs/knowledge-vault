@@ -289,6 +289,13 @@ fi
 RESP=$(curl -s --connect-timeout 3 --max-time 60 -X POST "$KB_MCP_URL" -H "$AUTH" -H "$CT" -H "$AC" \
   -H "Mcp-Session-Id: $SID" --data @"$REQF")
 rm -f "$REQF"
+# CLOSE THE SESSION. Every chunk opens its own MCP session, and without this the
+# server keeps each one indefinitely: a 100 MB transcript is ~117 chunks, so one
+# flush leaked 117 server-side transports. Best-effort and never fatal — the
+# submission already succeeded or failed above, and a failed cleanup must not
+# change that verdict or the caller's offset decision.
+[ -n "$SID" ] && curl -s -o /dev/null --connect-timeout 2 --max-time 5 \
+  -X DELETE "$KB_MCP_URL" -H "$AUTH" -H "Mcp-Session-Id: $SID" 2>/dev/null || true
 # isError:true is a tool rejection (queue full, bad project, oversize) surfaced
 # as an HTTP-200 JSON-RPC result — it must FAIL so the caller does NOT advance
 # the offset and lose the chunk.

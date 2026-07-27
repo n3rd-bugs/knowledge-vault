@@ -434,3 +434,60 @@ def test_embedding_is_still_available_and_is_the_expensive_one():
     full = tools_setup.build_setup_guide(include_scripts=True)
     assert len(full) > 5 * len(lean), "include_scripts no longer embeds anything"
     assert "### File: " in full
+
+
+# --------------------------------------------------------------------------
+# The enrolment bootstrap block. This is the headline path — the one command a
+# new machine actually runs — and no test ever generated it: every guard above
+# calls build_setup_guide() without enrol=, taking the empty-block branch.
+# --------------------------------------------------------------------------
+
+
+def _issued(grants_owner: bool = True, minutes: int = 15):
+    from datetime import UTC, datetime, timedelta
+
+    from kbcore.enrolment import IssuedCode
+
+    return IssuedCode(
+        code="kbe_" + "a" * 32,
+        expires_at=datetime.now(UTC) + timedelta(minutes=minutes),
+        grants_owner=grants_owner,
+        issued_to="owner",
+        project="myproj",
+    )
+
+
+def test_the_bootstrap_block_is_a_runnable_one_command_setup():
+    guide = _prose(tools_setup.build_setup_guide(enrol=_issued()))
+    assert "kbe_" + "a" * 32 in guide, "the code is not in the block the user copies"
+    assert "export KB_ENROL_CODE=" in guide
+    assert "bash install.sh" in guide, "the block never actually runs the installer"
+    assert "curl" in guide and "Authorization: Bearer $KB_ENROL_CODE" in guide
+
+
+def test_the_bootstrap_fetches_exactly_the_allowlisted_scripts():
+    """Set comparison, so adding a fifth served script without updating the
+    bootstrap loop fails here rather than on a user's machine."""
+    from kbrest.server import _SETUP_SCRIPTS
+
+    guide = _prose(tools_setup.build_setup_guide(enrol=_issued()))
+    named = {s for s in _SETUP_SCRIPTS if s in guide}
+    assert named == set(_SETUP_SCRIPTS), (
+        f"bootstrap fetches {named}, server serves {_SETUP_SCRIPTS}"
+    )
+
+
+def test_the_block_states_which_credential_it_will_yield():
+    """Owner and grantee codes redeem to different things; the user is told
+    which, because it determines what the machine can then do."""
+    owner = _prose(tools_setup.build_setup_guide(enrol=_issued(grants_owner=True)))
+    grantee = _prose(tools_setup.build_setup_guide(enrol=_issued(grants_owner=False)))
+    assert owner != grantee, "the block reads identically for owner and grantee codes"
+    assert "THIS MACHINE" in grantee or "own grants" in grantee
+
+
+def test_an_already_expired_code_does_not_crash_the_guide():
+    """The minutes-remaining arithmetic runs on every call; a code that expired
+    between issue and render must not take kb_setup down with it."""
+    guide = _prose(tools_setup.build_setup_guide(enrol=_issued(minutes=-5)))
+    assert "KB_ENROL_CODE" in guide

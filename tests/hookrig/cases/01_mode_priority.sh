@@ -71,7 +71,11 @@ OUT=$(install_hooks)
 expect_mode CONNECTOR "only a claude CLI -> CONNECTOR"
 assert_file_contains "$CFG" "KB_CONNECTOR=1" "connector flag set"
 assert_file_contains "$CFG" "CLAUDE_BIN=$HOME/bin/claude" "connector binds the discovered CLI"
-assert_eq "0" "$(grep -c 'KB_TOKEN\|KB_MCP_URL\|KB_DIR=' "$CFG")" "CONNECTOR config carries no bearer"
+# Active SETTINGS only: the config also carries commented guidance that names the
+# bearer transports as the alternative for large sessions, and documentation
+# naming a key is not the same as setting one.
+assert_eq "0" "$(grep -v '^[[:space:]]*#' "$CFG" | grep -c 'KB_TOKEN\|KB_MCP_URL\|KB_DIR=')" \
+  "CONNECTOR config sets no bearer/competing transport key"
 
 step "3b: a ~/.claude.json MCP server NOT named kb/knowledge is ignored -> CONNECTOR"
 new_home p3b

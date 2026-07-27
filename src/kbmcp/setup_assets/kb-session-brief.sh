@@ -399,12 +399,16 @@ if [ "$MODE" = "brief" ]; then
     # Only warn if the LAST failure line is newer than the LAST success line — a
     # later " ok bytes=" (the retry drained) means the failure is stale and must
     # not resurface as noise every session (regression the recall-noise fix hit).
-    # The three tokens below cover EVERY failure line the flush hook can write
+    # NOT CAPTURED is matched here deliberately: a skip line can also carry
+    # " ok bytes=", and this rule runs FIRST and `next`s, so the firing is
+    # counted as a failure even though part of it succeeded. Bytes dropped
+    # because CONNECTOR cannot carry them must never read as a captured session.
+    # The tokens below cover EVERY failure line the flush hook can write
     # (FAILED: / chunk FAILED / BUG: / NOT CONFIGURED). An `http=[45]..` branch
     # used to sit here too and was dead — no hook has ever written `http=`; the
     # REST failure line carries its status as `chunk FAILED (500)`.
     RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
-      /FAILED|BUG:|NOT CONFIGURED/ { fail=$0; failn=NR; next }
+      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED/ { fail=$0; failn=NR; next }
       / (ok|partial) bytes=/ {
         # Belt and braces (HIGH-1): a summary whose (offset X/Y) shows X<Y is an
         # INCOMPLETE drain — count it as a failure even if the matching FAILED line

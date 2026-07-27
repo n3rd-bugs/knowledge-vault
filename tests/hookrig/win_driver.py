@@ -305,15 +305,30 @@ def main() -> int:
         return fail(f"Git Bash not found at {GITBASH} — the Windows lane needs it")
 
     # ---------------------------------------------------------- host tripwire
+    # Watch only what an errant hook install could plausibly touch. Hashing the
+    # WHOLE ~/.claude tree tripped on the owner simply USING Claude Code during a
+    # run: live session transcripts under projects/ grow continuously, as do
+    # history.jsonl and the telemetry dirs. A tripwire that fires on unrelated
+    # activity gets ignored, which is worse than not having one.
+    WATCHED = ["settings.json", "settings.local.json", "kb-flush.env", "hooks", "skills"]
+    watched_ps = ",".join(f"'{profile}\\.claude\\{w}'" for w in WATCHED)
     tripwire_ps = (
-        f"$d = '{profile}\\.claude'\n"
-        "if (Test-Path $d) {\n"
-        "  (Get-ChildItem -Recurse -File $d -ErrorAction SilentlyContinue |\n"
-        "    Sort-Object FullName | ForEach-Object { $_.FullName + ':' + $_.Length } |\n"
-        "    Out-String | ForEach-Object { [Security.Cryptography.SHA256]::Create().ComputeHash(\n"
-        "      [Text.Encoding]::UTF8.GetBytes($_)) } |\n"
-        "    ForEach-Object { $_.ToString('x2') }) -join ''\n"
-        "} else { 'ABSENT' }"
+        f"$paths = @({watched_ps})\n"
+        "$acc = ''\n"
+        "foreach ($p in $paths) {\n"
+        "  if (Test-Path $p) {\n"
+        "    $items = Get-ChildItem -Recurse -File $p -ErrorAction SilentlyContinue\n"
+        "    if ($items) {\n"
+        "      foreach ($i in ($items | Sort-Object FullName)) {\n"
+        "        $acc += $i.FullName + ':' + $i.Length + ';'\n"
+        "      }\n"
+        "    } else {\n"
+        "      $f = Get-Item $p -ErrorAction SilentlyContinue\n"
+        "      if ($f -and -not $f.PSIsContainer) { $acc += $f.FullName + ':' + $f.Length + ';' }\n"
+        "    }\n"
+        "  } else { $acc += $p + ':ABSENT;' }\n"
+        "}\n"
+        "$acc"
     )
     before = win.ps(tripwire_ps)[1].strip()
     print(f"-- host tripwire armed on {profile}\\.claude")

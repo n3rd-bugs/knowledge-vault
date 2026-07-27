@@ -179,10 +179,16 @@ heavy sessions.
    ```
    KB_CONNECTOR=1
    CLAUDE_BIN=/absolute/path/to/claude
-   # KB_CONNECTOR_CHUNK=24000   # bytes per relayed chunk
-   # KB_CONNECTOR_MAX=240000    # bytes per hook firing (SessionEnd ignores this
-   #                            # and always drains, since nothing follows it)
+   # KB_CONNECTOR_CHUNK=24000          # bytes per chunk = ONE model call
+   # KB_CONNECTOR_MAX=240000           # bytes per mid-session firing
+   # KB_CONNECTOR_SESSION_MAX=2000000  # absolute ceiling per firing
    ```
+   **CONNECTOR does not scale to large sessions.** It spends one headless
+   `claude -p` call per chunk, so a 300 MB transcript would be ~13,000 model
+   calls. Above `KB_CONNECTOR_SESSION_MAX` only the most RECENT bytes are
+   relayed and the rest is dropped with a loud `NOT CAPTURED` line naming the
+   transcript so you can re-ingest it. If your sessions are large, use a bearer
+   transport (MCP or REMOTE) — it chunks at 900 KB with no model in the path.
 
    **LOCAL** (this machine IS the KB host):
    ```
@@ -225,6 +231,9 @@ place a problem shows up**. What to look for:
   that project. `(000)` means the endpoint was unreachable at all.
 - `chunk FAILED (…)` in CONNECTOR mode — the relay could not reach the KB tool;
   confirm the KB connector is enabled for your claude.ai account.
+- `NOT CAPTURED <n> bytes` — the session was too large for CONNECTOR mode and
+  those bytes were dropped (not queued, not resumable). The line names the
+  transcript file; re-ingest it, or switch to a bearer transport.
 - Nothing at all in the log — the hooks are not registered. Check that
   `~/.claude/settings.json` lists all four events, and re-run the installer.
 

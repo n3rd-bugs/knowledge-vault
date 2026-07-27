@@ -294,6 +294,36 @@ export T CWD SID PROJECT LOG REPO BRANCH COMMIT
 # python3, with no jq anywhere on the box) as exported vars + functions.
 export KB_JQ_BIN KB_PY_BIN KB_JSON_PROBED
 export -f kb_json_build kb_json_valid
+# kb_timeout must reach the detached child too: the CONNECTOR relay is the one
+# network call in this script that was never bounded, and an unbounded call there
+# cannot even report itself (every summary line is written AFTER the loop).
+export KB_TIMEOUT_BIN KB_TIMEOUT_PROBED
+export -f kb_timeout _kb_timeout_ok
+
+# Only ONE drain may own a session's offset file at a time. PreCompact and
+# SessionEnd both detach, and a large transcript keeps a child busy for minutes,
+# so firings overlap routinely. Two children then read the same offset, relay the
+# same chunk, and the slower one's late write can REWIND the offset and re-send
+# bytes already accepted. flock where it exists; a mkdir lock (atomic everywhere,
+# including Git Bash) otherwise. A lock older than an hour is assumed dead — a
+# drain that long has already failed, and refusing forever would be worse.
+kb_take_lock() { # <lockpath> -- 0 = we own it, 1 = someone else is draining
+  _kbl="$1"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"$_kbl" 2>/dev/null || return 0
+    flock -n 9 2>/dev/null || return 1
+    return 0
+  fi
+  if ! mkdir "$_kbl.d" 2>/dev/null; then
+    _kba=$(find "$_kbl.d" -maxdepth 0 -mmin +60 2>/dev/null)
+    [ -n "$_kba" ] || return 1
+    rmdir "$_kbl.d" 2>/dev/null || true
+    mkdir "$_kbl.d" 2>/dev/null || return 1
+  fi
+  trap 'rmdir "$_kbl.d" 2>/dev/null || true' EXIT INT TERM
+  return 0
+}
+export -f kb_take_lock
 
 # Opportunistic housekeeping — bound our OWN state/log growth so a daily-driver
 # machine doesn't accumulate thousands of dead .offset files and an unrotated
@@ -345,14 +375,29 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
   OFFF="$STATE/${OKEY:-default}.offset"
   HELPER="$HOOKDIR/kb-mcp-call.sh"
+  # Overridable for the same reason KB_CONNECTOR_MAX is: the budget is a policy
+  # choice, not a constant of nature, and a cap that cannot be set small cannot
+  # be tested at all (a 200 MB fixture per run is not a test, it is a wait).
+  export KB_FLUSH_CHUNK="${KB_FLUSH_CHUNK:-900000}"
+  export KB_FLUSH_MAX="${KB_FLUSH_MAX:-209715200}"
   export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER EV
   "$DETACH" bash -c '
-    CHUNK=900000; MAX_PER_FIRING=209715200   # 200 MB/firing; rest resumes next firing
+    CHUNK="$KB_FLUSH_CHUNK"; MAX_PER_FIRING="$KB_FLUSH_MAX"   # rest resumes next firing
     [ "$EV" = "SessionEnd" ] && MAX_PER_FIRING=1099511627776   # terminal firing: drain all
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
+    kb_take_lock "$OFFF.lock" || exit 0   # another firing is already draining this session
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac   # empty/corrupt offset -> restart
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
+    # A transcript SMALLER than the stored offset was rotated, truncated or
+    # replaced (or the offset was corrupted upward). Without this branch the
+    # `-le` below exits 0 forever and the session is never captured again —
+    # silently, with no log line, until the 30-day sweep removes the offset.
+    if [ "$SIZE" -lt "$OFFSET" ]; then
+      echo "$(date -Is) flush $PROJECT transcript shrank ($SIZE < offset $OFFSET) — restarting from 0"
+      OFFSET=0
+      printf "%s" 0 >"$OFFF.t" 2>/dev/null && mv "$OFFF.t" "$OFFF" 2>/dev/null || true
+    fi
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
     set --   # git context, appended to every request body; empty fields omitted
@@ -466,15 +511,56 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   export CLAUDE_BIN OFFF EV
   export KB_CONNECTOR_CHUNK="${KB_CONNECTOR_CHUNK:-24000}"
   export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
+  # An ABSOLUTE ceiling per firing, including the terminal one. SessionEnd used
+  # to lift the cap to 1 TB so the tail could never be stranded — correct for a
+  # normal session, catastrophic for a large one: at 24 KB per model call a
+  # 300 MB transcript is ~13,000 headless `claude -p` invocations, i.e. days of
+  # background work silently spending the user'"'"'s Claude usage, detached and
+  # untracked. CONNECTOR is the zero-config transport, not the bulk one.
+  export KB_CONNECTOR_SESSION_MAX="${KB_CONNECTOR_SESSION_MAX:-2000000}"
   "$DETACH" bash -c '
     export KB_HOOK_GUARD=1   # children (claude -p) must not re-trigger KB hooks
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
+    kb_take_lock "$OFFF.lock" || exit 0   # another firing is already draining this session
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
+    if [ "$SIZE" -lt "$OFFSET" ]; then
+      echo "$(date -Is) connector $PROJECT transcript shrank ($SIZE < offset $OFFSET) — restarting from 0"
+      OFFSET=0
+      printf "%s" 0 >"$OFFF.t" 2>/dev/null && mv "$OFFF.t" "$OFFF" 2>/dev/null || true
+    fi
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
-    CAP="$KB_CONNECTOR_MAX"; [ "$EV" = "SessionEnd" ] && CAP=1099511627776   # drain all at end
+    # SessionEnd still gets a LARGER budget than a mid-session firing (it is the
+    # last chance for this session), but no longer an unbounded one. In practice
+    # the backlog gate below is what enforces the bound — it trims the delta to
+    # at most KB_CONNECTOR_SESSION_MAX before the loop starts, so this CAP can
+    # never bind. It is kept as defence in depth, not as the primary mechanism.
+    CAP="$KB_CONNECTOR_MAX"; [ "$EV" = "SessionEnd" ] && CAP="$KB_CONNECTOR_SESSION_MAX"
+
+    # BACKLOG GATE. If the undrained delta exceeds what this transport can carry,
+    # skip forward and keep the most RECENT bytes rather than the oldest: on a
+    # transcript growing faster than the budget, a head-first policy would relay
+    # the session opening forever and never reach what just happened.
+    # This runs BEFORE any relay, so the loud line lands immediately instead of
+    # hours in, and it names the transcript path — nothing else in the connector
+    # log does, and without it the dropped bytes cannot be re-ingested by hand.
+    SKIPPED=0
+    BACKLOG=$((SIZE - OFFSET))
+    if [ "$BACKLOG" -gt "$KB_CONNECTOR_SESSION_MAX" ]; then
+      NEWOFF=$((SIZE - KB_CONNECTOR_SESSION_MAX))
+      # Realign forward to the next line start so the first relayed chunk is not
+      # half a JSONL record.
+      ADV=$(tail -c +$((NEWOFF+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" | head -1 | wc -c | tr -d " ")
+      case "$ADV" in ""|*[!0-9]*) ADV=0 ;; esac
+      NEWOFF=$((NEWOFF + ADV))
+      [ "$NEWOFF" -gt "$SIZE" ] && NEWOFF="$SIZE"
+      SKIPPED=$((NEWOFF - OFFSET))
+      OFFSET="$NEWOFF"
+      printf "%s" "$OFFSET" >"$OFFF.t" 2>/dev/null && mv "$OFFF.t" "$OFFF" 2>/dev/null || true
+      echo "$(date -Is) connector $PROJECT NOT CAPTURED $SKIPPED bytes (kept the most recent $KB_CONNECTOR_SESSION_MAX of $SIZE) — CONNECTOR relays one model call per $KB_CONNECTOR_CHUNK bytes, so this delta would have cost $((BACKLOG / KB_CONNECTOR_CHUNK)) calls. Those bytes are GONE, not queued and not resumable. For full capture set KB_MCP_URL/KB_REST_URL + KB_TOKEN (or KB_DIR) in $CFG, then re-ingest $T"
+    fi
     while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$CAP" ]; do
       TMPC=$(mktemp)
       tail -c +$((OFFSET+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" >"$TMPC"
@@ -495,7 +581,10 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
           fi
         fi
       fi
-      OUT=$("$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
+      # BOUNDED: this was the only unbounded network call in the script, and the
+      # one place where hanging is invisible — every summary line below is
+      # written AFTER the loop, so a wedged relay reports nothing at all, ever.
+      OUT=$(kb_timeout "${KB_CONNECTOR_TIMEOUT:-120}" "$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or the single word DUPLICATE if the tool reports it was already queued, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
       rm -f "$TMPC"
       # OUT is untrusted model output: a headless claude -p run whose stdin is the
       # raw transcript delta, so an adversarial tool-result/webpage seen during the
@@ -505,6 +594,16 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       # vector (LOW-2). Strip control chars + backticks, cap at 200 chars.
       OUTLOG=$(printf "%s" "$OUT" | tr -d "[:cntrl:]\140" | cut -c1-200)
       case "$OUT" in
+        # The server dedupes on content hash and answers "duplicate — already
+        # queued", which carries NO digits — so this used to fall through to the
+        # "no id" failure branch and break WITHOUT advancing. Replaying an
+        # already-accepted chunk (after a crash, a zero-length offset file, or an
+        # overlapping firing) then re-sent the same bytes forever: a permanent,
+        # self-perpetuating stall. A duplicate means the bytes ARE in the queue,
+        # which is exactly what advancing the offset records. Matched FIRST so it
+        # cannot be captured by the failure patterns below.
+        *DUPLICATE*|*[Dd]uplicate*|*already\ queued*)
+          OFFSET=$((OFFSET + BYTES)); printf "%s" "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
         *[Ff][Aa][Ii][Ll]*|*[Ee]rror*|*NOTOOL*|*unavailable*)
           echo "$(date -Is) connector $PROJECT chunk FAILED ($OUTLOG) at offset $OFFSET — will resume"; break ;;
         *[0-9]*) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
@@ -514,14 +613,24 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     # Truthful summary (HIGH-1): only a fully-drained firing logs " ok bytes=";
     # an early break (chunk FAILED / held partial line / per-firing cap) logs a
     # "partial" line the pre-brief does not read as success.
-    if [ "$SENT" -gt 0 ]; then
+    # "will resume" is a promise, and on the TERMINAL firing there is nothing left
+    # to keep it: no further firing exists for this session_id, so bytes still
+    # undrained at SessionEnd are lost, not deferred. Saying "will resume" there
+    # is the difference between a user re-ingesting the file and a user believing
+    # the session was captured. Likewise the cap notice must name the cap that
+    # was ACTUALLY in force, not KB_CONNECTOR_MAX regardless of event.
+    if [ "$SENT" -gt 0 ] || [ "$SKIPPED" -gt 0 ]; then
+      SKIPNOTE=""
+      [ "$SKIPPED" -gt 0 ] && SKIPNOTE=" NOT CAPTURED $SKIPPED bytes"
       if [ "$OFFSET" -ge "$SIZE" ]; then
-        echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+        echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)$SKIPNOTE"
+      elif [ "$EV" = "SessionEnd" ]; then
+        echo "$(date -Is) connector $PROJECT NOT CAPTURED $((SIZE-OFFSET)) bytes (offset $OFFSET/$SIZE)$SKIPNOTE — SessionEnd is the FINAL firing for this session, so these bytes will NOT resume. Re-ingest $T, or switch to a bearer transport in $CFG"
       else
-        echo "$(date -Is) connector $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE) — will resume"
+        echo "$(date -Is) connector $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE)$SKIPNOTE — will resume"
       fi
     fi
-    [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -ge "$KB_CONNECTOR_MAX" ] &&       echo "$(date -Is) connector $PROJECT per-firing cap reached; $((SIZE-OFFSET)) bytes resume next firing"
+    [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -ge "$CAP" ] && [ "$EV" != "SessionEnd" ] &&       echo "$(date -Is) connector $PROJECT per-firing cap reached ($CAP); $((SIZE-OFFSET)) bytes resume next firing"
     # Terminal event, fully drained: drop this session'"'"'s offset file.
     [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
   ' </dev/null >>"$LOG" 2>&1 &

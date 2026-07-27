@@ -77,11 +77,39 @@ stub_field() { # jq-filter jq-expr -> values, one per line
   stub_requests | "$RIG_JQ" -r "select($1) | $2"
 }
 
+# Concatenate a field across records with NO separator. stub_field uses `jq -r`,
+# which terminates every value with a newline — invisible on scalars, but when
+# reassembling N transcript chunks it silently inserts N extra bytes and turns a
+# byte-exact comparison into a mystery diff at the first chunk boundary.
+stub_concat() { # jq-filter jq-expr -> values, joined with nothing
+  stub_requests | "$RIG_JQ" -j "select($1) | $2"
+}
+
 wait_stub() { # min-records [timeout-s] -- wait for the DETACHED hook child to land
   local want="$1" t="${2:-25}" i=0 n
   while [ "$i" -lt "$((t * 4))" ]; do
     n=$(stub_total)
     [ "${n:-0}" -ge "$want" ] && return 0
+    i=$((i + 1))
+    sleep 0.25
+  done
+  return 1
+}
+
+log_count() { # pattern -> how many matching lines the flush log has
+  [ -f "$LOGF" ] && grep -cE "$1" "$LOGF" 2>/dev/null || echo 0
+}
+
+# Wait for a FIRING to finish, not merely to start. Every firing ends with exactly
+# one summary line (" ok bytes=" when drained, " partial bytes=" when it stopped
+# early), so counting those is the only reliable completion signal for a hook that
+# detaches. Waiting on "a submission arrived" instead lets a case fire again while
+# the previous child is still draining: both children then read the SAME offset
+# file and re-send the same chunk, which looks exactly like a product bug.
+wait_firing() { # previous-summary-count [timeout-s]
+  local want=$(( ${1:-0} + 1 )) t="${2:-120}" i=0
+  while [ "$i" -lt "$((t * 4))" ]; do
+    [ "$(log_count ' (ok|partial) bytes=')" -ge "$want" ] && return 0
     i=$((i + 1))
     sleep 0.25
   done

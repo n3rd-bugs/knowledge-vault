@@ -102,6 +102,7 @@ def ingest(
     tags: list[str] | None = None,
     meta: dict[str, Any] | None = None,
     code_ref: CodeRef | dict | None = None,
+    raw_ref: dict | None = None,
     raw_content: bytes | None = None,
     is_source: bool = False,
     valid_from: datetime | None = None,
@@ -121,11 +122,50 @@ def ingest(
             tags=tags,
             meta=meta,
             code_ref=code_ref,
+            raw_ref=raw_ref,
             raw_content=raw_content,
             is_source=is_source,
             valid_from=valid_from,
             valid_to=valid_to,
         )
+
+
+def _validated_raw_ref(conn: psycopg.Connection, ref: dict) -> dict:
+    """Check a raw-region anchor against the archive it claims to point into.
+
+    An unverifiable anchor is worse than none — it carries the authority of
+    provenance without the substance. So the source must exist, be readable by
+    this caller, actually hold raw content, and the byte range must lie inside
+    it. Anything else is refused at ingest rather than discovered later by
+    whoever tries to follow the citation.
+    """
+    from kbcore import documents
+
+    if not isinstance(ref, dict):
+        raise InvalidOperation("raw_ref must be an object")
+    try:
+        source_id = int(ref["source_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidOperation("raw_ref.source_id is required and must be an integer") from exc
+    start = int(ref.get("start", 0) or 0)
+    end = ref.get("end")
+    end = int(end) if end is not None else None
+    if start < 0 or (end is not None and end <= start):
+        raise InvalidOperation("raw_ref range must satisfy 0 <= start < end")
+
+    info = documents.describe_raw(source_id)  # raises NotFound / applies read scope
+    size = int(info["bytes"])
+    if start >= size or (end is not None and end > size):
+        raise InvalidOperation(
+            f"raw_ref range {start}..{end} lies outside the {size}-byte source {source_id}"
+        )
+    out = {"source_id": source_id, "start": start, "bytes": size, "uri": info["uri"]}
+    if end is not None:
+        out["end"] = end
+    for optional in ("line_start", "line_end", "note"):
+        if ref.get(optional) is not None:
+            out[optional] = ref[optional]
+    return out
 
 
 def ingest_in(
@@ -142,6 +182,7 @@ def ingest_in(
     tags: list[str] | None = None,
     meta: dict[str, Any] | None = None,
     code_ref: CodeRef | dict | None = None,
+    raw_ref: dict | None = None,
     raw_content: bytes | None = None,
     is_source: bool = False,
     valid_from: datetime | None = None,
@@ -241,6 +282,14 @@ def ingest_in(
     if code_ref is not None:
         ref = code_ref if isinstance(code_ref, CodeRef) else CodeRef(**code_ref)
         full_meta["code_ref"] = ref.model_dump(exclude_none=True)
+    if raw_ref is not None:
+        # A raw_ref says "this claim came from bytes X..Y of that archived
+        # source". Validated HERE, at the chokepoint, because an anchor that
+        # points at nothing is worse than no anchor: it reads as provenance
+        # while being unverifiable. The referenced source must exist, belong to
+        # a project this caller may read, actually have raw content, and the
+        # range must fall inside it.
+        full_meta["raw_ref"] = _validated_raw_ref(conn, raw_ref)
 
     item_id = conn.execute(
         """

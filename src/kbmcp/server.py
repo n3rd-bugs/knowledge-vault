@@ -428,6 +428,7 @@ from kbmcp import (  # noqa: E402
     prompts,
     resources,
     tools_deepsearch,
+    tools_docs,
     tools_phase5,
     tools_setup,
 )
@@ -435,6 +436,7 @@ from kbmcp import (  # noqa: E402
 tools_phase5.register(mcp)
 tools_deepsearch.register(mcp)
 tools_setup.register(mcp)
+tools_docs.register(mcp)
 # MCP prompts + read-only resources (claude.ai surfaces both in its attach menu).
 prompts.register(mcp)
 resources.register(mcp)

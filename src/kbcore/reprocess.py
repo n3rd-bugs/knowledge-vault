@@ -55,13 +55,23 @@ from kbcore.scrub import scrub
 logger = logging.getLogger("kbcore.reprocess")
 
 
+# SESSION-ONLY stays the rule (see the module docstring): git/manual content is
+# stored AS-IS, so its body already IS its content and replaying could only
+# duplicate bodies. Submitted DOCUMENTS are the one exception, and they are an
+# exception on exactly that reasoning rather than despite it: kbcore.documents
+# stores a CARD as the body and the real content in the raw blob, so there is
+# genuinely un-extracted material behind them. They are identified by their
+# uri scheme, not by kind, so an ordinary kind='file' source is untouched.
+DOC_URI_PREFIX = "doc://"
+
+
 def reprocessable_sources(
     project: str | None = None,
     before: str | None = None,
     extractor: str | None = None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Session sources whose raw archive is retained on disk. Read-only.
+    """Sources whose raw archive is retained on disk. Read-only.
 
     One raw transcript window backs SEVERAL source rows (ingest creates one per
     extracted item, all sharing kind/uri/raw_path), so rows are grouped per
@@ -74,8 +84,11 @@ def reprocessable_sources(
     rows whose archive has vanished from disk are dropped AFTER it, so the
     returned count can be below the limit.
     """
-    clauses = ["s.kind = 'session'", "s.raw_path IS NOT NULL"]
-    params: list[Any] = []
+    # Sessions, plus documents submitted through kbcore.documents. assemble_text()
+    # already decides JSONL-vs-plain per blob (_mostly_jsonl), so a document
+    # replays as prose and a transcript as a transcript.
+    clauses = ["(s.kind = 'session' OR s.uri LIKE %s)", "s.raw_path IS NOT NULL"]
+    params: list[Any] = [DOC_URI_PREFIX + "%"]
     if project is not None:
         clauses.append("s.project = %s")
         params.append(project)
@@ -132,7 +145,9 @@ def _source_context(source_id: int) -> dict[str, Any]:
         if row is None:
             raise NotFound(f"source {source_id} does not exist")
         kind, project, uri, raw_path = row
-        if kind != "session":
+        # Same exception as the listing: a submitted document has real
+        # un-extracted content behind a card body, unlike as-is git/manual rows.
+        if kind != "session" and not str(uri or "").startswith(DOC_URI_PREFIX):
             raise InvalidOperation(
                 f"source {source_id} is kind={kind!r}; only session sources are reprocessable"
             )
@@ -140,13 +155,16 @@ def _source_context(source_id: int) -> dict[str, Any]:
             raise InvalidOperation(f"source {source_id} has no retained raw archive")
         metas = conn.execute(
             "SELECT i.meta FROM items i JOIN sources s ON s.id = i.source_id "
-            "WHERE s.kind = 'session' AND s.uri = %s ORDER BY i.id",
+            "WHERE (s.kind = 'session' OR s.uri LIKE 'doc://%%') "
+            "AND s.uri = %s ORDER BY i.id",
             (uri,),
         ).fetchall()
         existing = {
             r[0]
             for r in conn.execute(
-                "SELECT content_hash FROM sources WHERE kind = 'session' AND uri = %s", (uri,)
+                "SELECT content_hash FROM sources "
+                "WHERE (kind = 'session' OR uri LIKE 'doc://%%') AND uri = %s",
+                (uri,),
             ).fetchall()
         }
     code_ref = branch = prev = None

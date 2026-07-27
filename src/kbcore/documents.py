@@ -162,7 +162,14 @@ def sweep_staging(older_than_hours: int = STAGING_TTL_HOURS) -> int:
 
 
 def _preview(raw: bytes) -> str:
-    text = raw[:PREVIEW_BYTES].decode("utf-8", errors="replace")
+    """A bounded, storable preview of the document for the registration card.
+
+    Lossy ON PURPOSE and only here: the card is for recognising the document in
+    a search result, while the ARCHIVE holds the bytes. NULs are stripped
+    because Postgres TEXT cannot store them, and a binary document would
+    otherwise make the whole insert fail.
+    """
+    text = raw[:PREVIEW_BYTES].decode("utf-8", errors="replace").replace("\x00", "")
     # Never cut mid-line in the preview: a half line reads as corruption.
     if len(raw) > PREVIEW_BYTES and "\n" in text:
         text = text.rsplit("\n", 1)[0]

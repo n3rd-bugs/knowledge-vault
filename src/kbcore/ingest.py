@@ -162,9 +162,24 @@ def _validated_raw_ref(conn: psycopg.Connection, ref: dict) -> dict:
     out = {"source_id": source_id, "start": start, "bytes": size, "uri": info["uri"]}
     if end is not None:
         out["end"] = end
-    for optional in ("line_start", "line_end", "note"):
-        if ref.get(optional) is not None:
-            out[optional] = ref[optional]
+    # Line numbers are a convenience for humans, but an unchecked one is a claim
+    # the citation cannot support — validate against the source's real line count.
+    lines = int(info.get("lines") or 0)
+    for key in ("line_start", "line_end"):
+        if ref.get(key) is None:
+            continue
+        try:
+            n = int(ref[key])
+        except (TypeError, ValueError) as exc:
+            raise InvalidOperation(f"raw_ref.{key} must be an integer") from exc
+        if n < 1 or (lines and n > lines):
+            raise InvalidOperation(f"raw_ref.{key}={n} is outside the source's {lines} line(s)")
+        out[key] = n
+    if ref.get("line_end") is not None and ref.get("line_start") is not None:
+        if int(ref["line_end"]) < int(ref["line_start"]):
+            raise InvalidOperation("raw_ref.line_end precedes line_start")
+    if ref.get("note") is not None:
+        out["note"] = str(ref["note"])[:500]
     return out
 
 
@@ -273,7 +288,24 @@ def ingest_in(
     source_id = row[0]
 
     if raw_content is not None and kind in ("file", "session", "git"):
-        raw_path = archive_raw(project, raw_content)
+        # Archive the SCRUBBED bytes. This used to store the caller's originals,
+        # so the raw store held exactly what scrub() exists to remove — and
+        # kb_read_raw hands whole blobs back. Reprocess re-scrubs anyway, so
+        # nothing downstream depends on the originals. The blob stays keyed on
+        # the hash of the ORIGINAL, so two documents that scrub alike still
+        # cannot overwrite each other's archive.
+        # TEXT is scrubbed; BINARY is stored verbatim. Decoding binary with
+        # errors="replace" to run text regexes over it would corrupt the very
+        # thing the archive exists to preserve — a dataset or image would come
+        # back mangled — while finding nothing, since the patterns are textual.
+        try:
+            _text = raw_content.decode("utf-8")
+        except UnicodeDecodeError:
+            raw_path = archive_raw(project, raw_content)
+        else:
+            _clean_raw, _raw_red = scrub(_text)
+            merge_redactions(redactions, _raw_red)
+            raw_path = archive_raw(project, _clean_raw.encode("utf-8"), key=raw_content)
         conn.execute("UPDATE sources SET raw_path = %s WHERE id = %s", (raw_path, source_id))
 
     full_meta = dict(meta or {})
@@ -289,7 +321,10 @@ def ingest_in(
         # while being unverifiable. The referenced source must exist, belong to
         # a project this caller may read, actually have raw content, and the
         # range must fall inside it.
-        full_meta["raw_ref"] = _validated_raw_ref(conn, raw_ref)
+        # Scrubbed like every other meta leaf. This was assigned AFTER the meta
+        # scrub above, making raw_ref the one leaf a secret could ride through
+        # (its free-text `note` is caller-supplied) — the hole A11-3 FIX 2 closed.
+        full_meta["raw_ref"] = scrub_tree(_validated_raw_ref(conn, raw_ref), redactions)
 
     item_id = conn.execute(
         """
@@ -410,7 +445,7 @@ def _insert_chunks(conn: psycopg.Connection, item_id: int, chunks: list[str]) ->
     )
 
 
-def archive_raw(project: str, raw: bytes) -> str:
+def archive_raw(project: str, raw: bytes, *, key: bytes | None = None) -> str:
     """Store the original bytes zstd-compressed under KB_RAW (OPS-4). Idempotent.
 
     Keyed by the hash of the ORIGINAL bytes, not the scrubbed content hash —
@@ -421,7 +456,7 @@ def archive_raw(project: str, raw: bytes) -> str:
     """
     directory = settings.raw / project
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / f"{hashlib.sha256(raw).hexdigest()[:16]}.zst"
+    path = directory / f"{hashlib.sha256(key if key is not None else raw).hexdigest()[:16]}.zst"
     if not path.exists():
         path.write_bytes(zstandard.ZstdCompressor(level=9).compress(raw))
     return str(path)

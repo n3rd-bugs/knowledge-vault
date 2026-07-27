@@ -67,6 +67,21 @@ def render_item(item: ItemDetail) -> str:
         lines.append(f"tags: {', '.join(item.tags)}")
     if item.code_ref:
         lines.append(item.code_ref.render())
+    # An anchor nobody can see is an anchor nobody follows: show the region and
+    # the source id, which is what kb_read_raw takes to fetch the cited bytes.
+    ref = item.meta.get("raw_ref") if isinstance(item.meta, dict) else None
+    if isinstance(ref, dict) and ref.get("source_id") is not None:
+        span = (
+            f"{ref.get('start', 0)}-{ref['end']}"
+            if ref.get("end") is not None
+            else f"from {ref.get('start', 0)}"
+        )
+        ln = ""
+        if ref.get("line_start"):
+            ln = f", lines {ref['line_start']}" + (
+                f"-{ref['line_end']}" if ref.get("line_end") else ""
+            )
+        lines.append(f"raw: source {ref['source_id']} bytes {span}{ln} ({ref.get('uri', '')})")
     span = _valid_span(item.valid_from, item.valid_to)
     if span:
         lines.append(f"valid: {span}")

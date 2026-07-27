@@ -182,6 +182,7 @@ def kb_save(
     body: str,
     tags: list[str] | None = None,
     code_ref: dict | None = None,
+    raw_ref: dict | None = None,
     links: list[dict] | None = None,
     valid_from: str | None = None,
     valid_to: str | None = None,
@@ -193,7 +194,12 @@ def kb_save(
     runbook|qa|config. Always tag with namespaced tags — lang: (python, c,
     js…), hw: (tps55288, atmega328p…), protocol: (spi, i2c, uart, http…),
     framework:, tool: (docker, systemd…), os:, domain: — lowercase,
-    hyphenated. Anchor knowledge about code with
+    Anchor a claim to a REGION of stored raw material with
+    raw_ref={"source_id", "start", "end"?, "line_start"?, "line_end"?, "note"?} —
+    the byte range of the transcript or document it came from, so the citation
+    can be followed with kb_read_raw and checked rather than trusted. It is
+    validated on save: the source must exist, be readable, hold raw content, and
+    the range must fall inside it. Anchor knowledge about code with
     code_ref={"repo","path","lines?","commit?","symbol?"}. links relates the
     new item to existing ones: [{"rel":"fixes","item_id":7}] (rels: fixes,
     alternative_to, depends_on, implements, mentions, derived_from).
@@ -217,6 +223,7 @@ def kb_save(
             trust="verified",
             tags=tags,
             code_ref=code_ref,
+            raw_ref=raw_ref,
             valid_from=vf,
             valid_to=vt,
         )

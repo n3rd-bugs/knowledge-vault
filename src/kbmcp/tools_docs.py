@@ -17,11 +17,22 @@ import logging
 
 from fastmcp.exceptions import ToolError
 
-from kbcore import documents
+from kbcore import documents, project_tokens
 from kbcore.errors import KBError
 from kbmcp import ANNOTATIONS_READ, ANNOTATIONS_WRITE
 
 log = logging.getLogger("kbmcp.docs")
+
+
+def _env_key(project: str) -> str:
+    """The kb-tokens.env variable name for a project.
+
+    Uppercased with non-alphanumerics folded to underscores, because a project
+    slug may contain `-` and `.` which are not legal in a shell variable name.
+    The hook derives the same key from its own PROJECT, so the two must agree.
+    """
+    safe = "".join(c if c.isalnum() else "_" for c in project.upper())
+    return f"KB_TOKEN_{safe}"
 
 
 def _decode(content: str | None, content_b64: str | None) -> bytes:
@@ -105,6 +116,66 @@ def register(mcp) -> None:
         except KBError as e:
             raise ToolError(str(e)) from e
         return f"staged {staged} bytes for upload {upload_id}"
+
+    @mcp.tool(annotations=ANNOTATIONS_WRITE)
+    def kb_project_token(
+        project: str,
+        machine: str = "default",
+        expires_days: int | None = None,
+    ) -> str:
+        """Get a REVOCABLE credential for ONE project, to capture sessions on this
+        machine.
+
+        The token can search, browse and save in `project` and can do nothing
+        anywhere else, so a machine holds one narrow credential per project
+        instead of one broad credential for everything. Works for a project that
+        does not exist yet — that is how you start one.
+
+        You can only get a token for a project you can already write: this
+        carries your access to a machine, it never grants access.
+
+        Issuing again for the same (project, machine) REVOKES the previous one,
+        so a leaked token dies the moment you replace it. Revoke explicitly with
+        `kb principal revoke <project>@<machine>`.
+
+        The secret is shown ONCE. Add the printed line to
+        ~/.claude/kb-tokens.env on that machine and the session hooks will use it
+        automatically for that project.
+        """
+        try:
+            t = project_tokens.issue(
+                project, machine=machine, expires_days=expires_days, note="kb_project_token"
+            )
+        except KBError as e:
+            raise ToolError(str(e)) from e
+        expiry = f", expires {t.expires_at:%Y-%m-%d}" if t.expires_at else ", no expiry"
+        replaced = " (the previous token for this machine is now revoked)" if t.replaced else ""
+        return (
+            f"token for project '{t.project}' on '{t.machine}'{expiry}{replaced}.\n"
+            f"Add this line to ~/.claude/kb-tokens.env (chmod 600):\n\n"
+            f"    {_env_key(t.project)}={t.token}\n\n"
+            f"Revoke later with: kb principal revoke {t.name}"
+        )
+
+    @mcp.tool(annotations=ANNOTATIONS_READ)
+    def kb_project_tokens(project: str | None = None) -> str:
+        """List the live per-project capture tokens you can see — never secrets.
+
+        Shows which (project, machine) pairs have a credential, when it was
+        issued and whether it has expired, so a machine that stopped capturing
+        can be diagnosed without guessing.
+        """
+        try:
+            rows = project_tokens.list_for(project)
+        except KBError as e:
+            raise ToolError(str(e)) from e
+        if not rows:
+            return "no project tokens issued"
+        return "\n".join(
+            f"  {r['project']:<24} {r['machine']:<16} issued {(r['created_at'] or '')[:10]}"
+            + (f" EXPIRED {(r['expires_at'] or '')[:10]}" if r["expired"] else "")
+            for r in rows
+        )
 
     @mcp.tool(annotations=ANNOTATIONS_READ)
     def kb_read_raw(source_id: int, start: int = 0, end: int | None = None) -> str:

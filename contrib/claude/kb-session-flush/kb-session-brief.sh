@@ -408,7 +408,7 @@ if [ "$MODE" = "brief" ]; then
     # used to sit here too and was dead — no hook has ever written `http=`; the
     # REST failure line carries its status as `chunk FAILED (500)`.
     RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
-      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED/ { fail=$0; failn=NR; next }
+      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED|NEEDS TOKEN/ { fail=$0; failn=NR; next }
       / (ok|partial) bytes=/ {
         # Belt and braces (HIGH-1): a summary whose (offset X/Y) shows X<Y is an
         # INCOMPLETE drain — count it as a failure even if the matching FAILED line

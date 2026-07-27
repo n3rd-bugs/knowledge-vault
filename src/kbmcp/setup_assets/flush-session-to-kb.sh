@@ -345,6 +345,50 @@ if [ -f "$LOG" ]; then
   fi
 fi
 
+# ---------------------------------------------------------- per-project token
+# A machine writing several projects should carry one NARROW, revocable
+# credential per project rather than one broad credential for everything. Tokens
+# live in ~/.claude/kb-tokens.env as KB_TOKEN_<PROJECT>, and the project is
+# already known (slugified cwd), so the right one is selected here. KB_TOKEN
+# stays the fallback, so a single-token machine keeps working unchanged.
+TOKENS="$HOME/.claude/kb-tokens.env"
+if [ -f "$TOKENS" ]; then
+  # shellcheck disable=SC1090
+  . "$TOKENS"
+fi
+# Fold the project slug into a legal shell variable name the same way
+# kb_project_token does when it prints the line to add.
+PROJ_KEY=$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || true)
+if [ -n "$PROJ_TOKEN" ]; then
+  KB_TOKEN="$PROJ_TOKEN"
+  KB_TOKEN_SOURCE="project token for $PROJECT"
+else
+  KB_TOKEN_SOURCE="shared KB_TOKEN"
+fi
+
+# A machine that has per-project tokens but none for THIS project is not
+# misconfigured in general — it just has not been given access to this one yet.
+# Say exactly that, and exactly how to fix it, rather than failing later with an
+# opaque 403. Rate-limited like the other NOT CONFIGURED lines.
+if [ -z "${KB_TOKEN:-}" ] && [ -f "$TOKENS" ]; then
+  STAMP="$HOME/.claude/hooks/state/.notoken-$PROJECT.stamp"
+  mkdir -p "$HOME/.claude/hooks/state" 2>/dev/null || true
+  NOW=$(date +%s 2>/dev/null || echo 0)
+  LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
+  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
+  if [ "$((NOW - LAST))" -ge 3600 ]; then
+    printf '%s\n' "$NOW" >"$STAMP" 2>/dev/null || true
+    echo "$(date -Is) flush $PROJECT NEEDS TOKEN: no KB_TOKEN_$PROJ_KEY in $TOKENS and no shared KB_TOKEN, so this session was NOT captured. Ask the KB for one: kb_project_token(project=\"$PROJECT\", machine=\"$(hostname 2>/dev/null || echo this-machine)\") — then add the printed line to $TOKENS" >>"$LOG"
+  fi
+  # Stop here rather than falling through to the generic NOT CONFIGURED branch.
+  # Both lines are true, but the pre-brief shows the LAST failure, and "you need
+  # a token for this project, run this to get one" is the one the user can act
+  # on — letting the generic line land after it buries the useful message.
+  # LOCAL mode needs no token, so it is never short-circuited here.
+  [ -z "${KB_DIR:-}" ] && exit 0
+fi
+
 if [ -n "${KB_DIR:-}" ]; then
   # LOCAL: trusted CLI enqueue — checkpointed, GPU-free (nightly drain extracts).
   UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"

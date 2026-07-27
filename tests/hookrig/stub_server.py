@@ -124,6 +124,7 @@ class Handler(BaseHTTPRequestHandler):
     def _done(self, rec: dict[str, Any], code: int, obj: Any, **hdrs: str) -> None:
         """Record the request as answered, then answer it."""
         rec.setdefault("status", code)
+        rec.setdefault("bearer", self._bearer())
         State.record(rec)
         self._send(code, json.dumps(obj).encode("utf-8"), **hdrs)
 
@@ -132,6 +133,17 @@ class Handler(BaseHTTPRequestHandler):
         if not h.strip():
             return "missing"
         return "ok" if h == f"Bearer {TOKEN}" else "bad"
+
+    def _bearer(self) -> str:
+        """The bearer AS PRESENTED, recorded whether or not it was accepted.
+
+        Which credential a hook chose is a separate question from whether the
+        server liked it, and per-project token selection can only be asserted by
+        seeing the actual value on the wire. Safe here and nowhere else: this is
+        a throwaway stub on an --internal network.
+        """
+        h = self.headers.get("Authorization", "")
+        return h[7:].strip() if h[:7].lower() == "bearer " else ""
 
     # ------------------------------------------------------------------ routes
     def do_GET(self) -> None:  # noqa: N802

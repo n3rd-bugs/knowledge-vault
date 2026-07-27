@@ -205,6 +205,39 @@ kb principal ungrant alice acme-infra   # remove one project, keep the rest
   A non-owner web write is forced `unverified` + quarantined until you promote,
   so the browser can never mint verified knowledge nor reach an agent's search
   before review. `guest`/`reader` grantees remain fully read-only.
+## 2.4 Per-project capture tokens
+
+A machine that works across several projects should carry one **narrow,
+revocable** credential per project rather than one broad credential for all of
+them. Ask the KB for one:
+
+```
+kb_project_token(project="myproj", machine="laptop")
+  -> KB_TOKEN_MYPROJ=kbg_…      # add to ~/.claude/kb-tokens.env (chmod 600)
+```
+
+| Property | Behaviour |
+| --- | --- |
+| Scope | `contributor` role + exactly ONE read-write grant. It can search, browse and save in that project and **nothing anywhere else** |
+| Naming | `<project>@<machine>`, so `access_log` names the machine and revocation is per machine |
+| Revoke | `kb principal revoke myproj@laptop` — a timestamp flip; the next request stops |
+| Re-issue | Issuing again for the same (project, machine) **revokes the previous token**, so a leaked one dies when you replace it |
+| New projects | An owner may take a token for a project that does not exist yet — that is how you start one |
+| Never an escalation | You can only get a token for a project you can already write; it carries access, it never grants it |
+| Expiry | Opt-in (`expires_days`). Default none: a capture credential that expires unannounced is a silent outage — revocation is the answer, and it is immediate |
+
+`kb_project_tokens()` lists live tokens (never secrets), including which have
+expired — so a machine that stopped capturing can be diagnosed rather than
+guessed at.
+
+**The hook picks the right one automatically.** It already knows the project
+(the slugified cwd), so it selects `KB_TOKEN_<PROJECT>` from
+`~/.claude/kb-tokens.env`. If there is no token for that project it does not
+fail obscurely — it writes a `NEEDS TOKEN` line naming the variable to add and
+the exact call to make, and the next session's pre-brief puts it in front of
+you. A machine with only the shared `KB_TOKEN` keeps working unchanged: that
+stays the fallback.
+
 ## 2.5 Enrolment codes
 
 A machine sets itself up by redeeming a **one-time code** (`kbe_…`) rather than

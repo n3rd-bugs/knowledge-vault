@@ -76,6 +76,8 @@ tokens are long-lived and refresh silently.
 | `kb_ingest_session(project, transcript, kind?, repo?, branch?, commit?)` | **Submit a conversation or memory dump** (see §6) |
 | `kb_consolidate()` | Request an on-demand nightly refine pass (dedupe, summaries, contradictions, archive, re-embed) |
 | `kb_setup(rest_url?, include_scripts?)` | Returns a short setup guide **plus a one-time enrolment code** so a machine credentials itself (see §6). The hook scripts are fetched, not embedded — pass `include_scripts=true` only for a machine with no HTTP access to the KB |
+| `kb_project_token(project, machine?, expires_days?)` | **A revocable credential for ONE project** — narrow, per-machine, and re-issuing revokes the old one. Works for a project that does not exist yet ([SHARING.md §2.4](SHARING.md#24-per-project-capture-tokens)) |
+| `kb_project_tokens(project?)` | List live per-project tokens (never secrets), including expired ones |
 | `kb_put_doc(project, name, content?/content_b64?, upload_id?, note?, tags?, extract?)` | **Store a RAW document for reference** — a spec, config, log or dataset from the workspace. Archived verbatim and replayable forever; `extract=true` also mines it into knowledge. Returns the `source_id` other items cite |
 | `kb_put_doc_chunk(upload_id, offset, content?/content_b64?)` | Stage one chunk of a document larger than ~900 KB, then finalise with `kb_put_doc(upload_id=…)` |
 | `kb_read_raw(source_id, start?, end?)` | Read the original bytes behind a source — how a `raw_ref` citation gets **checked** rather than trusted (owner-only: `CAP_EXPORT`) |

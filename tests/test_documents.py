@@ -205,9 +205,15 @@ def test_extract_true_actually_queues_the_document(kb, as_owner):
     assert doc.extracted is True, "the document was not queued for extraction"
     assert doc.source_id, "the caller must still learn where the document went"
 
-    pending = ingest_queue.list_pending(limit=50) if hasattr(ingest_queue, "list_pending") else None
-    if pending is not None:
-        assert any(doc.uri == getattr(r, "source_uri", None) for r in pending)
+    # This assertion used to be dead: it guarded on hasattr(ingest_queue,
+    # "list_pending"), a function that does not exist, so it never ran — leaving
+    # the test asserting only a boolean the code computes about itself.
+    rows = ingest_queue.pending(limit=50)
+    mine = [r for r in rows if r.get("project") == "proj"]
+    assert mine, "nothing was queued for the document's project"
+    # The queued content must be the DOCUMENT, not the card body — the property
+    # that silently breaks if _extract_document is ever handed the item text.
+    assert any("a finding worth mining" in (r.get("content") or "") for r in mine)
 
 
 def test_a_failed_extraction_does_not_lose_the_stored_document(kb, as_owner, monkeypatch):
@@ -219,3 +225,50 @@ def test_a_failed_extraction_does_not_lose_the_stored_document(kb, as_owner, mon
     doc = documents.put_document("proj", "still-stored.txt", content=b"kept\n", extract=True)
     assert doc.extracted is False
     assert documents.read_raw(doc.source_id) == b"kept\n"
+
+
+# ------------------------------------------------------- staging authority
+
+
+def test_staging_needs_the_save_capability(kb, as_owner):
+    """stage_chunk WRITES to the KB's disk. The identity this guards against is
+    concrete: the zero-authority 'enrolling-machine' principal, which exists so a
+    new box can redeem a code and holds no capabilities at all."""
+    from kbmcp import principal_ctx
+
+    enrolling = scope.Principal(name=principal_ctx.ENROLLING_NAME, is_owner=False)
+    with scope.use_principal(enrolling), pytest.raises(KBError):
+        documents.stage_chunk("some-upload", b"x" * 10, offset=0)
+
+
+def test_one_principal_cannot_finalise_anothers_staged_bytes(kb, as_owner):
+    """The staging key is caller-chosen, so without a per-principal namespace one
+    identity could stage bytes under an id another finalised into their own
+    project — a project-wall breach through a filesystem key."""
+    a = scope.Principal(
+        name="alice",
+        read_projects=frozenset({"pa"}),
+        write_projects=frozenset({"pa"}),
+        caps=frozenset({"save", "search", "browse"}),
+    )
+    b = scope.Principal(
+        name="bob",
+        read_projects=frozenset({"pb"}),
+        write_projects=frozenset({"pb"}),
+        caps=frozenset({"save", "search", "browse"}),
+    )
+    with scope.use_principal(a):
+        documents.stage_chunk("shared-id", b"alice's secret bytes\n", offset=0)
+    with scope.use_principal(b), pytest.raises(NotFound):
+        documents.put_document("pb", "stolen.txt", upload_id="shared-id")
+    # Alice's staged bytes are untouched and still finalise for her.
+    with scope.use_principal(a):
+        doc = documents.put_document("pa", "mine.txt", upload_id="shared-id")
+    assert documents.read_raw(doc.source_id) == b"alice's secret bytes\n"
+
+
+def test_staging_is_bounded(kb, as_owner):
+    """The raw store is tarred into every off-site backup, so an unbounded
+    upload is an unbounded backup."""
+    with pytest.raises(InvalidOperation):
+        documents.stage_chunk("too-big", b"x" * (documents.MAX_CHUNK_BYTES + 1), offset=0)

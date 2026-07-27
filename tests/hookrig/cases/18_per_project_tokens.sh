@@ -25,15 +25,23 @@ cfg_rest
 install_hooks >/dev/null
 
 TOKENS="$HOME/.claude/kb-tokens.env"
-# alpha uses the token the stub ACCEPTS, so its session actually lands;
-# beta uses a different one, which the stub records even while rejecting it —
-# selection is the property under test, acceptance is the server's business.
-ALPHA="$RIG_TOKEN"
+# THREE DISTINCT values. ALPHA was previously set to $RIG_TOKEN — the same value
+# cfg_rest writes as the shared KB_TOKEN — which made the alpha assertion
+# unfalsifiable: deleting the whole selection block would have fallen back to the
+# shared token, put the same bytes on the wire, and still passed. The stub
+# records the bearer whether or not it accepts it, so selection can be asserted
+# without any of these needing to be the accepted one.
+ALPHA="kbg_alpha0000000000000000000000000000000000"
 BETA="kbg_beta00000000000000000000000000000000000"
+# A HYPHENATED project, because the hook folds the slug into a shell variable
+# name (data-server -> KB_TOKEN_DATA_SERVER) and every project here was
+# alphanumeric, so the folding was never exercised.
+DASHED="kbg_dashed000000000000000000000000000000000"
 cat >"$TOKENS" <<EOF
 # one narrow credential per project
 KB_TOKEN_ALPHA=$ALPHA
 KB_TOKEN_BETA=$BETA
+KB_TOKEN_DATA_SERVER=$DASHED
 EOF
 chmod 600 "$TOKENS"
 
@@ -47,10 +55,11 @@ mkdir -p "$WA"
 mk_transcript "$WA/t.jsonl" 40 alpha
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$WA/t.jsonl" "$WA" alpha-1)"
 assert_eq "0" "$RC" "the hook exits 0"
-wait_stub 1 60 || fail "nothing was submitted for alpha"
-assert_eq "alpha" "$(stub_field '.transport=="rest"' '.project' | tail -1)" "submitted under alpha"
+wait_stub 1 60 || fail "nothing reached the stub for alpha"
 assert_eq "$ALPHA" "$(stub_field '.' '.bearer // empty' | tail -1)" \
-  "alpha's session carried ALPHA's token"
+  "alpha's session carried ALPHA's token, not the shared fallback"
+assert_ne "$RIG_TOKEN" "$(stub_field '.' '.bearer // empty' | tail -1)" \
+  "it did NOT fall back to the shared KB_TOKEN"
 
 step "a session in project 'beta' is sent with BETA's token"
 WB="$HOME/work/beta"
@@ -61,6 +70,16 @@ fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$WB/t.jsonl" "$WB" beta-1)"
 wait_stub "$((BEFORE + 1))" 60 || fail "nothing reached the stub for beta"
 assert_eq "$BETA" "$(stub_field '.' '.bearer // empty' | tail -1)" \
   "beta's session carried BETA's token, not alpha's"
+
+step "a HYPHENATED project folds to the right variable name"
+WD="$HOME/work/data-server"
+mkdir -p "$WD"
+mk_transcript "$WD/t.jsonl" 40 dashed
+BEFORE=$(stub_total)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$WD/t.jsonl" "$WD" dashed-1)"
+wait_stub "$((BEFORE + 1))" 60 || fail "nothing reached the stub for data-server"
+assert_eq "$DASHED" "$(stub_field '.' '.bearer // empty' | tail -1)" \
+  "data-server resolved KB_TOKEN_DATA_SERVER (hyphen folded to underscore)"
 
 # ---------------------------------- 2. a project with no token says so, loudly
 step "a project with NO token is announced, with the exact command to fix it"

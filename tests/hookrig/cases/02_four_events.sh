@@ -41,8 +41,11 @@ assert_eq "" "$(jq -r '.hooks.UserPromptSubmit[0].matcher' "$SETTINGS")" "UserPr
 step "timeouts are declared (a hook Claude Code cannot bound would stall a session)"
 assert_eq "15" "$(jq -r '.hooks.PreCompact[0].hooks[0].timeout' "$SETTINGS")" "PreCompact timeout 15s"
 assert_eq "15" "$(jq -r '.hooks.SessionEnd[0].hooks[0].timeout' "$SETTINGS")" "SessionEnd timeout 15s"
-assert_eq "30" "$(jq -r '.hooks.SessionStart[0].hooks[0].timeout' "$SETTINGS")" "SessionStart timeout 30s"
-assert_eq "15" "$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].timeout' "$SETTINGS")" "UserPromptSubmit timeout 15s"
+# The two SEARCH hooks get 35s: the registered timeout must EXCEED the script's
+# own budget (30s) or Claude Code kills the hook first and the internal ceiling
+# is dead code. The flush hooks keep 15s — they detach immediately.
+assert_eq "35" "$(jq -r '.hooks.SessionStart[0].hooks[0].timeout' "$SETTINGS")" "SessionStart timeout 35s"
+assert_eq "35" "$(jq -r '.hooks.UserPromptSubmit[0].hooks[0].timeout' "$SETTINGS")" "UserPromptSubmit timeout 35s"
 
 step "all three scripts are installed and executable"
 for f in flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do

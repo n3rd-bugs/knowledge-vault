@@ -343,9 +343,14 @@ if [ "$EV" = "UserPromptSubmit" ]; then
     [ "$LH" = "$QH" ] && [ $((NOW - LT)) -lt 600 ] && exit 0
   fi
   K=3
-  ST=6
-  HELPER_TO=8
-  CONN_TO=12
+  # A CEILING, not a cost. Steady-state recall is ~1.4s, so raising this does
+  # not slow a healthy KB — it only matters when the KB is reachable but slow,
+  # which is exactly the cold start after a restart (~9s while the embedder
+  # loads). A DEAD KB still fails in ~2s via the reachability probe below, so
+  # the full budget is never spent on an unreachable host.
+  ST=30
+  HELPER_TO=32
+  CONN_TO=30
   ALLOW_CONN="${KB_PROMPT_RECALL_CONNECTOR:-0}"
   MODE=recall
 else

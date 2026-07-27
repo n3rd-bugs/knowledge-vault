@@ -476,13 +476,13 @@ if [ -n "$KB_JQ_BIN" ]; then
     entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$HOOK" \
       '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
     brief_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$BRIEF" \
-      '{matcher:"startup|clear",hooks:[{type:"command",command:$b,args:[$c],timeout:30}]}')
+      '{matcher:"startup|clear",hooks:[{type:"command",command:$b,args:[$c],timeout:35}]}')
     recall_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$BRIEF" \
-      '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
+      '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:35}]}')
   else
     entry=$("$KB_JQ_BIN" -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
-    brief_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:30}]}')
-    recall_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
+    brief_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:35}]}')
+    recall_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"",hooks:[{type:"command",command:$c,timeout:35}]}')
   fi
   "$KB_JQ_BIN" --argjson e "$entry" --argjson b "$brief_entry" --argjson r "$recall_entry" \
     --arg c "$HOOK" --arg bc "$BRIEF" '
@@ -537,8 +537,8 @@ data["hooks"] = hooks
 for ev, script, matcher, timeout in (
     ("PreCompact", hook, "", 15),
     ("SessionEnd", hook, "", 15),
-    ("SessionStart", brief, "startup|clear", 30),
-    ("UserPromptSubmit", brief, "", 15),
+    ("SessionStart", brief, "startup|clear", 35),
+    ("UserPromptSubmit", brief, "", 35),
 ):
     cur = hooks.get(ev)
     cur = cur if isinstance(cur, list) else []

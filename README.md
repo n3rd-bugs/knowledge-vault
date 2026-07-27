@@ -178,7 +178,7 @@ running the installer — an existing config is never overwritten.
   recent commit subjects is injected into Claude's starting context. Fails silently — a briefing
   never breaks a session.
 - **Per-prompt recall** (`UserPromptSubmit`): each substantive prompt also gets a KB search seeded by
-  the prompt itself. Self-throttling; `KB_RECALL=0` turns just this off.
+  the prompt itself. Self-throttling; `KB_PROMPT_RECALL=0` turns just this off.
 
 **Verifying it works.** Every outcome is a line in `~/.claude/hooks/flush-session.log` — the hooks
 always exit 0, so the log is the only signal. Look for `local … ok bytes=` (LOCAL),

@@ -346,6 +346,23 @@ else
   MODE=brief
 fi
 
+# ---------------------------------------------------------- per-project token
+# The SAME resolver the flush hook uses, and it must be here too: the default
+# enrolment path writes a project-scoped credential to kb-tokens.env and
+# deliberately writes NO shared KB_TOKEN. Without this, both transport guards
+# below test an empty KB_TOKEN, evaluate false, and the hook exits silently —
+# so pre-brief and per-prompt recall are dead on arrival on every machine set up
+# the recommended way, with no output and no log line to say why.
+# Reported from the repeater project after a real reinstall (KB item 1193).
+TOKENS="$HOME/.claude/kb-tokens.env"
+if [ -f "$TOKENS" ]; then
+  # shellcheck disable=SC1090
+  . "$TOKENS"
+fi
+PROJ_KEY=$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || true)
+[ -n "$PROJ_TOKEN" ] && KB_TOKEN="$PROJ_TOKEN"
+
 HITS=""
 if [ -n "${KB_DIR:-}" ]; then
   # LOCAL reachability: the repo dir must exist (a trivial, instant check) —

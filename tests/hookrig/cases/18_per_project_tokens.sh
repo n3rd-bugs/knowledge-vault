@@ -123,6 +123,48 @@ else
   note "log tail: $(tail -3 "$LOGF" | cut -c1-100 | tr '\n' '|')"
 fi
 
+# --------------- 2b. the BRIEF hook must resolve the same token (KB item 1193)
+# The default enrolment path writes a project-scoped credential and NO shared
+# KB_TOKEN. The flush hook handled that; the brief hook did not, so on every
+# machine set up the recommended way pre-brief and per-prompt recall were dead
+# on arrival — silently, with no log line. Reported from the repeater project
+# after a real reinstall, not found by this rig, which is why it is here now.
+new_home briefproj
+stub_reset
+cfg_rest
+install_hooks >/dev/null
+BTOK="kbg_brief0000000000000000000000000000000000"
+printf 'KB_TOKEN_BRIEFREPO=%s\n' "$BTOK" >"$HOME/.claude/kb-tokens.env"
+chmod 600 "$HOME/.claude/kb-tokens.env"
+# Remove the shared token, exactly as a project-scoped enrolment leaves things.
+grep -v '^KB_TOKEN=' "$CFG" >"$CFG.t" && mv "$CFG.t" "$CFG"
+WBR="$HOME/work/briefrepo"
+mkdir -p "$WBR"
+
+step "pre-brief works with ONLY a project token (no shared KB_TOKEN)"
+BEFORE=$(stub_total)
+fire "$HOOKS/kb-session-brief.sh" "$(start_event startup "$WBR")"
+assert_eq "0" "$RC" "the brief hook exits 0"
+wait_stub "$((BEFORE + 1))" 45 || fail "the brief hook made NO request — pre-brief is dead on arrival"
+assert_eq "$BTOK" "$(stub_field '.' '.bearer // empty' | tail -1)" \
+  "the brief hook used the project token"
+# What matters is that the hook REACHED the KB with the right credential — the
+# earlier failure was that it never made a request at all. Whether the canned
+# stub reply yields printable hits is the stub's business, not the hook's.
+note "brief stdout: ${#OUT} chars"
+
+step "per-prompt recall resolves the same token"
+BEFORE=$(stub_total)
+fire "$HOOKS/kb-session-brief.sh" "$(prompt_event "how does the retry backoff work in this service" "$WBR")"
+wait_stub "$((BEFORE + 1))" 45 || fail "recall made no request"
+assert_eq "$BTOK" "$(stub_field '.' '.bearer // empty' | tail -1)" \
+  "recall used the project token too"
+
+step "the documented off-switch is the one the script tests"
+# The guide said KB_RECALL=0 while the script tests KB_PROMPT_RECALL — a switch
+# that silently does nothing is worse than no switch.
+assert_file_contains "$HOOKS/kb-session-brief.sh" "KB_PROMPT_RECALL" "the script tests KB_PROMPT_RECALL"
+
 # ------------------------------------- 3. a single-token machine still works
 step "a machine with only the shared KB_TOKEN is unaffected"
 new_home sharedtoken

@@ -197,7 +197,7 @@ Vault, across **four** registered events:
 - **Per-prompt recall** (`UserPromptSubmit`): each substantive prompt also gets a
   KB search seeded by the prompt itself, injected as `[KB recall · project …]`.
   It self-throttles (slash commands, very short prompts and repeated queries are
-  skipped). Set `KB_RECALL=0` in the config to turn just this one off.
+  skipped). Set `KB_PROMPT_RECALL=0` in the config to turn just this one off.
 
 ## Which mode is this machine?
 

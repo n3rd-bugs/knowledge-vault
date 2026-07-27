@@ -475,4 +475,12 @@ echo
 echo "smoke test (feeds a fake PreCompact event to the hook):"
 echo "  T=\$(ls -t \"\$HOME\"/.claude/projects/*/*.jsonl | head -1)"
 echo "  printf '{\"transcript_path\":\"%s\",\"cwd\":\"%s\",\"session_id\":\"smoke\"}' \"\$T\" \"\$PWD\" | $HOOK"
-echo "  sleep 2 && tail -3 $HOOKS/flush-session.log   # expect: local … | mcp … ok | remote … http=202"
+# The expected markers are the ones the hook REALLY writes. The old hint said
+# "mcp … ok | remote … http=202" — no code path has ever emitted either string,
+# so anyone following it grepped for a marker that cannot appear and concluded a
+# working install had failed. MCP and REMOTE share one branch and both log "flush".
+echo "  sleep 2 && tail -3 $HOOKS/flush-session.log"
+echo "  # expect one of:  local <proj> ok bytes=N (offset N/N)      [LOCAL]"
+echo "  #                 flush <proj> ok bytes=N (offset X/Y)      [MCP or REMOTE]"
+echo "  #                 connector <proj> ok bytes=N (offset X/Y)  [CONNECTOR]"
+echo "  # 'ok' means fully drained; 'partial' means more bytes follow next firing."

@@ -100,6 +100,81 @@ wait_log() { # pattern [timeout-s]
 
 settle() { sleep 1.5; } # let a detached child that should do NOTHING prove it
 
+# --------------------------------------------------------------- connector relay
+# CONNECTOR mode's data path is a headless `claude -p` invoked as "$CLAUDE_BIN".
+# That is just a path to an executable, so the ENTIRE chunk loop is exercisable
+# hermetically by standing a recorder in its place — no egress, no Claude usage,
+# and deterministic chunk boundaries. run-connector.sh still proves the REAL
+# relay reaches claude.ai; these helpers pin what it does with the bytes.
+RELAY_DIR_NAME="relay"
+
+fake_claude_relay() { # a `claude` that RECORDS every relayed chunk, in order
+  mkdir -p "$HOME/$RELAY_DIR_NAME"
+  cat >"$HOME/bin/claude" <<'RELAYEOF'
+#!/usr/bin/env bash
+# Stand-in for the headless `claude -p` relay. Records each invocation's stdin
+# (the chunk as it went on the wire) plus its argv, then answers like the real
+# thing: a bare queue id on success.
+D="$HOME/relay"
+mkdir -p "$D"
+N=$(( $(cat "$D/.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$N" >"$D/.n"
+cat >"$D/chunk.$N"
+printf '%s\n' "$*" >"$D/argv.$N"
+# KB_RIG_FAIL_AT=<n>  -> the nth invocation reports failure the way the model would.
+# KB_RIG_FAIL_MODE    -> what it says (default FAILED); use to exercise each
+#                        branch of the hook's output classification.
+if [ -n "${KB_RIG_FAIL_AT:-}" ] && [ "$N" = "$KB_RIG_FAIL_AT" ]; then
+  printf '%s\n' "${KB_RIG_FAIL_MODE:-FAILED}"
+  exit 0
+fi
+echo $((4000 + N))
+RELAYEOF
+  chmod +x "$HOME/bin/claude"
+}
+
+relay_count() { # how many chunks the relay has been handed so far
+  cat "$HOME/$RELAY_DIR_NAME/.n" 2>/dev/null || echo 0
+}
+
+relay_chunk() { # <n> -- the exact bytes of the nth relayed chunk
+  cat "$HOME/$RELAY_DIR_NAME/chunk.$1" 2>/dev/null
+}
+
+relay_bytes() { # <n> -- size of the nth relayed chunk
+  wc -c <"$HOME/$RELAY_DIR_NAME/chunk.$1" 2>/dev/null | tr -d " "
+}
+
+relay_concat() { # every chunk, in order -- must reproduce the delta EXACTLY
+  local n i
+  n=$(relay_count)
+  for i in $(seq 1 "${n:-0}"); do cat "$HOME/$RELAY_DIR_NAME/chunk.$i"; done
+}
+
+relay_reset() { rm -rf "$HOME/$RELAY_DIR_NAME"; mkdir -p "$HOME/$RELAY_DIR_NAME"; }
+
+wait_relay() { # want-chunks [timeout-s] -- the relay runs in the DETACHED child
+  local want="$1" t="${2:-30}" i=0
+  while [ "$i" -lt "$((t * 4))" ]; do
+    [ "$(relay_count)" -ge "$want" ] && return 0
+    i=$((i + 1))
+    sleep 0.25
+  done
+  return 1
+}
+
+cfg_connector() { # CONNECTOR config pointing at a given claude binary
+  printf '# CONNECTOR\nKB_CONNECTOR=1\nCLAUDE_BIN=%s\n' "${1:-$HOME/bin/claude}" | write_cfg
+}
+
+read_offset() { # the single .offset file for this HOME (or 0)
+  local f
+  f=$(ls "$HOOKS/state/"*.offset 2>/dev/null | head -1)
+  [ -n "$f" ] && cat "$f" || echo 0
+}
+
+offset_file() { ls "$HOOKS/state/"*.offset 2>/dev/null | head -1; }
+
 # ------------------------------------------------------------------- host side
 # Where clean-room HOMEs live and what PATH a case starts with. Defaults are the
 # container's; the WINDOWS lane (run-windows.sh) overrides both so the SAME

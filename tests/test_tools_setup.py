@@ -189,3 +189,154 @@ def test_scrub_redacts_own_kb_token(kb, monkeypatch):
     )
     assert settings.kb_token not in clean
     assert red.get("kb_token", 0) >= 2, "bare occurrences redacted too"
+
+
+# --------------------------------------------------------------------------
+# Drift guards: the guide is DOCUMENTATION FOR CODE, and it silently rotted.
+# For a long time it told operators to verify a fresh install by looking for
+# `mcp … ok` / `remote … http=202` in flush-session.log. No hook has ever
+# written either string, so anyone who followed the instructions grepped for a
+# marker that cannot appear and concluded a working install had failed. The
+# assertions below tie every claim the guide makes back to the shipped scripts,
+# so the next such divergence fails a test instead of a user's setup.
+# --------------------------------------------------------------------------
+
+FLUSH_HOOK = (CONTRIB / "flush-session-to-kb.sh").read_text()
+INSTALL_SH = (CONTRIB / "install.sh").read_text()
+
+
+def _prose(guide: str) -> str:
+    """The guide's own text, excluding the four scripts embedded at the end.
+
+    Everything after the first `### File:` heading is verbatim script source, so
+    asserting over the whole string would match the scripts' own comments rather
+    than anything the guide claims.
+    """
+    head, sep, _ = guide.partition("### File: ")
+    assert sep, "the guide no longer embeds the scripts under a '### File: ' heading"
+    return head
+
+
+def _emitted_log_lines(script: str) -> str:
+    """Only the lines a script actually WRITES to the log (not its comments)."""
+    return "\n".join(ln for ln in script.splitlines() if 'echo "$(date -Is)' in ln)
+
+
+def test_guide_covers_every_transport_with_its_config_keys():
+    """All four transports, each with the keys its config block actually needs.
+
+    A mode documented without its keys is unusable: auto-detection is skipped
+    whenever ~/.claude/kb-flush.env already exists, so writing that file by hand
+    is the ONLY way to choose a mode, and the keys must therefore be in reach.
+    """
+    guide = _prose(tools_setup.build_setup_guide())
+    required = {
+        "LOCAL": ["KB_DIR", "UV"],
+        "MCP": ["KB_MCP_URL", "KB_TOKEN"],
+        "CONNECTOR": ["KB_CONNECTOR=1", "CLAUDE_BIN"],
+        "REMOTE": ["KB_REST_URL", "KB_TOKEN"],
+    }
+    for mode, keys in required.items():
+        assert mode in guide, f"{mode} mode is never named in the setup guide"
+        for key in keys:
+            assert key in guide, f"{mode} mode is documented without its {key} config key"
+
+
+def test_guide_documents_all_four_registered_events():
+    """The guide must describe every event the installer registers.
+
+    UserPromptSubmit went undocumented for a long time: the guide said three
+    events while the installer registered four, so per-prompt recall injected KB
+    hits into context without ever being mentioned to the operator.
+    """
+    guide = _prose(tools_setup.build_setup_guide())
+    events = ["PreCompact", "SessionEnd", "SessionStart", "UserPromptSubmit"]
+    for ev in events:
+        assert f'"{ev}"' in INSTALL_SH or f".hooks.{ev}" in INSTALL_SH or f"'{ev}'" in INSTALL_SH, (
+            f"{ev} is no longer registered by install.sh — update this guard and the guide"
+        )
+        assert ev in guide, f"install.sh registers {ev} but the setup guide never mentions it"
+
+
+def test_guide_success_markers_are_ones_the_hook_actually_writes():
+    """Every log marker the guide tells the operator to expect must be real.
+
+    The marker is the ONLY signal a hook gives: it always exits 0 so it can never
+    block Claude Code. Documenting an unreachable marker turns a healthy install
+    into an apparently broken one.
+    """
+    prose = _prose(tools_setup.build_setup_guide())
+    emitted_lines = _emitted_log_lines(FLUSH_HOOK)
+    # (documented marker, the emitting line in the shipped hook)
+    for marker, emitted in [
+        ("local <project> ok bytes=", "local $PROJECT ok bytes="),
+        ("flush <project> ok bytes=", "flush $PROJECT ok bytes="),
+        ("connector <project> ok bytes=", "connector $PROJECT ok bytes="),
+    ]:
+        assert marker in prose, f"the guide no longer documents the {marker!r} marker"
+        assert emitted in emitted_lines, (
+            f"the guide promises {marker!r} but no hook line emits {emitted!r}"
+        )
+
+
+def test_guide_never_promises_a_marker_no_hook_emits():
+    """The specific regression: `http=` and a `remote …` log tag are fiction.
+
+    MCP and REMOTE share ONE branch in the flush hook and both log the tag
+    `flush`; no line anywhere writes an HTTP status as `http=NNN`.
+    """
+    prose = _prose(tools_setup.build_setup_guide())
+    emitted = _emitted_log_lines(FLUSH_HOOK)
+    assert "http=" not in prose, "the guide promises an http= marker the hooks never write"
+    assert "http=" not in emitted, (
+        "a hook line started emitting http= — update the guide, this guard, and "
+        "the pre-brief failure scanner together"
+    )
+    assert "remote …" not in prose and "remote ..." not in prose, (
+        "the guide names a 'remote' log tag; MCP and REMOTE both log 'flush'"
+    )
+
+
+def test_guide_states_connector_outranks_remote():
+    """Auto-detection picks CONNECTOR before REMOTE whenever a claude binary
+    exists — which is nearly every machine running Claude Code. An operator who
+    wants bearer REMOTE mode must be told to write the config FIRST, or they
+    will never get the mode they asked for."""
+    guide = _prose(tools_setup.build_setup_guide())
+    assert guide.index("CONNECTOR mode") < guide.index("REMOTE mode"), (
+        "the guide lists REMOTE before CONNECTOR, contradicting the installer's priority"
+    )
+    assert "CONNECTOR outranks REMOTE" in guide
+    # And the installer really does order them that way: connector branch first.
+    assert INSTALL_SH.index("KB_CONNECTOR=1") < INSTALL_SH.index("KB_REST_URL=https://"), (
+        "install.sh no longer prefers CONNECTOR over REMOTE — the guide now lies"
+    )
+
+
+def test_guide_documents_the_failure_signals():
+    """A setup guide that cannot explain failure is half a guide: the hooks are
+    silent by design, so the operator needs the exact strings to look for."""
+    prose = _prose(tools_setup.build_setup_guide())
+    for signal in ["NOT CONFIGURED", "chunk FAILED", "flush-session.log"]:
+        assert signal in prose, f"the guide never mentions the {signal!r} failure signal"
+        assert signal in FLUSH_HOOK, f"{signal!r} is documented but no longer emitted"
+
+
+def test_installer_smoke_hint_matches_what_the_hook_emits():
+    """install.sh prints its own verification hint — a third copy of the same
+    claim, and it carried the same fiction (`mcp … ok | remote … http=202`).
+    Whatever it tells the operator to expect must be a marker the flush hook
+    really writes."""
+    hint = "\n".join(
+        ln for ln in INSTALL_SH.splitlines() if "expect" in ln or "flush-session.log" in ln
+    )
+    assert hint, "install.sh no longer prints a smoke-test hint"
+    assert "http=" not in hint, "install.sh promises an http= marker no hook emits"
+    emitted = _emitted_log_lines(FLUSH_HOOK)
+    for tag in ["local", "flush", "connector"]:
+        assert f"{tag} <proj> ok bytes=" in INSTALL_SH, (
+            f"install.sh's hint no longer names the {tag!r} success marker"
+        )
+        assert f"{tag} $PROJECT ok bytes=" in emitted, (
+            f"install.sh promises a {tag!r} marker the hook does not emit"
+        )

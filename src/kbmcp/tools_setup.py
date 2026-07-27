@@ -103,30 +103,56 @@ def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> 
     )
     return f"""# Install the KB Claude Code session hooks (on THIS machine)
 
-Two hooks connect this machine's Claude Code sessions to the Knowledge Vault, in
-both directions:
+Two hook scripts connect this machine's Claude Code sessions to the Knowledge
+Vault, across **four** registered events:
 
 - **Flush out** (`PreCompact` + `SessionEnd`): the session's new transcript delta
   is enqueued to the KB before every compaction — non-blocking, GPU-free.
-- **Pre-brief in** (`SessionStart`): a new session (startup or `/clear`) gets a
+- **Pre-brief in** (`SessionStart`, matcher `startup|clear`): a new session gets a
   quick KB search — seeded by the repo's recent commit subjects — injected into
   Claude's starting context, so it begins aware of prior decisions and gotchas.
+- **Per-prompt recall** (`UserPromptSubmit`): each substantive prompt also gets a
+  KB search seeded by the prompt itself, injected as `[KB recall · project …]`.
+  It self-throttles (slash commands, very short prompts and repeated queries are
+  skipped). Set `KB_RECALL=0` in the config to turn just this one off.
 
-## Which mode is this machine? (`install.sh` auto-detects)
+## Which mode is this machine?
 
-- **KB host** (a local KB repo + `uv` present): LOCAL mode — no token needed.
-- **Already connected via `claude mcp`** (a bearer-registered KB server in
-  `~/.claude.json`): **MCP mode — zero config.** The installer reuses that
-  registration's URL + token, and the hooks call `kb_ingest_session` /
-  `kb_search` over the same MCP endpoint. Nothing to fill in.
-- **Otherwise, self-hosted KB**: REMOTE mode — the hooks POST to your KB's REST
-  endpoint with a bearer token (fill in step 3).
-- **claude.ai OAuth connector only** (no static bearer): **CONNECTOR mode,
-  zero config.** claude.ai connectors bridge into Claude Code automatically, and
-  the hooks relay through a headless `claude -p` call using that cloud-held
-  auth. Caveats: the model is the data path (small ~24 KB chunks, capped per
-  firing) and each flush/brief spends Claude usage — bearer modes are the
-  efficient path for heavy sessions.
+`install.sh` auto-detects, and the **first match wins** — this order matters:
+
+1. **LOCAL mode** — chosen when `$KB_DIR/pyproject.toml` exists (default
+   `$HOME/data-server`) **and** `uv` is on `PATH`. No token needed; the hook
+   enqueues straight into the KB repo. Writes `KB_DIR`, `UV`.
+   If your checkout is elsewhere, run the installer as
+   `KB_DIR=/path/to/kb-repo bash ~/.claude/kb-setup/install.sh`.
+2. **MCP mode — zero config** — chosen when `~/.claude.json` holds an mcpServers
+   entry whose name matches `kb`/`knowledge`, whose url ends `/mcp`, and whose
+   `headers.Authorization` carries a Bearer. The installer reuses that
+   registration, and the hooks call `kb_ingest_session` / `kb_search` over the
+   same endpoint. Writes `KB_MCP_URL`, `KB_TOKEN`. Nothing to fill in.
+3. **CONNECTOR mode — zero config** — chosen when a `claude` binary is found (on
+   `PATH`, in `~/.local/bin`, `~/.claude/local`, or the VS Code extension
+   bundle). For a claude.ai **OAuth connector only** machine with no static
+   bearer: the claude.ai KB connector bridges into Claude Code, and the hooks
+   relay through a headless `claude -p` using that cloud-held auth. Writes
+   `KB_CONNECTOR=1`, `CLAUDE_BIN`.
+4. **REMOTE mode** — the unconditional fallback: the hooks POST to your KB's REST
+   endpoint with a bearer token. Writes `KB_REST_URL`, `KB_TOKEN`.
+
+Two consequences worth knowing before you run it:
+
+- **CONNECTOR outranks REMOTE.** Essentially every machine running Claude Code
+  has a `claude` binary, so auto-detection will pick CONNECTOR, not REMOTE. If
+  you want bearer REMOTE mode you must **write `~/.claude/kb-flush.env` yourself
+  before running the installer** (step 3) — the installer keeps an existing
+  config and never overwrites or upgrades one.
+- **The mode is sticky.** Detection only runs when `~/.claude/kb-flush.env` does
+  not exist. To change modes later, edit or delete that file and re-run.
+
+CONNECTOR is zero-config but not free: the model is the data path, so the
+transcript relays in ~24 KB chunks through a headless `claude -p`, and each
+flush spends Claude usage. Bearer modes (MCP/REMOTE) are the efficient path for
+heavy sessions.
 
 ## Steps (a Claude Code client can perform these directly)
 
@@ -134,24 +160,80 @@ both directions:
    needed** — the scripts fall back to `python3`, and jq (a single static binary)
    is picked up from `PATH`, from `~/.claude/hooks/jq`, or from `$KB_JQ`.
 2. Write the four files below to `~/.claude/kb-setup/`.
-3. **REMOTE machines only** (skip if `install.sh` reports LOCAL or MCP) — create
-   `~/.claude/kb-flush.env`, then `chmod 600` it. {remote_hint}
+3. **Only if you want a specific mode** — write `~/.claude/kb-flush.env` first,
+   then `chmod 600` it. Skip this entirely to let step 4 auto-detect.
+
+   **REMOTE** (a self-hosted KB over REST). {remote_hint}
    ```
    KB_REST_URL={url}
    KB_TOKEN={token_line}
    ```
-4. Run the installer (idempotent; registers PreCompact + SessionEnd + Session
-   Start in `~/.claude/settings.json`, preserving any other hooks):
+
+   **MCP** (same server, MCP endpoint — use the `/mcp` URL and the same bearer):
+   ```
+   KB_MCP_URL={url}/mcp
+   KB_TOKEN={token_line}
+   ```
+
+   **CONNECTOR** (no token at all; relays through the claude.ai KB connector):
+   ```
+   KB_CONNECTOR=1
+   CLAUDE_BIN=/absolute/path/to/claude
+   # KB_CONNECTOR_CHUNK=24000   # bytes per relayed chunk
+   # KB_CONNECTOR_MAX=240000    # bytes per hook firing (SessionEnd ignores this
+   #                            # and always drains, since nothing follows it)
+   ```
+
+   **LOCAL** (this machine IS the KB host):
+   ```
+   KB_DIR=/absolute/path/to/the/kb/repo
+   UV=/absolute/path/to/uv
+   ```
+4. Run the installer (idempotent; registers all four events in
+   `~/.claude/settings.json`, preserving any other hooks you have):
    ```bash
    bash ~/.claude/kb-setup/install.sh
    ```
-5. Smoke test (the installer prints exact commands): feed a fake event to the
-   flush hook and confirm `~/.claude/hooks/flush-session.log` shows a `local …`
-   (LOCAL) or `remote … http=202` (REMOTE) line. New sessions will then start
-   with a `[KB pre-brief · project …]` block.
+   It prints the mode it chose, the JSON backend it will use, and an exact smoke
+   test. On Windows/Git Bash it registers `bash.exe` as the command with the
+   script as an argument, because Claude Code there spawns hooks via
+   CreateProcess and cannot execute a bare `.sh`.
+5. Smoke test — run the commands the installer printed, then check
+   `~/.claude/hooks/flush-session.log`. **The marker depends on the mode:**
+
+   | Mode | Success line |
+   |------|--------------|
+   | LOCAL | `local <project> ok bytes=N (offset N/N)` |
+   | MCP **or** REMOTE | `flush <project> ok bytes=N (offset X/Y)` |
+   | CONNECTOR | `connector <project> ok bytes=N (offset X/Y)` |
+
+   `ok` means the delta drained fully; `partial … — will resume` means the rest
+   goes on the next firing (normal for a big transcript in CONNECTOR mode). New
+   sessions then start with a `[KB pre-brief · project …]` block.
+
+## If it does not work
+
+Every failure is written to `~/.claude/hooks/flush-session.log`; the hooks always
+exit 0 so they can never block Claude Code, which means **the log is the only
+place a problem shows up**. What to look for:
+
+- `NOT CONFIGURED: no transport in …` — no mode is configured; the session was
+  **not** captured. Write `~/.claude/kb-flush.env` (step 3) and re-run step 4.
+- `NOT CONFIGURED: no JSON tool …` — neither jq nor python3 was found. Drop a
+  static `jq` in `~/.claude/hooks/`, or set `KB_JQ=/path/to/jq` in the config.
+- `chunk FAILED (401)` / `(403)` — the bearer is wrong or lacks write access to
+  that project. `(000)` means the endpoint was unreachable at all.
+- `chunk FAILED (…)` in CONNECTOR mode — the relay could not reach the KB tool;
+  confirm the KB connector is enabled for your claude.ai account.
+- Nothing at all in the log — the hooks are not registered. Check that
+  `~/.claude/settings.json` lists all four events, and re-run the installer.
+
+A failed chunk never advances the offset, so nothing is lost: the next firing
+re-sends from exactly where it stopped.
 
 To disable later: remove the entries from `~/.claude/settings.json` `hooks`, or
-delete `~/.claude/kb-flush.env` (the hooks no-op without config).
+delete `~/.claude/kb-flush.env` (the hooks no-op without config, apart from one
+rate-limited `NOT CONFIGURED` line so the silence is never mistaken for success).
 
 {files_block}
 """

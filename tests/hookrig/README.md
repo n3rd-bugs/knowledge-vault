@@ -91,6 +91,8 @@ production, and a sub-agent once truncated the live schema. So:
 | `10_never_silent_failure` | an unreachable MCP/REST endpoint → exit 0, empty stdout, an explanatory line in `flush-session.log`, offset untouched — and the next `SessionStart` surfaces that failure; garbage input is an inert no-op | — |
 | `11_guard_always_on` | `KB_HOOK_GUARD` is checked on line 14 of **both** hooks, before the config is even read: guarded firings do no work in **MCP and LOCAL** modes and on both brief events. Every assertion is paired with a positive control | correction to the inverted **885** |
 | `12_incomplete_config_silence` | an incomplete transport config (`KB_REST_URL`/`KB_MCP_URL` with an empty `KB_TOKEN`) logs a `NOT CONFIGURED` line instead of being a permanent silent no-op, and the next `SessionStart` surfaces it | **1174** |
+| `13_connector_chunking` | CONNECTOR relay byte contract, with a **recorder standing in for the model** (`CLAUDE_BIN` is just a path): a 60 KB delta relays as sequential `KB_CONNECTOR_CHUNK` windows, each cut on a **line** boundary and individually valid JSONL, the chunks reassemble **byte for byte**, the offset reaches EOF, the firing logs a truthful `ok bytes=` (never `partial`), the child is invoked headless with a tool allowlist and no permission bypass, and a drained transcript re-sends nothing | — |
+| `14_connector_caps_and_resume` | every way a CONNECTOR firing stops EARLY still leaves the session **resumable, never truncated**: `KB_CONNECTOR_MAX` caps a `PreCompact` firing (logged `partial` + `per-firing cap reached`, never `ok`) and later firings drain the rest with no re-send or loss; `SessionEnd` **ignores** the cap and retires the offset file; a refused chunk advances the offset by exactly the accepted bytes and is retried verbatim; `Error`/`NOTOOL`/no-id replies all count as failure; a still-being-written partial line is held on `PreCompact` but **sent** at `SessionEnd` | — |
 | `20_no_jq_python_fallback` *(image: `nojq`)* | a box with **no jq** (and no sudo): install succeeds on the **python3** backend, the mode chain (incl. MCP auto-discovery from `~/.claude.json`) still resolves, four events register, MCP **and** REST flushes really submit; and install.sh's jq merge vs its python merge produce a **byte-identical** `settings.json` from the same seeded input (foreign hooks, unicode, mixed types preserved) | **1173**, **1152** |
 | `21_no_json_tool_loud` *(image: `nojson`)* | **no jq and no python3**: install **fails loudly** with a sudo-free remedy (names `~/.local/bin`, the co-location path and `KB_JQ`; never `apt install`) and writes no `settings.json`; a flush **and** a brief fired in that state exit 0, print nothing, and each append a rate-limited `NOT CONFIGURED` line the pre-brief lifts into the next session | **1174** |
 | `22_colocated_jq_and_kb_jq` *(image: `nojson`)* | backend-chain links 2 and 3 on a box with no JSON tool at all: a jq **beside the hooks** and `KB_JQ=/path/to/jq` each make install + flush + recall work, and the installer propagates that jq into `~/.claude/hooks/` so the box survives losing `KB_JQ` | **496** |
@@ -181,12 +183,27 @@ relay reaches the claude.ai KB connector and a real submission lands in the live
 ingest queue (23,827 bytes); the offset advances (resume-not-resend); cleanup
 leaves nothing behind.
 
-OPEN / not yet pinned: on a 57 KB transcript only the FIRST ~24 KB chunk landed
-inside the wait window and the flush log was empty at that point, though the
-submission had succeeded. Whether the remaining chunks relay on the next firing
-(by design, per KB_CONNECTOR_MAX) or the detached relay was simply still in flight
-when the container exited is UNRESOLVED — do not claim connector chunking works
-until a case pins it.
+RESOLVED 2026-07-27 — connector chunking is now pinned, hermetically. The open
+question was whether the bytes beyond the first ~24 KB chunk relay at all: on a
+57 KB transcript only the first chunk had landed inside the live lane's wait
+window. The live lane could never settle it cheaply, because every chunk there is
+a real `claude -p` costing real usage and tens of seconds.
+
+`CLAUDE_BIN` is just a path to an executable (flush-session-to-kb.sh:498), so
+cases 13 and 14 stand a RECORDER in place of the model (`fake_claude_relay` in
+lib.sh) and assert the byte contract directly — free, deterministic, no egress.
+Between them they pin: chunk sizing and line-boundary cutting, byte-for-byte
+reassembly of the delta, offset advance per ACCEPTED chunk, the KB_CONNECTOR_MAX
+per-firing budget, SessionEnd draining in full (it is terminal, so honouring the
+budget would strand the tail forever), the partial-line hold and its SessionEnd
+exception, every failure classification leaving the offset untouched so the
+refused chunk is retried verbatim, and the truthful ok/partial/cap logging.
+
+The answer to the original question: the remaining chunks DO relay, on the next
+firing, exactly as KB_CONNECTOR_MAX intends. The live lane's empty log was the
+detached relay still in flight when the container exited, not lost content.
+run-connector.sh keeps its narrower job — proving the real relay reaches
+claude.ai — and no longer has to carry the byte contract.
 
 ## The WINDOWS lane (opt-in, a REAL box over WinRM)
 

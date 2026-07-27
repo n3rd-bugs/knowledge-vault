@@ -97,8 +97,11 @@ the next session's pre-brief surfaces. A hook never dies silently.
    - If **LOCAL**, nothing more to configure.
 
 3. Run the smoke test the installer prints (feeds a fake `PreCompact` event to the
-   hook) and confirm `~/.claude/hooks/flush-session.log` shows a `local … ` line
-   (LOCAL) or `remote … http=202` line (REMOTE). Tell the user it's live: every
+   hook) and confirm `~/.claude/hooks/flush-session.log` shows the marker for the
+   installed mode — `local <proj> ok bytes=…` (LOCAL), `flush <proj> ok bytes=…`
+   (MCP **and** REMOTE — they share one branch), or `connector <proj> ok bytes=…`
+   (CONNECTOR). `ok` means fully drained; `partial` means the rest follows on the
+   next firing. (No hook writes `http=`.) Tell the user it's live: every
    compaction and session-end now flushes to the KB.
 
 ## Porting to another machine

@@ -30,6 +30,8 @@ _SCRIPTS = (
     "install.sh",
 )
 _PLACEHOLDER_URL = "https://api.example.com"
+# MCP lives on its own host (kb.<domain>), not under the REST base.
+_PLACEHOLDER_MCP_URL = "https://kb.example.com/mcp"
 
 
 def _read(name: str) -> str:
@@ -74,6 +76,14 @@ def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> 
     """
     configured = (rest_url or settings.kb_public_rest_url or "").strip()
     url = (configured or _PLACEHOLDER_URL).rstrip("/")
+    # MCP is a DIFFERENT service on a DIFFERENT host from REST — kbrest serves
+    # only /api/* and has no /mcp route at all, so deriving the MCP endpoint by
+    # appending "/mcp" to the REST base hands out a URL that cannot work. The
+    # MCP base is kb_public_url (what the server advertises for OAuth metadata).
+    # It is not set on every deployment path, so fall back to a labelled
+    # placeholder rather than inventing one.
+    mcp_base = (settings.kb_public_url or "").strip().rstrip("/")
+    mcp_url = f"{mcp_base}/mcp" if mcp_base else _PLACEHOLDER_MCP_URL
     if token:
         remote_hint = (
             "Your bearer is embedded below (you authenticated this call with that "
@@ -96,6 +106,16 @@ def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> 
             "and `KB_TOKEN` to a bearer token."
         )
         token_line = "<your KB bearer token>"
+    mcp_hint = (
+        ""
+        if mcp_base
+        else (
+            "\n   *(This server does not publish its MCP base URL, so the value "
+            "above is a placeholder — replace it with your KB's MCP endpoint. "
+            "It is the URL you registered with `claude mcp add`, ending in "
+            "`/mcp`.)*"
+        )
+    )
     scripts = {name: _read(name) for name in _SCRIPTS}
     files_block = "\n\n".join(
         f"### File: `~/.claude/kb-setup/{name}`\n\n```bash\n{body.rstrip()}\n```"
@@ -169,11 +189,12 @@ heavy sessions.
    KB_TOKEN={token_line}
    ```
 
-   **MCP** (same server, MCP endpoint — use the `/mcp` URL and the same bearer):
+   **MCP** (the same KB, over its MCP endpoint — note this is a DIFFERENT host
+   from the REST base above; the REST service has no `/mcp` route):
    ```
-   KB_MCP_URL={url}/mcp
+   KB_MCP_URL={mcp_url}
    KB_TOKEN={token_line}
-   ```
+   ```{mcp_hint}
 
    **CONNECTOR** (no token at all; relays through the claude.ai KB connector):
    ```

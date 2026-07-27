@@ -340,3 +340,48 @@ def test_installer_smoke_hint_matches_what_the_hook_emits():
         assert f"{tag} $PROJECT ok bytes=" in emitted, (
             f"install.sh promises a {tag!r} marker the hook does not emit"
         )
+
+
+def test_mcp_url_is_not_derived_from_the_rest_base(monkeypatch):
+    """MCP and REST are different services on different hosts.
+
+    kbrest serves only `/api/*` and has no `/mcp` route, so building the MCP
+    endpoint by appending "/mcp" to the REST base hands the operator a URL that
+    cannot work. The MCP base is `kb_public_url` — what the server advertises
+    for its own OAuth metadata.
+    """
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "https://api.example.org")
+    monkeypatch.setattr(settings, "kb_public_url", "https://kb.example.org")
+    guide = _prose(tools_setup.build_setup_guide())
+    assert "KB_MCP_URL=https://kb.example.org/mcp" in guide
+    assert "KB_REST_URL=https://api.example.org" in guide
+    assert "KB_MCP_URL=https://api.example.org/mcp" not in guide, (
+        "the MCP endpoint was derived from the REST base — that host has no /mcp route"
+    )
+
+
+def test_mcp_url_falls_back_to_a_LABELLED_placeholder(monkeypatch):
+    """Not every deployment path publishes an MCP base URL (it is set on the
+    public MCP container but not the local one). When it is absent the guide
+    must say the value is a placeholder rather than present a fabricated URL as
+    if it were this server's real endpoint."""
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "https://api.example.org")
+    monkeypatch.setattr(settings, "kb_public_url", "")
+    guide = _prose(tools_setup.build_setup_guide())
+    assert "KB_MCP_URL=https://api.example.org/mcp" not in guide
+    assert "placeholder" in guide, "an unknown MCP URL is presented without warning"
+
+
+def test_rest_route_prefix_still_matches_what_the_guide_implies():
+    """The REMOTE config takes a BASE url; the hook appends the path itself.
+    If kbrest ever stopped serving /api/ingest-session, the documented base
+    would silently become wrong."""
+    rest = (Path(__file__).resolve().parents[1] / "src" / "kbrest" / "server.py").read_text()
+    assert '"/api/ingest-session"' in rest, (
+        "the REST ingest path moved — the guide's base URL is now wrong"
+    )
+    assert '"/mcp"' not in rest, "kbrest now serves /mcp — revisit the MCP URL derivation"

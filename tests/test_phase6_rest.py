@@ -137,7 +137,7 @@ def test_enrol_redeems_a_code_for_the_machines_own_credential(client, monkeypatc
     from kbcore import enrolment, scope
 
     with scope.use_principal(scope.OWNER):
-        issued = enrolment.create_code()
+        issued = enrolment.create_code(project="myproj")
     r = client.post(
         "/api/enrol",
         json={"machine": "laptop"},
@@ -145,15 +145,18 @@ def test_enrol_redeems_a_code_for_the_machines_own_credential(client, monkeypatc
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["token"] == TEST_TOKEN  # an owner code yields the owner credential
-    assert body["is_owner"] is True
+    # A SCOPED, revocable credential — never the master key.
+    assert body["token"] != TEST_TOKEN
+    assert body["is_owner"] is False
+    assert body["project"] == "myproj"
+    assert body["principal"] == "myproj@laptop"
 
 
 def test_enrol_is_single_use_over_http(client):
     from kbcore import enrolment, scope
 
     with scope.use_principal(scope.OWNER):
-        issued = enrolment.create_code()
+        issued = enrolment.create_code(project="myproj")
     h = {"Authorization": f"Bearer {issued.code}"}
     assert client.post("/api/enrol", json={}, headers=h).status_code == 200
     second = client.post("/api/enrol", json={}, headers=h)
@@ -212,7 +215,7 @@ def test_an_enrolment_code_may_fetch_the_scripts_without_spending_itself(client)
     from kbcore import enrolment, scope
 
     with scope.use_principal(scope.OWNER):
-        issued = enrolment.create_code()
+        issued = enrolment.create_code(project="myproj")
     h = {"Authorization": f"Bearer {issued.code}"}
     assert client.get("/api/setup/install.sh", headers=h).status_code == 200
     # Still redeemable afterwards.

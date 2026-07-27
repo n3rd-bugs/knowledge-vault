@@ -71,6 +71,7 @@ class IssuedCode:
     expires_at: datetime
     grants_owner: bool
     issued_to: str
+    project: str | None = None  # the project an owner code will be scoped to
 
 
 @dataclass(frozen=True)
@@ -81,13 +82,19 @@ class RedeemedCredential:
     is_owner: bool
     principal_name: str | None  # the per-machine principal, when one was minted
     expires_at: datetime | None
+    project: str | None = None  # the project this credential is scoped to
 
 
 def _looks_like_code(value: str | None) -> bool:
     return bool(value) and str(value).startswith(CODE_PREFIX)
 
 
-def create_code(*, ttl_minutes: int = DEFAULT_TTL_MINUTES, note: str | None = None) -> IssuedCode:
+def create_code(
+    *,
+    ttl_minutes: int = DEFAULT_TTL_MINUTES,
+    note: str | None = None,
+    project: str | None = None,
+) -> IssuedCode:
     """Issue a one-time enrolment code for the CURRENT principal.
 
     The authority is read from :mod:`kbcore.scope` rather than taken as an
@@ -128,15 +135,28 @@ def create_code(*, ttl_minutes: int = DEFAULT_TTL_MINUTES, note: str | None = No
         conn.execute(
             """
             INSERT INTO enrolment_codes
-                   (code_hash, issued_to, grants_owner, principal_id, expires_at, redeemed_note)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                   (code_hash, issued_to, grants_owner, principal_id, expires_at,
+                    redeemed_note, project)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (_hash(code), principal.name, grants_owner, principal_id, expires_at, note),
+            (
+                _hash(code),
+                principal.name,
+                grants_owner,
+                principal_id,
+                expires_at,
+                note,
+                (project or "").strip().lower() or None,
+            ),
         )
     # The plaintext is never logged — only that one was issued, and to whom.
     log.info("enrolment code issued to %s (owner=%s, ttl=%dm)", principal.name, grants_owner, ttl)
     return IssuedCode(
-        code=code, expires_at=expires_at, grants_owner=grants_owner, issued_to=principal.name
+        code=code,
+        expires_at=expires_at,
+        grants_owner=grants_owner,
+        issued_to=principal.name,
+        project=(project or "").strip().lower() or None,
     )
 
 
@@ -176,28 +196,51 @@ def redeem(
              WHERE code_hash = %s
                AND redeemed_at IS NULL
                AND expires_at > now()
-         RETURNING id, issued_to, grants_owner, principal_id
+         RETURNING id, issued_to, grants_owner, principal_id, project
             """,
             (from_addr, label, _hash(str(code))),
         ).fetchone()
         if row is None:
             log.warning("enrolment refused (unknown/expired/already used) from %s", from_addr)
             raise InvalidOperation(_REFUSED)
-        code_id, issued_to, grants_owner, principal_id = (
+        code_id, issued_to, grants_owner, principal_id, project = (
             int(row[0]),
             row[1],
             bool(row[2]),
             row[3],
+            row[4],
         )
 
     if grants_owner:
-        # The owner already holds this credential; the code was only the envelope
-        # that carried it out of the transcript.
-        from kbcore.config import settings
+        # An owner enrolment used to return settings.kb_token itself, because a
+        # fixed-grant token cannot write a project that does not exist yet and
+        # the hooks name projects from the cwd. That handed the MASTER KEY to a
+        # machine — unrevocable without rotating it everywhere, and extractable
+        # from an OAuth session in two calls.
+        #
+        # Per-project tokens removed the reason: the machine now asks for a
+        # narrow, revocable credential per project (kb_project_token) and the
+        # hook selects it. So enrolment issues a token for the machine's DEFAULT
+        # project rather than the master, and the machine collects the rest as it
+        # needs them. Nothing here can be more than the owner already had.
+        if project is None:
+            raise InvalidOperation(
+                "an owner enrolment must name the project this machine will capture; "
+                "pass project= (the machine can request more later with kb_project_token)"
+            )
+        from kbcore import project_tokens
 
-        log.info("enrolment redeemed by %s as OWNER for %r", from_addr, label)
+        with scope.use_principal(scope.OWNER):
+            issued = project_tokens.issue(
+                project, machine=label, note=f"enrolled machine (code {code_id})"
+            )
+        log.info("enrolment redeemed by %s -> project token %s", from_addr, issued.name)
         return RedeemedCredential(
-            token=settings.kb_token, is_owner=True, principal_name=None, expires_at=None
+            token=issued.token,
+            is_owner=False,
+            principal_name=issued.name,
+            expires_at=issued.expires_at,
+            project=issued.project,
         )
 
     # A grantee code mints a machine-specific principal carrying EXACTLY the

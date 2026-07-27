@@ -312,9 +312,9 @@ watcher + daily repo-docs scan, and the nightly consolidation on a timer).
 - The large extractor runs only in the nightly pass or explicit user-invoked runs (GPU courtesy).
 - **Enrolment codes** (`kbe_…`) let a machine credential itself without a bearer being pasted
   anywhere: single-use, ~15 min, SHA-256 at rest, refusals byte-identical, and they authenticate as
-  an identity with no projects and no capabilities. An **owner's** code redeems to `KB_TOKEN`
-  itself — treat enrolling a machine as trusting it like the KB host. A grantee's mints a fresh
-  per-machine token instead. See [SHARING.md §2.5](SHARING.md#25-enrolment-codes).
+  an identity with no projects and no capabilities. A code redeems to a **narrow, revocable
+  per-project token** — never the master key — so no enrolled machine holds owner authority and any
+  one can be revoked alone. See [SHARING.md §2.5](SHARING.md#25-enrolment-codes).
 - Reading whole archived originals (`kb_read_raw`) requires `CAP_EXPORT`, which no role bundle
   carries — it is owner-only unless deliberately granted.
 - **Recommended hardening:** a per-project `projects.public` allow-list so NDA/client projects can be

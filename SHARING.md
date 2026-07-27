@@ -261,7 +261,7 @@ transcript holds a dead string.
 
 | Property | Behaviour |
 | --- | --- |
-| Authority | Never more than the identity that asked. Owner → `KB_TOKEN`; grantee → a fresh per-machine `kbg_` with exactly their grants; ungranted identity → no code at all |
+| Authority | Never more than the identity that asked. Owner → a per-project token for the project the code names; grantee → a fresh per-machine `kbg_` with exactly their grants; ungranted identity → no code at all |
 | Lifetime | ~15 min (clamped to 60), max 5 unredeemed per identity |
 | Single use | One atomic `UPDATE … WHERE redeemed_at IS NULL`; two racing redemptions cannot both win |
 | At rest | SHA-256 only (`enrolment_codes.code_hash`); plaintext shown once |
@@ -281,15 +281,14 @@ both match the scrubber).
   stored (token hash only) and never printed by `kb principal list`; the
   plaintext appears exactly once, at create/rotate.
 
-  **The one exception is enrolment, and it is the OWNER'S OWN machines.** An
-  enrolment code issued to the owner redeems to `KB_TOKEN` itself, so that a
-  machine can capture sessions in projects that do not exist yet — a fixed-grant
-  token cannot express that and fails the moment a session runs in a new
-  directory. A code issued to a GRANTEE never does this: it mints a fresh
-  per-machine `kbg_` principal carrying exactly that grantee's grants. See
-  [§2.5](#25-enrolment-codes). Practical consequence: the master key is only as
-  revocable as your ability to rotate it everywhere, so treat an owner enrolment
-  as "this machine is now trusted like the KB host".
+  **This now holds for enrolment too.** An owner's enrolment code briefly did
+  hand over `KB_TOKEN`, because a fixed-grant credential cannot write a project
+  that does not exist yet. [Per-project tokens](#24-per-project-capture-tokens)
+  removed that reason: an owner code names the project the machine will capture
+  and redeems to a narrow, revocable token for exactly it, and the machine
+  requests more with `kb_project_token` as it starts working elsewhere. No
+  enrolled machine holds owner authority, and any one of them can be revoked on
+  its own.
 - **Audit.** Grantee reads are attributed by name in `access_log.principal`
   (NULL = owner/legacy).
 - **One manual step that is NOT code:** the Google OAuth app must be

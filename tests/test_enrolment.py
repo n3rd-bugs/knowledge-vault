@@ -34,24 +34,49 @@ def _grantee(name: str, projects: tuple[str, ...] = ("alpha",), rw: bool = True)
 # ---------------------------------------------------------------- issuing
 
 
-def test_owner_code_redeems_to_the_owner_credential(kb, as_owner, monkeypatch):
-    """The owner's machine needs authority over projects that do not exist yet.
+def test_owner_code_redeems_to_a_SCOPED_REVOCABLE_token_not_the_master(kb, as_owner, monkeypatch):
+    """An owner enrolment used to return settings.kb_token itself.
 
-    A fixed-grant token cannot express that — it fails the moment a session runs
-    in a new directory — so an owner's code redeems to the credential the owner
-    already holds. That is a transport decision, not an escalation.
+    The justification was real — a fixed-grant token cannot write a project that
+    does not exist yet, and the hooks name projects from the cwd — but the cost
+    was an unrevocable master key on every enrolled machine, extractable from an
+    OAuth session in two calls. Per-project tokens removed the justification, so
+    an owner code now names its project and redeems to a narrow token for it.
     """
     from kbcore.config import settings
 
     monkeypatch.setattr(settings, "kb_token", "master-secret-for-test")
-    issued = enrolment.create_code()
-    assert issued.code.startswith(enrolment.CODE_PREFIX)
-    assert issued.grants_owner is True
+    issued = enrolment.create_code(project="myproj")
+    assert issued.grants_owner is True and issued.project == "myproj"
 
     cred = enrolment.redeem(issued.code, machine="laptop")
-    assert cred.is_owner is True
-    assert cred.token == "master-secret-for-test"
-    assert cred.principal_name is None, "an owner code must not create a principal row"
+    assert cred.token != "master-secret-for-test", "the master key was handed out"
+    assert cred.is_owner is False, "an enrolled machine must not hold owner authority"
+    assert cred.project == "myproj"
+    assert cred.principal_name == "myproj@laptop", "the credential must be individually revocable"
+
+    p = principals.resolve_token(cred.token)
+    assert p is not None
+    assert p.write_projects == frozenset({"myproj"}), "the token reaches beyond its project"
+
+
+def test_an_owner_code_must_name_its_project(kb, as_owner):
+    """Without a project there is nothing to scope the credential to, and the
+    only thing left to hand over would be the master."""
+    issued = enrolment.create_code()
+    assert issued.project is None
+    with pytest.raises(InvalidOperation):
+        enrolment.redeem(issued.code, machine="laptop")
+
+
+def test_an_enrolled_machine_can_be_revoked_alone(kb, as_owner):
+    from kbcore import project_tokens
+
+    a = enrolment.redeem(enrolment.create_code(project="myproj").code, machine="laptop")
+    b = enrolment.redeem(enrolment.create_code(project="myproj").code, machine="desktop")
+    assert project_tokens.revoke("myproj", "laptop") is True
+    assert principals.resolve_token(a.token) is None
+    assert principals.resolve_token(b.token) is not None, "revocation hit the wrong machine"
 
 
 def test_grantee_code_mints_a_PER_MACHINE_principal_with_only_their_grants(kb, as_owner):
@@ -103,7 +128,7 @@ def test_a_code_works_exactly_once(kb, as_owner, monkeypatch):
     from kbcore.config import settings
 
     monkeypatch.setattr(settings, "kb_token", "master-secret-for-test")
-    issued = enrolment.create_code()
+    issued = enrolment.create_code(project="myproj")
     enrolment.redeem(issued.code, machine="first")
     with pytest.raises(InvalidOperation):
         enrolment.redeem(issued.code, machine="second")
@@ -129,7 +154,7 @@ def test_refusals_are_indistinguishable(kb, as_owner, monkeypatch):
     from kbcore.config import settings
 
     monkeypatch.setattr(settings, "kb_token", "master-secret-for-test")
-    spent = enrolment.create_code()
+    spent = enrolment.create_code(project="myproj")
     enrolment.redeem(spent.code)
 
     stale = enrolment.create_code()
@@ -242,7 +267,7 @@ def test_a_spent_or_expired_code_stops_authenticating(kb, as_owner, monkeypatch)
     from kbmcp import principal_ctx
 
     monkeypatch.setattr(settings, "kb_token", "master-secret-for-test")
-    spent = enrolment.create_code()
+    spent = enrolment.create_code(project="myproj")
     assert principal_ctx.resolve_bearer(f"Bearer {spent.code}") is not None
     enrolment.redeem(spent.code)
     assert principal_ctx.resolve_bearer(f"Bearer {spent.code}") is None

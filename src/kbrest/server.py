@@ -208,6 +208,7 @@ def _register_write(app: FastAPI) -> None:
             "token": cred.token,
             "is_owner": cred.is_owner,
             "principal": cred.principal_name,
+            "project": cred.project,
             "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
         }
 

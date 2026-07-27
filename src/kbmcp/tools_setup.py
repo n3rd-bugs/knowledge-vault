@@ -372,7 +372,11 @@ def register(mcp) -> None:
     # (the master for the owner), so it must keep full approval friction (a lighter,
     # read-only badge would let a prompt-injected session pull the token silently).
     @mcp.tool(annotations=ANNOTATIONS_WRITE)
-    def kb_setup(rest_url: str | None = None, include_scripts: bool = False) -> str:
+    def kb_setup(
+        rest_url: str | None = None,
+        project: str | None = None,
+        include_scripts: bool = False,
+    ) -> str:
         """Set up the KB Claude Code session hooks on the machine running this
         client. Returns a ready-to-apply guide plus the hook scripts and an
         idempotent installer: a flush hook (captures each session into the KB
@@ -389,6 +393,11 @@ def register(mcp) -> None:
         anything gets the manual guide instead. If this call is authenticated
         with the static bearer, that token is also embedded directly.
 
+        Pass `project` to scope the machine's first credential (usually the repo
+        you are in). The machine gets a NARROW, revocable token for that project
+        — never the master key — and can request more later with
+        kb_project_token as it starts working in other projects.
+
         The reply does NOT include the hook scripts: they are ~23k tokens that
         get written to disk and executed verbatim, and the bootstrap command
         fetches them. Pass include_scripts=true only for a machine that cannot
@@ -400,7 +409,7 @@ def register(mcp) -> None:
         # redeemed. A caller with no grants gets no code and the manual guide.
         issued = None
         try:
-            issued = enrolment.create_code(note="kb_setup")
+            issued = enrolment.create_code(note="kb_setup", project=project)
         except (InvalidOperation, KBError) as exc:
             log.info("no enrolment code issued: %s", exc)
         except Exception:  # noqa: BLE001 — enrolment must never break setup

@@ -340,6 +340,7 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
       -H "Content-Type: application/json" \
       -d "$(kb_json_build - machine s "$(hostname 2>/dev/null || echo machine)")" 2>&1)
     ENROL_TOK=$(printf '%s' "$ENROL_OUT" | kb_json_get token)
+    ENROL_PROJ=$(printf '%s' "$ENROL_OUT" | kb_json_get project)
     if [ -n "$ENROL_TOK" ]; then
       # 0600 at CREATION (install(1) sets the mode atomically) so the token is
       # never briefly world-readable under the default umask.
@@ -347,9 +348,25 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
       {
         echo "# KB session hooks (REMOTE) — enrolled $(date -Is 2>/dev/null || date)"
         echo "KB_REST_URL=${KB_REST_URL%/}"
-        echo "KB_TOKEN=$ENROL_TOK"
       } >"$CFG"
       chmod 600 "$CFG"
+      # A scoped credential goes in kb-tokens.env under its project, so the hook
+      # picks it for that project and other projects can be added beside it.
+      # Only a credential with NO project (a grantee carrying its own grants)
+      # belongs in the config as the shared fallback.
+      if [ -n "$ENROL_PROJ" ]; then
+        TOKENS_ENV="$HOME/.claude/kb-tokens.env"
+        [ -f "$TOKENS_ENV" ] || install -m 600 /dev/null "$TOKENS_ENV"
+        PKEY=$(printf '%s' "$ENROL_PROJ" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+        # Replace any previous line for this project rather than appending.
+        grep -v "^KB_TOKEN_${PKEY}=" "$TOKENS_ENV" >"$TOKENS_ENV.t" 2>/dev/null || true
+        printf 'KB_TOKEN_%s=%s\n' "$PKEY" "$ENROL_TOK" >>"$TOKENS_ENV.t"
+        mv "$TOKENS_ENV.t" "$TOKENS_ENV"
+        chmod 600 "$TOKENS_ENV"
+        echo "enrol:    project '$ENROL_PROJ' -> KB_TOKEN_$PKEY in $TOKENS_ENV"
+      else
+        printf 'KB_TOKEN=%s\n' "$ENROL_TOK" >>"$CFG"
+      fi
       ENROL_WHO=$(printf '%s' "$ENROL_OUT" | kb_json_get principal)
       echo "enrol:    redeemed -> $CFG${ENROL_WHO:+ (principal: $ENROL_WHO)}"
     else

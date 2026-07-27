@@ -1,0 +1,15 @@
+-- 016_enrolment_project.sql — scope an owner's enrolment to a project.
+-- ADDITIVE only (Invariant 5): one nullable column, nothing altered.
+--
+-- An owner's enrolment code used to redeem to the MASTER token, because a
+-- fixed-grant credential cannot write a project that does not exist yet and the
+-- session hooks name projects from the working directory. That handed an
+-- unrevocable master key to every enrolled machine.
+--
+-- Per-project tokens removed the reason (kbcore.project_tokens): a machine now
+-- holds one narrow, revocable credential per project. So an owner code names the
+-- project the machine will start capturing, redeems to a token for exactly that
+-- project, and the machine asks for further ones as it needs them. NULL keeps
+-- the column meaningful for grantee codes, which carry the grantee's own grants
+-- and never needed a project.
+ALTER TABLE enrolment_codes ADD COLUMN IF NOT EXISTS project TEXT;

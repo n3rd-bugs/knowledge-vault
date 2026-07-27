@@ -24,6 +24,12 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("aws_key", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("github_token", re.compile(r"ghp_[A-Za-z0-9]{36}")),
     ("api_key", re.compile(r"sk-[A-Za-z0-9\-_]{20,}")),
+    # OUR OWN grantee bearer. It used to survive ingest unless it happened to be
+    # written as `KB_TOKEN=...` (caught by the generic `credential` rule below) —
+    # so a token quoted in prose, or handed to a user in a chat reply, was
+    # captured verbatim into the KB by the session hooks. Any credential this
+    # system MINTS must be redactable by this system.
+    ("kb_token", re.compile(r"kbg_[A-Za-z0-9\-_]{20,}")),
     ("jwt", re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+")),
     (
         "credential",

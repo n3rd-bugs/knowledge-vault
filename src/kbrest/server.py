@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from kbcore import (
     compress,
+    enrolment,
     graph,
     ingest,
     ingest_queue,
@@ -41,8 +42,10 @@ from kbcore.errors import (
     NotFound,
 )
 from kbcore.models import ItemDetail, ProjectInfo, ReviewEntry, SearchHit, SimilarHit
+from kbmcp import principal_ctx
 from kbmcp.server import BearerAuthMiddleware, _validate_runtime_config
 from kbrest.schemas import (
+    EnrolRequest,
     IngestSessionRequest,
     ItemCreate,
     LinkRequest,
@@ -169,6 +172,35 @@ def _register_write(app: FastAPI) -> None:
             "duplicate": res.id is None,
             "requeued": res.requeued,
             "permanently_failed": res.permanently_failed,
+        }
+
+    @app.post("/api/enrol")
+    def api_enrol(payload: EnrolRequest, request: Request) -> dict:
+        """Exchange a one-time enrolment code for this machine's credential.
+
+        This is the ONLY route an enrolment code can usefully reach. The code
+        authenticated like any other bearer (so the SEC-1 check is untouched and
+        no path is exempt), but it resolves to an identity with no projects and
+        no capabilities — every other route therefore sees a caller that can
+        read nothing and write nothing.
+
+        Redemption is single-use and atomic in kbcore; unknown, expired and
+        already-redeemed codes are refused identically.
+        """
+        current = scope.current()
+        if current.name != principal_ctx.ENROLLING_NAME:
+            # A real bearer does not need to enrol — and must not be able to use
+            # this route to mint a second credential for itself.
+            raise HTTPException(status_code=404, detail="not found")
+        raw = request.headers.get("authorization", "")
+        code = raw[7:].strip() if raw[:7].lower() == "bearer " else raw.strip()
+        client = request.client.host if request.client else None
+        cred = enrolment.redeem(code, machine=payload.machine, from_addr=client)
+        return {
+            "token": cred.token,
+            "is_owner": cred.is_owner,
+            "principal": cred.principal_name,
+            "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
         }
 
     @app.post("/api/items", status_code=201)

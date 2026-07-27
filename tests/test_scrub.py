@@ -41,3 +41,27 @@ def test_scrubber_leaves_clean_text_alone():
     clean, redactions = scrub(text)
     assert clean == text
     assert redactions == {}
+
+
+def test_our_own_minted_bearer_is_redacted():
+    """A credential this system MINTS must be redactable by this system.
+
+    kbg_ tokens used to survive ingest unless they happened to be written as
+    `KB_TOKEN=...` (caught by the generic `credential` rule). A token quoted in
+    prose — exactly how a setup flow would hand one to a user — was captured
+    verbatim into the KB by the session hooks that flush every transcript.
+    """
+    from kbcore.scrub import scrub
+
+    tok = "kbg_" + "A" * 43
+    for text in (
+        tok,
+        f"your token is {tok} keep it safe",
+        f"KB_TOKEN={tok}",
+        f'{{"KB_TOKEN": "{tok}"}}',
+        f"export KB_TOKEN='{tok}'",
+    ):
+        out, red = scrub(text)
+        assert tok not in out, f"the minted bearer survived ingest in: {text[:40]!r}"
+        assert "REDACTED" in out
+        assert sum(red.values()) >= 1

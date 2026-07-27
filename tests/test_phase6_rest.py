@@ -126,3 +126,62 @@ def test_rest_supersede_and_link_and_review(client):
         json={"src_item_id": fix, "rel": "not-a-rel", "dst_item_id": bug},
     )
     assert bad.status_code == 400 and "error" in bad.json()
+
+
+# --------------------------------------------------------------------------
+# POST /api/enrol — a machine exchanges a one-time code for its own credential.
+# --------------------------------------------------------------------------
+
+
+def test_enrol_redeems_a_code_for_the_machines_own_credential(client, monkeypatch):
+    from kbcore import enrolment, scope
+
+    with scope.use_principal(scope.OWNER):
+        issued = enrolment.create_code()
+    r = client.post(
+        "/api/enrol",
+        json={"machine": "laptop"},
+        headers={"Authorization": f"Bearer {issued.code}"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["token"] == TEST_TOKEN  # an owner code yields the owner credential
+    assert body["is_owner"] is True
+
+
+def test_enrol_is_single_use_over_http(client):
+    from kbcore import enrolment, scope
+
+    with scope.use_principal(scope.OWNER):
+        issued = enrolment.create_code()
+    h = {"Authorization": f"Bearer {issued.code}"}
+    assert client.post("/api/enrol", json={}, headers=h).status_code == 200
+    second = client.post("/api/enrol", json={}, headers=h)
+    assert second.status_code >= 400, "a redeemed code was accepted twice"
+
+
+def test_a_real_bearer_cannot_use_the_enrol_route(client):
+    """A credential that already works must not be able to mint a second one.
+
+    The route is reachable only by the zero-authority enrolling identity; anyone
+    else gets the same unknown-path 404 the rest of the surface uses, so the
+    route's existence is not an oracle either.
+    """
+    r = client.post("/api/enrol", json={"machine": "x"}, headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_enrol_rejects_an_unknown_code(client):
+    from kbcore import enrolment
+
+    r = client.post(
+        "/api/enrol",
+        json={},
+        headers={"Authorization": f"Bearer {enrolment.mint_code()}"},
+    )
+    assert r.status_code >= 400
+    assert TEST_TOKEN not in r.text
+
+
+def test_enrol_route_is_not_reachable_without_any_credential(client):
+    assert client.post("/api/enrol", json={}).status_code == 401

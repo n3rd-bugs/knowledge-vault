@@ -59,3 +59,15 @@ class IngestSessionRequest(BaseModel):
     repo: str | None = None
     branch: str | None = None
     commit: str | None = None
+
+
+class EnrolRequest(BaseModel):
+    """Redeem a one-time enrolment code for this machine's own credential.
+
+    The CODE is not in the body — it rides the Authorization header, so it is
+    handled by exactly the same bearer path as every other credential and never
+    lands in a request-body log. `machine` is a human label for the audit trail
+    and for naming the per-machine principal.
+    """
+
+    machine: str | None = None

@@ -148,7 +148,7 @@ def kb_schema():
 _KB_TEST_TABLES = (
     "access_log", "review_queue", "relations", "entities", "chunks", "items",
     "sources", "projects", "session_checkpoints", "ingest_queue",
-    "principal_grants", "principals",
+    "principal_grants", "principals", "enrolment_codes",
 )
 
 

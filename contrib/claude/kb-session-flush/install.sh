@@ -320,6 +320,46 @@ _find_claude() {
     2>/dev/null | head -1
 }
 
+# ---------------------------------------------------------------- ENROLMENT
+# KB_ENROL_CODE turns setup into one command: the code is exchanged for THIS
+# machine's own credential and written straight into the config, so no bearer is
+# ever pasted by hand (or left sitting in a chat transcript that the session
+# hooks would then flush into the KB).
+#
+# Only ever runs when there is no config yet — an enrolment must not silently
+# replace a working transport — and the code is sent as a BEARER, never in a URL
+# or a request body, so it cannot leak through a proxy access log.
+if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
+  if [ -z "${KB_REST_URL:-}" ]; then
+    echo "enrol:    KB_ENROL_CODE set but KB_REST_URL is not — cannot redeem" >&2
+  elif ! command -v curl >/dev/null 2>&1; then
+    echo "enrol:    KB_ENROL_CODE set but curl is missing — cannot redeem" >&2
+  else
+    ENROL_OUT=$(kb_timeout 30 curl -sS --max-time 25 -X POST "${KB_REST_URL%/}/api/enrol" \
+      -H "Authorization: Bearer $KB_ENROL_CODE" \
+      -H "Content-Type: application/json" \
+      -d "$(kb_json_build - machine s "$(hostname 2>/dev/null || echo machine)")" 2>&1)
+    ENROL_TOK=$(printf '%s' "$ENROL_OUT" | kb_json_get token)
+    if [ -n "$ENROL_TOK" ]; then
+      # 0600 at CREATION (install(1) sets the mode atomically) so the token is
+      # never briefly world-readable under the default umask.
+      install -m 600 /dev/null "$CFG"
+      {
+        echo "# KB session hooks (REMOTE) — enrolled $(date -Is 2>/dev/null || date)"
+        echo "KB_REST_URL=${KB_REST_URL%/}"
+        echo "KB_TOKEN=$ENROL_TOK"
+      } >"$CFG"
+      chmod 600 "$CFG"
+      ENROL_WHO=$(printf '%s' "$ENROL_OUT" | kb_json_get principal)
+      echo "enrol:    redeemed -> $CFG${ENROL_WHO:+ (principal: $ENROL_WHO)}"
+    else
+      # Never echo the response verbatim: it is a credential channel.
+      echo "enrol:    code was REFUSED (already redeemed, expired, or invalid) — ask for a new one" >&2
+    fi
+    unset ENROL_TOK ENROL_OUT
+  fi
+fi
+
 if [ ! -f "$CFG" ]; then
   # Create the config with owner-only perms BEFORE the bearer token is written.
   # Under the default umask 022 a plain '>' redirect would create $CFG as 0644,

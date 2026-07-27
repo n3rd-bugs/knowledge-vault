@@ -11,13 +11,15 @@ A drift-guard test keeps the shipped copies identical to ``contrib/``.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 
-from kbcore import scope
+from kbcore import enrolment, scope
 from kbcore.config import settings
+from kbcore.errors import InvalidOperation, KBError
 from kbmcp import ANNOTATIONS_WRITE, ANNOTATIONS_WRITE_IDEMPOTENT
 
 log = logging.getLogger("kbmcp.setup")
@@ -63,7 +65,11 @@ def _presented_bearer_token() -> str | None:
     return None
 
 
-def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> str:
+def build_setup_guide(
+    rest_url: str | None = None,
+    token: str | None = None,
+    enrol: object | None = None,
+) -> str:
     """Assemble the install guide + embedded scripts. Pure text, no I/O beyond
     reading the packaged assets.
 
@@ -116,6 +122,42 @@ def build_setup_guide(rest_url: str | None = None, token: str | None = None) -> 
             "`/mcp`.)*"
         )
     )
+    # A one-time enrolment code turns steps 2-4 into a single command. The code
+    # is what travels through the transcript, NOT the credential: it is single
+    # use and expires in minutes, so once the machine has redeemed it the
+    # transcript holds a dead string. That matters here specifically because the
+    # session hooks flush transcripts into the KB, which is then backed up.
+    if enrol is not None:
+        mins = max(1, round((enrol.expires_at - datetime.now(UTC)).total_seconds() / 60))
+        auth = (
+            "the OWNER credential (it works on every project, including ones that do not exist yet)"
+            if enrol.grants_owner
+            else "a credential for THIS MACHINE carrying exactly your own grants, "
+            "revocable on its own"
+        )
+        enrol_block = f"""
+## Fastest path: one-time enrolment (recommended)
+
+This code redeems ONCE for {auth}, and expires in ~{mins} minutes:
+
+```bash
+KB_ENROL_CODE={enrol.code} \\
+KB_REST_URL={url} \\
+bash ~/.claude/kb-setup/install.sh
+```
+
+The installer exchanges the code for this machine's credential, writes
+`~/.claude/kb-flush.env` with `chmod 600`, and registers the hooks — nothing to
+copy by hand. The code is single-use: if it is refused, it was already redeemed
+or it expired, and you should ask for a new one rather than reuse this message.
+
+You still need step 2 first (write the four files). Everything below step 4 is
+the manual equivalent, for machines where you would rather set the transport up
+yourself.
+"""
+    else:
+        enrol_block = ""
+
     scripts = {name: _read(name) for name in _SCRIPTS}
     files_block = "\n\n".join(
         f"### File: `~/.claude/kb-setup/{name}`\n\n```bash\n{body.rstrip()}\n```"
@@ -174,6 +216,7 @@ transcript relays in ~24 KB chunks through a headless `claude -p`, and each
 flush spends Claude usage. Bearer modes (MCP/REMOTE) are the efficient path for
 heavy sessions.
 
+{enrol_block}
 ## Steps (a Claude Code client can perform these directly)
 
 1. Check you have a JSON tool: `command -v jq || command -v python3`. **No sudo
@@ -315,13 +358,29 @@ def register(mcp) -> None:
         before compaction) and a pre-brief hook (injects relevant KB knowledge
         into new sessions). On the KB host it installs in LOCAL mode; from any
         other machine pass rest_url (your KB REST base, e.g.
-        https://api.your-host). If this call is authenticated with the static
-        bearer, the token is embedded in the returned config automatically
-        (OAuth-authenticated calls never receive it). If you are running in
-        Claude Code, you can write the files and run install.sh yourself.
+        https://api.your-host).
+
+        Setup is one command: the guide carries a ONE-TIME ENROLMENT CODE that
+        the installer exchanges for this machine's own credential, so no bearer
+        is ever pasted by hand. The code is single-use and expires in minutes —
+        it is safe to emit into a conversation precisely because it stops being
+        a credential the moment it is used. A caller with no access to enrol
+        anything gets the manual guide instead. If this call is authenticated
+        with the static bearer, that token is also embedded directly.
         """
+        # Issue an enrolment code automatically for any caller that HAS authority
+        # to enrol something. It is safe to emit unprompted precisely because it
+        # is not a credential: single use, minutes long, and useless once
+        # redeemed. A caller with no grants gets no code and the manual guide.
+        issued = None
         try:
-            return build_setup_guide(rest_url, token=_presented_bearer_token())
+            issued = enrolment.create_code(note="kb_setup")
+        except (InvalidOperation, KBError) as exc:
+            log.info("no enrolment code issued: %s", exc)
+        except Exception:  # noqa: BLE001 — enrolment must never break setup
+            log.warning("enrolment code issue failed; returning the manual guide", exc_info=True)
+        try:
+            return build_setup_guide(rest_url, token=_presented_bearer_token(), enrol=issued)
         except OSError as e:  # packaged assets unreadable — surface cleanly
             log.exception("kb_setup asset read failed")
             raise ToolError(f"setup assets unavailable: {e}") from e

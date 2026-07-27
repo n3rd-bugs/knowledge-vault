@@ -25,7 +25,7 @@ import secrets
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-from kbcore import principals, scope
+from kbcore import enrolment, principals, scope
 from kbcore.config import settings
 
 log = logging.getLogger("kbmcp.principal")
@@ -37,6 +37,9 @@ _EMAIL_CLAIM_KEYS = ("email", "https://www.googleapis.com/auth/userinfo.email")
 def _master_matches(token: str) -> bool:
     expected = settings.kb_token
     return bool(expected) and secrets.compare_digest(token.encode(), expected.encode())
+
+
+ENROLLING_NAME = "enrolling-machine"
 
 
 def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
@@ -52,7 +55,18 @@ def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
         tok = tok[7:].strip()
     if _master_matches(tok):
         return scope.OWNER
-    return principals.resolve_token(tok)
+    grantee = principals.resolve_token(tok)
+    if grantee is not None:
+        return grantee
+    # An unredeemed ENROLMENT code authenticates too, as the narrowest identity
+    # this system has: no projects, no capabilities. It exists so a brand-new
+    # machine can reach exactly one endpoint (POST /api/enrol) to exchange the
+    # code for its real credential, WITHOUT the bearer check being disabled for
+    # an unauthenticated path (CLAUDE.md rule 6). Every other route sees an
+    # identity that can read nothing and write nothing, which is what it is.
+    if str(tok).startswith(enrolment.CODE_PREFIX):
+        return scope.Principal(name=ENROLLING_NAME, is_owner=False)
+    return None
 
 
 def resolve_google_email(email: str | None) -> scope.Principal:

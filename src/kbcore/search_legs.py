@@ -47,7 +47,14 @@ KW_OR_FALLBACK_MIN = 5
 MAX_ID_TOKENS = 8
 # Cap parsed lexemes fed to the OR fallback (bounds the per-row coverage count
 # for pasted walls of text; lexemes beyond this are simply not OR'd).
-MAX_OR_LEXEMES = 64
+# Each lexeme costs its own full scan of `chunks` to compute df, so this is a
+# LATENCY cap, not a quality one. 64 was reachable in practice: the pre-brief
+# hook seeds its query with recent git commit SUBJECTS, and a handful of
+# conventional-commit lines tokenises to ~30 lexemes and took 18.8s — past the
+# hook's 20s budget, so the brief silently returned nothing (sungrow, KB 1111).
+# 12 is well above what carries signal: the IDF weighting means the few rarest
+# terms dominate the ranking, and the tail of common words cannot outweigh them.
+MAX_OR_LEXEMES = 12
 
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 

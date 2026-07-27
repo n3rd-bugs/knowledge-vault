@@ -252,3 +252,91 @@ def queue_depth() -> int:
             return 0
         row = conn.execute("SELECT count(*) FROM ingest_queue WHERE status = 'pending'").fetchone()
     return int(row[0])
+
+
+# How long a session's chunks must be QUIET before the drain treats them as a
+# complete unit. The hook sends a large delta as many sequential rows across
+# several firings, so coalescing eagerly would extract a half-session and then
+# extract the rest separately.
+COALESCE_QUIET_MINUTES = 30
+
+# The same drainable set pending() uses: still pending, or failed but under the
+# retry budget. Named once so the two paths cannot drift apart.
+_DRAINABLE = "(status = 'pending' OR (status = 'failed' AND attempts < %s))"
+
+
+def pending_groups(limit: int = 200, quiet_minutes: int = COALESCE_QUIET_MINUTES):
+    """Drainable rows grouped by the SESSION they belong to.
+
+    The network path windows RAW JSONL at 900 KB, while the local path assembles
+    to text first — measured on a real transcript, 114 MB of JSONL is 2.7 MB of
+    conversation, so the network path produces ~42x the rows for the same
+    session (350 vs 9 for 300 MB). Each row is its own 14B extraction, against a
+    200-row nightly budget, so one large session could starve every project for
+    days.
+
+    Grouping by source_uri and ordering by id restores the local path's
+    behaviour: the caller concatenates, assembles ONCE, and re-windows the
+    assembled text. Row order is the hook's byte order, because it submits
+    sequential offsets.
+
+    A group is returned only when its newest row has been quiet for
+    ``quiet_minutes`` — a session still being written would otherwise be
+    extracted in halves. Rows with no source_uri (single ad-hoc submissions)
+    come back as groups of one, which is what they already were.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            WITH d AS (
+                SELECT id, project, kind, content, meta, created_at,
+                       coalesce(meta->>'source_uri', 'queue:' || id::text) AS grp
+                  FROM ingest_queue
+                 WHERE {_DRAINABLE}
+            ),
+            quiet AS (
+                -- The wait exists ONLY to avoid splitting a session that is
+                -- still being submitted. A group of ONE row cannot be split, so
+                -- it drains immediately — which also keeps every single-shot
+                -- submission (an ad-hoc ingest, a small session) as responsive
+                -- as it was before coalescing existed.
+                SELECT grp FROM d GROUP BY grp
+                 HAVING count(*) = 1
+                     OR max(created_at) < now() - make_interval(mins => %s)
+            )
+            SELECT d.id, d.project, d.kind, d.content, d.meta, d.grp
+              FROM d JOIN quiet USING (grp)
+             ORDER BY d.grp, d.id
+            """,  # noqa: S608 — _DRAINABLE is a constant fragment
+            (MAX_ATTEMPTS, int(quiet_minutes)),
+        ).fetchall()
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for rid, project, kind, content, meta, grp in rows:
+        groups.setdefault(grp, []).append(
+            {"id": rid, "project": project, "kind": kind, "content": content, "meta": meta or {}}
+        )
+    # Cap on ROWS, not groups, so the nightly budget still bounds the work.
+    out, taken = [], 0
+    for grp, members in groups.items():
+        if taken + len(members) > limit and out:
+            break
+        out.append({"uri": grp, "rows": members})
+        taken += len(members)
+    return out
+
+
+def mark_group_extracted(ids: list[int], saved: int, rejected: int) -> None:
+    """Flip a whole coalesced group in ONE transaction.
+
+    All-or-nothing matters: a group extracted once must not leave some rows
+    pending for a second, partial extraction of the same session.
+    """
+    if not ids:
+        return
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET status='extracted', saved_count=%s, "
+            "rejected_count=%s, processed_at=now() WHERE id = ANY(%s)",
+            (saved, rejected, list(ids)),
+        )

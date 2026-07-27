@@ -72,9 +72,21 @@ def _drain_ingest_queue() -> tuple[int, int]:
     """
     drained = 0
     saved_total = 0
-    for row in ingest_queue.pending(limit=QUEUE_BATCH):
+    # COALESCED BY SESSION. The network path windows RAW JSONL at 900 KB while
+    # the local path assembles to text first, so the same session arrives as ~42x
+    # more rows over MCP/REST (measured: 114 MB of JSONL is 2.7 MB of
+    # conversation — 350 rows vs 9 for a 300 MB session). Extracting each raw
+    # window separately spent the whole 200-row nightly budget on one session and
+    # fed the 14B mostly JSON scaffolding. Concatenating a session's rows and
+    # assembling ONCE restores the local path's behaviour.
+    for group in ingest_queue.pending_groups(limit=QUEUE_BATCH):
+        rows = group["rows"]
+        row = rows[0]
+        ids = [r["id"] for r in rows]
         try:
-            text = sessions.assemble_text(row["content"], row["kind"])
+            # Row order is the hook's byte order (it submits sequential offsets),
+            # so plain concatenation reconstitutes the delta before assembly.
+            text = sessions.assemble_text("".join(r["content"] for r in rows), row["kind"])
             meta = row["meta"] or {}
             uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
             saved, rejected = sessions.extract_and_ingest(
@@ -86,11 +98,17 @@ def _drain_ingest_queue() -> tuple[int, int]:
                 # a phantom {"path": "."} code_ref.
                 code_ref=None,
                 branch=meta.get("branch"),
-                extra_detail={"ingest_queue_id": row["id"], "source": row["kind"]},
+                extra_detail={
+                    "ingest_queue_id": row["id"],
+                    "source": row["kind"],
+                    **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
+                },
                 extra_meta=sessions._session_provenance(meta.get("repo"), meta.get("commit")),
             )
-            ingest_queue.mark_extracted(row["id"], saved, rejected)
-            drained += 1
+            # All-or-nothing: a group extracted once must never leave rows
+            # pending for a second, partial extraction of the same session.
+            ingest_queue.mark_group_extracted(ids, saved, rejected)
+            drained += len(ids)
             saved_total += saved
         except (ExtractorUnavailable, EmbedderUnavailable) as e:
             # CONNECTIVITY (Ollama down/restarting/model-not-loaded during the
@@ -100,25 +118,35 @@ def _drain_ingest_queue() -> tuple[int, int]:
             # deferral counter and, if a "transient" failure never heals (a
             # payload-deterministic 5xx / mid-response crash), escalates the row to
             # 'failed' so it can't re-drain every night forever (review finding).
-            if ingest_queue.mark_deferred(row["id"], f"{type(e).__name__}: {e}"):
+            # Every row in the group, not just the first: deferring one and
+            # leaving the rest pending would split the session and extract it in
+            # pieces on the next run — the exact thing coalescing prevents.
+            escalated = [
+                rid for rid in ids if ingest_queue.mark_deferred(rid, f"{type(e).__name__}: {e}")
+            ]
+            if escalated:
                 logger.error(
-                    "row %s escalated to failed after %d deferrals (transient never healed): %s",
-                    row["id"],
+                    "rows %s escalated to failed after %d deferrals (transient never healed): %s",
+                    escalated,
                     ingest_queue.DEFERRAL_CAP,
                     e,
                 )
             else:
-                logger.warning("row %s deferred (extractor/embedder unavailable): %s", row["id"], e)
+                logger.warning(
+                    "%d row(s) deferred (extractor/embedder unavailable): %s", len(ids), e
+                )
         except ExtractionFailed as e:
             # CONTENT-DETERMINISTIC (unparseable output, unterminated <think>, a
             # per-row read timeout, a 4xx): re-running the 14B on this exact row
             # fails identically, so bound it with the attempts cap instead of
             # retrying every nightly run forever (queue self-heal taxonomy).
-            logger.warning("row %s extraction failed (content): %s", row["id"], e)
-            ingest_queue.mark_failed(row["id"], f"{type(e).__name__}: {e}")
+            logger.warning("group %s extraction failed (content): %s", ids, e)
+            for rid in ids:
+                ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
         except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
-            logger.exception("draining ingest_queue row %s failed", row["id"])
-            ingest_queue.mark_failed(row["id"], f"{type(e).__name__}: {e}")
+            logger.exception("draining ingest_queue group %s failed", ids)
+            for rid in ids:
+                ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
     return drained, saved_total
 
 

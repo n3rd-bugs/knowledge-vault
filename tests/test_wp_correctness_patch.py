@@ -457,3 +457,97 @@ def test_extract_items_pins_deterministic_options(monkeypatch):
     # truncated transcripts and cut JSON mid-object (see test_llm_num_ctx).
     assert captured["options"] == {"seed": llm.EXTRACT_SEED, "num_ctx": settings.kb_llm_num_ctx}
     assert "temperature" not in captured["options"], "no greedy decoding; seed pins the retry"
+
+
+# --------------------------------------------------------------------------
+# Session coalescing. The network path windows RAW JSONL at 900 KB while the
+# local path assembles to text first, so the same session arrives as ~42x more
+# rows over MCP/REST (measured on a real transcript: 114 MB of JSONL is 2.7 MB
+# of conversation — 350 rows vs 9 for a 300 MB session). Extracting each raw
+# window separately spent the entire 200-row nightly budget on ONE session.
+# --------------------------------------------------------------------------
+
+
+def _queue_session_chunks(project: str, uri: str, n: int) -> list[int]:
+    """n sequential chunks of one session, as the hook submits them."""
+    import json
+
+    ids = []
+    for i in range(n):
+        line = json.dumps({"type": "user", "i": i, "text": f"chunk {i} body"}) + "\n"
+        res = ingest_queue.enqueue(project, line, kind="session", source_uri=uri)
+        ids.append(res.id)
+    return ids
+
+
+def test_one_sessions_chunks_drain_as_ONE_extraction(kb, monkeypatch):
+    """The whole point: N rows for one session must become ONE unit of work."""
+    from kbcore.db import transaction
+
+    ids = _queue_session_chunks("coalesce-proj", "session:big", 6)
+    assert all(ids), "setup did not queue six rows"
+
+    # Age them past the quiet period — a live session is still being written.
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET created_at = now() - interval '2 hours' "
+            "WHERE meta->>'source_uri' = 'session:big'"
+        )
+
+    groups = ingest_queue.pending_groups(limit=200)
+    mine = [g for g in groups if g["uri"] == "session:big"]
+    assert len(mine) == 1, f"the session did not coalesce: {len(mine)} groups"
+    assert len(mine[0]["rows"]) == 6, "not every chunk joined the group"
+    # Row order is the hook's byte order; concatenation must reconstitute it.
+    assert [r["id"] for r in mine[0]["rows"]] == sorted(ids)
+
+
+def test_a_session_still_being_written_is_NOT_drained_in_halves(kb):
+    """Coalescing eagerly would extract half a session and the rest later."""
+    _queue_session_chunks("coalesce-proj", "session:live", 4)
+    uris = {g["uri"] for g in ingest_queue.pending_groups(limit=200)}
+    assert "session:live" not in uris, "a fresh multi-chunk session was drained mid-flight"
+
+
+def test_a_single_submission_is_never_delayed(kb):
+    """The wait exists only to avoid splitting a session. One row cannot split,
+    so an ad-hoc submission must stay as responsive as before coalescing."""
+    res = ingest_queue.enqueue("coalesce-proj", "a one-shot note", kind="session")
+    uris = {g["uri"] for g in ingest_queue.pending_groups(limit=200)}
+    assert f"queue:{res.id}" in uris, "a single submission was delayed by the quiet period"
+
+
+def test_a_failed_group_fails_WHOLE(kb):
+    """Marking one row and leaving the rest pending would split the session on
+    the next run — exactly what coalescing prevents."""
+    from kbcore.db import connect, transaction
+
+    ids = _queue_session_chunks("coalesce-proj", "session:bad", 3)
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET created_at = now() - interval '2 hours' "
+            "WHERE meta->>'source_uri' = 'session:bad'"
+        )
+    for rid in ids:
+        ingest_queue.mark_failed(rid, "boom")
+    with connect() as conn:
+        states = [
+            r[0]
+            for r in conn.execute(
+                "SELECT status FROM ingest_queue WHERE id = ANY(%s)", (ids,)
+            ).fetchall()
+        ]
+    assert set(states) == {"failed"}, f"the group split across states: {states}"
+
+
+def test_marking_a_group_extracted_is_atomic(kb):
+    from kbcore.db import connect
+
+    ids = _queue_session_chunks("coalesce-proj", "session:ok", 4)
+    ingest_queue.mark_group_extracted(ids, saved=2, rejected=1)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT status, saved_count FROM ingest_queue WHERE id = ANY(%s)", (ids,)
+        ).fetchall()
+    assert {r[0] for r in rows} == {"extracted"}, "not every row in the group was flipped"
+    assert {r[1] for r in rows} == {2}

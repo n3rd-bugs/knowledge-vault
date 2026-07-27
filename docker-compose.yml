@@ -22,8 +22,16 @@ services:
     container_name: kb-mcp
     command: ["python", "-m", "kbmcp.server"]
     env_file: [.env]
+    volumes:
+      # The RAW ARCHIVE. sources.raw_path holds an ABSOLUTE host path, so a
+      # container that cannot see it at the SAME path cannot read any raw
+      # content: kb_read_raw, kb_describe_raw and every raw_ref anchor
+      # validation failed for all 687 archived sources until this mount
+      # existed. Read-WRITE because kb_put_doc archives through this path.
+      - ${HOME}/kb/raw:/home/usama/kb/raw:rw
     environment:
       KB_DB_URL: postgresql://kb@db:5432/kb
+      KB_RAW: /home/usama/kb/raw
       OLLAMA_URL: http://host.docker.internal:11434
       KB_BIND: 0.0.0.0
       KB_PORT: "8321"
@@ -45,6 +53,7 @@ services:
     env_file: [.env, oauth.env]   # oauth.env: GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET (gitignored)
     environment:
       KB_DB_URL: postgresql://kb@db:5432/kb
+      KB_RAW: /home/usama/kb/raw
       OLLAMA_URL: http://host.docker.internal:11434
       KB_BIND: 0.0.0.0
       KB_PORT: "8321"
@@ -71,6 +80,12 @@ services:
     # logged out ("KB loses authentication quickly"). Encrypted at rest with a
     # key derived from the Google client secret, so persisting it is safe.
     volumes:
+      # The RAW ARCHIVE. sources.raw_path holds an ABSOLUTE host path, so a
+      # container that cannot see it at the SAME path cannot read any raw
+      # content: kb_read_raw, kb_describe_raw and every raw_ref anchor
+      # validation failed for all 687 archived sources until this mount
+      # existed. Read-WRITE because kb_put_doc archives through this path.
+      - ${HOME}/kb/raw:/home/usama/kb/raw:rw
       - fastmcp-oauth:/root/.local/share/fastmcp
     # This IS the OAuth server: it calls Google server-side (OIDC discovery, JWKS,
     # and the auth-code -> token exchange at the callback). kbnet's embedded
@@ -103,8 +118,16 @@ services:
     container_name: kb-rest
     command: ["python", "-m", "kbrest.server"]
     env_file: [.env]
+    volumes:
+      # The RAW ARCHIVE. sources.raw_path holds an ABSOLUTE host path, so a
+      # container that cannot see it at the SAME path cannot read any raw
+      # content: kb_read_raw, kb_describe_raw and every raw_ref anchor
+      # validation failed for all 687 archived sources until this mount
+      # existed. Read-WRITE because kb_put_doc archives through this path.
+      - ${HOME}/kb/raw:/home/usama/kb/raw:rw
     environment:
       KB_DB_URL: postgresql://kb@db:5432/kb
+      KB_RAW: /home/usama/kb/raw
       OLLAMA_URL: http://host.docker.internal:11434
       KB_BIND: 0.0.0.0
       KB_REST_PORT: "8322"
@@ -124,6 +147,7 @@ services:
     env_file: [.env, oauth.env]   # oauth.env: GOOGLE_CLIENT_ID/SECRET for web "Sign in with Google"
     environment:
       KB_DB_URL: postgresql://kb@db:5432/kb
+      KB_RAW: /home/usama/kb/raw
       OLLAMA_URL: http://host.docker.internal:11434
       KB_BIND: 0.0.0.0
       KB_WEB_PORT: "8323"

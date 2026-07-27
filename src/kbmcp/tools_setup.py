@@ -314,6 +314,15 @@ heavy sessions.
    goes on the next firing (normal for a big transcript in CONNECTOR mode). New
    sessions then start with a `[KB pre-brief · project …]` block.
 
+## Which project a session files under
+
+The **git root's** directory name, slugified — a session started in a subdirectory
+files under the repo, not the subdirectory. To name a workspace explicitly, put
+one line in `.kbproject` at the repo root (e.g. `punch-rescue`); it is slugified
+the same way, so it can only ever become `[a-z0-9-]`. Each project needs its own
+token (`kb_project_token`), and the hooks say `NEEDS TOKEN` naming the exact call
+when one is missing.
+
 ## If it does not work
 
 Every failure is written to `~/.claude/hooks/flush-session.log`; the hooks always

@@ -210,4 +210,53 @@ wait_stub "$((BEFORE + 1))" 60 || fail "nothing was submitted from the non-git d
 assert_eq "loosedir" "$(stub_field '.transport=="rest"' '.project' | tail -1)" \
   "a non-git directory degrades to its own basename"
 
+# ------------------------------- 5. a workspace may NAME ITSELF (.kbproject)
+step "a .kbproject file overrides the directory name"
+# The folder and the project are not always the same thing: a clone under a
+# different name, two checkouts of one logical project, a monorepo area.
+new_home declared
+stub_reset
+cfg_rest
+install_hooks >/dev/null
+D="$HOME/work/some-random-clone-dir"
+mkdir -p "$D"
+git -C "$D" init -q 2>/dev/null && git -C "$D" commit -q --allow-empty -m init 2>/dev/null
+printf 'Punch-Rescue\n' >"$D/.kbproject"
+mk_transcript "$D/t.jsonl" 30 declared
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$D/t.jsonl" "$D" decl-1)"
+wait_stub 1 60 || fail "nothing was submitted"
+assert_eq "punch-rescue" "$(stub_field '.transport=="rest"' '.project' | tail -1)" \
+  "the declared name won, slugified"
+
+step "the declared name is slugified like any other — it is repo-controlled data"
+new_home declaredevil
+stub_reset
+cfg_rest
+install_hooks >/dev/null
+E="$HOME/work/evil"
+mkdir -p "$E"
+# Whatever a repo puts here can only ever become [a-z0-9-].
+printf '../../etc/passwd; rm -rf /\n' >"$E/.kbproject"
+mk_transcript "$E/t.jsonl" 30 evil
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$E/t.jsonl" "$E" evil-1)"
+wait_stub 1 60 || fail "nothing was submitted"
+GOT=$(stub_field '.transport=="rest"' '.project' | tail -1)
+note "declared '../../etc/passwd; rm -rf /' -> project '$GOT'"
+case "$GOT" in
+  *[!a-z0-9-]*) fail "the declared name was not slugified: [$GOT]" ;;
+  "") fail "the declared name produced an empty project" ;;
+  *) pass "reduced to a safe slug" ;;
+esac
+
+step "a subdirectory session still picks up the ROOT's declaration"
+mkdir -p "$D/nested/deep"
+mk_transcript "$D/nested/deep/t.jsonl" 20 nested
+BEFORE=$(stub_total)
+export HOME="$RIG_HOMEBASE/declared"
+export HOOKS="$HOME/.claude/hooks" CFG="$HOME/.claude/kb-flush.env" LOGF="$HOOKS/flush-session.log"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$HOME/work/some-random-clone-dir/nested/deep/t.jsonl" "$HOME/work/some-random-clone-dir/nested/deep" nest-1)"
+wait_stub "$((BEFORE + 1))" 60 || fail "nothing was submitted from the nested dir"
+assert_eq "punch-rescue" "$(stub_field '.transport=="rest"' '.project' | tail -1)" \
+  "the root's .kbproject applies from a subdirectory too"
+
 finish

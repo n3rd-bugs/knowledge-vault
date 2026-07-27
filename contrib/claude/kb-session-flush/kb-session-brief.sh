@@ -285,7 +285,19 @@ CWD=$(kb_winpath "$CWD")
 # into another, and the per-project token lookup would miss.
 PROJECT_DIR=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null) || PROJECT_DIR=""
 [ -n "$PROJECT_DIR" ] || PROJECT_DIR="${CWD:-x}"
-PROJECT=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' |
+# A workspace may NAME ITSELF: a `.kbproject` file at the repo root (or the cwd
+# for a non-git tree) overrides the directory name. Needed whenever the folder
+# and the project are not the same thing — a clone or worktree under a different
+# name, two checkouts that are one logical project, or a monorepo area that
+# deserves its own. Only the first line is read, and it is slugified by exactly
+# the same rules as a directory name, because this is repo-controlled data:
+# whatever it contains can only ever become [a-z0-9-].
+PROJECT_RAW=$(basename "$PROJECT_DIR")
+if [ -r "$PROJECT_DIR/.kbproject" ]; then
+  PROJECT_DECLARED=$(head -n1 "$PROJECT_DIR/.kbproject" 2>/dev/null | tr -d '\r' | cut -c1-64)
+  [ -n "$PROJECT_DECLARED" ] && PROJECT_RAW="$PROJECT_DECLARED"
+fi
+PROJECT=$(printf '%s' "$PROJECT_RAW" | tr '[:upper:]' '[:lower:]' |
   tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
 [ -n "$PROJECT" ] || exit 0
 

@@ -180,6 +180,19 @@ running the installer — an existing config is never overwritten.
 - **Per-prompt recall** (`UserPromptSubmit`): each substantive prompt also gets a KB search seeded by
   the prompt itself. Self-throttling; `KB_PROMPT_RECALL=0` turns just this off.
 
+**Which project a session files under.** The **git root's** directory name, slugified — so a
+session started in a subdirectory files under the repo, not the subdirectory. A workspace can name
+itself instead by putting one line in a `.kbproject` file at the repo root:
+
+```bash
+echo 'punch-rescue' > .kbproject     # this checkout files under 'punch-rescue'
+```
+
+Useful when the folder and the project are not the same thing: a clone or worktree under a
+different name, two checkouts that are one logical project, or a monorepo area that deserves its
+own. The value is slugified exactly like a directory name, so it can only ever become `[a-z0-9-]`.
+A non-git directory falls back to its own name.
+
 **Verifying it works.** Every outcome is a line in `~/.claude/hooks/flush-session.log` — the hooks
 always exit 0, so the log is the only signal. Look for `local … ok bytes=` (LOCAL),
 `flush … ok bytes=` (MCP **and** REMOTE — they share a branch) or `connector … ok bytes=`

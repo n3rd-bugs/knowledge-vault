@@ -141,7 +141,8 @@ docker network create --internal "$NET" >/dev/null || die "could not create $NET
 printf -- '-- starting the stub KB server\n'
 docker run -d --name "$STUB_CT" --network "$NET" --network-alias hookrig-stub \
   --read-only --tmpfs /tmp:rw,size=64m \
-  -v "$RIG_DIR:/rig:ro" -e "RIG_TOKEN=$RIG_TOKEN" \
+  -v "$RIG_DIR:/rig:ro" -v "$SKILL_DIR:/skill:ro" \
+  -e "RIG_TOKEN=$RIG_TOKEN" -e "SKILL=/skill" \
   "$IMAGE" python3 /rig/stub_server.py >/dev/null || die "could not start the stub"
 
 ready=0

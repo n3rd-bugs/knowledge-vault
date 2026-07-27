@@ -419,6 +419,9 @@ def main() -> int:
             f"set RIG_RECORD={sandbox}\\requests.jsonl\r\n"
             "set RIG_TOKEN=kbrig_0000000000000000000000000000\r\n"
             f"set PYTHONPATH={sandbox}\r\n"
+            # So the stub can serve the real hook scripts at /api/setup/<name>,
+            # which is what a bootstrapping machine fetches.
+            f"set SKILL={sandbox}\\skill\r\n"
             f'cd /d "{sandbox}"\r\n'
             f'"{pyexe}" "{sandbox}\\stub_server.py" > "{stub_log}" 2>&1\r\n'
         )

@@ -43,8 +43,10 @@ def test_setup_assets_match_contrib():
         assert shipped == canonical, f"{name} drifted from contrib — run `make sync-assets`"
 
 
-def test_guide_embeds_all_scripts_and_steps():
-    guide = tools_setup.build_setup_guide()
+def test_guide_embeds_all_scripts_when_asked():
+    """include_scripts=True is the air-gapped path: a machine that cannot reach
+    the KB over HTTP still needs the four scripts verbatim."""
+    guide = tools_setup.build_setup_guide(include_scripts=True)
     # both hook behaviors named
     assert "PreCompact" in guide and "SessionStart" in guide
     # every script embedded (a distinctive line from each of the four)
@@ -206,15 +208,14 @@ INSTALL_SH = (CONTRIB / "install.sh").read_text()
 
 
 def _prose(guide: str) -> str:
-    """The guide's own text, excluding the four scripts embedded at the end.
+    """The guide's own text, excluding any verbatim script source.
 
-    Everything after the first `### File:` heading is verbatim script source, so
-    asserting over the whole string would match the scripts' own comments rather
-    than anything the guide claims.
+    The scripts are only embedded when include_scripts=True; in the default lean
+    reply there is nothing to strip. Either way, assertions about what the GUIDE
+    claims must not accidentally match a script's own comments.
     """
     head, sep, _ = guide.partition("### File: ")
-    assert sep, "the guide no longer embeds the scripts under a '### File: ' heading"
-    return head
+    return head if sep else guide
 
 
 def _emitted_log_lines(script: str) -> str:
@@ -385,3 +386,51 @@ def test_rest_route_prefix_still_matches_what_the_guide_implies():
         "the REST ingest path moved — the guide's base URL is now wrong"
     )
     assert '"/mcp"' not in rest, "kbrest now serves /mcp — revisit the MCP URL derivation"
+
+
+# --------------------------------------------------------------------------
+# Context cost. kb_setup's reply lands in the caller's context window, so its
+# SIZE is part of its contract: embedding the four scripts spent ~23,000 tokens
+# — 91% of the reply — on bytes that are written to disk and executed without
+# anyone reading them. That was paid on every call, including a passing "how do
+# I set this up?".
+# --------------------------------------------------------------------------
+
+_CHARS_PER_TOKEN = 4  # rough, and deliberately conservative for a budget check
+
+
+def test_default_reply_is_small_enough_to_ask_casually():
+    guide = tools_setup.build_setup_guide()
+    approx_tokens = len(guide) // _CHARS_PER_TOKEN
+    assert approx_tokens < 4_000, (
+        f"the default kb_setup reply is ~{approx_tokens} tokens; it must stay small "
+        "enough that asking how to set up the system does not consume the context "
+        "needed to actually do it"
+    )
+
+
+def test_default_reply_does_not_embed_the_scripts():
+    guide = tools_setup.build_setup_guide()
+    assert "### File: " not in guide
+    # A distinctive line from each script must be absent from the lean reply.
+    for needle in (
+        "flush this session's NEW transcript",
+        "Minimal MCP streamable-HTTP client",
+    ):
+        assert needle not in guide, f"script body leaked into the lean reply: {needle!r}"
+
+
+def test_the_lean_reply_still_says_where_the_scripts_come_from():
+    """Leaving them out is only acceptable if the reply says how to get them."""
+    guide = _prose(tools_setup.build_setup_guide())
+    assert "/api/setup/" in guide, "the lean reply never says where to fetch the scripts"
+    assert "include_scripts" in guide, "no way to discover the inline alternative"
+    for name in ("install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh"):
+        assert name in guide, f"{name} is not named in the lean reply"
+
+
+def test_embedding_is_still_available_and_is_the_expensive_one():
+    lean = tools_setup.build_setup_guide()
+    full = tools_setup.build_setup_guide(include_scripts=True)
+    assert len(full) > 5 * len(lean), "include_scripts no longer embeds anything"
+    assert "### File: " in full

@@ -11,9 +11,10 @@ Run: ``python -m kbrest.server``.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 
 from kbcore import (
@@ -51,6 +52,13 @@ from kbrest.schemas import (
     LinkRequest,
     ReviewResolveRequest,
     SupersedeRequest,
+)
+
+# Exactly the four files install.sh needs. An allowlist, not a path join,
+# so this route can never become a way to read arbitrary files.
+_SETUP_ASSETS = Path(__file__).resolve().parents[1] / "kbmcp" / "setup_assets"
+_SETUP_SCRIPTS = frozenset(
+    {"install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh"}
 )
 
 log = logging.getLogger("kbrest")
@@ -202,6 +210,25 @@ def _register_write(app: FastAPI) -> None:
             "principal": cred.principal_name,
             "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
         }
+
+    @app.get("/api/setup/{name}", response_class=PlainTextResponse)
+    def api_setup_script(name: str) -> str:
+        """Serve one hook script as plain text, so a new machine can FETCH the
+        installer instead of a model having to reproduce it.
+
+        Embedding the four scripts in the kb_setup reply cost ~23,000 tokens of
+        the caller's context every time it was asked how to set up — 91% of the
+        reply — for bytes no human or model ever needs to read. Downloading them
+        costs nothing but a curl.
+
+        Reachable by any live credential INCLUDING an unredeemed enrolment code
+        (a brand-new machine has nothing else yet). A GET does not consume the
+        code — only POST /api/enrol redeems it. The scripts are not secret; the
+        allowlist below exists to stop the path being a file-read primitive.
+        """
+        if name not in _SETUP_SCRIPTS:
+            raise HTTPException(status_code=404, detail="not found")
+        return (_SETUP_ASSETS / name).read_text()
 
     @app.post("/api/items", status_code=201)
     def api_create_item(payload: ItemCreate) -> dict:

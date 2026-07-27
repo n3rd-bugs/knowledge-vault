@@ -185,3 +185,52 @@ def test_enrol_rejects_an_unknown_code(client):
 
 def test_enrol_route_is_not_reachable_without_any_credential(client):
     assert client.post("/api/enrol", json={}).status_code == 401
+
+
+# --------------------------------------------------------------------------
+# GET /api/setup/{name} — a new machine fetches the hooks instead of a model
+# reproducing ~23k tokens of shell into the caller's context.
+# --------------------------------------------------------------------------
+
+
+def test_setup_scripts_are_served_verbatim(client):
+    from pathlib import Path
+
+    for name in ("install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh"):
+        r = client.get(f"/api/setup/{name}", headers=AUTH)
+        assert r.status_code == 200, name
+        on_disk = (
+            Path(__file__).resolve().parents[1] / "src" / "kbmcp" / "setup_assets" / name
+        ).read_text()
+        assert r.text == on_disk, f"{name} was altered in transit"
+
+
+def test_an_enrolment_code_may_fetch_the_scripts_without_spending_itself(client):
+    """A brand-new machine holds nothing but the code, so it must be able to
+    download the installer — and doing so must NOT redeem the code, or the
+    bootstrap would consume its own credential before using it."""
+    from kbcore import enrolment, scope
+
+    with scope.use_principal(scope.OWNER):
+        issued = enrolment.create_code()
+    h = {"Authorization": f"Bearer {issued.code}"}
+    assert client.get("/api/setup/install.sh", headers=h).status_code == 200
+    # Still redeemable afterwards.
+    assert client.post("/api/enrol", json={}, headers=h).status_code == 200
+
+
+def test_the_setup_route_is_not_a_file_read_primitive(client):
+    for bad in (
+        "../../../etc/passwd",
+        "..%2f..%2fetc%2fpasswd",
+        ".env",
+        "SKILL.md",
+        "server.py",
+    ):
+        r = client.get(f"/api/setup/{bad}", headers=AUTH)
+        assert r.status_code in (404, 400), f"{bad!r} was served"
+        assert "root:" not in r.text
+
+
+def test_setup_scripts_need_a_credential(client):
+    assert client.get("/api/setup/install.sh").status_code == 401

@@ -69,6 +69,7 @@ def build_setup_guide(
     rest_url: str | None = None,
     token: str | None = None,
     enrol: object | None = None,
+    include_scripts: bool = False,
 ) -> str:
     """Assemble the install guide + embedded scripts. Pure text, no I/O beyond
     reading the packaged assets.
@@ -136,33 +137,53 @@ def build_setup_guide(
             "revocable on its own"
         )
         enrol_block = f"""
-## Fastest path: one-time enrolment (recommended)
-
-This code redeems ONCE for {auth}, and expires in ~{mins} minutes:
+## Set this machine up (one block, nothing to copy by hand)
 
 ```bash
-KB_ENROL_CODE={enrol.code} \\
-KB_REST_URL={url} \\
-bash ~/.claude/kb-setup/install.sh
+export KB_REST_URL={url}
+export KB_ENROL_CODE={enrol.code}   # single use, expires in ~{mins} min
+mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+  curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
+done
+bash install.sh
 ```
 
-The installer exchanges the code for this machine's credential, writes
-`~/.claude/kb-flush.env` with `chmod 600`, and registers the hooks — nothing to
-copy by hand. The code is single-use: if it is refused, it was already redeemed
-or it expired, and you should ask for a new one rather than reuse this message.
+That fetches the hooks, redeems the code for {auth}, writes `~/.claude/kb-flush.env`
+(mode 600) and registers the four hook events. The installer prints the mode it
+chose and a smoke test.
 
-You still need step 2 first (write the four files). Everything below step 4 is
-the manual equivalent, for machines where you would rather set the transport up
-yourself.
+If the code is refused it was already redeemed or it expired — ask for a new one
+rather than reusing this message.
 """
     else:
         enrol_block = ""
 
-    scripts = {name: _read(name) for name in _SCRIPTS}
-    files_block = "\n\n".join(
-        f"### File: `~/.claude/kb-setup/{name}`\n\n```bash\n{body.rstrip()}\n```"
-        for name, body in scripts.items()
-    )
+    # The four scripts are ~23,000 tokens. Embedding them burned that much of the
+    # caller's context on every single kb_setup call — including a passing "how do
+    # I set this up?" — for bytes nobody reads: they are written to disk verbatim
+    # and executed. The machine fetches them instead, and the full embed stays
+    # available for a box that cannot reach the KB over HTTP.
+    if include_scripts:
+        scripts = {name: _read(name) for name in _SCRIPTS}
+        files_block = "## The files (verbatim)\n\n" + "\n\n".join(
+            f"### File: `~/.claude/kb-setup/{name}`\n\n```bash\n{body.rstrip()}\n```"
+            for name, body in scripts.items()
+        )
+    else:
+        files_block = (
+            "## The scripts\n\n"
+            "Fetched by the command above, not reproduced here: they are ~23k tokens "
+            "of shell that is written to disk and executed verbatim, so putting them "
+            "in this reply would spend most of your context on bytes nobody reads.\n\n"
+            "- `install.sh` — idempotent installer; detects the mode and registers the hooks\n"
+            "- `flush-session-to-kb.sh` — PreCompact + SessionEnd capture\n"
+            "- `kb-session-brief.sh` — SessionStart pre-brief + UserPromptSubmit recall\n"
+            "- `kb-mcp-call.sh` — MCP transport helper\n\n"
+            "Each is served at `GET {url}/api/setup/<name>` and lives in the repo at "
+            "`contrib/claude/kb-session-flush/`. Call `kb_setup(include_scripts=true)` "
+            "to get them inline instead (for a machine with no HTTP access to the KB)."
+        )
     return f"""# Install the KB Claude Code session hooks (on THIS machine)
 
 Two hook scripts connect this machine's Claude Code sessions to the Knowledge
@@ -351,7 +372,7 @@ def register(mcp) -> None:
     # (the master for the owner), so it must keep full approval friction (a lighter,
     # read-only badge would let a prompt-injected session pull the token silently).
     @mcp.tool(annotations=ANNOTATIONS_WRITE)
-    def kb_setup(rest_url: str | None = None) -> str:
+    def kb_setup(rest_url: str | None = None, include_scripts: bool = False) -> str:
         """Set up the KB Claude Code session hooks on the machine running this
         client. Returns a ready-to-apply guide plus the hook scripts and an
         idempotent installer: a flush hook (captures each session into the KB
@@ -367,6 +388,11 @@ def register(mcp) -> None:
         a credential the moment it is used. A caller with no access to enrol
         anything gets the manual guide instead. If this call is authenticated
         with the static bearer, that token is also embedded directly.
+
+        The reply does NOT include the hook scripts: they are ~23k tokens that
+        get written to disk and executed verbatim, and the bootstrap command
+        fetches them. Pass include_scripts=true only for a machine that cannot
+        reach the KB over HTTP.
         """
         # Issue an enrolment code automatically for any caller that HAS authority
         # to enrol something. It is safe to emit unprompted precisely because it
@@ -380,7 +406,12 @@ def register(mcp) -> None:
         except Exception:  # noqa: BLE001 — enrolment must never break setup
             log.warning("enrolment code issue failed; returning the manual guide", exc_info=True)
         try:
-            return build_setup_guide(rest_url, token=_presented_bearer_token(), enrol=issued)
+            return build_setup_guide(
+                rest_url,
+                token=_presented_bearer_token(),
+                enrol=issued,
+                include_scripts=include_scripts,
+            )
         except OSError as e:  # packaged assets unreadable — surface cleanly
             log.exception("kb_setup asset read failed")
             raise ToolError(f"setup assets unavailable: {e}") from e

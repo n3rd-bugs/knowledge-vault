@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from stub_contract import Invalid, Queue, enqueue_result, validate_submission
@@ -34,6 +35,11 @@ from stub_contract import Invalid, Queue, enqueue_result, validate_submission
 TOKEN = os.environ.get("RIG_TOKEN", "kbrig_0000000000000000000000000000")
 RECORD_PATH = os.environ.get("RIG_RECORD", "/tmp/requests.jsonl")
 PORT = int(os.environ.get("RIG_PORT", "8000"))
+# Where the rig mounted the skill, so the stub can serve the REAL scripts.
+SKILL_DIR = Path(os.environ.get("SKILL", "/skill"))
+SETUP_SCRIPTS = frozenset(
+    {"install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh"}
+)
 
 SEARCH_HITS = "\n".join(
     [
@@ -50,12 +56,16 @@ class State:
     lock = threading.Lock()
     seq = 0
     sessions: set[str] = set()
+    # Enrolment codes already redeemed. Single-use is the property under test,
+    # so the stub must enforce it rather than accept a code repeatedly.
+    spent_codes: set[str] = set()
 
     @classmethod
     def reset(cls) -> None:
         with cls.lock:
             cls.seq = 0
             cls.sessions = set()
+            cls.spent_codes = set()
             with open(RECORD_PATH, "w", encoding="utf-8"):
                 pass
         Queue.reset()
@@ -140,6 +150,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"reset\n", "text/plain")
         elif path == "/api/search":
             self._rest_search()
+        elif path.startswith("/api/setup/"):
+            self._serve_script(path.rsplit("/", 1)[-1])
         else:
             self._done({"transport": "http", "method": "GET", "path": path}, 404, {"error": "?"})
 
@@ -196,9 +208,44 @@ class Handler(BaseHTTPRequestHandler):
             self._mcp(raw)
         elif path == "/api/ingest-session":
             self._rest_ingest(raw)
+        elif path == "/api/enrol":
+            self._enrol(raw)
         else:
             rec = {"transport": "http", "method": "POST", "path": path, "bytes": len(raw)}
             self._done(rec, 404, {"error": "not found"})
+
+    # ------------------------------------------------------------- enrolment
+    # Mirrors the real GET /api/setup/<name> and POST /api/enrol closely enough
+    # to exercise the BOOTSTRAP a new machine performs: fetch the four scripts
+    # with the enrolment code as bearer, then redeem it for a real credential.
+    # The code must survive the fetches (only the POST spends it) or the
+    # bootstrap would consume its own credential before using it.
+    def _serve_script(self, name: str) -> None:
+        rec = {"transport": "http", "method": "GET", "path": self.path, "script": name}
+        if self._auth() == "missing":
+            self._done(rec, 401, {"error": "unauthorized"})
+            return
+        if name not in SETUP_SCRIPTS:
+            self._done(rec, 404, {"error": "not found"})
+            return
+        body = (SKILL_DIR / name).read_bytes()
+        rec["bytes"] = len(body)
+        State.record({**rec, "status": 200})
+        self._send(200, body, "text/plain")
+
+    def _enrol(self, raw: bytes) -> None:
+        header = self.headers.get("Authorization", "")
+        code = header[7:].strip() if header[:7].lower() == "bearer " else ""
+        rec = {"transport": "http", "method": "POST", "path": "/api/enrol", "code": bool(code)}
+        if not code.startswith("kbe_"):
+            self._done(rec, 401, {"error": "unauthorized"})
+            return
+        if code in State.spent_codes:
+            # Single use, exactly like the real endpoint.
+            self._done(rec, 400, {"error": "enrolment code is not valid"})
+            return
+        State.spent_codes.add(code)
+        self._done(rec, 200, {"token": TOKEN, "is_owner": True, "principal": None})
 
     # --------------------------------------------------------------------- MCP
     def _mcp(self, raw: bytes) -> None:

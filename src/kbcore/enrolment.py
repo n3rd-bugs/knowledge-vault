@@ -211,6 +211,24 @@ def redeem(
             row[4],
         )
 
+    if grants_owner and not project:
+        # VALIDATE BEFORE CLAIMING. This check used to sit AFTER the atomic
+        # UPDATE, so a refusal still marked the code redeemed — the user got an
+        # error, then found the code dead and could not even fetch the scripts
+        # (401), because a spent code no longer authenticates. Reported from
+        # repeater after three codes were burned in a row (KB 1198).
+        with transaction() as conn:
+            conn.execute(
+                "UPDATE enrolment_codes SET redeemed_at = NULL, redeemed_from = NULL "
+                "WHERE id = %s",
+                (code_id,),
+            )
+        raise InvalidOperation(
+            "this enrolment code names no project. Ask for one with "
+            "kb_setup(project='<the project this machine will capture>') — the "
+            "code is still valid and can be redeemed once you have a scoped one."
+        )
+
     if grants_owner:
         # An owner enrolment used to return settings.kb_token itself, because a
         # fixed-grant token cannot write a project that does not exist yet and
@@ -223,11 +241,6 @@ def redeem(
         # hook selects it. So enrolment issues a token for the machine's DEFAULT
         # project rather than the master, and the machine collects the rest as it
         # needs them. Nothing here can be more than the owner already had.
-        if project is None:
-            raise InvalidOperation(
-                "an owner enrolment must name the project this machine will capture; "
-                "pass project= (the machine can request more later with kb_project_token)"
-            )
         from kbcore import project_tokens
 
         with scope.use_principal(scope.OWNER):

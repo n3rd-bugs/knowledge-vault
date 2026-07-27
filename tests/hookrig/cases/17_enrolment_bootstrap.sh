@@ -103,8 +103,15 @@ new_home bootstrap2
 mkdir -p "$HOME/.claude/kb-setup"
 cp "$SKILL"/*.sh "$HOME/.claude/kb-setup/"
 OUT2=$(cd "$HOME/.claude/kb-setup" && KB_ENROL_CODE="$CODE" KB_REST_URL="$STUB" bash install.sh 2>&1)
-assert_eq "0" "$?" "install.sh still exits 0 on a refused code"
-assert_contains "$OUT2" "REFUSED" "the refusal is reported, not swallowed"
+RC2=$?
+# An INSTALLER that could not configure the machine must fail loudly. It used to
+# exit 0 and write a placeholder config (api.example.com, empty token) that read
+# as a finished install and captured nothing forever (KB 1198).
+assert_ne "0" "$RC2" "install.sh reports failure when enrolment is refused"
+assert_contains "$OUT2" "refused this code" "the refusal names the server's own reason"
+assert_contains "$OUT2" "NOT configuring" "it says the machine was left unconfigured"
+assert_not_contains "$(cat "$CFG" 2>/dev/null || echo)" "api.example.com" \
+  "no placeholder config was written to look like success"
 if grep -q "KB_TOKEN=$RIG_TOKEN" "$CFG" 2>/dev/null; then
   fail "a spent code still configured the machine"
 else

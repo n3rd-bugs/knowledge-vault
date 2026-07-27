@@ -370,14 +370,36 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
       ENROL_WHO=$(printf '%s' "$ENROL_OUT" | kb_json_get principal)
       echo "enrol:    redeemed -> $CFG${ENROL_WHO:+ (principal: $ENROL_WHO)}"
     else
-      # Never echo the response verbatim: it is a credential channel.
-      echo "enrol:    code was REFUSED (already redeemed, expired, or invalid) — ask for a new one" >&2
+      # DISTINGUISH THE FAILURE. This printed one message for every path —
+      # network error, timeout, JSON parse failure, refusal — which made a
+      # working request indistinguishable from a bad code and cost a user hours
+      # (KB 1198). The response body is still never echoed: it is a credential
+      # channel. Only the server's own error TEXT is surfaced, which carries no
+      # secret, plus the HTTP status.
+      ENROL_ERR=$(printf '%s' "$ENROL_OUT" | kb_json_get error)
+      ENROL_DET=$(printf '%s' "$ENROL_OUT" | kb_json_get detail)
+      if [ -n "$ENROL_ERR$ENROL_DET" ]; then
+        echo "enrol:    the KB refused this code: ${ENROL_ERR:-$ENROL_DET}" >&2
+      elif [ -z "$ENROL_OUT" ]; then
+        echo "enrol:    NO RESPONSE from $KB_REST_URL — network, DNS or the wrong URL" >&2
+      else
+        echo "enrol:    unreadable response from $KB_REST_URL (not JSON) — wrong URL, or a proxy in the way" >&2
+      fi
+      # And do NOT fall through to writing a placeholder config. The fallback
+      # below authors KB_REST_URL=https://api.example.com with an empty token,
+      # which reads as a successful install and captures nothing forever.
+      echo "enrol:    NOT configuring this machine — fix the code or the URL and re-run" >&2
+      ENROL_FAILED=1
     fi
     unset ENROL_TOK ENROL_OUT
   fi
 fi
 
-if [ ! -f "$CFG" ]; then
+if [ "${ENROL_FAILED:-0}" = "1" ]; then
+  # An attempted-and-failed enrolment is NOT an unconfigured machine: writing the
+  # REMOTE placeholder here is what made a broken install look finished.
+  echo "config:   left unwritten (enrolment failed)"
+elif [ ! -f "$CFG" ]; then
   # Create the config with owner-only perms BEFORE the bearer token is written.
   # Under the default umask 022 a plain '>' redirect would create $CFG as 0644,
   # leaving KB_TOKEN world-readable in the window before the chmod below — and

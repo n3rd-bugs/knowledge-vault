@@ -280,7 +280,12 @@ SID=$(printf '%s' "$INPUT" | kb_json_get session_id)
 [ -n "$CWD" ] || CWD="$PWD"
 CWD=$(kb_winpath "$CWD")
 
-PROJECT=$(basename "${CWD:-x}" | tr '[:upper:]' '[:lower:]' |
+# THE GIT ROOT, not the cwd — and it must agree with the flush hook, or a
+# session started in a subdirectory would brief from one project and capture
+# into another, and the per-project token lookup would miss.
+PROJECT_DIR=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null) || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || PROJECT_DIR="${CWD:-x}"
+PROJECT=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' |
   tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
 [ -n "$PROJECT" ] || exit 0
 

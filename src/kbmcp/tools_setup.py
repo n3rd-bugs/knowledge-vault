@@ -128,10 +128,17 @@ def build_setup_guide(
     # use and expires in minutes, so once the machine has redeemed it the
     # transcript holds a dead string. That matters here specifically because the
     # session hooks flush transcripts into the KB, which is then backed up.
+    # A code with no project cannot redeem (an owner enrolment must name the
+    # project it scopes to), so emitting a bootstrap block for one advertises a
+    # command that always fails — exactly what happened in the field (KB 1198).
+    if enrol is not None and not getattr(enrol, "project", None):
+        enrol = None
     if enrol is not None:
         mins = max(1, round((enrol.expires_at - datetime.now(UTC)).total_seconds() / 60))
         auth = (
-            "the OWNER credential (it works on every project, including ones that do not exist yet)"
+            f"a narrow, revocable credential for project "
+            f"'{getattr(enrol, 'project', None) or '?'}' (ask for another with "
+            "kb_project_token as you start other projects)"
             if enrol.grants_owner
             else "a credential for THIS MACHINE carrying exactly your own grants, "
             "revocable on its own"
@@ -157,7 +164,12 @@ If the code is refused it was already redeemed or it expired — ask for a new o
 rather than reusing this message.
 """
     else:
-        enrol_block = ""
+        enrol_block = (
+            "\n## One-command setup\n\n"
+            "Not available here: an enrolment code must name the project this machine "
+            'will capture. Ask again as `kb_setup(project="<project>")` — usually the '
+            "repo you are in — and this section becomes a single copy-paste block.\n"
+        )
 
     # The four scripts are ~23,000 tokens. Embedding them burned that much of the
     # caller's context on every single kb_setup call — including a passing "how do

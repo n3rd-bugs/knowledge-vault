@@ -309,8 +309,17 @@ def test_guide_states_connector_outranks_remote():
     )
     assert "CONNECTOR outranks REMOTE" in guide
     # And the installer really does order them that way: connector branch first.
-    assert INSTALL_SH.index("KB_CONNECTOR=1") < INSTALL_SH.index("KB_REST_URL=https://"), (
-        "install.sh no longer prefers CONNECTOR over REMOTE — the guide now lies"
+    # Compare the lines that WRITE the config, not any mention of the strings —
+    # a comment naming KB_REST_URL used to satisfy this by accident.
+    writes = [
+        ln.strip()
+        for ln in INSTALL_SH.splitlines()
+        if ln.strip().startswith("echo ")
+        and ("KB_CONNECTOR=1" in ln or "KB_REST_URL=https://" in ln)
+    ]
+    order = [("connector" if "KB_CONNECTOR" in w else "remote") for w in writes]
+    assert order[:2] == ["connector", "remote"], (
+        f"install.sh no longer prefers CONNECTOR over REMOTE ({order}) — the guide now lies"
     )
 
 

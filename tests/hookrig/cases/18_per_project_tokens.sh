@@ -180,4 +180,34 @@ assert_eq "$RIG_TOKEN" "$(stub_field '.' '.bearer // empty' | tail -1)" \
   "it used the shared KB_TOKEN"
 assert_not_contains "$(cat "$LOGF")" "NEEDS TOKEN" "no spurious warning without kb-tokens.env"
 
+
+
+# ------------- 4. the project is the GIT ROOT, not the directory you started in
+step "a session started in a SUBDIRECTORY files under the repo, not the subdir"
+# Reported from the field: starting in repeater/main filed under "main" — a
+# project that had no token, splitting the repo's knowledge across whichever
+# directories people happened to open.
+new_home gitroot
+stub_reset
+cfg_rest
+install_hooks >/dev/null
+REPO="$HOME/work/myrepo"
+mkdir -p "$REPO/main/deep"
+git -C "$REPO" init -q 2>/dev/null && git -C "$REPO" commit -q --allow-empty -m init 2>/dev/null
+mk_transcript "$REPO/main/deep/t.jsonl" 30 sub
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$REPO/main/deep/t.jsonl" "$REPO/main/deep" sub-1)"
+wait_stub 1 60 || fail "nothing was submitted from the subdirectory"
+assert_eq "myrepo" "$(stub_field '.transport=="rest"' '.project' | tail -1)" \
+  "filed under the repo root, not the subdirectory"
+
+step "a NON-git directory still falls back to its own name"
+W2="$HOME/work/loosedir"
+mkdir -p "$W2"
+mk_transcript "$W2/t.jsonl" 30 loose
+BEFORE=$(stub_total)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$W2/t.jsonl" "$W2" loose-1)"
+wait_stub "$((BEFORE + 1))" 60 || fail "nothing was submitted from the non-git dir"
+assert_eq "loosedir" "$(stub_field '.transport=="rest"' '.project' | tail -1)" \
+  "a non-git directory degrades to its own basename"
+
 finish

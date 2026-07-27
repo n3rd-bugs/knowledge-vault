@@ -271,7 +271,14 @@ CWD=$(kb_winpath "$CWD")
 [ -n "$T" ] && [ -f "$T" ] || exit 0
 
 # Project = the working repo's dir name, slugified (falls back to "sessions").
-PROJECT=$(basename "${CWD:-sessions}" | tr '[:upper:]' '[:lower:]' |
+# THE GIT ROOT, not the cwd. A session started in a subdirectory (repeater/main,
+# src/, docs/) used to file under that subdirectory's name — so the same repo
+# produced different projects depending on where you happened to start, split its
+# knowledge across them, and had no token for the accidental ones. The repo root
+# is the stable identity; a non-git directory still falls back to the cwd.
+PROJECT_DIR=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null) || PROJECT_DIR=""
+[ -n "$PROJECT_DIR" ] || PROJECT_DIR="${CWD:-sessions}"
+PROJECT=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' |
   tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
 [ -z "$PROJECT" ] && PROJECT=sessions
 # Git context for code_ref anchoring: kb_ingest_session accepts repo/branch/

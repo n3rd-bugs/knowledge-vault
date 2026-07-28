@@ -10,6 +10,7 @@ and deep_search_jobs.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -17,7 +18,45 @@ from psycopg.types.json import Jsonb
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 
+log = logging.getLogger("kbcore.jobs")
+
 _ACTIVE = ("pending", "running")
+
+# A run that claimed a request and then died leaves it 'running' with no owner,
+# no heartbeat and no timeout. Because request_consolidation dedupes against
+# ('pending','running'), that ONE orphaned row silently swallows every future
+# request — consolidation stops forever and nothing says so. It happened: a
+# container redeploy killed a run mid-flight and 308 queue rows (227 MB) sat at
+# attempts=0 for 13 hours while each nightly request returned the dead id.
+#
+# A real run takes minutes (the 2026-07 baseline finished in 14). Six hours is
+# far beyond any legitimate run, so past that the row is treated as dead.
+STALE_RUN_HOURS = 6
+
+
+def _reap_stale_runs(conn) -> int:
+    """Fail any 'running' request older than STALE_RUN_HOURS. Returns how many.
+
+    Called before both the dedupe check and the claim, so a dead run can never
+    block the queue: the next request either reuses a genuinely live run or
+    starts a new one.
+    """
+    cur = conn.execute(
+        """
+        UPDATE consolidation_requests
+           SET status = 'failed', finished_at = now(),
+               result = coalesce(result, '{}'::jsonb)
+                        || jsonb_build_object('reaped', true, 'reason',
+                           'no completion after ' || %s || 'h; the worker died mid-run')
+         WHERE status = 'running'
+           AND started_at < now() - make_interval(hours => %s)
+        """,
+        (STALE_RUN_HOURS, STALE_RUN_HOURS),
+    )
+    n = cur.rowcount or 0
+    if n:
+        log.warning("reaped %d stale consolidation run(s) older than %dh", n, STALE_RUN_HOURS)
+    return n
 
 
 def request_consolidation(requested_by: str = "unknown") -> tuple[int, bool]:
@@ -28,6 +67,7 @@ def request_consolidation(requested_by: str = "unknown") -> tuple[int, bool]:
     stack multiple runs.
     """
     with transaction() as conn:
+        _reap_stale_runs(conn)
         existing = conn.execute(
             "SELECT id FROM consolidation_requests WHERE status = ANY(%s) ORDER BY id LIMIT 1",
             (list(_ACTIVE),),
@@ -48,6 +88,7 @@ def claim_pending_consolidation() -> int | None:
     Returns the claimed id, or None when nothing is pending.
     """
     with transaction() as conn:
+        _reap_stale_runs(conn)
         row = conn.execute(
             """
             UPDATE consolidation_requests SET status = 'running', started_at = now()

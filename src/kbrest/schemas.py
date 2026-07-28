@@ -56,6 +56,9 @@ class IngestSessionRequest(BaseModel):
     # guards in kbcore.compress.
     transcript_gz: str | None = None
     kind: str = "session"  # session | memory
+    # Identity shared by every chunk of ONE session, so the drain can coalesce
+    # them into a single extraction instead of one per 900 KB window.
+    session_uri: str | None = None
     repo: str | None = None
     branch: str | None = None
     commit: str | None = None

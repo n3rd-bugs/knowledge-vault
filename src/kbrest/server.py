@@ -171,6 +171,7 @@ def _register_write(app: FastAPI) -> None:
             payload.project,
             compress.resolve_transcript(payload.transcript, payload.transcript_gz),
             kind=payload.kind,
+            source_uri=payload.session_uri,
             repo=payload.repo,
             branch=payload.branch,
             commit=payload.commit,

@@ -184,6 +184,7 @@ def register(mcp) -> None:
         transcript: str | None = None,
         transcript_gz: str | None = None,
         kind: str = "session",
+        session_uri: str | None = None,
         repo: str | None = None,
         branch: str | None = None,
         commit: str | None = None,
@@ -195,11 +196,19 @@ def register(mcp) -> None:
         'memory' (a free-text memory dump). For LARGE transcripts pass
         transcript_gz = base64(gzip(text)) instead of transcript (~10x smaller
         on the wire). Pass repo/branch/commit to anchor the knowledge to code.
-        Re-submitting identical content is a no-op."""
+        Pass the SAME session_uri for every chunk of one session (any stable
+        string) so the drain extracts the conversation ONCE instead of once per
+        chunk. Re-submitting identical content is a no-op."""
         try:
             text = compress.resolve_transcript(transcript, transcript_gz)
             res = ingest_queue.enqueue(
-                project, text, kind=kind, repo=repo, branch=branch, commit=commit
+                project,
+                text,
+                kind=kind,
+                source_uri=session_uri,
+                repo=repo,
+                branch=branch,
+                commit=commit,
             )
             if res.id is None:
                 return "duplicate — already queued"

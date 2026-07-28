@@ -113,7 +113,11 @@ stub_reset
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$WORK/t.jsonl" "$WORK" sess-nogit PreCompact)"
 if wait_stub 1 25; then pass "the submission landed"; else fail "nothing submitted"; fi
 KEYS=$(stub_field '.tool=="kb_ingest_session"' '.arg_keys | join(",")')
-assert_eq "kind,project,transcript_gz" "$KEYS" "exactly the three base fields, no empty git keys"
+# session_uri is always present now: it is the identity that lets the drain
+# coalesce a session's chunks into ONE extraction instead of one per 900 KB
+# window. The point of this assertion is unchanged — no EMPTY git keys may
+# leak into the body — so the expected set grows by exactly that field.
+assert_eq "kind,project,session_uri,transcript_gz" "$KEYS" "exactly the three base fields, no empty git keys"
 
 step "REST flush submits too (the other body builder)"
 new_home nojq_rest

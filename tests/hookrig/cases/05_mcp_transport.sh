@@ -40,7 +40,11 @@ assert_eq "kb_ingest_session" "$(stub_field '.rpc=="tools/call"' '.tool')" "tool
 assert_eq "my-repo" "$(stub_field '.tool=="kb_ingest_session"' '.project')" "project slugified from cwd basename My_Repo"
 assert_eq "session" "$(stub_field '.tool=="kb_ingest_session"' '.kind')" "kind=session"
 assert_eq "gz" "$(stub_field '.tool=="kb_ingest_session"' '.encoding')" "payload sent as transcript_gz"
-assert_eq "kind,project,transcript_gz" "$(stub_field '.tool=="kb_ingest_session"' '.arg_keys | join(",")')" "no extra arguments"
+# session_uri is always present now: it is the identity that lets the drain
+# coalesce a session's chunks into ONE extraction instead of one per 900 KB
+# window. The point of this assertion is unchanged — no EMPTY git keys may
+# leak into the body — so the expected set grows by exactly that field.
+assert_eq "kind,project,session_uri,transcript_gz" "$(stub_field '.tool=="kb_ingest_session"' '.arg_keys | join(",")')" "no extra arguments"
 assert_eq "false" "$(stub_field '.tool=="kb_ingest_session"' '.is_error')" "stub accepted the submission"
 
 step "the decoded payload is byte-identical to what was fed in"

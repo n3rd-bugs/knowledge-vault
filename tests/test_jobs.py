@@ -62,3 +62,69 @@ def test_finish_failure_marks_failed(kb):
 
 def test_status_none_when_empty(kb):
     assert jobs.latest_consolidation_status() is None
+
+
+# --------------------------------------------------------------------------
+# Stale-run recovery. A run that died mid-flight left its request 'running'
+# forever, and because request_consolidation dedupes against
+# ('pending','running') that one orphan silently swallowed every later request.
+# Observed in production: a container redeploy killed a run and 308 queue rows
+# (227 MB) sat untouched for 13 hours while each request returned the dead id.
+# --------------------------------------------------------------------------
+
+
+def _age_running(hours: int) -> None:
+    from kbcore.db import transaction
+
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE consolidation_requests SET started_at = now() - make_interval(hours => %s) "
+            "WHERE status = 'running'",
+            (hours,),
+        )
+
+
+def test_a_dead_run_does_not_block_consolidation_forever(kb):
+    from kbcore import jobs
+
+    first, created = jobs.request_consolidation("test")
+    assert created
+    assert jobs.claim_pending_consolidation() == first  # now 'running', and never finishes
+    _age_running(jobs.STALE_RUN_HOURS + 1)
+
+    second, created2 = jobs.request_consolidation("test")
+    assert created2, "a dead run still blocked a new request"
+    assert second != first
+    assert jobs.latest_consolidation_status()["status"] == "pending"
+
+
+def test_a_LIVE_run_still_dedupes(kb):
+    """The reaper must not undo the anti-spam guarantee: a run that is genuinely
+    in flight still absorbs further requests."""
+    from kbcore import jobs
+
+    first, _ = jobs.request_consolidation("test")
+    jobs.claim_pending_consolidation()
+    _age_running(1)  # young enough to be alive
+
+    second, created = jobs.request_consolidation("test")
+    assert not created and second == first, "a live run was reaped and duplicated"
+
+
+def test_the_reaped_row_records_why(kb):
+    """A silently-vanished run teaches nobody anything."""
+    from kbcore import jobs
+    from kbcore.db import connect
+
+    rid, _ = jobs.request_consolidation("test")
+    jobs.claim_pending_consolidation()
+    _age_running(jobs.STALE_RUN_HOURS + 1)
+    jobs.request_consolidation("test")
+
+    with connect() as conn:
+        status, result = conn.execute(
+            "SELECT status, result FROM consolidation_requests WHERE id = %s", (rid,)
+        ).fetchone()
+    assert status == "failed"
+    assert result and result.get("reaped") is True
+    assert "died mid-run" in result.get("reason", "")

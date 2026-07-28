@@ -472,6 +472,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
     set --   # git context, appended to every request body; empty fields omitted
+    # THE SESSION IDENTITY. Every chunk of one session must carry the same value
+    # or the server cannot tell that 45 rows are one conversation: it then runs
+    # 45 separate 14B extractions instead of one, which is what let a 38 MB
+    # session monopolise a 200-row nightly budget. OKEY is already the
+    # sanitised session id (or the transcript path when there is none), so it is
+    # stable across every firing for this session and unique between sessions.
+    set -- "$@" session_uri s "session:$OKEY"
     [ -n "$REPO" ] && set -- "$@" repo s "$REPO"
     [ -n "$BRANCH" ] && set -- "$@" branch s "$BRANCH"
     [ -n "$COMMIT" ] && set -- "$@" commit s "$COMMIT"

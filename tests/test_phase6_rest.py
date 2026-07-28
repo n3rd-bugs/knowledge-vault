@@ -237,3 +237,42 @@ def test_the_setup_route_is_not_a_file_read_primitive(client):
 
 def test_setup_scripts_need_a_credential(client):
     assert client.get("/api/setup/install.sh").status_code == 401
+
+
+def test_a_chunked_session_shares_one_source_uri_end_to_end(client):
+    """The coalescing guarantee, asserted through the PRODUCING path.
+
+    The drain groups queue rows by meta->>'source_uri'. The unit tests seeded
+    that key themselves, so they proved the grouping while asserting nothing
+    about whether anything supplies it — and nothing did: a real 38 MB session
+    produced 45 rows with source_uri NULL, i.e. 45 separate 14B extractions.
+    """
+    from kbcore import ingest_queue
+
+    for i in range(3):
+        r = client.post(
+            "/api/ingest-session",
+            json={
+                "project": "coalesce-e2e",
+                "transcript": f"chunk {i}\n",
+                "session_uri": "session:abc",
+            },
+            headers=AUTH,
+        )
+        assert r.status_code == 202, r.text
+
+    groups = ingest_queue.pending_groups(limit=100, quiet_minutes=0)
+    mine = [g for g in groups if g["uri"] == "session:abc"]
+    assert len(mine) == 1, f"the session did not coalesce: {[g['uri'] for g in groups]}"
+    assert len(mine[0]["rows"]) == 3, "not every chunk joined the group"
+
+
+def test_a_submission_without_a_session_uri_still_works(client):
+    """Backward compatibility: an older hook sends no session_uri and must still
+    be accepted, landing as its own group exactly as before."""
+    r = client.post(
+        "/api/ingest-session",
+        json={"project": "coalesce-e2e", "transcript": "lone chunk\n"},
+        headers=AUTH,
+    )
+    assert r.status_code == 202, r.text

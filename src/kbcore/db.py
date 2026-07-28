@@ -7,6 +7,7 @@ f-string user values into a query.
 from __future__ import annotations
 
 import os
+import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -98,13 +99,24 @@ def advisory_lock(key: int) -> Iterator[bool]:
     this connection closes. Non-blocking: a second holder yields ``False`` so the
     caller can skip rather than queue.
     """
+    # SCHEMA-SCOPED. A pg advisory lock is per-DATABASE, not per-schema, so
+    # kb_test and public shared key 42: running the suite while a real nightly
+    # consolidation was in flight made 28 tests fail with a bare
+    # `assert skipped is False` — the tests were being correctly refused a lock
+    # production held. Same class as tests writing into the production raw
+    # store: shared state between test and prod, discovered only by coincidence.
+    # Folding the schema into the key keeps the mutual exclusion exact within a
+    # schema while making cross-schema contention impossible.
+    from kbcore.config import settings
+
+    scoped = (key << 16) ^ (zlib.crc32(settings.kb_db_schema.encode()) & 0xFFFF)
     conn = connect()
     conn.autocommit = True
     acquired = False
     try:
-        acquired = bool(conn.execute("SELECT pg_try_advisory_lock(%s)", (key,)).fetchone()[0])
+        acquired = bool(conn.execute("SELECT pg_try_advisory_lock(%s)", (scoped,)).fetchone()[0])
         yield acquired
     finally:
         if acquired:
-            conn.execute("SELECT pg_advisory_unlock(%s)", (key,))
+            conn.execute("SELECT pg_advisory_unlock(%s)", (scoped,))
         conn.close()

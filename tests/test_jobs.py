@@ -84,6 +84,40 @@ def _age_running(hours: int) -> None:
         )
 
 
+def _silence_queue() -> None:
+    """No row extracted recently — the heartbeat the reaper reads."""
+    from kbcore.db import transaction
+
+    with transaction() as conn:
+        conn.execute("UPDATE ingest_queue SET processed_at = now() - interval '3 hours'")
+
+
+def test_a_SLOW_but_working_run_is_never_reaped(kb):
+    """The failure the first version of this reaper would have caused.
+
+    A 6-hour ceiling was set from a 14-minute baseline taken on a nearly-empty
+    queue. Measured on a real backlog the drain runs ~0.5 rows/min, so a full
+    200-row batch takes ~6.2 hours — the reaper would have killed a healthy run
+    mid-work, which is worse than the wedge it was written to fix.
+    """
+    from kbcore import ingest_queue, jobs
+
+    first, _ = jobs.request_consolidation("test")
+    jobs.claim_pending_consolidation()
+    _age_running(jobs.STALE_RUN_HOURS + 4)  # far past any age threshold
+    # ...but the work is still moving.
+    ingest_queue.enqueue("slow-proj", "a chunk being worked on", kind="session")
+    from kbcore.db import transaction
+
+    with transaction() as conn:
+        conn.execute("UPDATE ingest_queue SET processed_at = now()")
+
+    second, created = jobs.request_consolidation("test")
+    assert not created and second == first, (
+        "a run that is old but STILL EXTRACTING was reaped — slow is not dead"
+    )
+
+
 def test_a_dead_run_does_not_block_consolidation_forever(kb):
     from kbcore import jobs
 
@@ -91,6 +125,7 @@ def test_a_dead_run_does_not_block_consolidation_forever(kb):
     assert created
     assert jobs.claim_pending_consolidation() == first  # now 'running', and never finishes
     _age_running(jobs.STALE_RUN_HOURS + 1)
+    _silence_queue()  # and nothing has been extracted since: genuinely dead
 
     second, created2 = jobs.request_consolidation("test")
     assert created2, "a dead run still blocked a new request"
@@ -119,6 +154,7 @@ def test_the_reaped_row_records_why(kb):
     rid, _ = jobs.request_consolidation("test")
     jobs.claim_pending_consolidation()
     _age_running(jobs.STALE_RUN_HOURS + 1)
+    _silence_queue()
     jobs.request_consolidation("test")
 
     with connect() as conn:
@@ -127,4 +163,8 @@ def test_the_reaped_row_records_why(kb):
         ).fetchone()
     assert status == "failed"
     assert result and result.get("reaped") is True
-    assert "died mid-run" in result.get("reason", "")
+    # The reason must name BOTH conditions, because either alone is a
+    # misdiagnosis: age alone reaps healthy slow runs, silence alone reaps a run
+    # that simply has nothing to do.
+    reason = result.get("reason", "")
+    assert "running for over" in reason and "no row extracted" in reason, reason

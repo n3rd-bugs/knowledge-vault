@@ -25,37 +25,54 @@ _ACTIVE = ("pending", "running")
 # A run that claimed a request and then died leaves it 'running' with no owner,
 # no heartbeat and no timeout. Because request_consolidation dedupes against
 # ('pending','running'), that ONE orphaned row silently swallows every future
-# request — consolidation stops forever and nothing says so. It happened: a
-# container redeploy killed a run mid-flight and 308 queue rows (227 MB) sat at
-# attempts=0 for 13 hours while each nightly request returned the dead id.
+# request — consolidation stops forever and nothing says so. It happened: 308
+# queue rows (227 MB) sat at attempts=0 for 13 hours while each nightly request
+# returned the dead id.
 #
-# A real run takes minutes (the 2026-07 baseline finished in 14). Six hours is
-# far beyond any legitimate run, so past that the row is treated as dead.
+# DURATION ALONE IS THE WRONG TEST, and a first attempt at this got it wrong: a
+# 6-hour ceiling was set from a 14-minute baseline taken when the queue was
+# nearly empty. Measured on a real backlog the drain runs at ~0.5 rows/min, so a
+# full QUEUE_BATCH of 200 takes ~6.2 hours — the reaper would have killed a
+# HEALTHY run that was still working, which is a worse failure than the one it
+# was written to fix.
+#
+# So the test is LIVENESS, not age: a run is dead only if it is old AND nothing
+# has been extracted recently. ingest_queue.processed_at is already a heartbeat
+# written by the work itself, so this needs no schema change and cannot drift
+# from reality the way a separate heartbeat column would.
 STALE_RUN_HOURS = 6
+PROGRESS_WINDOW_MINUTES = 45
 
 
 def _reap_stale_runs(conn) -> int:
-    """Fail any 'running' request older than STALE_RUN_HOURS. Returns how many.
+    """Fail 'running' requests that are old AND have stopped making progress.
 
-    Called before both the dedupe check and the claim, so a dead run can never
-    block the queue: the next request either reuses a genuinely live run or
-    starts a new one.
+    Returns how many were reaped. Called before both the dedupe check and the
+    claim, so a dead run can never block the queue — while a slow one, which
+    looks identical by age alone, is left to finish.
     """
+    recent = conn.execute(
+        "SELECT count(*) FROM ingest_queue WHERE processed_at > now() - make_interval(mins => %s)",
+        (PROGRESS_WINDOW_MINUTES,),
+    ).fetchone()[0]
+    if recent:
+        return 0  # something is still being extracted: a run is alive, however slow
     cur = conn.execute(
         """
         UPDATE consolidation_requests
            SET status = 'failed', finished_at = now(),
                result = coalesce(result, '{}'::jsonb)
                         || jsonb_build_object('reaped', true, 'reason',
-                           'no completion after ' || %s || 'h; the worker died mid-run')
+                           'running for over ' || %s || 'h with no row extracted in '
+                           || %s || ' min; the worker is gone')
          WHERE status = 'running'
            AND started_at < now() - make_interval(hours => %s)
         """,
-        (STALE_RUN_HOURS, STALE_RUN_HOURS),
+        (STALE_RUN_HOURS, PROGRESS_WINDOW_MINUTES, STALE_RUN_HOURS),
     )
     n = cur.rowcount or 0
     if n:
-        log.warning("reaped %d stale consolidation run(s) older than %dh", n, STALE_RUN_HOURS)
+        log.warning("reaped %d stale consolidation run(s): old and not progressing", n)
     return n
 
 

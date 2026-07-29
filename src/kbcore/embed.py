@@ -13,7 +13,16 @@ from kbcore.errors import EmbedderUnavailable, ExtractionFailed
 
 # Short keep-alive per OPS-1 — embedder loads on demand and unloads fast.
 KEEP_ALIVE = "2m"
-_TIMEOUT = httpx.Timeout(120.0, connect=10.0)
+# The DRAIN budget. 120s used to be the ceiling here while every LLM call got
+# 600s, and Ollama's own model-load budget is 300s — so the client gave up while
+# the server was still legitimately loading, and the drain recorded a failure for
+# a model that was about to be ready. Matching llm.py removes that mismatch.
+_TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+# The INTERACTIVE budget. A user's kb_search must never inherit the drain's
+# patience: a wedged embedder blocking a prompt for ten minutes is a worse
+# failure than returning nothing. embed_query is the seam between the two, so
+# the split lives there rather than in a global.
+_QUERY_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
 def _classify_embed_error(e: httpx.HTTPError) -> Exception:
@@ -49,8 +58,12 @@ def _classify_embed_error(e: httpx.HTTPError) -> Exception:
     return EmbedderUnavailable(msg)
 
 
-def embed_texts(texts: list[str]) -> list[list[float]]:
-    """Embed a batch of texts. Returns one ``KB_EMBED_DIM`` vector per text."""
+def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> list[list[float]]:
+    """Embed a batch of texts. Returns one ``KB_EMBED_DIM`` vector per text.
+
+    ``timeout`` defaults to the drain budget; the read path passes the shorter
+    interactive one so a stalled embedder cannot hold a user's prompt open.
+    """
     if not texts:
         return []
     payload: dict = {
@@ -61,7 +74,9 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     if settings.kb_embed_device == "cpu":
         payload["options"] = {"num_gpu": 0}
     try:
-        resp = httpx.post(f"{settings.ollama_url}/api/embed", json=payload, timeout=_TIMEOUT)
+        resp = httpx.post(
+            f"{settings.ollama_url}/api/embed", json=payload, timeout=timeout or _TIMEOUT
+        )
         resp.raise_for_status()
     except httpx.HTTPError as e:
         # Clean domain error for CLI/MCP consumers; full trace stays in logs
@@ -88,8 +103,8 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-def embed_one(text: str) -> list[float]:
-    return embed_texts([text])[0]
+def embed_one(text: str, *, timeout: httpx.Timeout | None = None) -> list[float]:
+    return embed_texts([text], timeout=timeout)[0]
 
 
 def embed_query(text: str) -> list[float]:
@@ -108,4 +123,5 @@ def embed_query(text: str) -> list[float]:
     failures via embed_one intercept query embeds too. Asserted in
     tests/test_embed_query_prefix.py; do not inline an HTTP call here.
     """
-    return embed_one(settings.kb_embed_query_prefix + text)
+    # The interactive budget, not the drain's: this is the read path.
+    return embed_one(settings.kb_embed_query_prefix + text, timeout=_QUERY_TIMEOUT)

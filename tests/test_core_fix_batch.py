@@ -83,7 +83,7 @@ def client(kb, monkeypatch):
 def test_rest_extraction_failed_on_read_is_503(client, monkeypatch):
     from kbcore.errors import ExtractionFailed
 
-    def boom(text):
+    def boom(text, **kw):  # **kw: embed_texts gained a timeout kwarg
         raise ExtractionFailed("bge-m3 first-token exceeded the read budget under load")
 
     monkeypatch.setattr(embed_mod, "embed_one", boom)

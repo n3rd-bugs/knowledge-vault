@@ -41,3 +41,32 @@ def test_a_4xx_is_still_a_content_defect():
         "", request=req, response=httpx.Response(404, text="model not found", request=req)
     )
     assert isinstance(_classify_embed_error(missing), EmbedderUnavailable)
+
+
+def test_the_read_path_does_not_inherit_the_drain_timeout(monkeypatch):
+    """A stalled embedder must not hold a user's prompt open for ten minutes.
+
+    The drain budget went 120s -> 600s to match llm.py: the client used to give
+    up while Ollama was still legitimately loading a model, recording a failure
+    for something about to be ready. But kb_search runs through embed_query, and
+    inheriting 600s there would turn a slow embedder into a hung prompt.
+    embed_query is the seam between the two budgets, so the split lives there.
+    """
+    from kbcore import embed
+
+    assert embed._TIMEOUT.read == 600.0, "the drain lost its longer budget"
+    assert embed._QUERY_TIMEOUT.read == 30.0
+
+    seen: list = []
+    # Capture at embed_texts, the single point both paths funnel through. The
+    # autouse fake_embeddings fixture already replaces it, so patch it again
+    # here rather than trying to intercept httpx underneath it.
+    monkeypatch.setattr(
+        embed, "embed_texts", lambda texts, **kw: (seen.append(kw.get("timeout")), [[0.0]])[1]
+    )
+
+    embed.embed_query("a user question")
+    embed.embed_one("a drain chunk")
+
+    assert seen[0] is embed._QUERY_TIMEOUT, "the read path used the drain budget"
+    assert seen[1] is None, "embed_one should default to the drain budget"

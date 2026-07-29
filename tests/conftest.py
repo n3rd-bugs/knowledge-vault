@@ -58,7 +58,11 @@ def fake_vector(text: str) -> list[float]:
 @pytest.fixture(autouse=True)
 def fake_embeddings(monkeypatch):
     """Mock Ollama for every test: embed_texts returns deterministic vectors."""
-    monkeypatch.setattr(embed, "embed_texts", lambda texts: [fake_vector(t) for t in texts])
+    # **kw so the stub keeps matching the real signature: embed_texts gained a
+    # timeout kwarg (the read path uses a shorter budget than the drain), and a
+    # stub that silently rejects new kwargs turns a signature change into a
+    # confusing TypeError in unrelated tests.
+    monkeypatch.setattr(embed, "embed_texts", lambda texts, **kw: [fake_vector(t) for t in texts])
 
 
 @pytest.fixture(autouse=True)

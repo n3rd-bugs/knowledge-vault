@@ -28,7 +28,9 @@ PREFIX = "Instruct: Given a query, retrieve relevant knowledge base items\nQuery
 def _capture(into: list[list[str]]):
     """embed_texts stand-in that records every batch and stays deterministic."""
 
-    def fake(texts: list[str]) -> list[list[float]]:
+    def fake(
+        texts: list[str], **kw
+    ) -> list[list[float]]:  # **kw: embed_texts gained a timeout kwarg
         into.append(list(texts))
         return [fake_vector(t) for t in texts]
 
@@ -60,7 +62,9 @@ def test_search_prefixes_query_but_ingest_stays_plain(kb, monkeypatch):
     seen: list[str] = []
     calls: list[list[str]] = []
 
-    def flatten(texts: list[str]) -> list[list[float]]:
+    def flatten(
+        texts: list[str], **kw
+    ) -> list[list[float]]:  # **kw: embed_texts gained a timeout kwarg
         seen.extend(texts)
         calls.append(list(texts))
         return [fake_vector(t) for t in texts]

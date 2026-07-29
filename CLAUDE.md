@@ -27,7 +27,15 @@ You are implementing the system specified in `PLAN.md` (v2.1 — primary use cas
    relations/review_queue/ingest_queue.
 6. Network: bind `KB_BIND` only; bearer check on every MCP request; never disable auth "temporarily".
 7. `TIMESTAMPTZ`/UTC everywhere. `datetime.now(timezone.utc)`, never naive datetimes.
-8. GPU courtesy: embed calls set short keep-alive; the 14B extractor is invoked only from `consolidate.py` or explicit user-invoked runs (`kb ingest-session`, `kb deep-search`). Residency: `KB_LLM_KEEP_ALIVE=-1` keeps it loaded (owner decision 2026-07 — idle residency is power-cheap; set 0 to reclaim VRAM).
+8. GPU courtesy: embed calls set short keep-alive; the 14B extractor is invoked only from `consolidate.py` or explicit user-invoked runs (`kb ingest-session`, `kb deep-search`). Residency: `KB_LLM_KEEP_ALIVE` is a FINITE seconds value (600), **never `-1`** (corrected 2026-07-29).
+   The original `-1` (owner decision 2026-07 — idle residency is power-cheap) predates
+   `OLLAMA_MAX_LOADED_MODELS=1`. With ONE model slot, `-1` pins the primary permanently and every
+   other model — extractors, judges, embedder — waits forever for a slot that can never free; they
+   surface as `ReadTimeout`, not as an out-of-memory error, which is why this reads as a network
+   fault. A finite keep-alive holds the model resident across its whole cohort phase (which is what
+   the pin was actually for) and still lets the next phase have the slot. Cold loads measured
+   2026-07-29 with the slot free: granite4.1:8b 4s, gemma3:12b 17s, qwen3:14b 25s — the load cost
+   the pin was avoiding is negligible.
    **Amendment (2026-07-29):** the card holds ONE Ollama model at a time
    (`OLLAMA_MAX_LOADED_MODELS=1`), because the "fits alongside" path mispredicted the
    embedder's size and silently ran 40% of embeddings on CPU. Consequently the ensemble's

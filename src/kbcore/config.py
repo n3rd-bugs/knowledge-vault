@@ -120,7 +120,11 @@ class Settings(BaseSettings):
     # regardless), and it removes the ~20s reload per LLM call that dominated
     # consolidation runtime. Cost: ~10GB VRAM stays occupied. Kill switch: set 0
     # (unload per call) or a bounded value like 300 (seconds) to reclaim VRAM.
-    kb_llm_keep_alive: int = -1
+    # Seconds the LLM stays resident. MUST be finite: with OLLAMA_MAX_LOADED_MODELS=1
+    # a negative ("resident forever") value pins the only slot and every other model
+    # — extractors, judges, embedder — waits for a slot that can never free, surfacing
+    # as ReadTimeout rather than OOM. Measured 2026-07-29; see Invariant 8.
+    kb_llm_keep_alive: int = 600
     # Context window for every /api/chat LLM call. Without an explicit num_ctx,
     # Ollama runs its RUNTIME default (4K), silently truncating transcript input
     # and capping JSON output (done_reason=length) — measured 2026-07-18: the

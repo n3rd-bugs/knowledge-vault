@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+from itertools import zip_longest
 
 import pytest
 
@@ -91,7 +92,7 @@ def _install_judge(monkeypatch, supported=frozenset(), errors=frozenset()) -> li
     calls: list[dict] = []
 
     def fake(title, body, transcript, *, judge_model=None, keep_alive=None):
-        calls.append({"title": title, "judge_model": judge_model})
+        calls.append({"title": title, "judge_model": judge_model, "keep_alive": keep_alive})
         if title in errors:
             raise ExtractionFailed("judge blew up (test)")
         return {"supported": title in supported, "reason": "test verdict"}
@@ -589,3 +590,203 @@ def test_run_ensemble_consumes_the_prefetch_instead_of_re_extracting(monkeypatch
     pre = {"primary": [{"title": "SPI mode", "body": "the DRV8706 needs SPI mode 1"}]}
     ensemble.run_ensemble(text, "proj", "uri", pre_extracted=pre)
     assert not called, "run_ensemble re-extracted despite being handed a prefetch"
+
+
+# --------------------------------------------------------------------------
+# Model-major JUDGING (2026-07-29). The card holds ONE model
+# (OLLAMA_MAX_LOADED_MODELS=1), so every alternation between the secondary and
+# the primary judge was a full cold load — and keep_alive=0 on the secondary
+# judge unloaded it after each call, guaranteeing the next reload. A run now
+# collects every judgement it needs and executes them GROUPED BY MODEL.
+# --------------------------------------------------------------------------
+
+
+def _runs(seq: list[str]) -> list[str]:
+    """Collapse a sequence to its contiguous runs: [a,a,b,b] -> [a,b]."""
+    out: list[str] = []
+    for x in seq:
+        if not out or out[-1] != x:
+            out.append(x)
+    return out
+
+
+def _force_interleaved_clusters(monkeypatch, primary: str = "prime") -> None:
+    """Hand run_ensemble singleton clusters that ALTERNATE primary / non-primary.
+
+    Entries are built primary-first, so the natural cluster order already groups
+    the two judge kinds and would hide a per-cluster swap. Alternating them is
+    the adversarial order: a judge loop that walks clusters swaps models on
+    every single cluster.
+    """
+
+    real_cluster = ensemble._cluster
+
+    def fake_cluster(entries, threshold):
+        clusters = real_cluster(entries, threshold)  # real geometry, shuffled order
+        prime = [c for c in clusters if c[0]["model"] == primary]
+        other = [c for c in clusters if c[0]["model"] != primary]
+        out = []
+        for a, b in zip_longest(prime, other):
+            if a is not None:
+                out.append(a)
+            if b is not None:
+                out.append(b)
+        return out
+
+    monkeypatch.setattr(ensemble, "_cluster", fake_cluster)
+
+
+def test_judging_is_model_major_no_model_swaps(monkeypatch, caplog):
+    """THE pinned requirement: one contiguous run per judge model, per batch."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+    prime_items = [
+        _item("prime one", "primary singleton one", POOL_SPAN),
+        _item("prime two", "primary singleton two", TMP_SPAN),
+        _item("prime three", "primary singleton three", RERANK_SPAN),
+    ]
+    extra_items = [
+        _item("extra one", "extra singleton one", POOL_SPAN),
+        _item("extra two", "extra singleton two", TMP_SPAN),
+        _item("extra three", "extra singleton three", RERANK_SPAN),
+    ]
+    _install_extractors(monkeypatch, {"prime": prime_items, "ex-a": extra_items})
+    judge_calls = _install_judge(monkeypatch, supported={it["title"] for it in extra_items})
+    _force_interleaved_clusters(monkeypatch)
+    caplog.set_level(logging.INFO, logger="kbworker.ensemble")
+
+    report = ensemble.run_ensemble(TEXT, "proj", "test://wpb2/modelmajor")
+
+    seq = [c["judge_model"] for c in judge_calls]
+    assert len(seq) == 6, "three primary singletons + three non-primary singletons"
+    assert _runs(seq) == ["second", "prime"], (
+        "each judge model must appear in exactly ONE contiguous run; a model "
+        "appearing twice in the run list is a cold reload on a one-slot card"
+    )
+    assert report["judged"] == 6
+    assert len(report["survivors"]) == 6, "all six survive — the batching changes no verdict"
+
+    groups = [r.getMessage() for r in caplog.records if "ensemble judge group" in r.getMessage()]
+    assert len(groups) == 2, "one observable log line per judge group"
+    assert "model=second" in groups[0] and "judgements=3" in groups[0]
+    assert "model=prime" in groups[1] and "judgements=3" in groups[1]
+
+
+def test_secondary_judge_keep_alive_is_never_zero(monkeypatch):
+    """keep_alive=0 on the secondary judge WAS the reload-per-call bug."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+    monkeypatch.setattr(settings, "kb_llm_keep_alive", -1)
+    _install_extractors(monkeypatch, {"prime": [P_ONLY], "ex-a": [A_ONLY]})
+    judge_calls = _install_judge(monkeypatch, supported={A_ONLY["title"]})
+
+    ensemble.run_ensemble(TEXT, "proj", "test://wpb2/keepalive")
+
+    by_model = {c["judge_model"]: c["keep_alive"] for c in judge_calls}
+    assert set(by_model) == {"second", "prime"}
+    assert all(c["keep_alive"] != 0 for c in judge_calls), "0 unloads the judge after every call"
+    ka = by_model["second"]
+    assert ka == settings.kb_drain_phase_keep_alive
+    assert isinstance(ka, int) and ka > 0, "the phase keep-alive must be a positive int"
+    # A NEGATIVE setting is CLAMPED, never propagated. An unbounded pin holds the
+    # only slot under OLLAMA_MAX_LOADED_MODELS=1, so the next model to run — the
+    # other judge, the next cohort's extractor, the embedder — waits forever and
+    # dies on the client timeout. That pin stalled the entire drain on 2026-07-29.
+    assert by_model["prime"] == settings.kb_drain_phase_keep_alive
+    assert all(c["keep_alive"] > 0 for c in judge_calls), "an unbounded pin starves the slot"
+
+
+def test_primary_judge_group_survives_a_zero_settings_keep_alive(monkeypatch):
+    """With KB_LLM_KEEP_ALIVE=0 (owner reclaims VRAM) the primary judge would
+    unload after each call; the GROUP keep-alive is the floor that stops it."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_llm_keep_alive", 0)
+    _install_extractors(monkeypatch, {"prime": [], "ex-a": [A_ONLY, B_ONLY]})
+    judge_calls = _install_judge(monkeypatch, supported={A_ONLY["title"], B_ONLY["title"]})
+
+    ensemble.run_ensemble(TEXT, "proj", "test://wpb2/keepalive-zero")
+
+    assert len(judge_calls) == 2
+    assert all(c["keep_alive"] == settings.kb_drain_phase_keep_alive for c in judge_calls)
+
+    # ...and the phase keep-alive is a FLOOR, never a cap: a longer configured
+    # residency for the primary is left alone (batching may only lengthen it).
+    judge_calls.clear()
+    monkeypatch.setattr(settings, "kb_llm_keep_alive", settings.kb_drain_phase_keep_alive * 3)
+    ensemble.run_ensemble(TEXT, "proj", "test://wpb2/keepalive-long")
+    assert all(c["keep_alive"] == settings.kb_llm_keep_alive for c in judge_calls)
+
+
+def test_secondary_judge_exception_still_ingests_as_primary_source(monkeypatch):
+    """Demote-to-review semantics: a secondary-judge ERROR never drops a
+    primary-sourced item, it only costs a judge_errors tick."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+    _install_extractors(monkeypatch, {"prime": [P_ONLY], "ex-a": []})
+    _install_judge(monkeypatch, errors={P_ONLY["title"]})
+
+    report = ensemble.run_ensemble(TEXT, "proj", "test://wpb2/secondary-error")
+
+    (surv,) = report["survivors"]
+    assert surv["extraction_pipeline"]["verified_by"] == "primary-source"
+    assert (report["judged"], report["judge_errors"], report["rejected_reps"]) == (1, 1, 0)
+
+
+def test_batched_judging_preserves_every_counter_and_label(monkeypatch):
+    """The full policy matrix in ONE batch — both judge kinds x
+    supported/unsupported/exception — with the counters pinned."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+    p_pass = _item("p pass", "primary singleton the second judge backs", POOL_SPAN)
+    p_fail = _item("p fail", "primary singleton the second judge rejects", TMP_SPAN)
+    p_err = _item("p err", "primary singleton whose judge dies", RERANK_SPAN)
+    a_pass = _item("a pass", "extra singleton the primary judge backs", POOL_SPAN)
+    a_fail = _item("a fail", "extra singleton the primary judge rejects", TMP_SPAN)
+    a_err = _item("a err", "extra singleton whose judge dies", RERANK_SPAN)
+    _install_extractors(
+        monkeypatch,
+        {
+            "prime": [SHARED, p_pass, p_fail, p_err],
+            "ex-a": [dict(SHARED), a_pass, a_fail, a_err],
+        },
+    )
+    judge_calls = _install_judge(
+        monkeypatch, supported={"p pass", "a pass"}, errors={"p err", "a err"}
+    )
+    _force_interleaved_clusters(monkeypatch)
+
+    report = ensemble.run_ensemble(TEXT, "proj", "test://wpb2/matrix")
+
+    by_title = {
+        s["item"]["title"]: s["extraction_pipeline"]["verified_by"] for s in report["survivors"]
+    }
+    assert by_title == {
+        "pool size decision": "primary-source",  # corroborated: never judged
+        "p pass": "secondary-judge",
+        "p fail": "secondary-judge-failed",  # demote-to-review, still ingests
+        "p err": "primary-source",  # judge error, still ingests
+        "a pass": "primary-judge",
+    }, "a fail / a err are fail-closed: rejected, not ingested"
+    assert report["corroborated"] == 1
+    assert report["judged"] == 6, "both branches count a judgement each"
+    assert report["judge_errors"] == 2, "one per branch"
+    assert report["rejected_reps"] == 2, "only the fail-closed branch rejects"
+    assert _runs([c["judge_model"] for c in judge_calls]) == ["second", "prime"]
+    assert [c["title"] for c in judge_calls if c["judge_model"] == "second"] == [
+        "p pass",
+        "p fail",
+        "p err",
+    ], "cluster order is preserved WITHIN a judge group"
+
+
+def test_corroborated_reps_never_reach_a_judge_group(monkeypatch):
+    """A batch with nothing to judge issues no judge call and logs no group."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+    _install_extractors(monkeypatch, {"prime": [SHARED], "ex-a": [dict(SHARED)]})
+    judge_calls = _install_judge(monkeypatch)
+
+    report = ensemble.run_ensemble(TEXT, "proj", "test://wpb2/nojudge")
+
+    assert judge_calls == []
+    assert (report["corroborated"], report["judged"], report["judge_errors"]) == (1, 0, 0)

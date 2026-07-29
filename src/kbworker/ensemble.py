@@ -23,15 +23,20 @@ Measured design (MODEL_RESEARCH_2026-07.md addendum 2, owner-approved
   judge.
 
 GPU courtesy (Invariant 8): only the primary stays resident (settings-driven
-keep_alive); every EXTRA extractor runs keep_alive=0. This module COMPUTES and
-REPORTS only — it imports no DB machinery and never writes. kbworker.sessions
-owns all ingest wiring, which is what makes shadow mode safe by construction.
+keep_alive); every EXTRA extractor runs keep_alive=0. JUDGING is MODEL-MAJOR
+(2026-07-29): with OLLAMA_MAX_LOADED_MODELS=1 the card holds one model, so the
+judgements a run needs are collected first, GROUPED by judge model and executed
+group by group — each judge model loads at most once per run instead of once per
+alternation. This module COMPUTES and REPORTS only — it imports no DB machinery
+and never writes. kbworker.sessions owns all ingest wiring, which is what makes
+shadow mode safe by construction.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+from dataclasses import dataclass
 from typing import Any
 
 from kbcore import embed, llm
@@ -185,6 +190,113 @@ def prefetch_extractions(texts: list[str]) -> list[dict[str, list[dict[str, Any]
     return out
 
 
+@dataclass
+class _Judgement:
+    """One DEFERRED judge call: which cluster plan entry it decides, by which
+    model, and under which failure semantics.
+
+    ``fail_closed`` is the whole reason the two branches stay distinguishable
+    after the judge loop was reordered: a non-primary singleton judged by the
+    primary is fail-closed (an unsupported verdict OR a judge exception rejects
+    the representative), while a primary singleton sent to the SECONDARY
+    cross-family judge is demote-to-review (it ingests either way, only the
+    ``verified_by`` label changes).
+    """
+
+    entry: dict[str, Any]
+    judge_model: str
+    fail_closed: bool
+
+
+def _group_keep_alive(model: str, primary: str) -> int:
+    """keep_alive for one judge GROUP — the model must survive the whole group.
+
+    The phase keep-alive (`kb_drain_phase_keep_alive`, the knob
+    :func:`prefetch_extractions` already uses for its cohort phases) is the
+    FLOOR: the primary keeps its settings-driven residency when that is longer,
+    so a group never reloads mid-way. What this is NOT is the old
+    ``keep_alive=0`` on the secondary judge: that unloaded the judge after every
+    single call, so with one model slot each judgement paid a full cold load.
+
+    A NEGATIVE setting ("resident forever") is clamped to the phase value rather
+    than propagated. Under ``OLLAMA_MAX_LOADED_MODELS=1`` an unbounded pin holds
+    the only slot permanently: the next phase's model — the other judge, the next
+    cohort's extractor, or the embedder that runs straight after — waits for a
+    slot that can never free and dies on the client timeout, which reads as a
+    network fault rather than a residency bug. Measured 2026-07-29: that pin
+    stalled the whole drain, while a cold load costs 4-25s. Lengthening residency
+    is therefore NOT universally safe on a one-slot card, and this helper must
+    never be the thing that reintroduces the pin (Invariant 8, corrected).
+    """
+    resident = settings.kb_llm_keep_alive
+    phase = settings.kb_drain_phase_keep_alive
+    if model == primary and resident > phase:
+        return resident
+    return phase
+
+
+def _judge_by_model(pending: list[_Judgement], transcript: str, primary: str) -> int:
+    """Run every pending judgement MODEL-MAJOR, stamping verdicts onto the plan.
+
+    Groups the judgements by judge model and executes the groups sequentially,
+    issuing a group's `llm.verify_item` calls back to back so the model loads at
+    most once. Mutates each :class:`_Judgement`'s ``entry`` in place
+    (``verified_by`` / ``survives``) and returns the judge-error count; the
+    caller derives ``rejected_reps`` from the plan.
+    """
+    groups: dict[str, list[_Judgement]] = {}
+    for p in pending:
+        groups.setdefault(p.judge_model, []).append(p)
+
+    errors = 0
+    # Group order (deterministic): every non-primary judge first, alphabetically,
+    # and the PRIMARY model's group LAST. The primary is also the extractor
+    # primary and the only model Invariant 8 keeps resident, so ending on it
+    # leaves the right model on the card, and a run whose only judgements are
+    # primary-judged (no secondary judge configured) never swaps at all.
+    for model in sorted(groups, key=lambda m: (m == primary, m)):
+        batch = groups[model]
+        keep_alive = _group_keep_alive(model, primary)
+        logger.info(
+            "ensemble judge group: model=%s judgements=%d keep_alive=%s",
+            model,
+            len(batch),
+            keep_alive,
+        )
+        for p in batch:
+            item = p.entry["rep"]["item"]
+            try:
+                verdict = llm.verify_item(
+                    str(item.get("title") or ""),
+                    str(item.get("body") or ""),
+                    transcript,
+                    judge_model=model,
+                    keep_alive=keep_alive,
+                )
+            except (ExtractorUnavailable, ExtractionFailed) as e:
+                errors += 1
+                if p.fail_closed:
+                    # Fail-closed: a judge failure never ingests the singleton
+                    # but never aborts the run either.
+                    logger.warning("ensemble judge failed for %r: %s", item.get("title"), e)
+                    p.entry["survives"] = False
+                else:
+                    # Item still survives (primary-sourced).
+                    logger.warning("secondary judge failed for %r: %s", item.get("title"), e)
+                continue
+            supported = bool(verdict.get("supported"))
+            if p.fail_closed:
+                if supported:
+                    p.entry["verified_by"] = "primary-judge"
+                else:
+                    p.entry["survives"] = False
+            else:
+                p.entry["verified_by"] = (
+                    "secondary-judge" if supported else "secondary-judge-failed"
+                )
+    return errors
+
+
 def run_ensemble(
     text: str,
     project: str,
@@ -200,7 +312,9 @@ def run_ensemble(
     Orchestrates the measured pipeline: per-model extraction (primary resident,
     extras keep_alive=0, per-model isolation) → the EXACT v1 quote gate
     (:func:`kbworker.sessions.gate_quotes`) → greedy cosine clustering of the
-    quote-usable UNION → one representative per cluster → survivor policy (e).
+    quote-usable UNION → one representative per cluster → survivor policy (e),
+    whose judge calls are collected first and executed GROUPED BY JUDGE MODEL so
+    no run alternates between models on a one-slot card.
     Writes NOTHING: the caller (kbworker.sessions) decides shadow vs live
     ingestion from the returned report, which carries the counts, the survivor
     entries (each with its ``extraction_pipeline`` meta-enrichment and B1 repair
@@ -241,16 +355,25 @@ def run_ensemble(
     threshold = settings.kb_ensemble_cluster_threshold
     clusters = _cluster(entries, threshold) if entries else []
 
-    survivors: list[dict[str, Any]] = []
+    # PASS ONE — decide each cluster's fate WITHOUT calling a judge; judgements
+    # are only recorded so they can be batched by model (see _judge_by_model).
     cluster_detail: list[dict[str, Any]] = []
-    corroborated = judged = judge_errors = rejected_reps = 0
+    plan: list[dict[str, Any]] = []
+    pending: list[_Judgement] = []
+    corroborated = 0
     for members in clusters:
         found_by = list(dict.fromkeys(e["model"] for e in members))
         cluster_detail.append({"models": found_by, "size": len(members)})
         if len(found_by) >= 2:
             corroborated += 1
         rep = _representative(members, primary)
-        item = rep["item"]
+        entry: dict[str, Any] = {
+            "rep": rep,
+            "found_by": found_by,
+            "verified_by": "",
+            "survives": True,
+        }
+        plan.append(entry)
         # Survivor policy (e), checked in order; only non-primary singletons
         # ever reach the primary judge. Primary singletons additionally get a
         # SECONDARY cross-family judge when configured (granite4.1:8b passed
@@ -262,55 +385,41 @@ def run_ensemble(
         if rep["model"] == primary:
             # Corroborated primary reps keep the 'primary-source' label (the
             # pinned WP-B2 contract); corroboration merely SKIPS the judge.
-            verified_by = "primary-source"
+            # This also stands if the secondary judge ERRORS out below.
+            entry["verified_by"] = "primary-source"
             if len(found_by) < 2 and settings.kb_ensemble_secondary_judge:
-                judged += 1
-                try:
-                    verdict = llm.verify_item(
-                        str(item.get("title") or ""),
-                        str(item.get("body") or ""),
-                        text,
-                        judge_model=settings.kb_ensemble_secondary_judge,
-                        keep_alive=0,
-                    )
-                    verified_by = (
-                        "secondary-judge" if verdict.get("supported") else "secondary-judge-failed"
-                    )
-                except (ExtractorUnavailable, ExtractionFailed) as e:
-                    logger.warning("secondary judge failed for %r: %s", item.get("title"), e)
-                    judge_errors += 1  # item still survives (primary-sourced)
-        elif len(found_by) >= 2:
-            verified_by = "corroboration"
-        else:
-            judged += 1
-            try:
-                verdict = llm.verify_item(
-                    str(item.get("title") or ""),
-                    str(item.get("body") or ""),
-                    text,
-                    judge_model=primary,
+                pending.append(
+                    _Judgement(entry, settings.kb_ensemble_secondary_judge, fail_closed=False)
                 )
-            except (ExtractorUnavailable, ExtractionFailed) as e:
-                # Fail-closed: a judge failure never ingests the singleton but
-                # never aborts the run either.
-                logger.warning("ensemble judge failed for %r: %s", item.get("title"), e)
-                judge_errors += 1
-                rejected_reps += 1
-                continue
-            if not verdict.get("supported"):
-                rejected_reps += 1
-                continue
-            verified_by = "primary-judge"
+        elif len(found_by) >= 2:
+            entry["verified_by"] = "corroboration"
+        else:
+            pending.append(_Judgement(entry, primary, fail_closed=True))
+
+    # Judge model-major: one load per model per run, not one per alternation.
+    judged = len(pending)
+    judge_errors = _judge_by_model(pending, text, primary)
+
+    # PASS TWO — apply the verdicts. A rejected representative is exactly a
+    # fail-closed judgement that came back unsupported or errored.
+    survivors: list[dict[str, Any]] = []
+    rejected_reps = 0
+    for entry in plan:
+        if not entry["survives"]:
+            rejected_reps += 1
+            continue
+        rep = entry["rep"]
+        found_by = entry["found_by"]
         survivors.append(
             {
-                "item": item,
+                "item": rep["item"],
                 "repair": rep["repair"],
                 "model": rep["model"],
                 "extraction_pipeline": {
                     "found_by": found_by,
                     "corroboration": len(found_by),
                     "quote_state": "grounded" if rep["repair"] is None else "repaired",
-                    "verified_by": verified_by,
+                    "verified_by": entry["verified_by"],
                 },
             }
         )

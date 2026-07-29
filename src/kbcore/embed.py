@@ -7,6 +7,7 @@ after use (Invariant 8). ``KB_EMBED_DEVICE=cpu`` forces CPU as an escape hatch.
 from __future__ import annotations
 
 import logging
+import time
 
 import httpx
 
@@ -22,6 +23,37 @@ KEEP_ALIVE = "2m"
 # the server was still legitimately loading, and the drain recorded a failure for
 # a model that was about to be ready. Matching llm.py removes that mismatch.
 _TIMEOUT = httpx.Timeout(600.0, connect=10.0)
+# Circuit breaker for the optional remote embed host. Seconds a host stays
+# "down" after failing, before one call is allowed through to re-probe it. Short
+# enough that a gaming box coming back is picked up within a minute or two;
+# long enough that a drain does not pay the connect timeout on every call.
+_HOST_DOWN_SECONDS = 90.0
+_down_until: dict[str, float] = {}
+
+
+def _is_down(host: str) -> bool:
+    """True while ``host`` is inside its cooldown from a recent failure."""
+    return time.monotonic() < _down_until.get(host, 0.0)
+
+
+def _mark_down(host: str) -> None:
+    """Open the breaker for ``host`` — logged once per trip, not per call."""
+    if not _is_down(host):
+        logger.warning("embed host %s marked down for %.0fs", host, _HOST_DOWN_SECONDS)
+    _down_until[host] = time.monotonic() + _HOST_DOWN_SECONDS
+
+
+def _mark_up(host: str) -> None:
+    """Close the breaker after a success (the re-probe that got through)."""
+    if _down_until.pop(host, None) is not None:
+        logger.info("embed host %s is back", host)
+
+
+def reset_host_health() -> None:
+    """Forget all breaker state — for tests and for an explicit operator retry."""
+    _down_until.clear()
+
+
 # The INTERACTIVE budget. A user's kb_search must never inherit the drain's
 # patience: a wedged embedder blocking a prompt for ten minutes is a worse
 # failure than returning nothing. embed_query is the seam between the two, so
@@ -41,10 +73,7 @@ def _classify_embed_error(e: httpx.HTTPError, host: str | None = None) -> Except
     # Name the host that ACTUALLY failed. This used to hardcode settings.embed_url,
     # so a fallback failure reported the remote address and made a local problem
     # look like a network one — an hour of misdiagnosis waiting to happen.
-    msg = (
-        f"embedding call to {host or settings.embed_url} failed: "
-        f"{e.__class__.__name__}: {e}"
-    )
+    msg = f"embedding call to {host or settings.embed_url} failed: {e.__class__.__name__}: {e}"
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
         body = (e.response.text or "").lower()
@@ -92,11 +121,19 @@ def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> li
     hosts = [settings.embed_url]
     if settings.embed_url != settings.ollama_url.rstrip("/"):
         hosts.append(settings.ollama_url.rstrip("/"))
+    # Skip a host known to be down. Failover WITHOUT memory retries the dead box on
+    # every single call and pays the connect timeout each time: measured 2026-07-29,
+    # 73 consecutive fallbacks x 10s = 12 minutes of a drain spent waiting on a
+    # gaming PC, with the GPU sitting at 0% because the process was blocked on a
+    # socket rather than computing. Never skip the LAST host — it is the fallback of
+    # last resort, and a wrong "down" verdict there would fail the call outright.
+    hosts = [h for i, h in enumerate(hosts) if i == len(hosts) - 1 or not _is_down(h)]
     resp = None
     for i, host in enumerate(hosts):
         try:
             resp = httpx.post(f"{host}/api/embed", json=payload, timeout=timeout or _TIMEOUT)
             resp.raise_for_status()
+            _mark_up(host)
             if i:
                 # Observable on purpose: a silent fallback would hide the remote
                 # box being gone, which is the whole reason we made it observable.
@@ -111,6 +148,7 @@ def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> li
             # only on ConnectError meant the fallback never fired in the exact
             # scenario it was written for — verified against a dead LAN address,
             # which timed out at 48s and raised instead of falling back.
+            _mark_down(host)
             if i == len(hosts) - 1:
                 raise _classify_embed_error(e, host) from e
         except httpx.HTTPError as e:

@@ -189,9 +189,16 @@ def test_clustering_unions_across_models(monkeypatch):
         "granite singleton",
         "gemma singleton",
     }
-    # Invariant 8: extras unload immediately; the primary keeps the settings
-    # default (None sentinel = resident keep_alive).
-    assert {c["model"]: c["keep_alive"] for c in calls} == {"prime": None, "ex-a": 0, "ex-b": 0}
+    # Invariant 8 (amendment, corrected 2026-07-29): the primary keeps the
+    # settings default (None sentinel = resident keep_alive); EXTRAS ride the
+    # drain PHASE keep-alive, never 0. keep_alive=0 unloaded each extra the
+    # instant its call returned, so on a one-slot card the next run paid a full
+    # cold load for it — while the phase value costs nothing extra, because the
+    # next model requested evicts it anyway. Same knob prefetch_extractions uses,
+    # so the prefetched and non-prefetched paths cannot disagree.
+    ka = settings.kb_drain_phase_keep_alive
+    assert {c["model"]: c["keep_alive"] for c in calls} == {"prime": None, "ex-a": ka, "ex-b": ka}
+    assert all(c["keep_alive"] != 0 for c in calls if c["model"] != "prime")
 
 
 def test_cluster_threshold_sensitivity(monkeypatch):
@@ -790,3 +797,375 @@ def test_corroborated_reps_never_reach_a_judge_group(monkeypatch):
 
     assert judge_calls == []
     assert (report["corroborated"], report["judged"], report["judge_errors"]) == (1, 0, 0)
+
+
+# --------------------------------------------------------------------------
+# COHORT-WIDE judging (2026-07-29). Measured on the live drain: 50 ollama model
+# loads for 37 chat calls, alternating qwen3 -> granite -> qwen3 -> granite,
+# ~90% of wall clock spent loading (granite 4s, gemma 17s, qwen3 25s). Cause:
+# OLLAMA_MAX_LOADED_MODELS=1 plus judging that was model-major only WITHIN one
+# job, so a cohort of 8 jobs alternated ~16 times. Judging is now hoisted to
+# COHORT scope: plan every job (no chat calls), judge the whole cohort
+# model-major, then finish + ingest job by job.
+# --------------------------------------------------------------------------
+
+
+def _cohort_jobs(n: int) -> list[dict]:
+    """n jobs, each with ONE primary singleton (→ secondary judge) and ONE
+    non-primary singleton (→ primary judge, fail-closed).
+
+    Both judge kinds in every job is the adversarial shape: per-job judging must
+    alternate models once per job, so a cohort of n jobs collapses to 2n runs
+    unless the batching is genuinely cohort-wide.
+    """
+    jobs = []
+    for i in range(n):
+        jobs.append(
+            {
+                "i": i,
+                "text": f"{TEXT}\n\nJob {i} marker.",
+                "uri": f"test://wpb2/cohort/{i}",
+                "prime": _item(f"p{i}", f"primary singleton {i}", TMP_SPAN),
+                "extra": _item(f"a{i}", f"extra singleton {i}", RERANK_SPAN),
+            }
+        )
+    return jobs
+
+
+def _install_cohort_extractors(monkeypatch, jobs: list[dict]) -> list[dict]:
+    """Per-JOB extractor output, keyed by the job marker in the text.
+
+    Keyed by marker rather than by identity because the queue scrubs content
+    before storing it, so the drain hands back an equal-but-not-identical string.
+    """
+    by_index = {j["i"]: j for j in jobs}
+    calls: list[dict] = []
+
+    def fake(text, *, model=None, keep_alive=None):
+        job = by_index[int(text.rsplit("Job ", 1)[1].split(" ")[0])]
+        m = model or settings.kb_extract_model
+        calls.append({"model": m, "job": job["i"], "keep_alive": keep_alive})
+        if m == "prime":
+            return [dict(job["prime"])]
+        if m == "ex-a":
+            return [dict(job["extra"])]
+        return []
+
+    monkeypatch.setattr(llm, "extract_items", fake)
+    return calls
+
+
+def _all_supported(jobs: list[dict]) -> set[str]:
+    """Every item of every job judged SUPPORTED — isolates ordering/attribution
+    from verdict policy, which the single-job matrix tests already pin."""
+    return {j["prime"]["title"] for j in jobs} | {j["extra"]["title"] for j in jobs}
+
+
+def _install_dying_judge(
+    monkeypatch, *, supported=frozenset(), dies_at=None, content_errors=()
+) -> list[dict]:
+    """Judge fake that can go DARK (ExtractorUnavailable) from a given title on.
+
+    ``dies_at`` is a (judge_model, title) pair: that call and every later call to
+    that model raise ExtractorUnavailable — connectivity, not content. Titles in
+    ``content_errors`` raise ExtractionFailed instead (content-deterministic,
+    strictly per item).
+    """
+    calls: list[dict] = []
+    dead: set[str] = set()
+
+    def fake(title, body, transcript, *, judge_model=None, keep_alive=None):
+        calls.append({"title": title, "judge_model": judge_model, "keep_alive": keep_alive})
+        if judge_model in dead:
+            raise ExtractorUnavailable(f"{judge_model} is gone (test)")
+        if dies_at is not None and (judge_model, title) == dies_at:
+            dead.add(judge_model)
+            raise ExtractorUnavailable(f"{judge_model} died on {title} (test)")
+        if title in content_errors:
+            raise ExtractionFailed("judge blew up (test)")
+        return {"supported": title in supported, "reason": "test verdict"}
+
+    monkeypatch.setattr(llm, "verify_item", fake)
+    return calls
+
+
+def _cohort_env(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "second")
+
+
+def test_cohort_judging_is_one_contiguous_run_per_model_across_ALL_jobs(monkeypatch, caplog):
+    """THE requirement: a batch never swaps back to a model it already ran.
+
+    Each judge model appears in exactly ONE contiguous run across the ENTIRE
+    cohort, so loads per cohort are bounded by the number of distinct judge
+    models — not multiplied by the number of jobs.
+    """
+    _cohort_env(monkeypatch)
+    jobs = _cohort_jobs(4)
+    _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_judge(monkeypatch, supported=_all_supported(jobs))
+    caplog.set_level(logging.INFO, logger="kbworker.ensemble")
+
+    plans = [ensemble.plan_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    assert judge_calls == [], "planning must issue NO judge call — that is the whole point"
+
+    ensemble.judge_cohort(plans)
+
+    seq = [c["judge_model"] for c in judge_calls]
+    assert len(seq) == 8, "four primary singletons + four non-primary singletons"
+    assert _runs(seq) == ["second", "prime"], (
+        "each judge model must appear in exactly ONE contiguous run across the "
+        "whole cohort; a second run is a cold reload on a one-slot card"
+    )
+    assert len(_runs(seq)) == len({*seq}), "runs == distinct judge models, independent of job count"
+    # Plan-major within a group, cluster order within a plan: deterministic.
+    assert [c["title"] for c in judge_calls if c["judge_model"] == "second"] == [
+        f"p{i}" for i in range(4)
+    ]
+    assert [c["title"] for c in judge_calls if c["judge_model"] == "prime"] == [
+        f"a{i}" for i in range(4)
+    ]
+
+    reports = [ensemble.finish_ensemble(p) for p in plans]
+    for i, report in enumerate(reports):
+        labels = {
+            s["item"]["title"]: s["extraction_pipeline"]["verified_by"] for s in report["survivors"]
+        }
+        assert labels == {f"p{i}": "secondary-judge", f"a{i}": "primary-judge"}
+        assert (report["judged"], report["judge_errors"], report["rejected_reps"]) == (2, 0, 0)
+        assert report["uri"] == jobs[i]["uri"]
+
+    groups = [r.getMessage() for r in caplog.records if "ensemble judge group" in r.getMessage()]
+    assert len(groups) == 2, "one observable log line per judge group, per COHORT"
+    assert "model=second" in groups[0] and "judgements=4" in groups[0] and "plans=4" in groups[0]
+    assert "model=prime" in groups[1] and "judgements=4" in groups[1] and "plans=4" in groups[1]
+
+
+def test_cohort_judging_beats_per_job_judging_and_agrees_with_it_exactly(monkeypatch):
+    """Same verdicts, same counters, same labels — 2 model runs instead of 2N."""
+    _cohort_env(monkeypatch)
+    jobs = _cohort_jobs(3)
+    _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_judge(monkeypatch, supported=_all_supported(jobs))
+
+    plans = [ensemble.plan_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    ensemble.judge_cohort(plans)
+    cohort_reports = [ensemble.finish_ensemble(p) for p in plans]
+    cohort_runs = _runs([c["judge_model"] for c in judge_calls])
+
+    judge_calls.clear()
+    single_reports = [ensemble.run_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    single_runs = _runs([c["judge_model"] for c in judge_calls])
+
+    assert cohort_reports == single_reports, (
+        "the cohort path must be byte-identical to the single-job path it replaces"
+    )
+    assert cohort_runs == ["second", "prime"]
+    assert single_runs == ["second", "prime"] * 3, "per job: one alternation each (the old cost)"
+    assert len(cohort_runs) == 2 and len(single_runs) == 6
+
+
+def test_no_cohort_judge_call_uses_a_nonpositive_keep_alive(monkeypatch):
+    """keep_alive=0 unloads the judge after every call; a negative value pins the
+    only slot forever. Both stalled this pipeline; neither may come back."""
+    _cohort_env(monkeypatch)
+    monkeypatch.setattr(settings, "kb_llm_keep_alive", -1)  # "resident forever" — must be CLAMPED
+    jobs = _cohort_jobs(3)
+    _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_judge(monkeypatch, supported={f"a{i}" for i in range(3)})
+
+    plans = [ensemble.plan_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    ensemble.judge_cohort(plans)
+
+    assert len(judge_calls) == 6
+    assert all(isinstance(c["keep_alive"], int) for c in judge_calls)
+    assert all(c["keep_alive"] > 0 for c in judge_calls), "0 unloads, negative pins the slot"
+    assert all(c["keep_alive"] == settings.kb_drain_phase_keep_alive for c in judge_calls)
+
+
+def test_a_content_error_stays_per_item_across_the_whole_cohort(monkeypatch):
+    """ExtractionFailed is about THAT item's text: no neighbour, in any job, moves."""
+    _cohort_env(monkeypatch)
+    jobs = _cohort_jobs(3)
+    _install_cohort_extractors(monkeypatch, jobs)
+    _install_dying_judge(
+        monkeypatch,
+        supported=_all_supported(jobs),
+        content_errors=("a1", "p2"),
+    )
+
+    plans = [ensemble.plan_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    ensemble.judge_cohort(plans)
+    reports = [ensemble.finish_ensemble(p) for p in plans]
+
+    labels = [
+        {s["item"]["title"]: s["extraction_pipeline"]["verified_by"] for s in r["survivors"]}
+        for r in reports
+    ]
+    assert labels[0] == {"p0": "secondary-judge", "a0": "primary-judge"}, "untouched neighbour"
+    assert labels[1] == {"p1": "secondary-judge"}, "a1 is fail-closed: rejected, not ingested"
+    assert labels[2] == {"p2": "primary-source", "a2": "primary-judge"}, (
+        "a secondary-judge error still ingests the primary-sourced item"
+    )
+    # Attribution: job A's judge error must never surface in job B's counters.
+    assert [r["judge_errors"] for r in reports] == [0, 1, 1]
+    assert [r["rejected_reps"] for r in reports] == [0, 1, 0]
+    assert [r["judged"] for r in reports] == [2, 2, 2]
+
+
+def test_a_primary_judge_dying_mid_cohort_defers_only_the_jobs_it_never_reached(monkeypatch):
+    """Fail-closed means NEVER INGESTED WITHOUT A VERDICT. Verdicts stamped before
+    the model died stand; the jobs it never reached DEFER whole (the drain's
+    ExtractorUnavailable handler leaves attempts untouched) rather than silently
+    dropping every non-primary singleton in the cohort."""
+    _cohort_env(monkeypatch)
+    jobs = _cohort_jobs(4)
+    _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_dying_judge(
+        monkeypatch, supported={f"a{i}" for i in range(4)}, dies_at=("prime", "a2")
+    )
+
+    plans = [ensemble.plan_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    ensemble.judge_cohort(plans)
+
+    # The secondary group ran to completion BEFORE the primary group started, so
+    # a dead primary judge costs it nothing.
+    assert [c["title"] for c in judge_calls if c["judge_model"] == "second"] == [
+        f"p{i}" for i in range(4)
+    ]
+    # ...and the dead group is ABANDONED at the first connectivity failure: a3 is
+    # never attempted, because it would fail identically.
+    assert [c["title"] for c in judge_calls if c["judge_model"] == "prime"] == ["a0", "a1", "a2"]
+
+    for i in (0, 1):
+        report = ensemble.finish_ensemble(plans[i])
+        assert {s["item"]["title"] for s in report["survivors"]} == {f"p{i}", f"a{i}"}
+        assert report["judge_errors"] == 0
+    for i in (2, 3):
+        with pytest.raises(ExtractorUnavailable) as excinfo:
+            ensemble.finish_ensemble(plans[i])
+        assert "prime" in str(excinfo.value), "the deferred row's error names the judge that died"
+        assert plans[i].judge_errors == 1
+
+
+def test_a_dead_secondary_judge_never_drops_a_primary_item_or_costs_the_primary_group(monkeypatch):
+    """Demote-to-review holds cohort-wide: every job still PROCEEDS."""
+    _cohort_env(monkeypatch)
+    jobs = _cohort_jobs(3)
+    _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_dying_judge(
+        monkeypatch, supported={f"a{i}" for i in range(3)}, dies_at=("second", "p0")
+    )
+
+    plans = [ensemble.plan_ensemble(j["text"], "proj", j["uri"]) for j in jobs]
+    ensemble.judge_cohort(plans)
+    reports = [ensemble.finish_ensemble(p) for p in plans]  # no job defers
+
+    assert [c["title"] for c in judge_calls] == ["p0", "a0", "a1", "a2"], (
+        "the secondary group is abandoned at the first failure; the PRIMARY group "
+        "still runs in full — one dead judge must not cost the other its group"
+    )
+    for i, report in enumerate(reports):
+        labels = {
+            s["item"]["title"]: s["extraction_pipeline"]["verified_by"] for s in report["survivors"]
+        }
+        assert labels == {f"p{i}": "primary-source", f"a{i}": "primary-judge"}
+        assert (report["judge_errors"], report["rejected_reps"]) == (1, 0)
+
+
+def test_a_cohort_prefetch_that_lost_the_primary_defers_instead_of_degrading(monkeypatch):
+    """A primary-less prefetch used to produce a silent primary-less report: no
+    extractor errors, no corroboration, every extra item a fail-closed singleton
+    judged by the SAME dead primary. It now fails like a primary extractor
+    failure, so the drain defers the group."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    _install_extractors(monkeypatch, {"prime": [P_ONLY], "ex-a": [A_ONLY]})
+    _install_judge(monkeypatch)
+
+    with pytest.raises(ExtractorUnavailable):
+        ensemble.plan_ensemble(TEXT, "proj", "test://wpb2/lostprimary", pre_extracted={"ex-a": []})
+    # A prefetch that HAS the primary is used as-is (no re-extraction).
+    plan = ensemble.plan_ensemble(
+        TEXT, "proj", "test://wpb2/goodprefetch", pre_extracted={"prime": [dict(P_ONLY)]}
+    )
+    assert plan.partial["candidates"] == {"prime": 1}
+
+
+def test_judge_cohort_tolerates_an_empty_cohort(monkeypatch):
+    assert ensemble.judge_cohort([]) == []
+
+
+def test_the_drain_judges_a_whole_cohort_model_major_end_to_end(monkeypatch, caplog):
+    """The two-level proof: ingestion sits ONE LINE after judging inside the
+    per-job call, so an ensemble-only split would not have batched anything. The
+    drain must plan the cohort, judge the cohort, then ingest job by job."""
+    from kbcore import ingest_queue
+
+    _cohort_env(monkeypatch)
+    monkeypatch.setattr(settings, "kb_ensemble_shadow", False)
+    monkeypatch.setattr(settings, "kb_drain_cohort", 8)
+    assert ensemble.mode() == "live"
+
+    jobs = _cohort_jobs(3)
+    extract_calls = _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_judge(monkeypatch, supported=_all_supported(jobs))
+    for job in jobs:
+        ingest_queue.enqueue("cohort-live", job["text"], kind="memory", source_uri=job["uri"])
+    caplog.set_level(logging.INFO, logger="kbworker.ensemble")
+
+    drained, saved = consolidate._drain_ingest_queue()
+
+    assert (drained, saved) == (3, 6), "every row drained; both survivors of each job ingested"
+    # Extraction: model-major across the cohort (the phase that already worked).
+    assert [c["model"] for c in extract_calls] == ["prime"] * 3 + ["ex-a"] * 3
+    # Judging: model-major across the cohort — 2 runs for 3 jobs, not 6.
+    seq = [c["judge_model"] for c in judge_calls]
+    assert len(seq) == 6
+    assert _runs(seq) == ["second", "prime"], "the drain still alternated per job"
+    groups = [r.getMessage() for r in caplog.records if "ensemble judge group" in r.getMessage()]
+    assert len(groups) == 2 and all("plans=3" in g for g in groups)
+
+    items = _session_items()
+    assert set(items) == {f"p{i}" for i in range(3)} | {f"a{i}" for i in range(3)}
+    assert items["a0"].meta["extraction_pipeline"]["verified_by"] == "primary-judge"
+    assert items["p0"].meta["extraction_pipeline"]["verified_by"] == "secondary-judge"
+    # Observable from the run report, not from journald archaeology.
+    st = consolidate._COHORT_STATS
+    assert (st["cohort_plans"], st["cohort_plan_failures"]) == (3, 0)
+    assert (st["cohort_judge_batches"], st["cohort_judge_failures"]) == (1, 0)
+
+
+def test_a_broken_cohort_judge_pass_falls_back_per_job_instead_of_ingesting_unjudged(monkeypatch):
+    """Plans are mutated in place, so half-judged plans must NEVER be finished:
+    an unjudged non-primary singleton would ingest as if approved."""
+    from kbcore import ingest_queue
+
+    _cohort_env(monkeypatch)
+    monkeypatch.setattr(settings, "kb_ensemble_shadow", False)
+    monkeypatch.setattr(settings, "kb_drain_cohort", 8)
+    jobs = _cohort_jobs(2)
+    _install_cohort_extractors(monkeypatch, jobs)
+    judge_calls = _install_judge(monkeypatch, supported=_all_supported(jobs))
+    for job in jobs:
+        ingest_queue.enqueue("cohort-boom", job["text"], kind="memory", source_uri=job["uri"])
+
+    real = ensemble.judge_cohort
+
+    def boom(plans):
+        # Only the COHORT pass explodes; the per-job fallback (run_ensemble's
+        # cohort of one) must still work, which is the point of the fallback.
+        if len(plans) > 1:
+            for p in plans:  # leave them corrupt, exactly like a partial pass
+                p.pending.clear()
+            raise RuntimeError("judge layer exploded (test)")
+        return real(plans)
+
+    monkeypatch.setattr(ensemble, "judge_cohort", boom)
+    drained, saved = consolidate._drain_ingest_queue()
+
+    assert consolidate._COHORT_STATS["cohort_judge_failures"] == 1
+    assert (drained, saved) == (2, 4), "the per-job path re-judged from scratch and ingested"
+    items = _session_items()
+    assert items["a0"].meta["extraction_pipeline"]["verified_by"] == "primary-judge"
+    assert all(c["judge_model"] in ("second", "prime") for c in judge_calls)

@@ -14,7 +14,7 @@ import shutil
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kbcore import (
     consolidation,
@@ -34,6 +34,9 @@ from kbcore.ingest import ingest
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
 from kbworker import ensemble, eval_sentinel, sessions
+
+if TYPE_CHECKING:
+    from kbworker.judging import EnsemblePlan
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -73,34 +76,214 @@ def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
 _COHORT_STATS: dict[str, int] = {}
 
 
+def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One JOB per coalesced group, with its text assembled EXACTLY ONCE.
+
+    COALESCED BY SESSION. The network path windows RAW JSONL at 900 KB while the
+    local path assembles to text first, so the same session arrives as ~42x more
+    rows over MCP/REST (measured: 114 MB of JSONL is 2.7 MB of conversation —
+    350 rows vs 9 for a 300 MB session). Extracting each raw window separately
+    spent the whole 200-row nightly budget on one session and fed the 14B mostly
+    JSON scaffolding. Concatenating a session's rows and assembling ONCE restores
+    the local path's behaviour. Row order is the hook's byte order (it submits
+    sequential offsets), so plain concatenation reconstitutes the delta.
+
+    The cohort phases and the ingest pass now share this ONE assembly, so the
+    text a judge saw is provably the text stored as the item's ``raw`` (it used
+    to be assembled twice, in two places). Per-group isolation as everywhere else
+    in the drain: a group that will not assemble is marked failed, never fatal.
+    """
+    jobs: list[dict[str, Any]] = []
+    for group in groups:
+        rows = group["rows"]
+        row = rows[0]
+        ids = [r["id"] for r in rows]
+        try:
+            meta = row["meta"] or {}
+            text = sessions.assemble_text("".join(r["content"] for r in rows), row["kind"])
+            jobs.append(
+                {
+                    "key": group["uri"],  # cohort key: the coalescing group id
+                    "ids": ids,
+                    "project": row["project"],
+                    "uri": meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}",
+                    "branch": meta.get("branch"),
+                    "text": text,
+                    # FIX 6 (audit 2026-07-26): a queued session/memory window
+                    # anchors no FILE — repo/commit ride the item meta as
+                    # provenance instead of a phantom {"path": "."} code_ref.
+                    "detail": {
+                        "ingest_queue_id": row["id"],
+                        "source": row["kind"],
+                        **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
+                    },
+                    "extra_meta": sessions._session_provenance(
+                        meta.get("repo"), meta.get("commit")
+                    ),
+                }
+            )
+        except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
+            logger.exception("assembling ingest_queue group %s failed", ids)
+            for rid in ids:
+                ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
+    return jobs
+
+
+def _cohort_prepare(
+    batch: list[dict[str, Any]],
+) -> tuple[dict[str, dict], dict[str, EnsemblePlan]]:
+    """The three MODEL-MAJOR phases for one cohort batch, before any ingest.
+
+    Phase 1 EXTRACT (``prefetch_extractions``): every extractor, model-major
+    across the batch. Phase 2 PLAN (``plan_ensemble``): gate + cluster + policy,
+    which touches only the EMBEDDER. Phase 3 JUDGE (``judge_cohort``): every
+    job's judgements grouped by judge model, so each judge loads ONCE for the
+    whole batch instead of once per job. Measured 2026-07-29: the drain issued 50
+    model loads for 37 chat calls because judging alternated per job.
+
+    Returns ``({key: pre_extracted}, {key: EnsemblePlan})``. EVERY phase is
+    swallow-and-count: a job with no plan simply falls back to the per-job path,
+    which is exactly today's behaviour. Cohorting is an optimisation, and an
+    optimisation that can break the drain is not one.
+    """
+    pre_by_key: dict[str, dict] = {}
+    plan_by_key: dict[str, EnsemblePlan] = {}
+    try:
+        texts = [job["text"] for job in batch]
+        for job, pre in zip(batch, ensemble.prefetch_extractions(texts), strict=True):
+            pre_by_key[job["key"]] = pre
+        _COHORT_STATS["cohort_batches"] += 1
+        _COHORT_STATS["cohort_jobs"] += len(batch)
+        logger.warning(
+            "cohort prefetch: batch %d, %d job(s) — each extractor loaded once",
+            _COHORT_STATS["cohort_batches"],
+            len(batch),
+        )
+    except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
+        _COHORT_STATS["cohort_failures"] += 1
+        logger.warning("cohort prefetch failed; falling back per job", exc_info=True)
+        return pre_by_key, plan_by_key
+
+    for job in batch:
+        pre = pre_by_key.get(job["key"])
+        if pre is None:
+            continue  # no prefetch for this job — the per-job path owns it
+        try:
+            plan_by_key[job["key"]] = ensemble.plan_ensemble(
+                job["text"],
+                job["project"],
+                job["uri"],
+                code_ref=None,
+                branch=job["branch"],
+                extra_detail=job["detail"],
+                pre_extracted=pre,
+            )
+        except Exception as e:  # noqa: BLE001 — one unplannable job falls back, alone
+            _COHORT_STATS["cohort_plan_failures"] += 1
+            logger.warning(
+                "cohort plan failed for %s (%s: %s); falling back per job",
+                job["uri"],
+                type(e).__name__,
+                e,
+            )
+    _COHORT_STATS["cohort_plans"] += len(plan_by_key)
+
+    if plan_by_key:
+        try:
+            ensemble.judge_cohort(list(plan_by_key.values()))
+            _COHORT_STATS["cohort_judge_batches"] += 1
+        except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
+            # Plans are mutated in place, so a half-judged plan would ingest
+            # UNJUDGED representatives as if approved. Drop them all: the per-job
+            # path re-judges from scratch, which is today's behaviour.
+            _COHORT_STATS["cohort_judge_failures"] += 1
+            logger.warning("cohort judging failed; falling back per job", exc_info=True)
+            plan_by_key.clear()
+    return pre_by_key, plan_by_key
+
+
+def _drain_job(
+    job: dict[str, Any], *, pre_extracted: dict | None, planned: EnsemblePlan | None
+) -> tuple[int, int]:
+    """Extract+ingest ONE coalesced group. Owns the queue self-heal taxonomy.
+
+    Returns ``(rows_drained, items_saved)`` — ``(0, 0)`` for any failure, which is
+    isolated here so one bad submission never aborts the drain.
+    """
+    ids = job["ids"]
+    try:
+        saved, rejected = sessions.extract_and_ingest(
+            job["text"],
+            job["project"],
+            job["uri"],
+            pre_extracted=pre_extracted,
+            planned=planned,
+            code_ref=None,
+            branch=job["branch"],
+            extra_detail=job["detail"],
+            extra_meta=job["extra_meta"],
+        )
+        # All-or-nothing: a group extracted once must never leave rows
+        # pending for a second, partial extraction of the same session.
+        ingest_queue.mark_group_extracted(ids, saved, rejected)
+        return len(ids), saved
+    except (ExtractorUnavailable, EmbedderUnavailable) as e:
+        # CONNECTIVITY (Ollama down/restarting/model-not-loaded during the
+        # nightly window — including a judge that went dark mid-cohort, which
+        # leaves fail-closed representatives without a verdict): do NOT
+        # mark_failed — leave the row 'pending' with attempts UNCHANGED so an
+        # outage never burns a row's retry budget; the next run retries once the
+        # model is back. mark_deferred bumps a bounded deferral counter and, if a
+        # "transient" failure never heals (a payload-deterministic 5xx /
+        # mid-response crash), escalates the row to 'failed' so it can't re-drain
+        # every night forever (review finding). Every row in the group, not just
+        # the first: deferring one and leaving the rest pending would split the
+        # session and extract it in pieces on the next run — the exact thing
+        # coalescing prevents.
+        escalated = [
+            rid for rid in ids if ingest_queue.mark_deferred(rid, f"{type(e).__name__}: {e}")
+        ]
+        if escalated:
+            logger.error(
+                "rows %s escalated to failed after %d deferrals (transient never healed): %s",
+                escalated,
+                ingest_queue.DEFERRAL_CAP,
+                e,
+            )
+        else:
+            logger.warning("%d row(s) deferred (extractor/embedder unavailable): %s", len(ids), e)
+    except ExtractionFailed as e:
+        # CONTENT-DETERMINISTIC (unparseable output, unterminated <think>, a
+        # per-row read timeout, a 4xx): re-running the 14B on this exact row
+        # fails identically, so bound it with the attempts cap instead of
+        # retrying every nightly run forever (queue self-heal taxonomy).
+        logger.warning("group %s extraction failed (content): %s", ids, e)
+        for rid in ids:
+            ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
+    except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
+        logger.exception("draining ingest_queue group %s failed", ids)
+        for rid in ids:
+            ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
+    return 0, 0
+
+
 def _drain_ingest_queue() -> tuple[int, int]:
     """Step 0: extract queued remote submissions — the ONLY place the 14B runs on
-    remote content (Invariant 8). Per-row isolation: one bad row logs + continues.
+    remote content (Invariant 8). Per-group isolation: one bad group logs + continues.
+
+    THREE PASSES PER COHORT (2026-07-29), then ingest job by job. Batching is per
+    cohort and never per run: the crash window stays one cohort wide (the same
+    exposure the extraction prefetch already had) and only ``kb_drain_cohort``
+    plans — each pinning its transcript — are live at once. Ingest and
+    ``mark_group_extracted`` deliberately stay per job: batching those would
+    widen the pre-existing "written but still pending" window for real.
 
     Returns ``(rows_drained, items_saved)``.
     """
-    drained = 0
-    saved_total = 0
-    # COALESCED BY SESSION. The network path windows RAW JSONL at 900 KB while
-    # the local path assembles to text first, so the same session arrives as ~42x
-    # more rows over MCP/REST (measured: 114 MB of JSONL is 2.7 MB of
-    # conversation — 350 rows vs 9 for a 300 MB session). Extracting each raw
-    # window separately spent the whole 200-row nightly budget on one session and
-    # fed the 14B mostly JSON scaffolding. Concatenating a session's rows and
-    # assembling ONCE restores the local path's behaviour.
     groups = ingest_queue.pending_groups(limit=QUEUE_BATCH)
+    jobs = _assemble_jobs(groups)
 
-    # COHORT PREFETCH. With one model slot on the card, every switch is a full
-    # load, so extracting model-major across a cohort turns ~3 extractor loads
-    # per row into ~3 per cohort. Only the extraction phase is batched; gating,
-    # clustering, judging and ingest stay strictly per job, so per-job failure
-    # isolation and the review/dedupe semantics are untouched.
-    #
-    # A prefetch failure is NEVER fatal: pre stays None and every job falls back
-    # to extracting for itself, which is exactly today's behaviour. Cohorting is
-    # an optimisation, and an optimisation that can break the drain is not one.
     cohort = max(1, int(settings.kb_drain_cohort))
-    pre_by_uri: dict[str, dict] = {}
     _COHORT_STATS.clear()
     _COHORT_STATS.update(
         {
@@ -108,103 +291,29 @@ def _drain_ingest_queue() -> tuple[int, int]:
             "cohort_batches": 0,
             "cohort_jobs": 0,
             "cohort_failures": 0,
+            "cohort_plans": 0,
+            "cohort_plan_failures": 0,
+            "cohort_judge_batches": 0,
+            "cohort_judge_failures": 0,
             "cohort_eligible": len(groups),
             "cohort_mode": ensemble.mode(),
         }
     )
-    if cohort > 1 and ensemble.mode() == "live" and groups:
-        for start in range(0, len(groups), cohort):
-            batch = groups[start : start + cohort]
-            texts, keys = [], []
-            for g in batch:
-                r0 = g["rows"][0]
-                texts.append(
-                    sessions.assemble_text("".join(r["content"] for r in g["rows"]), r0["kind"])
-                )
-                keys.append(g["uri"])
-            try:
-                for key, pre in zip(keys, ensemble.prefetch_extractions(texts), strict=True):
-                    pre_by_uri[key] = pre
-                _COHORT_STATS["cohort_batches"] += 1
-                _COHORT_STATS["cohort_jobs"] += len(batch)
-                logger.warning(
-                    "cohort prefetch: batch %d, %d job(s) — each extractor loaded once",
-                    _COHORT_STATS["cohort_batches"],
-                    len(batch),
-                )
-            except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
-                _COHORT_STATS["cohort_failures"] += 1
-                logger.warning("cohort prefetch failed; falling back per job", exc_info=True)
+    cohorting = cohort > 1 and ensemble.mode() == "live" and bool(jobs)
+    batches = [jobs[i : i + cohort] for i in range(0, len(jobs), cohort)] if cohorting else [jobs]
 
-    for group in groups:
-        rows = group["rows"]
-        row = rows[0]
-        ids = [r["id"] for r in rows]
-        try:
-            # Row order is the hook's byte order (it submits sequential offsets),
-            # so plain concatenation reconstitutes the delta before assembly.
-            text = sessions.assemble_text("".join(r["content"] for r in rows), row["kind"])
-            meta = row["meta"] or {}
-            uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
-            saved, rejected = sessions.extract_and_ingest(
-                text,
-                row["project"],
-                uri,
-                pre_extracted=pre_by_uri.get(group["uri"]),
-                # FIX 6 (audit 2026-07-26): a queued session/memory window anchors
-                # no FILE — repo/commit ride the item meta as provenance instead of
-                # a phantom {"path": "."} code_ref.
-                code_ref=None,
-                branch=meta.get("branch"),
-                extra_detail={
-                    "ingest_queue_id": row["id"],
-                    "source": row["kind"],
-                    **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
-                },
-                extra_meta=sessions._session_provenance(meta.get("repo"), meta.get("commit")),
+    drained = 0
+    saved_total = 0
+    for batch in batches:
+        pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
+        for job in batch:
+            rows, saved = _drain_job(
+                job,
+                pre_extracted=pre_by_key.get(job["key"]),
+                planned=plan_by_key.get(job["key"]),
             )
-            # All-or-nothing: a group extracted once must never leave rows
-            # pending for a second, partial extraction of the same session.
-            ingest_queue.mark_group_extracted(ids, saved, rejected)
-            drained += len(ids)
+            drained += rows
             saved_total += saved
-        except (ExtractorUnavailable, EmbedderUnavailable) as e:
-            # CONNECTIVITY (Ollama down/restarting/model-not-loaded during the
-            # nightly window): do NOT mark_failed — leave the row 'pending' with
-            # attempts UNCHANGED so an outage never burns a row's retry budget; the
-            # next run retries once the model is back. mark_deferred bumps a bounded
-            # deferral counter and, if a "transient" failure never heals (a
-            # payload-deterministic 5xx / mid-response crash), escalates the row to
-            # 'failed' so it can't re-drain every night forever (review finding).
-            # Every row in the group, not just the first: deferring one and
-            # leaving the rest pending would split the session and extract it in
-            # pieces on the next run — the exact thing coalescing prevents.
-            escalated = [
-                rid for rid in ids if ingest_queue.mark_deferred(rid, f"{type(e).__name__}: {e}")
-            ]
-            if escalated:
-                logger.error(
-                    "rows %s escalated to failed after %d deferrals (transient never healed): %s",
-                    escalated,
-                    ingest_queue.DEFERRAL_CAP,
-                    e,
-                )
-            else:
-                logger.warning(
-                    "%d row(s) deferred (extractor/embedder unavailable): %s", len(ids), e
-                )
-        except ExtractionFailed as e:
-            # CONTENT-DETERMINISTIC (unparseable output, unterminated <think>, a
-            # per-row read timeout, a 4xx): re-running the 14B on this exact row
-            # fails identically, so bound it with the attempts cap instead of
-            # retrying every nightly run forever (queue self-heal taxonomy).
-            logger.warning("group %s extraction failed (content): %s", ids, e)
-            for rid in ids:
-                ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
-        except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
-            logger.exception("draining ingest_queue group %s failed", ids)
-            for rid in ids:
-                ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
     return drained, saved_total
 
 

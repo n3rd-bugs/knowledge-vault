@@ -22,26 +22,35 @@ Measured design (MODEL_RESEARCH_2026-07.md addendum 2, owner-approved
   never block primary-sourced or corroborated items — those never reach the
   judge.
 
-GPU courtesy (Invariant 8): only the primary stays resident (settings-driven
-keep_alive); every EXTRA extractor runs keep_alive=0. JUDGING is MODEL-MAJOR
-(2026-07-29): with OLLAMA_MAX_LOADED_MODELS=1 the card holds one model, so the
-judgements a run needs are collected first, GROUPED by judge model and executed
-group by group — each judge model loads at most once per run instead of once per
-alternation. This module COMPUTES and REPORTS only — it imports no DB machinery
-and never writes. kbworker.sessions owns all ingest wiring, which is what makes
-shadow mode safe by construction.
+GPU courtesy (Invariant 8): only the primary is kept resident by the settings
+default; every EXTRA extractor runs with the DRAIN PHASE keep-alive
+(`kb_drain_phase_keep_alive`), never 0 — under OLLAMA_MAX_LOADED_MODELS=1 a
+keep_alive=0 unloads the model the instant its phase ends, so the next call to
+it pays a full cold load (Invariant 8 amendment, corrected 2026-07-29).
+JUDGING is MODEL-MAJOR and COHORT-WIDE: the judgements are collected first and
+executed grouped by judge model by :mod:`kbworker.judging`, across every job in
+a drain cohort, so each judge model loads at most ONCE per cohort instead of
+once per alternation. This module COMPUTES and REPORTS only — it imports no DB
+machinery and never writes. kbworker.sessions owns all ingest wiring, which is
+what makes shadow mode safe by construction.
+
+Three-stage shape (2026-07-29): :func:`plan_ensemble` (no chat call at all once
+extraction is prefetched) → :func:`kbworker.judging.judge_cohort` (every job's
+judgements, model-major) → :func:`finish_ensemble` (no model call). The drain
+runs the three across a whole cohort; :func:`run_ensemble` is the single-job
+wrapper over them and keeps its exact signature, return shape and semantics.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
 from typing import Any
 
 from kbcore import embed, llm
 from kbcore.config import settings
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
+from kbworker.judging import EnsemblePlan, Judgement, judge_cohort
 from kbworker.sessions import MAX_GATE_REASONS, gate_quotes
 
 logger = logging.getLogger("kbworker.ensemble")
@@ -105,9 +114,16 @@ def _extract_all(
 
     The primary uses the settings-driven keep_alive (resident by default) and a
     primary failure RAISES with the v1 taxonomy (ExtractorUnavailable /
-    ExtractionFailed — the queue drain owns retry semantics). Extras run
-    keep_alive=0 (Invariant 8: only the primary stays resident) and a failing
-    extra logs + is skipped, never aborting the run.
+    ExtractionFailed — the queue drain owns retry semantics). Extras run with the
+    DRAIN PHASE keep-alive and a failing extra logs + is skipped, never aborting
+    the run.
+
+    Extras used to run ``keep_alive=0``. On a one-slot card that is strictly
+    worse than the phase value: the model unloads the moment its call returns, so
+    the NEXT run reloads it from cold, while the phase keep-alive costs nothing
+    extra (the next model to be requested evicts it anyway — one slot). Same knob
+    :func:`prefetch_extractions` uses, so the prefetched and non-prefetched paths
+    can no longer disagree about residency (Invariant 8 amendment, 2026-07-29).
     """
     if pre is not None:
         return dict(pre), []
@@ -115,7 +131,9 @@ def _extract_all(
     failed: list[str] = []
     for m in extras:
         try:
-            per_model[m] = llm.extract_items(text, model=m, keep_alive=0)
+            per_model[m] = llm.extract_items(
+                text, model=m, keep_alive=settings.kb_drain_phase_keep_alive
+            )
         except (ExtractorUnavailable, ExtractionFailed) as e:
             logger.warning("ensemble extractor %s skipped: %s", m, e)
             failed.append(m)
@@ -174,8 +192,12 @@ def prefetch_extractions(texts: list[str]) -> list[dict[str, list[dict[str, Any]
 
     A model that fails is recorded as absent for EVERY text in the cohort — the
     same "skip the extra, never abort the run" rule the per-row path uses. The
-    primary is NOT special-cased here: a primary failure surfaces per text when
-    run_ensemble finds it missing, so one bad cohort cannot mask it.
+    primary is NOT special-cased here; :func:`plan_ensemble` raises
+    ExtractorUnavailable per text when the primary is missing from a prefetch, so
+    one bad cohort cannot mask it (that claim used to be made here and was FALSE:
+    a dead primary produced a silently primary-less report with no extractor
+    errors, turning every extra item into a fail-closed singleton judged by the
+    dead primary).
     """
     primary = settings.kb_extract_model
     extras = list(dict.fromkeys(m for m in settings.extract_ensemble if m != primary))
@@ -190,114 +212,7 @@ def prefetch_extractions(texts: list[str]) -> list[dict[str, list[dict[str, Any]
     return out
 
 
-@dataclass
-class _Judgement:
-    """One DEFERRED judge call: which cluster plan entry it decides, by which
-    model, and under which failure semantics.
-
-    ``fail_closed`` is the whole reason the two branches stay distinguishable
-    after the judge loop was reordered: a non-primary singleton judged by the
-    primary is fail-closed (an unsupported verdict OR a judge exception rejects
-    the representative), while a primary singleton sent to the SECONDARY
-    cross-family judge is demote-to-review (it ingests either way, only the
-    ``verified_by`` label changes).
-    """
-
-    entry: dict[str, Any]
-    judge_model: str
-    fail_closed: bool
-
-
-def _group_keep_alive(model: str, primary: str) -> int:
-    """keep_alive for one judge GROUP — the model must survive the whole group.
-
-    The phase keep-alive (`kb_drain_phase_keep_alive`, the knob
-    :func:`prefetch_extractions` already uses for its cohort phases) is the
-    FLOOR: the primary keeps its settings-driven residency when that is longer,
-    so a group never reloads mid-way. What this is NOT is the old
-    ``keep_alive=0`` on the secondary judge: that unloaded the judge after every
-    single call, so with one model slot each judgement paid a full cold load.
-
-    A NEGATIVE setting ("resident forever") is clamped to the phase value rather
-    than propagated. Under ``OLLAMA_MAX_LOADED_MODELS=1`` an unbounded pin holds
-    the only slot permanently: the next phase's model — the other judge, the next
-    cohort's extractor, or the embedder that runs straight after — waits for a
-    slot that can never free and dies on the client timeout, which reads as a
-    network fault rather than a residency bug. Measured 2026-07-29: that pin
-    stalled the whole drain, while a cold load costs 4-25s. Lengthening residency
-    is therefore NOT universally safe on a one-slot card, and this helper must
-    never be the thing that reintroduces the pin (Invariant 8, corrected).
-    """
-    resident = settings.kb_llm_keep_alive
-    phase = settings.kb_drain_phase_keep_alive
-    if model == primary and resident > phase:
-        return resident
-    return phase
-
-
-def _judge_by_model(pending: list[_Judgement], transcript: str, primary: str) -> int:
-    """Run every pending judgement MODEL-MAJOR, stamping verdicts onto the plan.
-
-    Groups the judgements by judge model and executes the groups sequentially,
-    issuing a group's `llm.verify_item` calls back to back so the model loads at
-    most once. Mutates each :class:`_Judgement`'s ``entry`` in place
-    (``verified_by`` / ``survives``) and returns the judge-error count; the
-    caller derives ``rejected_reps`` from the plan.
-    """
-    groups: dict[str, list[_Judgement]] = {}
-    for p in pending:
-        groups.setdefault(p.judge_model, []).append(p)
-
-    errors = 0
-    # Group order (deterministic): every non-primary judge first, alphabetically,
-    # and the PRIMARY model's group LAST. The primary is also the extractor
-    # primary and the only model Invariant 8 keeps resident, so ending on it
-    # leaves the right model on the card, and a run whose only judgements are
-    # primary-judged (no secondary judge configured) never swaps at all.
-    for model in sorted(groups, key=lambda m: (m == primary, m)):
-        batch = groups[model]
-        keep_alive = _group_keep_alive(model, primary)
-        logger.info(
-            "ensemble judge group: model=%s judgements=%d keep_alive=%s",
-            model,
-            len(batch),
-            keep_alive,
-        )
-        for p in batch:
-            item = p.entry["rep"]["item"]
-            try:
-                verdict = llm.verify_item(
-                    str(item.get("title") or ""),
-                    str(item.get("body") or ""),
-                    transcript,
-                    judge_model=model,
-                    keep_alive=keep_alive,
-                )
-            except (ExtractorUnavailable, ExtractionFailed) as e:
-                errors += 1
-                if p.fail_closed:
-                    # Fail-closed: a judge failure never ingests the singleton
-                    # but never aborts the run either.
-                    logger.warning("ensemble judge failed for %r: %s", item.get("title"), e)
-                    p.entry["survives"] = False
-                else:
-                    # Item still survives (primary-sourced).
-                    logger.warning("secondary judge failed for %r: %s", item.get("title"), e)
-                continue
-            supported = bool(verdict.get("supported"))
-            if p.fail_closed:
-                if supported:
-                    p.entry["verified_by"] = "primary-judge"
-                else:
-                    p.entry["survives"] = False
-            else:
-                p.entry["verified_by"] = (
-                    "secondary-judge" if supported else "secondary-judge-failed"
-                )
-    return errors
-
-
-def run_ensemble(
+def plan_ensemble(
     text: str,
     project: str,
     uri: str,
@@ -306,20 +221,20 @@ def run_ensemble(
     branch: str | None = None,
     extra_detail: dict[str, Any] | None = None,
     pre_extracted: dict[str, list[dict[str, Any]]] | None = None,
-) -> dict[str, Any]:
-    """Extract with every configured model, converge, verify — REPORT only.
+) -> EnsemblePlan:
+    """Everything before the judge: extract → quote-gate → cluster → PASS ONE.
 
-    Orchestrates the measured pipeline: per-model extraction (primary resident,
-    extras keep_alive=0, per-model isolation) → the EXACT v1 quote gate
-    (:func:`kbworker.sessions.gate_quotes`) → greedy cosine clustering of the
-    quote-usable UNION → one representative per cluster → survivor policy (e),
-    whose judge calls are collected first and executed GROUPED BY JUDGE MODEL so
-    no run alternates between models on a one-slot card.
-    Writes NOTHING: the caller (kbworker.sessions) decides shadow vs live
-    ingestion from the returned report, which carries the counts, the survivor
-    entries (each with its ``extraction_pipeline`` meta-enrichment and B1 repair
-    record), and the pass-through ingest context (project/uri/code_ref/branch/
-    extra_detail) so both call sites share one signature.
+    Issues NO chat call when handed ``pre_extracted`` — the only model it touches
+    then is the EMBEDDER (clustering), which is what lets the drain run a whole
+    cohort's planning contiguously and leave the card's one slot on the embedder
+    for the duration.
+
+    Raises exactly what the fused version raised: the primary's
+    ExtractorUnavailable / ExtractionFailed, and EmbedderUnavailable from
+    clustering. PLUS one new, deliberate case: a prefetch that is MISSING the
+    primary raises ExtractorUnavailable instead of quietly producing a
+    primary-less report (see :func:`prefetch_extractions`) — the group defers and
+    re-drains intact rather than ingesting a degraded extraction.
     """
     primary = settings.kb_extract_model
     extras = list(dict.fromkeys(m for m in settings.extract_ensemble if m != primary))
@@ -328,8 +243,16 @@ def run_ensemble(
     # pre_extracted lets the drain run each model ONCE across a cohort of jobs
     # (prefetch_extractions) instead of once per job. With one model slot on the
     # card every switch is a full load, so that is the difference between ~3
-    # extractor loads per row and ~3 per cohort. The rest of the pipeline is
-    # unchanged and still runs per job.
+    # extractor loads per row and ~3 per cohort.
+    if pre_extracted is not None and primary not in pre_extracted:
+        # A cohort prefetch whose PRIMARY died: without this the job would run on
+        # extras only, reporting no extractor errors, no primary items and no
+        # corroboration — every extra item becoming a fail-closed singleton sent
+        # to a judge that is the same dead primary. Fail like a per-job primary
+        # failure so the drain defers the group instead (audit 2026-07-29).
+        raise ExtractorUnavailable(
+            f"cohort prefetch produced no output for the primary extractor {primary!r}"
+        )
     per_model, failed = _extract_all(text, primary, extras, pre=pre_extracted)
 
     # Quote-gate per model; the union of USABLE items feeds clustering,
@@ -356,10 +279,11 @@ def run_ensemble(
     clusters = _cluster(entries, threshold) if entries else []
 
     # PASS ONE — decide each cluster's fate WITHOUT calling a judge; judgements
-    # are only recorded so they can be batched by model (see _judge_by_model).
+    # are only recorded so they can be batched by model across a whole COHORT
+    # (kbworker.judging.judge_cohort).
     cluster_detail: list[dict[str, Any]] = []
     plan: list[dict[str, Any]] = []
-    pending: list[_Judgement] = []
+    pending: list[Judgement] = []
     corroborated = 0
     for members in clusters:
         found_by = list(dict.fromkeys(e["model"] for e in members))
@@ -389,22 +313,67 @@ def run_ensemble(
             entry["verified_by"] = "primary-source"
             if len(found_by) < 2 and settings.kb_ensemble_secondary_judge:
                 pending.append(
-                    _Judgement(entry, settings.kb_ensemble_secondary_judge, fail_closed=False)
+                    Judgement(entry, settings.kb_ensemble_secondary_judge, fail_closed=False)
                 )
         elif len(found_by) >= 2:
             entry["verified_by"] = "corroboration"
         else:
-            pending.append(_Judgement(entry, primary, fail_closed=True))
+            pending.append(Judgement(entry, primary, fail_closed=True))
 
-    # Judge model-major: one load per model per run, not one per alternation.
-    judged = len(pending)
-    judge_errors = _judge_by_model(pending, text, primary)
+    return EnsemblePlan(
+        text=text,
+        primary=primary,
+        plan=plan,
+        pending=pending,
+        # The 15 report keys that are FINAL before any judge call, in report
+        # order — finish_ensemble adds only the three that judging decides.
+        partial={
+            "project": project,
+            "uri": uri,
+            "code_ref": code_ref,
+            "branch": branch,
+            "extra_detail": extra_detail,
+            "primary": primary,
+            "extractor_errors": failed,
+            "candidates": candidates,
+            "usable": usable,
+            "unanchored": unanchored,
+            "gate_rejections": gate_rejections[:MAX_GATE_REASONS],
+            "clusters": len(clusters),
+            "cluster_detail": cluster_detail,
+            "corroborated": corroborated,
+            "judged": len(pending),
+        },
+    )
+
+
+def finish_ensemble(plan: EnsemblePlan) -> dict[str, Any]:
+    """PASS TWO: apply the verdicts and assemble the report. No model calls.
+
+    Raises :class:`ExtractorUnavailable` iff a judge went dark leaving a
+    FAIL-CLOSED judgement undecided. Fail-closed means "never ingested without a
+    verdict", and deferring the whole job satisfies that strictly harder than
+    dropping the item would, while keeping the drain's rule that an outage never
+    burns a row's retry budget: the group defers with attempts unchanged and
+    re-drains intact (plans are rebuilt fresh, and ingest dedupes on
+    (kind, uri, content_hash), so the redo is clean).
+
+    A job whose only undecided judgements are DEMOTE-TO-REVIEW proceeds: a
+    secondary-judge failure never drops a primary-sourced item (pinned contract),
+    it costs a judge_errors tick and keeps the 'primary-source' label.
+    """
+    stranded = [j for j in plan.undecided if j.fail_closed]
+    if stranded:
+        raise ExtractorUnavailable(
+            f"{plan.outage or 'judge unavailable'} — {len(stranded)} fail-closed "
+            f"judgement(s) never got a verdict; deferring this group"
+        )
 
     # PASS TWO — apply the verdicts. A rejected representative is exactly a
     # fail-closed judgement that came back unsupported or errored.
     survivors: list[dict[str, Any]] = []
     rejected_reps = 0
-    for entry in plan:
+    for entry in plan.plan:
         if not entry["survives"]:
             rejected_reps += 1
             continue
@@ -425,22 +394,50 @@ def run_ensemble(
         )
 
     return {
-        "project": project,
-        "uri": uri,
-        "code_ref": code_ref,
-        "branch": branch,
-        "extra_detail": extra_detail,
-        "primary": primary,
-        "extractor_errors": failed,
-        "candidates": candidates,
-        "usable": usable,
-        "unanchored": unanchored,
-        "gate_rejections": gate_rejections[:MAX_GATE_REASONS],
-        "clusters": len(clusters),
-        "cluster_detail": cluster_detail,
-        "corroborated": corroborated,
-        "judged": judged,
-        "judge_errors": judge_errors,
+        **plan.partial,
+        "judge_errors": plan.judge_errors,
         "rejected_reps": rejected_reps,
         "survivors": survivors,
     }
+
+
+def run_ensemble(
+    text: str,
+    project: str,
+    uri: str,
+    *,
+    code_ref: dict[str, str] | None = None,
+    branch: str | None = None,
+    extra_detail: dict[str, Any] | None = None,
+    pre_extracted: dict[str, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Extract with every configured model, converge, verify — REPORT only.
+
+    The SINGLE-JOB entry point: a cohort of one over the three-stage split, with
+    the same signature, the same 18-key report and the same semantics it always
+    had. Shadow mode (kbworker.sessions), ``kb reprocess`` (kbcore.reprocess) and
+    every direct caller keep using this; only the drain, which has a cohort to
+    amortise, drives plan/judge/finish itself.
+
+    The measured pipeline: per-model extraction (primary resident, extras on the
+    drain phase keep-alive, per-model isolation) → the EXACT v1 quote gate
+    (:func:`kbworker.sessions.gate_quotes`) → greedy cosine clustering of the
+    quote-usable UNION → one representative per cluster → survivor policy (e),
+    whose judge calls are collected first and executed GROUPED BY JUDGE MODEL so
+    no run alternates between models on a one-slot card. Writes NOTHING: the
+    caller decides shadow vs live ingestion from the returned report, which
+    carries the counts, the survivor entries (each with its
+    ``extraction_pipeline`` meta-enrichment and B1 repair record) and the
+    pass-through ingest context (project/uri/code_ref/branch/extra_detail).
+    """
+    planned = plan_ensemble(
+        text,
+        project,
+        uri,
+        code_ref=code_ref,
+        branch=branch,
+        extra_detail=extra_detail,
+        pre_extracted=pre_extracted,
+    )
+    judge_cohort([planned])
+    return finish_ensemble(planned)

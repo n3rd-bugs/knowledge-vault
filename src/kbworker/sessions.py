@@ -15,7 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kbcore import extract_hygiene, llm
 from kbcore.checkpoints import get_checkpoint, set_checkpoint
@@ -30,6 +30,9 @@ from kbcore.quote_modality import is_aspirational
 from kbcore.quote_repair import find_span
 from kbcore.review import queue_review_in
 from kbcore.scrub import scrub
+
+if TYPE_CHECKING:  # kbworker.judging imports kbcore only — no runtime cycle either way
+    from kbworker.judging import EnsemblePlan
 
 logger = logging.getLogger("kbworker.sessions")
 
@@ -411,6 +414,7 @@ def extract_and_ingest(
     extra_detail: dict[str, Any] | None = None,
     extra_meta: dict[str, Any] | None = None,
     pre_extracted: dict | None = None,
+    planned: EnsemblePlan | None = None,
 ) -> tuple[int, int]:
     """Extract → quote-validate/repair → ingest, the core shared by file + queue paths.
 
@@ -438,23 +442,45 @@ def extract_and_ingest(
     as today, then the ensemble computes and LOGS its counts, writing nothing
     (any shadow failure is swallowed — it must never affect v1's outcome).
     Non-empty + shadow false: the ensemble REPLACES v1 — survivors ingest via
-    :func:`_ingest_ensemble_survivors` and ``extractor`` is ignored (the
-    ensemble owns model selection).
+    :func:`ingest_ensemble_report` and ``extractor`` is ignored (the ensemble
+    owns model selection).
+
+    ``planned`` is the COHORT hand-off (2026-07-29). This function is the one
+    that welds "judge" to "write", so the drain cannot batch judging across jobs
+    unless it can pause a job at the judge boundary: it hands over an
+    :class:`~kbworker.judging.EnsemblePlan` whose judgements have ALREADY been
+    executed model-major with the rest of the cohort, and only PASS TWO + ingest
+    run here. Same threading precedent as ``pre_extracted``, one level deeper.
+    A plan that does not match this call's project/uri is IGNORED (never trusted)
+    — ingesting job A's survivors under job B's uri, with B's transcript stored
+    as their raw, is the one cross-job corruption this split could cause.
     """
     ensemble_on = bool(settings.extract_ensemble)
     if ensemble_on and not settings.kb_ensemble_shadow:
         from kbworker import ensemble  # lazy: the v1 path must not depend on it
 
-        report = ensemble.run_ensemble(
-            text,
-            project,
-            uri,
-            code_ref=code_ref,
-            branch=branch,
-            extra_detail=extra_detail,
-            pre_extracted=pre_extracted,
-        )
-        return _ingest_ensemble_survivors(report, text, extra_meta=extra_meta)
+        report = None
+        if planned is not None:
+            if planned.partial.get("uri") == uri and planned.partial.get("project") == project:
+                report = ensemble.finish_ensemble(planned)
+            else:
+                logger.warning(
+                    "ignoring a mis-keyed ensemble plan (plan uri=%r project=%r) for %r",
+                    planned.partial.get("uri"),
+                    planned.partial.get("project"),
+                    uri,
+                )
+        if report is None:
+            report = ensemble.run_ensemble(
+                text,
+                project,
+                uri,
+                code_ref=code_ref,
+                branch=branch,
+                extra_detail=extra_detail,
+                pre_extracted=pre_extracted,
+            )
+        return ingest_ensemble_report(report, text, extra_meta=extra_meta)
 
     if extractor is None:
         extractor = llm.extract_items
@@ -492,8 +518,8 @@ def extract_and_ingest(
     return saved, rejected
 
 
-def _ingest_ensemble_survivors(
-    report: dict[str, Any], text: str, extra_meta: dict[str, Any] | None = None
+def ingest_ensemble_report(
+    report: dict[str, Any], text: str, *, extra_meta: dict[str, Any] | None = None
 ) -> tuple[int, int]:
     """Live-mode ensemble ingest: survivors flow through the SAME path as v1.
 

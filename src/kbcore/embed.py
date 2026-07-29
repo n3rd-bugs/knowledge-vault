@@ -29,7 +29,7 @@ _TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 _QUERY_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
-def _classify_embed_error(e: httpx.HTTPError) -> Exception:
+def _classify_embed_error(e: httpx.HTTPError, host: str | None = None) -> Exception:
     """Connectivity (defer) vs content (bounded) for an embed HTTP failure.
 
     A 4xx shaped by a pathological chunk is deterministic → :class:`ExtractionFailed`
@@ -38,7 +38,13 @@ def _classify_embed_error(e: httpx.HTTPError) -> Exception:
     :class:`EmbedderUnavailable`, deferred and retried, with the deferral cap as
     the escape hatch for a "transient" that never heals.
     """
-    msg = f"embedding call to {settings.embed_url} failed: {e.__class__.__name__}: {e}"
+    # Name the host that ACTUALLY failed. This used to hardcode settings.embed_url,
+    # so a fallback failure reported the remote address and made a local problem
+    # look like a network one — an hour of misdiagnosis waiting to happen.
+    msg = (
+        f"embedding call to {host or settings.embed_url} failed: "
+        f"{e.__class__.__name__}: {e}"
+    )
     if isinstance(e, httpx.HTTPStatusError):
         status = e.response.status_code
         body = (e.response.text or "").lower()
@@ -96,16 +102,23 @@ def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> li
                 # box being gone, which is the whole reason we made it observable.
                 logger.warning("embed host %s unreachable; served by %s", hosts[0], host)
             break
-        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
             # Cannot REACH this host — try the next one. The last one re-raises.
+            #
+            # TimeoutException, not just ConnectError: a machine that is powered
+            # off or busy gaming DROPS packets rather than refusing them, so it
+            # presents as a ReadTimeout, not a refused connection. Failing over
+            # only on ConnectError meant the fallback never fired in the exact
+            # scenario it was written for — verified against a dead LAN address,
+            # which timed out at 48s and raised instead of falling back.
             if i == len(hosts) - 1:
-                raise _classify_embed_error(e) from e
+                raise _classify_embed_error(e, host) from e
         except httpx.HTTPError as e:
             # Reached it and it answered badly (or timed out mid-request): that
             # is not a reachability problem, so failing over would just repeat it.
             # Clean domain error for CLI/MCP consumers; full trace stays in logs
             # (CLAUDE.md §Code style).
-            raise _classify_embed_error(e) from e
+            raise _classify_embed_error(e, host) from e
     # A 200 whose BODY is not the expected shape (Ollama emitting {"error":...}
     # with 200 during a restart, a proxy error page, or wrong-length vectors) would
     # otherwise escape as a raw KeyError/JSONDecodeError/TypeError and the drain

@@ -86,6 +86,13 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
     ollama_url: str = "http://127.0.0.1:11434"
+    # Where the EMBEDDER lives. Defaults to ollama_url, so a single-box setup is
+    # unchanged. Pointing it at a second machine is the cleanest fix for VRAM
+    # contention: embedding runs on every chunk of every row, so moving it off
+    # the extractor's card removes the swap that dominated drain time — the
+    # local card then holds one 14B at a time instead of thrashing between a
+    # 11.4GB extractor and a 2.3GB embedder that never both fit.
+    kb_embed_url: str = ""
     kb_embed_model: str = "bge-m3"
     kb_embed_dim: int = 1024
     kb_embed_device: str = "auto"
@@ -279,6 +286,11 @@ class Settings(BaseSettings):
     def web_allowed_emails(self) -> list[str]:
         """`KB_WEB_ALLOWED_EMAILS` parsed as a lowercased comma-separated list."""
         return [e.strip().lower() for e in self.kb_web_allowed_emails.split(",") if e.strip()]
+
+    @property
+    def embed_url(self) -> str:
+        """The embedder endpoint — its own host when set, else the main one."""
+        return (self.kb_embed_url or self.ollama_url).rstrip("/")
 
     @property
     def extract_ensemble(self) -> list[str]:

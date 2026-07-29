@@ -19,10 +19,11 @@ _TIMEOUT = httpx.Timeout(120.0, connect=10.0)
 def _classify_embed_error(e: httpx.HTTPError) -> Exception:
     """Connectivity (defer) vs content (bounded) for an embed HTTP failure.
 
-    Mirror of llm._classify_extractor_error: a per-row ReadTimeout or a 4xx shaped
-    by a pathological chunk is deterministic → :class:`ExtractionFailed` (the queue
-    drain bounds it via the attempts cap); connect errors, model-not-loaded and 5xx
-    are transient → :class:`EmbedderUnavailable` (deferred and retried).
+    A 4xx shaped by a pathological chunk is deterministic → :class:`ExtractionFailed`
+    (the queue drain bounds it via the attempts cap). Everything else — connect
+    errors, timeouts, model-not-loaded, 5xx — is transient →
+    :class:`EmbedderUnavailable`, deferred and retried, with the deferral cap as
+    the escape hatch for a "transient" that never heals.
     """
     msg = f"embedding call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
     if isinstance(e, httpx.HTTPStatusError):
@@ -32,8 +33,19 @@ def _classify_embed_error(e: httpx.HTTPError) -> Exception:
         if not model_missing and 400 <= status < 500:
             return ExtractionFailed(msg)
         return EmbedderUnavailable(msg)
-    if isinstance(e, httpx.TimeoutException) and not isinstance(e, httpx.ConnectTimeout):
-        return ExtractionFailed(msg)
+    # A ReadTimeout used to be classified as ExtractionFailed on the theory that
+    # it is "shaped by a pathological chunk" and therefore deterministic. That
+    # holds when ONE chunk is pathological. It does not hold when the embedder
+    # itself is starved: a drain hit 28 rows across three projects with this
+    # identical error while the GPU sat at 0% and VRAM was full, and every one
+    # was marked permanently failed after burning its attempts budget — for a
+    # condition that would have cleared on its own.
+    #
+    # Treat it as transient. That is right for BOTH causes, because the deferral
+    # counter already distinguishes them: an environmental stall heals and the
+    # row drains later, while a genuinely pathological chunk keeps timing out and
+    # mark_deferred escalates it to 'failed' at DEFERRAL_CAP. Deferring costs a
+    # retry; misclassifying costs the row.
     return EmbedderUnavailable(msg)
 
 

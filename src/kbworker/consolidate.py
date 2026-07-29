@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -336,11 +337,27 @@ def _rejection_rate() -> float | None:
 
 
 def _run_step(counts: dict[str, Any], key: str, fn) -> None:
-    """Run one step, isolating failure: log and leave the count at 0."""
+    """Run one step, isolating failure: log and leave the count at 0.
+
+    Also TIMES it. A pass ran for over an hour producing nothing, and there was
+    no way to say which step consumed it without guessing — the same blind spot
+    that hid a 40% CPU fallback and an inert cohort path. Durations land in the
+    run report (counts["step_secs"]), which is persisted in
+    consolidation_requests.result, so "where did the hour go" is answerable from
+    data on the next run rather than by instrumenting after the fact.
+    """
+    t0 = time.monotonic()
     try:
         counts[key] = fn()
     except Exception:  # noqa: BLE001 — one step must not abort the pass
         logger.exception("consolidation step %r failed", key)
+    finally:
+        secs = round(time.monotonic() - t0, 1)
+        counts.setdefault("step_secs", {})[key] = secs
+        # WARNING so it survives the unit's default level: an INFO line here was
+        # invisible in journald and cost hours of archaeology.
+        if secs >= 60:
+            logger.warning("consolidation step %r took %.0fs", key, secs)
 
 
 def _write_report(counts: dict[str, Any]) -> int:

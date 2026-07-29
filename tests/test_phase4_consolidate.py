@@ -275,3 +275,32 @@ def test_advisory_lock_makes_concurrent_run_skip(kb):
     with db.connect() as conn:
         reports = conn.execute("SELECT count(*) FROM items WHERE type='report'").fetchone()[0]
     assert reports == 0, "skipped run does no work (no report written)"
+
+
+def test_every_step_is_timed_in_the_run_report(kb, monkeypatch):
+    """A pass ran over an hour producing nothing and there was no way to say
+    which step consumed it. Durations now ride the report, which is persisted in
+    consolidation_requests.result — so the question is answerable from data on
+    the NEXT occurrence instead of by instrumenting after the fact."""
+    from kbworker import consolidate
+
+    counts: dict = {}
+    consolidate._run_step(counts, "fast_step", lambda: 7)
+    assert counts["fast_step"] == 7
+    assert "fast_step" in counts["step_secs"]
+    assert counts["step_secs"]["fast_step"] >= 0
+
+
+def test_a_failing_step_is_still_timed(kb):
+    """A step that blows up is exactly the one whose duration matters — timing
+    it in a finally means a crash cannot hide how long it burned first."""
+    from kbworker import consolidate
+
+    counts: dict = {}
+
+    def boom():
+        raise RuntimeError("step exploded")
+
+    consolidate._run_step(counts, "bad_step", boom)
+    assert "bad_step" not in counts, "a failed step must not report a count"
+    assert "bad_step" in counts["step_secs"], "a failed step was not timed"

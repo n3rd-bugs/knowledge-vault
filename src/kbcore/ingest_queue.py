@@ -9,6 +9,8 @@ text is never persisted — only the scrubbed content is stored. All SQL lives h
 from __future__ import annotations
 
 import hashlib
+import logging
+from datetime import datetime
 from typing import Any, NamedTuple
 
 from psycopg.types.json import Jsonb
@@ -17,6 +19,8 @@ from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.scrub import scrub
+
+logger = logging.getLogger("kbcore.ingest_queue")
 
 QUEUE_KINDS = ("session", "memory")
 MAX_CONTENT_BYTES = 1_000_000  # ~1 MB cap on a single submission
@@ -202,6 +206,50 @@ def mark_extracted(queue_id: int, saved: int, rejected: int) -> None:
             """,
             (saved, rejected, queue_id),
         )
+
+
+def requeue_failed(*, since: datetime | None = None, reason: str = "") -> list[int]:
+    """Return ``failed`` rows to ``pending`` so a fixed pipeline can retry them.
+
+    A row is marked ``failed`` by a policy judgement — "this content cannot be
+    extracted" — but that judgement is only as good as the classifier that made
+    it. When a TRANSIENT fault has been misclassified as content-deterministic,
+    the rows it condemned are not bad content; they are casualties of a bug, and
+    they sit at a terminal status no automatic path will ever revisit.
+
+    Concretely (2026-07-29): an embed ReadTimeout was classified as permanent,
+    so a zombie consolidation retired 12 rows on a fault fixed hours earlier.
+    Invariant 5 is what makes this recoverable — automation flips ``status`` and
+    never deletes, so the content was intact and only the verdict was wrong.
+
+    ``attempts`` is RESET, deliberately: the previous attempts were spent against
+    a broken classifier, and carrying them forward would exhaust
+    :data:`MAX_ATTEMPTS` against a pipeline that can now succeed. ``requeue_count``
+    is left alone — it guards the re-arm budget, a different concern.
+
+    This is an OWNER repair, never automation: nothing calls it on a schedule,
+    and it widens no automatic path (Invariant 5's carve-out is about non-knowledge
+    stores; this only moves knowledge rows BACK into reach).
+    """
+    with transaction() as conn:
+        rows = conn.execute(
+            """
+            UPDATE ingest_queue
+               SET status = 'pending', attempts = 0, processed_at = NULL,
+                   error = CASE
+                             WHEN %(reason)s = '' THEN error
+                             ELSE left(
+                               coalesce(error, '') || ' | requeued: ' || %(reason)s, 2000)
+                           END
+             WHERE status = 'failed'
+               AND (%(since)s::timestamptz IS NULL OR processed_at >= %(since)s)
+            RETURNING id
+            """,
+            {"since": since, "reason": reason},
+        ).fetchall()
+    ids = [r[0] for r in rows]
+    logger.info("requeued %d failed row(s) to pending: %s", len(ids), reason or "(no reason given)")
+    return ids
 
 
 def mark_failed(queue_id: int, error: str) -> None:

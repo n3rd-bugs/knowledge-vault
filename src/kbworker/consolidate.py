@@ -129,6 +129,41 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return jobs
 
 
+def _batch_jobs(jobs: list[dict[str, Any]], cohort: int) -> list[list[dict[str, Any]]]:
+    """Slice jobs into cohort batches, bounded by BOTH job count and total bytes.
+
+    The count is the throughput bound (per-job cost is dominated by model loading,
+    so jobs/hour is what sizes a cohort). The byte budget is purely an OOM GUARD:
+    a cohort holds every job's assembled text in memory at once, so one unusually
+    large transcript must not be able to make a full-sized cohort exhaust RAM.
+
+    A job larger than the whole budget is still taken, ALONE. Skipping it would
+    return an empty batch and the drain would make no progress — one oversized row
+    would wedge the queue permanently, which is a worse failure than a big cohort.
+    """
+    budget = max(1, int(settings.kb_drain_cohort_bytes))
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    used = 0
+    for job in jobs:
+        size = len(job.get("text") or "")
+        if current and (len(current) >= cohort or used + size > budget):
+            batches.append(current)
+            current, used = [], 0
+        if not current and size > budget:
+            logger.warning(
+                "cohort: job %r is %.1f MB, over the %.1f MB budget — taken alone",
+                job.get("key"),
+                size / 1e6,
+                budget / 1e6,
+            )
+        current.append(job)
+        used += size
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _cohort_prepare(
     batch: list[dict[str, Any]],
 ) -> tuple[dict[str, dict], dict[str, EnsemblePlan]]:
@@ -300,7 +335,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
         }
     )
     cohorting = cohort > 1 and ensemble.mode() == "live" and bool(jobs)
-    batches = [jobs[i : i + cohort] for i in range(0, len(jobs), cohort)] if cohorting else [jobs]
+    batches = _batch_jobs(jobs, cohort) if cohorting else [jobs]
 
     drained = 0
     saved_total = 0

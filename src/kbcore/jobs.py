@@ -41,7 +41,12 @@ _ACTIVE = ("pending", "running")
 # written by the work itself, so this needs no schema change and cannot drift
 # from reality the way a separate heartbeat column would.
 STALE_RUN_HOURS = 6
-PROGRESS_WINDOW_MINUTES = 45
+# Must EXCEED the longest a healthy cohort can run with zero completions: no row
+# reaches 'extracted' until its cohort finishes its phases, so a long cohort looks
+# dead to a liveness check that only watches processed_at. At kb_drain_cohort=46
+# and 77.6 s/job a cohort is ~60 min, so 45 would have reaped a healthy run
+# (measured 2026-07-29). 90 keeps a 1.5x margin over that.
+PROGRESS_WINDOW_MINUTES = 90
 
 
 def _reap_stale_runs(conn) -> int:

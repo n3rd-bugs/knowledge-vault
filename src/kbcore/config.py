@@ -109,17 +109,25 @@ class Settings(BaseSettings):
     # OLLAMA_MAX_LOADED_MODELS=1 every model switch is a full load, so running
     # each extractor once across N jobs instead of once per job turns ~3 loads
     # per row into ~3 per cohort. 1 disables cohorting entirely (kill switch).
-    kb_drain_cohort: int = 8
+    #
+    # Sized on JOB COUNT, not bytes (measured 2026-07-29): assembled inputs vary
+    # 40x (1.0-43.5 kB) while cohort times varied only +/-3%, because per-job cost
+    # is dominated by MODEL LOADING, not input size. At 77.6 s/job, 46 jobs is
+    # ~1 hour — roughly one load per model per hour. Raising this further requires
+    # raising jobs.PROGRESS_WINDOW_MINUTES too: no row reaches 'extracted' until
+    # its cohort finishes, so a longer cohort looks dead to the stale-run reaper.
+    kb_drain_cohort: int = 46
+    # Memory ceiling for one cohort's assembled text — an OOM GUARD, not a
+    # throughput knob (bytes are a poor predictor of time; see above). It exists so
+    # a future large transcript cannot make a 46-job cohort exhaust RAM. Assembly
+    # must always take AT LEAST ONE job even if that job alone exceeds this, or an
+    # oversized row would wedge the queue permanently.
+    kb_drain_cohort_bytes: int = 48_000_000
     # keep_alive for a model while it works through its phase of a cohort.
     # Seconds, because llm.extract_items/verify_item are typed int | None —
     # only the low-level _chat accepts Ollama's "10m" string form.
     kb_drain_phase_keep_alive: int = 600
     kb_extract_model: str = "qwen3:14b"
-    # Extractor keep_alive (owner decision 2026-07): -1 keeps the model RESIDENT —
-    # idle residency draws single-digit watts (GPU idles down; VRAM refresh is on
-    # regardless), and it removes the ~20s reload per LLM call that dominated
-    # consolidation runtime. Cost: ~10GB VRAM stays occupied. Kill switch: set 0
-    # (unload per call) or a bounded value like 300 (seconds) to reclaim VRAM.
     # Seconds the LLM stays resident. MUST be finite: with OLLAMA_MAX_LOADED_MODELS=1
     # a negative ("resident forever") value pins the only slot and every other model
     # — extractors, judges, embedder — waits for a slot that can never free, surfacing

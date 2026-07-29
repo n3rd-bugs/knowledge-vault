@@ -79,7 +79,37 @@ def _drain_ingest_queue() -> tuple[int, int]:
     # window separately spent the whole 200-row nightly budget on one session and
     # fed the 14B mostly JSON scaffolding. Concatenating a session's rows and
     # assembling ONCE restores the local path's behaviour.
-    for group in ingest_queue.pending_groups(limit=QUEUE_BATCH):
+    groups = ingest_queue.pending_groups(limit=QUEUE_BATCH)
+
+    # COHORT PREFETCH. With one model slot on the card, every switch is a full
+    # load, so extracting model-major across a cohort turns ~3 extractor loads
+    # per row into ~3 per cohort. Only the extraction phase is batched; gating,
+    # clustering, judging and ingest stay strictly per job, so per-job failure
+    # isolation and the review/dedupe semantics are untouched.
+    #
+    # A prefetch failure is NEVER fatal: pre stays None and every job falls back
+    # to extracting for itself, which is exactly today's behaviour. Cohorting is
+    # an optimisation, and an optimisation that can break the drain is not one.
+    cohort = max(1, int(settings.kb_drain_cohort))
+    pre_by_uri: dict[str, dict] = {}
+    if cohort > 1 and ensemble.mode() == "live" and groups:
+        for start in range(0, len(groups), cohort):
+            batch = groups[start : start + cohort]
+            texts, keys = [], []
+            for g in batch:
+                r0 = g["rows"][0]
+                texts.append(
+                    sessions.assemble_text("".join(r["content"] for r in g["rows"]), r0["kind"])
+                )
+                keys.append(g["uri"])
+            try:
+                for key, pre in zip(keys, ensemble.prefetch_extractions(texts), strict=True):
+                    pre_by_uri[key] = pre
+                logger.info("cohort prefetch: %d job(s), extractors loaded once each", len(batch))
+            except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
+                logger.warning("cohort prefetch failed; falling back per job", exc_info=True)
+
+    for group in groups:
         rows = group["rows"]
         row = rows[0]
         ids = [r["id"] for r in rows]
@@ -93,6 +123,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
                 text,
                 row["project"],
                 uri,
+                pre_extracted=pre_by_uri.get(group["uri"]),
                 # FIX 6 (audit 2026-07-26): a queued session/memory window anchors
                 # no FILE — repo/commit ride the item meta as provenance instead of
                 # a phantom {"path": "."} code_ref.

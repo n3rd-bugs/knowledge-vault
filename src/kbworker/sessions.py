@@ -410,6 +410,7 @@ def extract_and_ingest(
     extractor=None,
     extra_detail: dict[str, Any] | None = None,
     extra_meta: dict[str, Any] | None = None,
+    pre_extracted: dict | None = None,
 ) -> tuple[int, int]:
     """Extract → quote-validate/repair → ingest, the core shared by file + queue paths.
 
@@ -445,7 +446,13 @@ def extract_and_ingest(
         from kbworker import ensemble  # lazy: the v1 path must not depend on it
 
         report = ensemble.run_ensemble(
-            text, project, uri, code_ref=code_ref, branch=branch, extra_detail=extra_detail
+            text,
+            project,
+            uri,
+            code_ref=code_ref,
+            branch=branch,
+            extra_detail=extra_detail,
+            pre_extracted=pre_extracted,
         )
         return _ingest_ensemble_survivors(report, text, extra_meta=extra_meta)
 

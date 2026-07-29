@@ -98,6 +98,15 @@ class Settings(BaseSettings):
     kb_embed_query_prefix: str = ""
     # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity,
     # 100% verbatim grounding. gemma3:12b is the approved fast fallback.
+    # How many queued jobs the drain extracts as ONE cohort. With
+    # OLLAMA_MAX_LOADED_MODELS=1 every model switch is a full load, so running
+    # each extractor once across N jobs instead of once per job turns ~3 loads
+    # per row into ~3 per cohort. 1 disables cohorting entirely (kill switch).
+    kb_drain_cohort: int = 8
+    # keep_alive for a model while it works through its phase of a cohort.
+    # Seconds, because llm.extract_items/verify_item are typed int | None —
+    # only the low-level _chat accepts Ollama's "10m" string form.
+    kb_drain_phase_keep_alive: int = 600
     kb_extract_model: str = "qwen3:14b"
     # Extractor keep_alive (owner decision 2026-07): -1 keeps the model RESIDENT —
     # idle residency draws single-digit watts (GPU idles down; VRAM refresh is on

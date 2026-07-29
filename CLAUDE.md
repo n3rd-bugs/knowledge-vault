@@ -28,6 +28,12 @@ You are implementing the system specified in `PLAN.md` (v2.1 — primary use cas
 6. Network: bind `KB_BIND` only; bearer check on every MCP request; never disable auth "temporarily".
 7. `TIMESTAMPTZ`/UTC everywhere. `datetime.now(timezone.utc)`, never naive datetimes.
 8. GPU courtesy: embed calls set short keep-alive; the 14B extractor is invoked only from `consolidate.py` or explicit user-invoked runs (`kb ingest-session`, `kb deep-search`). Residency: `KB_LLM_KEEP_ALIVE=-1` keeps it loaded (owner decision 2026-07 — idle residency is power-cheap; set 0 to reclaim VRAM).
+   **Amendment (2026-07-29):** the card holds ONE Ollama model at a time
+   (`OLLAMA_MAX_LOADED_MODELS=1`), because the "fits alongside" path mispredicted the
+   embedder's size and silently ran 40% of embeddings on CPU. Consequently the ensemble's
+   extras may hold `KB_DRAIN_PHASE_KEEP_ALIVE` (600s) while working through their phase of a
+   drain cohort, where the letter of this rule said 0. Net residency is strictly LOWER than
+   before — one model instead of an oversubscribed set — and the drain is the only caller.
 9. **The KB is not a code index.** Never bulk-ingest source trees; the repo scanner reads docs/ADR/README files only. Knowledge about code carries a `code_ref` anchor ({repo, path, lines, commit, symbol}) instead of the code itself. `kb_put_doc` accepts arbitrary bytes and does **not** change this: submit a document because a specific artefact is worth citing, never to walk a tree into the KB. A submitted document is archived + registered; it is only mined when `extract=true`.
 
 12. **Credentials are minted in kbcore, hashed at rest, shown once, and redactable.** Every secret this system issues (`kbg_` grantee tokens, `kbe_` enrolment codes) is generated only by a kbcore function, persisted only as a SHA-256, returned in plaintext exactly once, and matched by a `kbcore.scrub` pattern so it cannot survive ingest. Authority comes from `kbcore.scope`, never from a caller-supplied argument. A credential is not authenticated by its PREFIX — always verify it against its store (a prefix-only check once let `kbe_x` satisfy the bearer gate). Note that an OWNER's enrolment code redeems to `KB_TOKEN` itself: that is a deliberate, documented exception (SHARING.md §2.5), not a template.

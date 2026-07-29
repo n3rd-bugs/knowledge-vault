@@ -499,3 +499,93 @@ def test_consolidate_reports_ensemble_counts(monkeypatch):
     result = consolidate.main()
     assert result["ensemble_mode"] == "shadow"
     assert result["ensemble_shadow_survivors"] == 0, "empty queue → no shadow runs"
+
+
+# --------------------------------------------------------------------------
+# Cohort prefetch. With OLLAMA_MAX_LOADED_MODELS=1 every model switch is a full
+# load, so the drain runs each extractor ONCE across a cohort instead of once
+# per job. Only extraction is batched; everything downstream stays per job.
+# --------------------------------------------------------------------------
+
+
+def test_prefetch_loads_each_model_once_across_the_cohort(monkeypatch):
+    """The ORDER is the whole point: model-major, not job-major."""
+    from kbcore.config import settings
+    from kbworker import ensemble
+
+    monkeypatch.setattr(settings, "kb_extract_model", "primary")
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "primary,extraA,extraB")
+
+    calls: list[str] = []
+
+    def fake_extract(text, model=None, keep_alive=None):
+        calls.append(model)
+        return [{"title": f"t-{model}", "body": text}]
+
+    monkeypatch.setattr(ensemble.llm, "extract_items", fake_extract)
+    out = ensemble.prefetch_extractions(["one", "two", "three"])
+
+    assert len(out) == 3
+    assert set(out[0]) == {"primary", "extraA", "extraB"}
+    # Model-major: all three texts for one model before moving on. Job-major
+    # would read primary,extraA,extraB,primary,... and reload every model per row.
+    assert calls == ["primary"] * 3 + ["extraA"] * 3 + ["extraB"] * 3
+
+
+def test_prefetch_uses_an_INT_keep_alive(monkeypatch):
+    """llm.extract_items is typed keep_alive: int | None — only the low-level
+    _chat accepts Ollama's "10m" string. A string here would be a TypeError at
+    the worst possible moment, mid-drain."""
+    from kbcore.config import settings
+    from kbworker import ensemble
+
+    monkeypatch.setattr(settings, "kb_extract_model", "primary")
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "primary")
+    seen: list = []
+    monkeypatch.setattr(
+        ensemble.llm,
+        "extract_items",
+        lambda text, model=None, keep_alive=None: (seen.append(keep_alive), [])[1],
+    )
+    ensemble.prefetch_extractions(["x"])
+    assert isinstance(seen[0], int) and seen[0] > 0
+
+
+def test_a_failing_extractor_does_not_abort_the_cohort(monkeypatch):
+    """One model failing must cost that model, not the whole batch — the same
+    rule the per-row path uses for a failing extra."""
+    from kbcore.config import settings
+    from kbcore.errors import ExtractorUnavailable
+    from kbworker import ensemble
+
+    monkeypatch.setattr(settings, "kb_extract_model", "primary")
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "primary,flaky")
+
+    def fake_extract(text, model=None, keep_alive=None):
+        if model == "flaky":
+            raise ExtractorUnavailable("down")
+        return [{"title": "ok", "body": text}]
+
+    monkeypatch.setattr(ensemble.llm, "extract_items", fake_extract)
+    out = ensemble.prefetch_extractions(["a", "b"])
+    assert all("primary" in o for o in out), "a failing extra took the primary with it"
+    assert all("flaky" not in o for o in out)
+
+
+def test_run_ensemble_consumes_the_prefetch_instead_of_re_extracting(monkeypatch):
+    """The saving only exists if run_ensemble does NOT extract again."""
+    from kbcore.config import settings
+    from kbworker import ensemble
+
+    monkeypatch.setattr(settings, "kb_extract_model", "primary")
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "primary")
+    called: list = []
+    monkeypatch.setattr(
+        ensemble.llm,
+        "extract_items",
+        lambda *a, **k: (called.append(1), [])[1],
+    )
+    text = "the DRV8706 needs SPI mode 1"
+    pre = {"primary": [{"title": "SPI mode", "body": "the DRV8706 needs SPI mode 1"}]}
+    ensemble.run_ensemble(text, "proj", "uri", pre_extracted=pre)
+    assert not called, "run_ensemble re-extracted despite being handed a prefetch"

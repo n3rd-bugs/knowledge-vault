@@ -91,7 +91,10 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 
 def _extract_all(
-    text: str, primary: str, extras: list[str]
+    text: str,
+    primary: str,
+    extras: list[str],
+    pre: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], list[str]]:
     """Run every configured extractor; per-model isolation for the extras.
 
@@ -101,6 +104,8 @@ def _extract_all(
     keep_alive=0 (Invariant 8: only the primary stays resident) and a failing
     extra logs + is skipped, never aborting the run.
     """
+    if pre is not None:
+        return dict(pre), []
     per_model = {primary: llm.extract_items(text, model=primary)}
     failed: list[str] = []
     for m in extras:
@@ -154,6 +159,32 @@ def _representative(members: list[dict[str, Any]], primary: str) -> dict[str, An
     return min(members, key=key)
 
 
+def prefetch_extractions(texts: list[str]) -> list[dict[str, list[dict[str, Any]]]]:
+    """Run every configured extractor across a COHORT, model by model.
+
+    Returns one ``{model: items}`` per input text, in order. The ordering is the
+    entire point: looping model-major means each model is loaded once for the
+    whole cohort, where the per-row path reloads all three for every row. On a
+    card that holds one model at a time that is the dominant cost.
+
+    A model that fails is recorded as absent for EVERY text in the cohort — the
+    same "skip the extra, never abort the run" rule the per-row path uses. The
+    primary is NOT special-cased here: a primary failure surfaces per text when
+    run_ensemble finds it missing, so one bad cohort cannot mask it.
+    """
+    primary = settings.kb_extract_model
+    extras = list(dict.fromkeys(m for m in settings.extract_ensemble if m != primary))
+    ka = settings.kb_drain_phase_keep_alive
+    out: list[dict[str, list[dict[str, Any]]]] = [{} for _ in texts]
+    for model in [primary, *extras]:
+        for i, text in enumerate(texts):
+            try:
+                out[i][model] = llm.extract_items(text, model=model, keep_alive=ka)
+            except (ExtractorUnavailable, ExtractionFailed) as e:
+                logger.warning("cohort extractor %s failed on item %d: %s", model, i, e)
+    return out
+
+
 def run_ensemble(
     text: str,
     project: str,
@@ -162,6 +193,7 @@ def run_ensemble(
     code_ref: dict[str, str] | None = None,
     branch: str | None = None,
     extra_detail: dict[str, Any] | None = None,
+    pre_extracted: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Extract with every configured model, converge, verify — REPORT only.
 
@@ -179,7 +211,12 @@ def run_ensemble(
     extras = list(dict.fromkeys(m for m in settings.extract_ensemble if m != primary))
     min_ratio = settings.kb_quote_repair_min_ratio
 
-    per_model, failed = _extract_all(text, primary, extras)
+    # pre_extracted lets the drain run each model ONCE across a cohort of jobs
+    # (prefetch_extractions) instead of once per job. With one model slot on the
+    # card every switch is a full load, so that is the difference between ~3
+    # extractor loads per row and ~3 per cohort. The rest of the pipeline is
+    # unchanged and still runs per job.
+    per_model, failed = _extract_all(text, primary, extras, pre=pre_extracted)
 
     # Quote-gate per model; the union of USABLE items feeds clustering,
     # primary first so its items seed clusters and win ties.

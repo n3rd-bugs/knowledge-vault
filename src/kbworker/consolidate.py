@@ -64,6 +64,14 @@ def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
     return [c for c in clusters.values() if len(c) > 1]
 
 
+# Cohort telemetry for the run report. The FIRST attempt at cohorting shipped
+# with only a logger.info, and when throughput did not improve there was no way
+# to answer "did it even run?" without grepping journald — the same blind spot
+# that let 40% of embeddings run on CPU unnoticed. An optimisation you cannot
+# observe is an optimisation you cannot trust.
+_COHORT_STATS: dict[str, int] = {}
+
+
 def _drain_ingest_queue() -> tuple[int, int]:
     """Step 0: extract queued remote submissions — the ONLY place the 14B runs on
     remote content (Invariant 8). Per-row isolation: one bad row logs + continues.
@@ -92,6 +100,17 @@ def _drain_ingest_queue() -> tuple[int, int]:
     # an optimisation, and an optimisation that can break the drain is not one.
     cohort = max(1, int(settings.kb_drain_cohort))
     pre_by_uri: dict[str, dict] = {}
+    _COHORT_STATS.clear()
+    _COHORT_STATS.update(
+        {
+            "cohort_size": cohort,
+            "cohort_batches": 0,
+            "cohort_jobs": 0,
+            "cohort_failures": 0,
+            "cohort_eligible": len(groups),
+            "cohort_mode": ensemble.mode(),
+        }
+    )
     if cohort > 1 and ensemble.mode() == "live" and groups:
         for start in range(0, len(groups), cohort):
             batch = groups[start : start + cohort]
@@ -105,8 +124,15 @@ def _drain_ingest_queue() -> tuple[int, int]:
             try:
                 for key, pre in zip(keys, ensemble.prefetch_extractions(texts), strict=True):
                     pre_by_uri[key] = pre
-                logger.info("cohort prefetch: %d job(s), extractors loaded once each", len(batch))
+                _COHORT_STATS["cohort_batches"] += 1
+                _COHORT_STATS["cohort_jobs"] += len(batch)
+                logger.warning(
+                    "cohort prefetch: batch %d, %d job(s) — each extractor loaded once",
+                    _COHORT_STATS["cohort_batches"],
+                    len(batch),
+                )
             except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
+                _COHORT_STATS["cohort_failures"] += 1
                 logger.warning("cohort prefetch failed; falling back per job", exc_info=True)
 
     for group in groups:
@@ -372,6 +398,9 @@ def main() -> dict[str, Any]:
             return drained
 
         _run_step(counts, "queued_drained", _drain)
+        # Persisted in consolidation_requests.result, so a later run can be
+        # compared without re-deriving anything from logs.
+        counts.update(_COHORT_STATS)
 
         # active_projects AFTER the drain so freshly-ingested submissions count.
         projects = consolidation.active_projects()

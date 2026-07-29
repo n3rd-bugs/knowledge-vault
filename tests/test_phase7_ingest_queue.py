@@ -321,3 +321,64 @@ def test_local_queue_flush_chunks_large_delta(kb, tmp_path, monkeypatch):
     s2 = sessions.ingest_session(t, "bigflush", queue=True)
     assert s2.saved == 0
     assert ingest_queue.queue_depth() >= parts
+
+
+def test_the_run_report_says_whether_cohorting_actually_fired(kb, monkeypatch):
+    """An optimisation you cannot observe is one you cannot trust.
+
+    Cohorting first shipped with only a logger.info. When throughput did not
+    improve there was no way to answer "did it even run?" without grepping
+    journald — the same blind spot that let 40% of embeddings run on CPU
+    unnoticed for weeks. The run report now carries the answer, and it is
+    persisted in consolidation_requests.result.
+    """
+    from kbcore import ingest_queue
+    from kbcore.config import settings
+    from kbworker import consolidate, ensemble
+
+    monkeypatch.setattr(settings, "kb_drain_cohort", 4)
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "granite,gemma")
+    monkeypatch.setattr(settings, "kb_ensemble_shadow", False)
+
+    for i in range(3):
+        ingest_queue.enqueue("cohort-tel", f"chunk {i}\n", kind="session", source_uri=f"s{i}")
+
+    seen: list[int] = []
+    monkeypatch.setattr(
+        ensemble,
+        "prefetch_extractions",
+        lambda texts: (seen.append(len(texts)), [{} for _ in texts])[1],
+    )
+    monkeypatch.setattr(consolidate.sessions, "extract_and_ingest", lambda *a, **k: (0, 0))
+    consolidate._drain_ingest_queue()
+
+    st = consolidate._COHORT_STATS
+    assert st["cohort_mode"] == "live"
+    assert st["cohort_size"] == 4
+    assert st["cohort_batches"] >= 1, "cohorting did not fire and the report would not have said so"
+    assert st["cohort_jobs"] == 3
+    assert st["cohort_failures"] == 0
+    assert seen == [3], "the whole cohort was not handed to prefetch in one call"
+
+
+def test_a_prefetch_failure_is_counted_not_hidden(kb, monkeypatch):
+    """Falling back per job is correct, but it must be VISIBLE — otherwise a
+    permanently-broken optimisation looks identical to a working one."""
+    from kbcore import ingest_queue
+    from kbcore.config import settings
+    from kbworker import consolidate, ensemble
+
+    monkeypatch.setattr(settings, "kb_drain_cohort", 4)
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "granite")
+    monkeypatch.setattr(settings, "kb_ensemble_shadow", False)
+    ingest_queue.enqueue("cohort-fail", "x\n", kind="session", source_uri="sf")
+
+    def boom(texts):
+        raise RuntimeError("ollama exploded")
+
+    monkeypatch.setattr(ensemble, "prefetch_extractions", boom)
+    monkeypatch.setattr(consolidate.sessions, "extract_and_ingest", lambda *a, **k: (0, 0))
+    consolidate._drain_ingest_queue()
+
+    assert consolidate._COHORT_STATS["cohort_failures"] == 1
+    assert consolidate._COHORT_STATS["cohort_batches"] == 0

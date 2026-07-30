@@ -221,7 +221,39 @@ services:
   # inbound port, no Let's Encrypt/Namecheap ACME to maintain. Kill switch is
   # now `docker compose stop kb-cloudflared`.
 
+  # Self-hosted push for the Claude Code Stop hook. NOT ntfy.sh: the payload
+  # carries the working directory (i.e. a CLIENT PROJECT NAME — aquamonix,
+  # punchrescue), and publishing that to a third-party topic would leak NDA
+  # metadata from a system that is otherwise private, tunneled and
+  # single-identity. Self-hosting keeps the useful message and leaks nothing.
+  #
+  # DENY-ALL BY DEFAULT. ntfy is open to anyone by default and this is reachable
+  # from the internet through the tunnel, so anonymous read AND write are off:
+  # a topic name alone must never be enough to read your notifications or to
+  # publish to them. Credentials live in ntfy.env (gitignored).
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    container_name: kb-ntfy
+    command: ["serve"]
+    env_file: [ntfy.env]
+    environment:
+      NTFY_BASE_URL: "https://ntfy.n3rd-bugs.dev"
+      NTFY_LISTEN_HTTP: ":80"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_AUTH_FILE: /var/lib/ntfy/user.db
+      NTFY_AUTH_DEFAULT_ACCESS: "deny-all"
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      # Web Push is what makes Chrome a real client with the tab closed.
+      NTFY_WEB_PUSH_FILE: /var/lib/ntfy/webpush.db
+      NTFY_WEB_PUSH_EMAIL_ADDRESS: "mirzaon@gmail.com"
+    volumes:
+      - ntfy-data:/var/lib/ntfy
+    user: "1000:1000"
+    networks: [kbnet]
+    restart: unless-stopped
+
 volumes:
+  ntfy-data:
   kbdata:
   fastmcp-oauth:
 

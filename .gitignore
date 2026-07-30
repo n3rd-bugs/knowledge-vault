@@ -49,3 +49,4 @@ tests/hookrig/.build.log
 
 # Windows test host credentials (WinRM) — never commit
 .windows
+ntfy.env

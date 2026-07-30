@@ -129,6 +129,28 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return jobs
 
 
+def _past_deadline() -> bool:
+    """True once the configured wall-clock cutoff has passed.
+
+    Checked BETWEEN cohorts, never inside one: aborting mid-cohort would throw
+    away extraction work already paid for on the GPU, while stopping at a cohort
+    boundary costs nothing. Every job the drain has not reached is still
+    'pending', so the next run — nightly, or the boot catch-up after a power cut
+    — resumes exactly here. Resumption needs no state of its own; the queue IS
+    the checkpoint (Invariant 3: ingest is idempotent).
+    """
+    raw = (settings.kb_drain_deadline or "").strip()
+    if not raw:
+        return False
+    try:
+        hh, mm = (int(x) for x in raw.split(":", 1))
+        cutoff = datetime.now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+    except (ValueError, TypeError):
+        logger.warning("KB_DRAIN_DEADLINE %r is not HH:MM — ignoring", raw)
+        return False
+    return datetime.now() >= cutoff
+
+
 def _batch_jobs(jobs: list[dict[str, Any]], cohort: int) -> list[list[dict[str, Any]]]:
     """Slice jobs into cohort batches, bounded by BOTH job count and total bytes.
 
@@ -339,7 +361,18 @@ def _drain_ingest_queue() -> tuple[int, int]:
 
     drained = 0
     saved_total = 0
-    for batch in batches:
+    for n, batch in enumerate(batches):
+        if n and _past_deadline():
+            left = sum(len(b) for b in batches[n:])
+            logger.warning(
+                "drain stopping at %s deadline: %d cohort(s) / %d job(s) deferred — "
+                "rows stay 'pending' and the next run resumes here",
+                settings.kb_drain_deadline,
+                len(batches) - n,
+                left,
+            )
+            _COHORT_STATS["deadline_deferred_jobs"] = left
+            break
         pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
         for job in batch:
             rows, saved = _drain_job(

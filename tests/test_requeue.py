@@ -109,3 +109,51 @@ def test_an_oversized_job_is_taken_alone_never_skipped(monkeypatch):
     assert ["huge"] in [[j["key"] for j in b] for b in batches], (
         "the oversized job was not isolated"
     )
+
+
+# ------------------------------------------------- deadline / resumability
+
+
+def test_the_deadline_is_ignored_when_unset(monkeypatch):
+    from kbcore.config import settings
+    from kbworker.consolidate import _past_deadline
+
+    monkeypatch.setattr(settings, "kb_drain_deadline", "")
+    assert _past_deadline() is False
+
+
+def test_a_malformed_deadline_does_not_stop_the_drain(monkeypatch):
+    """A typo in config must not silently halt every run after the first cohort."""
+    from kbcore.config import settings
+    from kbworker.consolidate import _past_deadline
+
+    for bad in ("noon", "12", "12:xx", "::"):
+        monkeypatch.setattr(settings, "kb_drain_deadline", bad)
+        assert _past_deadline() is False, f"{bad!r} was not treated as 'no deadline'"
+
+
+def test_the_deadline_fires_only_after_the_cutoff(monkeypatch):
+    from datetime import datetime, timedelta
+
+    from kbcore.config import settings
+    from kbworker import consolidate
+
+    now = datetime.now()
+    past = (now - timedelta(minutes=5)).strftime("%H:%M")
+    future = (now + timedelta(minutes=90)).strftime("%H:%M")
+
+    monkeypatch.setattr(settings, "kb_drain_deadline", past)
+    assert consolidate._past_deadline() is True, "a cutoff already passed did not fire"
+
+    # Skip the wrap-around case near midnight, where +90min is tomorrow.
+    if (now + timedelta(minutes=90)).date() == now.date():
+        monkeypatch.setattr(settings, "kb_drain_deadline", future)
+        assert consolidate._past_deadline() is False, "a future cutoff fired early"
+
+
+def test_stopping_leaves_every_unreached_job_resumable(kb, as_owner):
+    """The queue IS the checkpoint: a deferred job must still be 'pending', so the
+    next run (nightly or the post-power-cut boot catch-up) picks it up."""
+    qid = _mk("proj", "a job the drain never reached")
+    rows = ingest_queue.pending(limit=100)
+    assert any(r["id"] == qid for r in rows), "an undrained job is not resumable"

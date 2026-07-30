@@ -126,16 +126,28 @@ class Settings(BaseSettings):
     # Sized on JOB COUNT, not bytes (measured 2026-07-29): assembled inputs vary
     # 40x (1.0-43.5 kB) while cohort times varied only +/-3%, because per-job cost
     # is dominated by MODEL LOADING, not input size. At 77.6 s/job, 46 jobs is
-    # ~1 hour — roughly one load per model per hour. Raising this further requires
+    # ~1 hour at FULL power. Derated to 30 on 2026-07-30 when the GPU was capped at
+    # 150W (UPS could not ride out a grid fluctuation): inference is slower, so a
+    # 46-job cohort risked exceeding jobs.PROGRESS_WINDOW_MINUTES and being reaped
+    # as dead. A shorter cohort also loses less in-memory work to the next power
+    # cut. Raising this further requires
     # raising jobs.PROGRESS_WINDOW_MINUTES too: no row reaches 'extracted' until
     # its cohort finishes, so a longer cohort looks dead to the stale-run reaper.
-    kb_drain_cohort: int = 46
+    kb_drain_cohort: int = 30
     # Memory ceiling for one cohort's assembled text — an OOM GUARD, not a
     # throughput knob (bytes are a poor predictor of time; see above). It exists so
     # a future large transcript cannot make a 46-job cohort exhaust RAM. Assembly
     # must always take AT LEAST ONE job even if that job alone exceeds this, or an
     # oversized row would wedge the queue permanently.
     kb_drain_cohort_bytes: int = 48_000_000
+    # Wall-clock time (HH:MM, local) after which the drain starts NO NEW cohort.
+    # The box is shared with interactive work and sits on a UPS that cannot ride
+    # out a grid fluctuation, so an unbounded overnight run is both a latency and
+    # a power risk. Stopping is always SAFE and always RESUMABLE: rows the drain
+    # has not reached are still 'pending', ingest is idempotent (Invariant 3), and
+    # the next run — nightly, or the boot catch-up after a power cut — picks up
+    # exactly where this one stopped. Empty disables the deadline.
+    kb_drain_deadline: str = "12:00"
     # keep_alive for a model while it works through its phase of a cohort.
     # Seconds, because llm.extract_items/verify_item are typed int | None —
     # only the low-level _chat accepts Ollama's "10m" string form.

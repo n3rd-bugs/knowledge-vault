@@ -6,6 +6,7 @@ f-string user values into a query.
 
 from __future__ import annotations
 
+import logging
 import os
 import zlib
 from collections.abc import Iterator
@@ -14,6 +15,8 @@ from contextlib import contextmanager
 import psycopg
 
 from kbcore.config import settings
+
+logger = logging.getLogger("kbcore.db")
 
 # Test-only live-data guard. When the test harness exports KB_TEST_GUARD=1, a
 # connection that resolves to the LIVE ``public`` schema is REFUSED unless the
@@ -89,6 +92,39 @@ def ping() -> bool:
         return conn.execute("SELECT 1").fetchone()[0] == 1
 
 
+def _warn_on_foreign_advisory_keys(conn, scoped: int, acquired: bool) -> None:
+    """Log our advisory key, and WARN if another connection holds a DIFFERENT one.
+
+    Mutual exclusion is only as good as every live process agreeing on the key.
+    They agree right up until the derivation changes: an already-running process
+    keeps the old key in resident bytecode, the two become invisible to each
+    other, and there is no error and no contention -- just two workers doing the
+    same job. That is exactly how two consolidations shared one GPU for 30 hours
+    (2026-07-29, legacy key 42 vs scoped 2764317). One catalog read per lock
+    attempt is the only cheap signal that would have caught it.
+    """
+    try:
+        others = conn.execute(
+            "SELECT objid, pid FROM pg_locks "
+            "WHERE locktype = 'advisory' AND granted AND objid <> %s",
+            (scoped,),
+        ).fetchall()
+    except Exception:  # observability must never break the lock path
+        logger.debug("advisory key %s (acquired=%s); peer check unavailable", scoped, acquired)
+        return
+    if others:
+        logger.warning(
+            "advisory key %s (acquired=%s) but OTHER advisory keys are held: %s -- "
+            "a key MISMATCH means mutual exclusion is NOT in effect; suspect a process "
+            "started before the key derivation last changed",
+            scoped,
+            acquired,
+            ", ".join(f"objid={o[0]} pid={o[1]}" for o in others),
+        )
+    else:
+        logger.info("advisory key %s (acquired=%s)", scoped, acquired)
+
+
 @contextmanager
 def advisory_lock(key: int) -> Iterator[bool]:
     """Hold a session-level ``pg_advisory_lock`` for the block (ARCH-5).
@@ -115,6 +151,7 @@ def advisory_lock(key: int) -> Iterator[bool]:
     acquired = False
     try:
         acquired = bool(conn.execute("SELECT pg_try_advisory_lock(%s)", (scoped,)).fetchone()[0])
+        _warn_on_foreign_advisory_keys(conn, scoped, acquired)
         yield acquired
     finally:
         if acquired:

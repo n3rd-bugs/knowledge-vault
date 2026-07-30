@@ -84,6 +84,10 @@ services:
       # kb.n3rd-bugs.dev; cloudflared (host systemd) forwards to the published port
       # below. Every issuer/PRM/redirect URL therefore renders as https://kb...dev.
       KB_PUBLIC_URL: "https://kb.n3rd-bugs.dev"
+      # uid 1000 has no passwd entry in the image, so Path.home() has nothing to
+      # resolve. FastMCP's OAuth proxy calls it to place its token store, so an
+      # explicit writable HOME is required — see the volume note below.
+      HOME: /home/app
     # FastMCP keeps OAuth state (claude.ai's client registration, refresh tokens,
     # upstream Google tokens) in an encrypted file store under this path. Without
     # a volume it is wiped on every redeploy -> POST /token 401 -> everyone is
@@ -96,7 +100,13 @@ services:
       # validation failed for all 687 archived sources until this mount
       # existed. Read-WRITE because kb_put_doc archives through this path.
       - ${HOME}/kb/raw:/home/usama/kb/raw:rw
-      - fastmcp-oauth:/root/.local/share/fastmcp
+      # Mounted under the HOME of uid 1000, NOT /root. This container runs as
+      # user 1000:1000 (so the shared raw archive is not created root-owned), and
+      # FastMCP derives its store from Path.home(). With the mount at /root/... the
+      # process had no writable home at all: Path.home() fell back to /, mkdir
+      # '/.local' raised PermissionError, and it crash-looped 252 times behind a
+      # 502 (2026-07-30). HOME in `environment` and this path must stay in sync.
+      - fastmcp-oauth:/home/app/.local/share/fastmcp
     # This IS the OAuth server: it calls Google server-side (OIDC discovery, JWKS,
     # and the auth-code -> token exchange at the callback). kbnet's embedded
     # resolver can't reach the internet, so give it public DNS (same as

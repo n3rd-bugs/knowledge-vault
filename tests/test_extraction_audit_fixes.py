@@ -190,7 +190,15 @@ def test_invented_identifiers_are_flagged_not_stripped():
 
     items = _items()
     flagged = items["ingest entry point"]
-    assert set(flagged.meta["unresolved_refs"]) == {"ingester.py", "OAUTH_TOKEN"}
+    # 'proj' has no configured tree, so PATH tokens are deliberately NOT flagged:
+    # a path is only checkable against the repo the knowledge is about, and
+    # accusing every path in every foreign project produced a 97.4% false-positive
+    # rate (703 of 722 open flags, measured 2026-07-30) that buried the real ones.
+    # ENV tokens are still checked — they resolve against this process's
+    # environment and config, which is meaningful whatever the project — so the
+    # OAUTH_TOKEN detection the audit added survives. See
+    # test_a_project_with_a_known_tree_is_still_checked for the path half.
+    assert set(flagged.meta["unresolved_refs"]) == {"OAUTH_TOKEN"}
     assert flagged.body.count("ingester.py") == 1, "the body is untouched (never stripped)"
 
     clean = items["ingest dedupe"]
@@ -200,7 +208,8 @@ def test_invented_identifiers_are_flagged_not_stripped():
     # on the flagged item's row.
     flagged_details = [d for d in _details() if "unresolved_refs" in d]
     assert len(flagged_details) == 1
-    assert set(flagged_details[0]["unresolved_refs"]) == {"ingester.py", "OAUTH_TOKEN"}
+    # Same project-aware semantics as the meta assertion above: env token only.
+    assert set(flagged_details[0]["unresolved_refs"]) == {"OAUTH_TOKEN"}
 
 
 # --- FIX 3: project router for KB-tooling knowledge ---------------------------
@@ -491,3 +500,50 @@ def test_unresolved_refs_is_capped_and_ordered():
     text = " ".join(f"ghost{i}.py" for i in range(30))
     refs = unresolved_refs(text)
     assert len(refs) == 12 and refs[0] == "ghost0.py"
+
+
+# ------------------------------------------------ ref_check is project-aware
+
+
+def test_refs_are_not_flagged_for_a_project_whose_tree_we_cannot_see(monkeypatch):
+    """A reference is only checkable against the repo the knowledge is about.
+
+    ref_check resolved everything against the data-server tree, so a session
+    about ANY other project had every path-shaped token flagged: measured
+    2026-07-30, 703 of 722 open unresolved_refs flags (97.4%) came from
+    aquamonix / i-redis / repeater — files that could not exist here. The noise
+    buried the 19 real flags. "I cannot see the tree" is not evidence that a
+    reference is broken.
+    """
+    from kbcore import ref_check
+
+    text = "the fix is in src/driver/main.py and scripts/deploy.sh"
+    assert ref_check.unresolved_refs(text, project="aquamonix") == [], (
+        "flagged references for a project with no known tree"
+    )
+
+
+def test_a_project_with_a_known_tree_is_still_checked(tmp_path, monkeypatch):
+    """Suppressing the false positives must not disable the check where it works."""
+    from kbcore import ref_check
+    from kbcore.config import settings
+
+    repo = tmp_path / "myproj"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "real.py").write_text("x = 1\n")
+    monkeypatch.setattr(settings, "kb_git_repos", str(repo))
+
+    refs = ref_check.unresolved_refs("see src/real.py and src/ghost.py", project="myproj")
+    assert "src/ghost.py" in refs, "a genuinely missing file was not flagged"
+    assert "src/real.py" not in refs, "an existing file was flagged"
+
+
+def test_an_explicit_repo_root_still_wins(tmp_path):
+    """The explicit argument is what the existing tests drive; it must not change."""
+    from kbcore import ref_check
+
+    (tmp_path / "here.py").write_text("x = 1\n")
+    refs = ref_check.unresolved_refs(
+        "here.py and gone.py", project="unknown-project", repo_root=tmp_path
+    )
+    assert "gone.py" in refs and "here.py" not in refs

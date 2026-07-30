@@ -141,9 +141,37 @@ def _resolves(
     return base in names or base in hooks
 
 
+def _root_for_project(project: str | None) -> Path | None:
+    """The tree a PROJECT's references should be resolved against, or None.
+
+    References are only checkable against the repo the knowledge is about. This
+    module resolved everything against the data-server tree, so a session about
+    any OTHER project had every path-shaped token flagged: measured 2026-07-30,
+    703 of 722 open `unresolved_refs` flags (97.4%) came from aquamonix, i-redis,
+    repeater and friends — files that could not possibly exist here. That noise
+    buried the 19 real data-server flags and made the signal worthless.
+
+    Returns None when no tree is known for the project. "I cannot see it" is not
+    evidence that a reference is broken, so the caller must SKIP the check rather
+    than flag — a false accusation is worse than a missed one for a signal whose
+    only job is to draw an owner's attention.
+    """
+    if not project:
+        return None
+    from kbcore.config import settings
+
+    for repo in settings.git_repos:
+        if repo.name == project and repo.is_dir():
+            return repo
+    if project == _REPO_ROOT.name:
+        return _REPO_ROOT
+    return None
+
+
 def unresolved_refs(
     text: str,
     *,
+    project: str | None = None,
     repo_root: Path | str | None = None,
     hooks_dir: Path | str | None = None,
     limit: int = MAX_REFS,
@@ -154,6 +182,18 @@ def unresolved_refs(
     result on ``meta.unresolved_refs`` and copies it into the review detail.
     Returns at most ``limit`` tokens, in first-appearance order.
     """
+    # PATH tokens are only checkable against the tree the knowledge is about; ENV
+    # tokens are checked against this process's environment and config files, which
+    # is meaningful whatever the project. So a missing tree suppresses paths ONLY —
+    # suppressing both also disabled the env check and dropped the OAUTH_TOKEN
+    # detection that an audit had specifically added.
+    paths_checkable = True
+    if repo_root is None and project is not None:
+        resolved = _root_for_project(project)
+        if resolved is None:
+            paths_checkable = False
+        else:
+            repo_root = resolved
     root = str(repo_root or _REPO_ROOT)
     hooks = str(hooks_dir or _HOOKS_DIR)
     rel, names = _repo_index(root)
@@ -165,6 +205,8 @@ def unresolved_refs(
         if _ENV_VAR.fullmatch(tok):
             if tok in env_names:
                 continue
+        elif not paths_checkable:
+            continue  # no tree for this project: cannot verify, so never accuse
         elif _resolves(tok, root, rel, names, hook_names):
             continue
         out.append(tok)

@@ -203,7 +203,19 @@ class Settings(BaseSettings):
     # applies suggestions in bulk (kb review apply-triage / kb_review_bulk). The
     # LLM never archives anything itself. This caps rows triaged per nightly
     # run. Kill switch: 0 disables the nightly step.
-    kb_review_triage_batch: int = 50
+    # COUPLED TO kb_review_expire_days ABOVE — the pair is what decides whether a
+    # bad extraction is ever looked at. Triage is oldest-first (review_triage.py
+    # ORDER BY rq.id), which is also expiry order, so each night it examines the
+    # rows closest to aging out. But a row that expires before triage reaches it
+    # closes having NEVER been examined, and its item stays live and searchable
+    # forever. So this batch must be >= the nightly MINT rate, or the gap silently
+    # becomes permanently-unexamined knowledge.
+    # Measured 2026-07-30: 8.35 review rows per session extracted (pipeline v2
+    # raised this ~8x from ~1.0), and at batch=50 coverage was 227/4560 = 5% —
+    # i.e. ~95% of rows were on track to expire unread. 500 covers a normal night
+    # and lets the backlog drain instead of grow. Cost is ~500 LLM calls, which is
+    # minutes now that model-major cohorting landed. Kill switch: 0.
+    kb_review_triage_batch: int = 500
     # Search-quality regression sentinel (§8): the nightly consolidation replays
     # the golden retrieval eval and flags a hit@5/MRR drop vs the prior run. Set
     # False to skip the eval entirely (kill switch).

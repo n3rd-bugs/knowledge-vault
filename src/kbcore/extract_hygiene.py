@@ -94,7 +94,7 @@ def evaluate(
         project, title=title, body=body, code_ref=clean_ref
     )
     kept_tags, dropped = tag_hygiene.filter_bled_tags(list(tags or []), title, body)
-    refs = ref_check.unresolved_refs(f"{title}\n{body}")
+    refs = ref_check.unresolved_refs(f"{title}\n{body}", project=routed)
     return Hygiene(
         project=routed,
         tags=kept_tags,

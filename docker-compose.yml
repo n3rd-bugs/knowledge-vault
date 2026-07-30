@@ -100,12 +100,14 @@ services:
       # validation failed for all 687 archived sources until this mount
       # existed. Read-WRITE because kb_put_doc archives through this path.
       - ${HOME}/kb/raw:/home/usama/kb/raw:rw
-      # Mounted under the HOME of uid 1000, NOT /root. This container runs as
-      # user 1000:1000 (so the shared raw archive is not created root-owned), and
-      # FastMCP derives its store from Path.home(). With the mount at /root/... the
-      # process had no writable home at all: Path.home() fell back to /, mkdir
-      # '/.local' raised PermissionError, and it crash-looped 252 times behind a
-      # 502 (2026-07-30). HOME in `environment` and this path must stay in sync.
+      # Path MUST match HOME above. uid 1000 has no passwd entry, so Path.home()
+      # resolved to / and mkdir('/.local') crash-looped the container 252 times
+      # behind a 502 (2026-07-30). The fix is an explicit HOME, NOT a different
+      # location: the store bakes ABSOLUTE paths into its own metadata, so moving
+      # it to /home/app made every existing entry fail FastMCP's path-security
+      # check ('Path /root/... is outside root /home/app/...') and broke the
+      # claude.ai connector's saved registration. Keep /root and make it WRITABLE
+      # by chowning the volume to 1000:1000 instead.
       - fastmcp-oauth:/home/app/.local/share/fastmcp
     # This IS the OAuth server: it calls Google server-side (OIDC discovery, JWKS,
     # and the auth-code -> token exchange at the callback). kbnet's embedded

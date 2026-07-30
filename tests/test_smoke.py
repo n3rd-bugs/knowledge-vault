@@ -15,7 +15,11 @@ def test_settings_defaults():
     s = Settings(_env_file=None)
     assert s.kb_embed_dim == 1024
     assert s.kb_port == 8321
-    assert s.kb_embed_model == "bge-m3"
+    # The embedder default moved to the instruction-aware model that is actually
+    # deployed; assert the PAIR, since the model alone without its query prefix is
+    # measurably worse than the bge-m3 it replaced (MODEL_RESEARCH_2026-07.md:192).
+    assert s.kb_embed_model == "qwen3-embedding:0.6b"
+    assert s.kb_embed_query_prefix.strip(), "instruction-aware default ships no prefix"
 
 
 def test_db_url_expands_password():

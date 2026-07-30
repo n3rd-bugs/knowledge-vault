@@ -102,3 +102,57 @@ def test_embed_query_routes_through_the_embed_texts_seam(monkeypatch):
     assert embed.embed_query("hello") == fake_vector("hello")
     monkeypatch.setattr(settings, "kb_embed_query_prefix", PREFIX)
     assert embed.embed_query("hello") == fake_vector(PREFIX + "hello")
+
+
+# ------------------------------------- the model/prefix pair must stay coherent
+
+
+def test_an_instruction_aware_model_without_its_prefix_warns(caplog):
+    """These two settings are one decision wearing two names.
+
+    qwen3-embedding needs its query prefix to beat bge-m3 (hit@5 0.759 vs 0.724);
+    WITHOUT it, it loses to the model it replaced. Splitting the pair degrades
+    retrieval silently, so the config must say so rather than trust a comment.
+    """
+    import logging
+
+    from kbcore.config import Settings
+
+    with caplog.at_level(logging.WARNING, logger="kbcore.config"):
+        Settings(kb_embed_model="qwen3-embedding:0.6b", kb_embed_query_prefix="")
+    assert "instruction-aware" in caplog.text
+    assert "WORSE" in caplog.text
+
+
+def test_the_coherent_pair_is_quiet(caplog):
+    """A warning that fires on the correct config is noise and gets ignored."""
+    import logging
+
+    from kbcore.config import Settings
+
+    with caplog.at_level(logging.WARNING, logger="kbcore.config"):
+        Settings(
+            kb_embed_model="qwen3-embedding:0.6b",
+            kb_embed_query_prefix="Instruct: x\nQuery: ",
+        )
+    assert "instruction-aware" not in caplog.text
+
+
+def test_a_non_instruction_model_needs_no_prefix(caplog):
+    """bge-m3 takes plain queries; demanding a prefix there would be wrong."""
+    import logging
+
+    from kbcore.config import Settings
+
+    with caplog.at_level(logging.WARNING, logger="kbcore.config"):
+        Settings(kb_embed_model="bge-m3", kb_embed_query_prefix="")
+    assert "instruction-aware" not in caplog.text
+
+
+def test_the_shipped_defaults_are_a_coherent_pair():
+    """A fresh deploy with no .env must not land in the degraded combination."""
+    from kbcore.config import Settings
+
+    d = Settings()
+    if "qwen3-embedding" in d.kb_embed_model:
+        assert d.kb_embed_query_prefix.strip(), "default model ships without its prefix"

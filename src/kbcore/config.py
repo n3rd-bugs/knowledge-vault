@@ -7,11 +7,15 @@ rule): import `settings` from here instead.
 
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logger = logging.getLogger("kbcore.config")
 
 # Repo root is two levels up from src/kbcore/config.py.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -93,7 +97,13 @@ class Settings(BaseSettings):
     # local card then holds one 14B at a time instead of thrashing between a
     # 11.4GB extractor and a 2.3GB embedder that never both fit.
     kb_embed_url: str = ""
-    kb_embed_model: str = "bge-m3"
+    # MUST stay coherent with kb_embed_query_prefix below — the pair is the config,
+    # not either half. An instruction-aware embedder run WITHOUT its prefix is
+    # measurably WORSE than bge-m3 (hit@5 0.724 vs 0.759 with it,
+    # MODEL_RESEARCH_2026-07.md:192), so a default that names the model but leaves
+    # the prefix empty ships the worst of both. Defaults now match what is actually
+    # deployed, and _check_embed_pairing() warns if the two are ever split.
+    kb_embed_model: str = "qwen3-embedding:0.6b"
     kb_embed_dim: int = 1024
     kb_embed_device: str = "auto"
     # Instruction prefix REQUIRED by instruction-aware embedders (qwen3-embedding)
@@ -102,7 +112,10 @@ class Settings(BaseSettings):
     # .env alongside the model swap — code stays model-agnostic. Measured
     # 2026-07-18 (MODEL_RESEARCH_2026-07 addendum): qwen3-embedding WITHOUT the
     # prefix is WORSE than bge-m3; with it, hit@5 0.759 vs 0.724.
-    kb_embed_query_prefix: str = ""
+    kb_embed_query_prefix: str = (
+        "Instruct: Given a web search query, retrieve relevant passages that "
+        "answer the query\nQuery: "
+    )
     # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity,
     # 100% verbatim grounding. gemma3:12b is the approved fast fallback.
     # How many queued jobs the drain extracts as ONE cohort. With
@@ -262,6 +275,25 @@ class Settings(BaseSettings):
     kb_git_repos: str = ""
     kb_archive_after_days: int = 180
     kb_dup_threshold: float = 0.97
+
+    @model_validator(mode="after")
+    def _check_embed_pairing(self) -> Settings:
+        """Warn when an instruction-aware embedder is configured without its prefix.
+
+        These two settings are one decision wearing two names. qwen3-embedding
+        needs its "Instruct: …\\nQuery: " prefix on the QUERY side to beat bge-m3
+        (hit@5 0.759 vs 0.724); without it, it LOSES to the model it replaced
+        (MODEL_RESEARCH_2026-07.md:192). Splitting the pair is silent — retrieval
+        just gets quietly worse, which is the hardest kind of regression to notice
+        and the reason this warns instead of trusting a comment.
+        """
+        if "qwen3-embedding" in self.kb_embed_model and not self.kb_embed_query_prefix.strip():
+            logger.warning(
+                "KB_EMBED_MODEL=%s is instruction-aware but KB_EMBED_QUERY_PREFIX is empty — "
+                "retrieval is measurably WORSE than bge-m3 in this configuration",
+                self.kb_embed_model,
+            )
+        return self
 
     @property
     def db_url(self) -> str:

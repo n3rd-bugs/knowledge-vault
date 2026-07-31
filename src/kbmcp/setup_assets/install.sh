@@ -592,6 +592,30 @@ if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
   fi
 fi
 
+# Discover the notification channel from the KB host. The owner should never
+# have to paste a token into a chat: a credential typed into a session is
+# captured by the flush hooks being installed here and ends up in the KB. 404
+# simply means notifications are not configured server-side, which is fine — the
+# hooks stay inert and this install is unaffected. `|| true` because an optional
+# convenience must never be able to fail an install (a 404 is curl exit 22 and
+# `set -e` would abort the whole thing).
+if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
+  _notify=$(curl -fsS --max-time 8 -H "Authorization: Bearer ${KB_TOKEN:-$KB_ENROL_CODE}" \
+    "${KB_REST_URL%/}/api/setup/notify.env" 2>/dev/null || true)
+  if [ -n "$_notify" ]; then
+    _nf="$HOME/.claude/notify.env"
+    if [ -f "$_nf" ]; then
+      echo "notify:   $_nf already exists — left alone (delete it to re-fetch)"
+    else
+      umask 077
+      printf '%s' "$_notify" > "$_nf"
+      chmod 600 "$_nf" 2>/dev/null || true
+      # The token is never echoed — only that a channel was configured.
+      echo "notify:   $_nf written (completion notifications enabled)"
+    fi
+  fi
+fi
+
 echo "hook:     $HOOK"
 echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-prompt KB recall)"
 echo "config:   $CFG  ($MODE)"

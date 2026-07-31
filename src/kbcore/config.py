@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     # REMOTE session-hook config so a new machine needs only a token. Empty ->
     # kb_setup emits a generic placeholder.
     kb_public_rest_url: str = ""
+    # Completion-notification channel handed to enrolled machines. Empty disables
+    # the feature entirely — no endpoint output, nothing written on install.
+    # KB_NOTIFY_TOKEN must be a WRITE-ONLY ntfy token scoped to the one topic, not
+    # an admin credential: it is distributed to every machine that enrols, so it
+    # must be able to announce completions and nothing else. It cannot read the
+    # notification history (which carries client project names) and is revocable
+    # per-machine at the ntfy side.
+    kb_notify_url: str = ""
+    kb_notify_topic: str = ""
+    kb_notify_token: str = ""
     # Lifetime of the FastMCP-issued access token. Decoupled from Google's ~1h
     # upstream expiry so a client hiccup doesn't surface as an hourly logout;
     # the proxy refreshes Google underneath (access_type=offline).

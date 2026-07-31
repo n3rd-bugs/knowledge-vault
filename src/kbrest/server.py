@@ -224,6 +224,38 @@ def _register_write(app: FastAPI) -> None:
             "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
         }
 
+    @app.get("/api/setup/notify.env", response_class=PlainTextResponse)
+    def api_setup_notify_env() -> str:
+        """The completion-notification channel, so an enrolling machine discovers
+        it instead of the owner pasting a token into a chat.
+
+        Pasting is not merely inconvenient — a credential typed into a session is
+        captured by the very flush hooks being installed and lands in the KB. That
+        happened here on 2026-07-31 (an ntfy admin password leaked into a
+        transcript under `bash -x` and had to be rotated), which is exactly why
+        this travels over an authenticated endpoint instead.
+
+        What is handed out is a WRITE-ONLY token scoped to one topic: a machine
+        can announce completions and nothing else. It cannot read the history,
+        cannot publish elsewhere, and is revocable without touching other boxes.
+        404 when unconfigured, so a deployment that does not want notifications
+        simply never sets these and installers carry on without them.
+        """
+        if not (settings.kb_notify_url and settings.kb_notify_topic):
+            raise HTTPException(status_code=404, detail="not found")
+        lines = [
+            "# Completion notifications — fetched from the KB host at install time.",
+            "# NTFY_TOKEN is WRITE-ONLY on this topic: publish yes, read no.",
+            f"NTFY_URL={settings.kb_notify_url}",
+            f"NTFY_TOPIC={settings.kb_notify_topic}",
+        ]
+        if settings.kb_notify_token:
+            lines.append(f"NTFY_TOKEN={settings.kb_notify_token}")
+        # 0 = notify on every completion; this is a private single-subscriber
+        # channel, so a missed completion costs more than an extra ping.
+        lines.append("NTFY_MIN_SECONDS=0")
+        return "\n".join(lines) + "\n"
+
     @app.get("/api/setup/manifest.json")
     def api_setup_manifest() -> dict:
         """Content digests for every shipped setup asset, so a machine can tell

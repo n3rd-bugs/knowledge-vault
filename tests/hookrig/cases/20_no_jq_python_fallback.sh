@@ -54,8 +54,8 @@ step "four events, two scripts (item 1152)"
 new_home nojq_events
 install_hooks >/dev/null
 KEYS=$("$RIG_JQ" -r '.hooks | keys | join(",")' "$SETTINGS")
-assert_eq "PreCompact,SessionEnd,SessionStart,UserPromptSubmit" "$KEYS" "exactly four event keys"
-assert_eq "2" "$("$RIG_JQ" -r '[.hooks[][].hooks[0].command] | unique | length' "$SETTINGS")" "two scripts"
+assert_eq "PreCompact,SessionEnd,SessionStart,Stop,UserPromptSubmit" "$KEYS" "exactly five event keys"
+assert_eq "4" "$("$RIG_JQ" -r '[.hooks[][].hooks[0].command] | unique | length' "$SETTINGS")" "four scripts"
 assert_eq "$HOOKS/flush-session-to-kb.sh" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].command' "$SETTINGS")" "PreCompact -> flush hook"
 assert_eq "startup|clear" "$("$RIG_JQ" -r '.hooks.SessionStart[0].matcher' "$SETTINGS")" "SessionStart matcher kept"
 

@@ -256,6 +256,14 @@ if [ -n "$KB_JQ_BIN" ]; then JSON_MODE="jq ($KB_JQ_BIN)"; else JSON_MODE="python
 install -m 0755 "$SKILL_DIR/flush-session-to-kb.sh" "$HOOK"
 BRIEF="$HOOKS/kb-session-brief.sh"
 install -m 0755 "$SKILL_DIR/kb-session-brief.sh" "$BRIEF"
+# Completion notifications. OPTIONAL and inert by default: notify-complete.sh does
+# nothing at all unless ~/.claude/notify.env names a channel, so installing it
+# costs one process spawn per response and never fails a session. turn-start.sh
+# stamps the turn so the notice can carry a duration.
+NOTIFY="$HOOKS/notify-complete.sh"
+TURNSTART="$HOOKS/turn-start.sh"
+[ -f "$SKILL_DIR/notify-complete.sh" ] && install -m 0755 "$SKILL_DIR/notify-complete.sh" "$NOTIFY"
+[ -f "$SKILL_DIR/turn-start.sh" ] && install -m 0755 "$SKILL_DIR/turn-start.sh" "$TURNSTART"
 install -m 0755 "$SKILL_DIR/kb-mcp-call.sh" "$HOOKS/kb-mcp-call.sh"
 
 # Co-locate the jq we just used NEXT TO THE HOOKS (originally a Windows fix, KB
@@ -479,25 +487,35 @@ if [ -n "$KB_JQ_BIN" ]; then
       '{matcher:"startup|clear",hooks:[{type:"command",command:$b,args:[$c],timeout:35}]}')
     recall_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$BRIEF" \
       '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:35}]}')
+      notify_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$NOTIFY" \
+        '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
+      turn_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$TURNSTART" \
+        '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:5}]}')
   else
     entry=$("$KB_JQ_BIN" -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
     brief_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:35}]}')
     recall_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"",hooks:[{type:"command",command:$c,timeout:35}]}')
+      notify_entry=$("$KB_JQ_BIN" -n --arg c "$NOTIFY" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
+      turn_entry=$("$KB_JQ_BIN" -n --arg c "$TURNSTART" '{matcher:"",hooks:[{type:"command",command:$c,timeout:5}]}')
   fi
-  "$KB_JQ_BIN" --argjson e "$entry" --argjson b "$brief_entry" --argjson r "$recall_entry" \
-    --arg c "$HOOK" --arg bc "$BRIEF" '
+  "$KB_JQ_BIN" --argjson e "$entry" --argjson b "$brief_entry" --argjson r "$recall_entry" --argjson n "$notify_entry" --argjson t "$turn_entry" \
+    --arg c "$HOOK" --arg bc "$BRIEF" --arg nc "$NOTIFY" --arg tc "$TURNSTART" '
     def ours($p): (.hooks[0].command == $p) or ((.hooks[0].args[0]? // "") == $p);
     .hooks = (.hooks // {})
     | .hooks.PreCompact = (((.hooks.PreCompact // []) | map(select(ours($c) | not))) + [$e])
     | .hooks.SessionEnd = (((.hooks.SessionEnd // []) | map(select(ours($c) | not))) + [$e])
     | .hooks.SessionStart = (((.hooks.SessionStart // []) | map(select(ours($bc) | not))) + [$b])
-    | .hooks.UserPromptSubmit = (((.hooks.UserPromptSubmit // []) | map(select(ours($bc) | not))) + [$r])
+      | .hooks.UserPromptSubmit = (((.hooks.UserPromptSubmit // [])
+            | map(select((ours($bc) or ours($tc)) | not))) + [$r, $t])
+      | .hooks.Stop = (((.hooks.Stop // []) | map(select(ours($nc) | not))) + [$n])
   ' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS"
 else
-  "$KB_PY_BIN" - "$SETTINGS" "$tmp" "$HOOK" "$BRIEF" "$BASHW" <<'PY' && mv "$tmp" "$SETTINGS"
+  "$KB_PY_BIN" - "$SETTINGS" "$tmp" "$HOOK" "$BRIEF" "$BASHW" "$NOTIFY" "$TURNSTART" <<'PY' && mv "$tmp" "$SETTINGS"
 import json, sys
 
 src, tmp, hook, brief, bashw = sys.argv[1:6]
+notify = sys.argv[6] if len(sys.argv) > 6 else ""
+turnstart = sys.argv[7] if len(sys.argv) > 7 else ""
 try:
     data = json.load(open(src, encoding="utf-8"))
 except Exception:
@@ -539,6 +557,13 @@ for ev, script, matcher, timeout in (
     ("SessionEnd", hook, "", 15),
     ("SessionStart", brief, "startup|clear", 35),
     ("UserPromptSubmit", brief, "", 35),
+    # Stop fires when Claude finishes responding. This is what tells you a long
+    # run is done on a machine you have walked away from — and it was the piece
+    # missing from every REMOTE box: the notify hook existed only where it had
+    # been hand-placed, so notifications looked "flaky" when they were simply
+    # absent (2026-07-31). Inert unless notify.env names a channel.
+    *((("Stop", notify, "", 15),) if notify else ()),
+    *((("UserPromptSubmit", turnstart, "", 5),) if turnstart else ()),
 ):
     cur = hooks.get(ev)
     cur = cur if isinstance(cur, list) else []
@@ -554,7 +579,7 @@ echo "hook:     $HOOK"
 echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-prompt KB recall)"
 echo "config:   $CFG  ($MODE)"
 echo "json:     $JSON_MODE"
-echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart + UserPromptSubmit registered)"
+echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart + UserPromptSubmit + Stop registered)"
 echo
 echo "smoke test (feeds a fake PreCompact event to the hook):"
 echo "  T=\$(ls -t \"\$HOME\"/.claude/projects/*/*.jsonl | head -1)"

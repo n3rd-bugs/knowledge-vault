@@ -88,7 +88,11 @@ assert_not_contains "$OUT" "$RIG_TOKEN" "install.sh did not echo the credential"
 step "the hooks are registered for all four events"
 for ev in PreCompact SessionEnd SessionStart UserPromptSubmit; do
   N=$("$RIG_JQ" -r --arg e "$ev" '[.hooks[$e][]?.hooks[]?] | length' "$SETTINGS")
-  assert_eq "1" "$N" "$ev registered exactly once"
+  # UserPromptSubmit carries TWO after the notification hooks shipped: the KB
+  # per-prompt recall AND turn-start.sh, which stamps the turn so the Stop notice
+  # can report how long the run took.
+  EXPECT=1; [ "$ev" = "UserPromptSubmit" ] && EXPECT=2
+  assert_eq "$EXPECT" "$N" "$ev registered the expected number of times"
 done
 
 # ------------------------------------------------------ 3. the code is now spent

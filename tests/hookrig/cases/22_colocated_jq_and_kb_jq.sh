@@ -35,7 +35,7 @@ OUT_INST=$(install_hooks 2>&1)
 RC_INST=$?
 assert_eq "0" "$RC_INST" "install succeeds using the jq beside the hooks"
 assert_contains "$OUT_INST" "$HOOKS/jq" "installer reports the co-located jq as its backend"
-assert_eq "4" "$("$HOOKS/jq" -r '.hooks | length' "$SETTINGS")" "four events registered"
+assert_eq "5" "$("$HOOKS/jq" -r '.hooks | length' "$SETTINGS")" "five events registered"
 
 step "a flush works with the co-located jq alone"
 WORK="$HOME/work/colocated-proj"

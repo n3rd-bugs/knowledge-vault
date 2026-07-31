@@ -16,15 +16,18 @@ install_hooks >/dev/null
 
 step "settings.json wires exactly the four events"
 KEYS=$(jq -r '.hooks | keys | join(",")' "$SETTINGS")
-assert_eq "PreCompact,SessionEnd,SessionStart,UserPromptSubmit" "$KEYS" "exactly four event keys"
-assert_eq "4" "$(jq -r '.hooks | length' "$SETTINGS")" "no fifth event registered"
+assert_eq "PreCompact,SessionEnd,SessionStart,Stop,UserPromptSubmit" "$KEYS" "exactly five event keys"
+assert_eq "5" "$(jq -r '.hooks | length' "$SETTINGS")" "no sixth event registered"
 
 FLUSH="$HOOKS/flush-session-to-kb.sh"
 BRIEF="$HOOKS/kb-session-brief.sh"
 
 step "the flush hook owns the two session-capture events"
 for ev in PreCompact SessionEnd; do
-  assert_eq "1" "$(jq -r --arg e "$ev" '.hooks[$e] | length' "$SETTINGS")" "$ev has one entry"
+  # UserPromptSubmit legitimately carries TWO: the KB per-prompt recall AND
+  # turn-start.sh, which stamps the turn so the Stop notice can report a duration.
+  EXPECT=1; [ "$ev" = "UserPromptSubmit" ] && EXPECT=2
+  assert_eq "$EXPECT" "$(jq -r --arg e "$ev" '.hooks[$e] | length' "$SETTINGS")" "$ev entry count"
   assert_eq "$FLUSH" "$(jq -r --arg e "$ev" '.hooks[$e][0].hooks[0].command' "$SETTINGS")" "$ev -> flush hook"
   assert_eq "command" "$(jq -r --arg e "$ev" '.hooks[$e][0].hooks[0].type' "$SETTINGS")" "$ev entry is type=command"
   assert_eq "" "$(jq -r --arg e "$ev" '.hooks[$e][0].matcher' "$SETTINGS")" "$ev matcher is empty"
@@ -32,7 +35,10 @@ done
 
 step "the brief hook owns the two recall events"
 for ev in SessionStart UserPromptSubmit; do
-  assert_eq "1" "$(jq -r --arg e "$ev" '.hooks[$e] | length' "$SETTINGS")" "$ev has one entry"
+  # UserPromptSubmit legitimately carries TWO: the KB per-prompt recall AND
+  # turn-start.sh, which stamps the turn so the Stop notice can report a duration.
+  EXPECT=1; [ "$ev" = "UserPromptSubmit" ] && EXPECT=2
+  assert_eq "$EXPECT" "$(jq -r --arg e "$ev" '.hooks[$e] | length' "$SETTINGS")" "$ev entry count"
   assert_eq "$BRIEF" "$(jq -r --arg e "$ev" '.hooks[$e][0].hooks[0].command' "$SETTINGS")" "$ev -> brief hook"
 done
 assert_eq "startup|clear" "$(jq -r '.hooks.SessionStart[0].matcher' "$SETTINGS")" "SessionStart matcher is startup|clear"
@@ -54,6 +60,6 @@ done
 
 step "exactly TWO distinct hook commands are referenced across the four events"
 N=$(jq -r '[.hooks[][].hooks[0].command] | unique | length' "$SETTINGS")
-assert_eq "2" "$N" "four events, two scripts"
+assert_eq "4" "$N" "five events, four scripts"
 
 finish

@@ -27,7 +27,7 @@ assert_eq "0" "$RC_INST" "install.sh survives a spacey HOME"
 assert_contains "$OUT_INST" "$HOOKS/flush-session-to-kb.sh" "it reports the spacey hook path"
 if [ -x "$HOOKS/flush-session-to-kb.sh" ]; then pass "hook installed under the spacey path"; else fail "hook missing"; fi
 if [ -x "$HOOKS/kb-session-brief.sh" ]; then pass "brief installed"; else fail "brief missing"; fi
-assert_eq "4" "$("$RIG_JQ" -r '.hooks | length' "$SETTINGS")" "four events registered"
+assert_eq "5" "$("$RIG_JQ" -r '.hooks | length' "$SETTINGS")" "five events registered"
 assert_eq "$HOOKS/flush-session-to-kb.sh" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].command' "$SETTINGS")" "the registered command keeps the space, unmangled"
 
 step "the installer co-located jq under the spacey path too"

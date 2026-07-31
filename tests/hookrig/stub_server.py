@@ -165,6 +165,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"reset\n", "text/plain")
         elif path == "/api/search":
             self._rest_search()
+        elif path == "/api/setup/manifest.json":
+            self._serve_manifest()
         elif path.startswith("/api/setup/"):
             self._serve_script(path.rsplit("/", 1)[-1])
         else:
@@ -235,6 +237,31 @@ class Handler(BaseHTTPRequestHandler):
     # with the enrolment code as bearer, then redeem it for a real credential.
     # The code must survive the fetches (only the POST spends it) or the
     # bootstrap would consume its own credential before using it.
+    def _serve_manifest(self) -> None:
+        """Mirror GET /api/setup/manifest.json: a content-derived version plus a
+        digest per shipped script, so a box can tell it is stale without pulling
+        every file."""
+        import hashlib as _h
+
+        rec = {"transport": "http", "method": "GET", "path": self.path, "script": "manifest.json"}
+        if self._auth() == "missing":
+            self._done(rec, 401, {"error": "unauthorized"})
+            return
+        files = {
+            n: _h.sha256((SKILL_DIR / n).read_bytes()).hexdigest()
+            for n in sorted(SETUP_SCRIPTS)
+            if (SKILL_DIR / n).exists()
+        }
+        version = _h.sha256(
+            "".join(f"{k}:{v}" for k, v in sorted(files.items())).encode()
+        ).hexdigest()[:12]
+        State.record({**rec, "status": 200})
+        self._send(
+            200,
+            json.dumps({"version": version, "files": files, "count": len(files)}).encode(),
+            "application/json",
+        )
+
     def _serve_script(self, name: str) -> None:
         rec = {"transport": "http", "method": "GET", "path": self.path, "script": name}
         if self._auth() == "missing":

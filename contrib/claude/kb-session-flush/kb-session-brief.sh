@@ -366,6 +366,40 @@ else
   CONN_TO=25
   ALLOW_CONN=1
   MODE=brief
+
+  # ------------------------------------------------ are these hooks up to date?
+  # A box cannot otherwise tell. It compares what it has against whatever the
+  # server hands out, so a server that was never rebuilt makes EVERY box report
+  # itself current — which is exactly how a remote machine sat on stale scripts
+  # while the fix it needed went unshipped (2026-07-31). The server now publishes
+  # a content-derived version, so the comparison is a single small GET.
+  #
+  # SessionStart only, never per-prompt: this is a once-a-session courtesy, not a
+  # poll. Entirely best-effort — a slow or absent manifest must never delay or
+  # fail a session, so it is bounded and every failure is silent.
+  if [ "${KB_VERSION_CHECK:-1}" = "1" ] && [ -n "${KB_REST_URL:-}" ]; then
+    _hooks_dir="$HOME/.claude/hooks"
+    _stamp="$_hooks_dir/.setup-version"
+    _remote=$(curl -fsS --connect-timeout 3 --max-time 6 -H "Authorization: Bearer $KB_TOKEN" \
+      "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
+      | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
+    if [ -n "$_remote" ]; then
+      # Compare against the version recorded at install time. A missing stamp
+      # means these hooks predate versioning, which is itself worth reporting.
+      _local=$(cat "$_stamp" 2>/dev/null || echo "")
+      if [ "$_local" != "$_remote" ]; then
+        printf '[KB setup] Your hook scripts are OUT OF DATE (installed %s, server %s).\n' \
+          "${_local:-unversioned}" "$_remote"
+        printf 'Re-run the installer to pick up the current scripts:\n'
+        printf '  cd ~/.claude/kb-setup 2>/dev/null || mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup\n'
+        printf '  for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \\\n'
+        printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh; do\n'
+        printf '    curl -fsS -H "Authorization: Bearer $KB_TOKEN" "%s/api/setup/$f" -o "$f"\n' "${KB_REST_URL%/}"
+        printf '  done && bash install.sh\n'
+        printf 'This is FYI — nothing is broken, but newer scripts may capture more.\n\n'
+      fi
+    fi
+  fi
 fi
 
 # ---------------------------------------------------------- per-project token

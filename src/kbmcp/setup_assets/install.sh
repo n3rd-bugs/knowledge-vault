@@ -575,6 +575,23 @@ with open(tmp, "w", encoding="utf-8") as fh:
 PY
 fi
 
+# Record WHICH version was installed, so kb-session-brief.sh can tell at session
+# start whether the server has moved on. Without a stamp the brief reports
+# "unversioned", which is correct and still actionable for hooks that predate
+# this. Best-effort: a machine that cannot reach the manifest is still installed.
+if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
+  # `|| true` is load-bearing: with `set -e`, a 404 from an older server (curl
+  # exit 22) would abort the WHOLE install over an optional stamp. Versioning is
+  # a convenience; it must never be able to break the thing it describes.
+  _v=$(curl -fsS --max-time 8 -H "Authorization: Bearer ${KB_TOKEN:-$KB_ENROL_CODE}" \
+    "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
+    | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
+  if [ -n "$_v" ]; then
+    printf '%s\n' "$_v" > "$HOOKS/.setup-version" 2>/dev/null || true
+    echo "version:  $_v (recorded in $HOOKS/.setup-version)"
+  fi
+fi
+
 echo "hook:     $HOOK"
 echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-prompt KB recall)"
 echo "config:   $CFG  ($MODE)"

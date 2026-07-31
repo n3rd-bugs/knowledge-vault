@@ -150,7 +150,8 @@ def build_setup_guide(
 export KB_REST_URL={url}
 export KB_ENROL_CODE={enrol.code}   # single use, expires in ~{mins} min
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
-for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
+         kb-mcp-call.sh notify-complete.sh turn-start.sh; do
   curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh

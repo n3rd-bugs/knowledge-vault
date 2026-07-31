@@ -38,7 +38,10 @@ PORT = int(os.environ.get("RIG_PORT", "8000"))
 # Where the rig mounted the skill, so the stub can serve the REAL scripts.
 SKILL_DIR = Path(os.environ.get("SKILL", "/skill"))
 SETUP_SCRIPTS = frozenset(
-    {"install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh"}
+    {"install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh",
+    "notify-complete.sh",
+    "turn-start.sh",
+}
 )
 
 SEARCH_HITS = "\n".join(

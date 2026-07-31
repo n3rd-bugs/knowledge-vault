@@ -66,7 +66,8 @@ for bin in claude uv kb; do
 done
 
 step "the skill under test is complete"
-for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
+         kb-mcp-call.sh notify-complete.sh turn-start.sh; do
   if [ -f "$SKILL/$f" ]; then pass "skill has $f"; else fail "skill missing $f"; fi
 done
 

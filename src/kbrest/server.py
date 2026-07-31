@@ -10,6 +10,7 @@ Run: ``python -m kbrest.server``.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -58,7 +59,17 @@ from kbrest.schemas import (
 # so this route can never become a way to read arbitrary files.
 _SETUP_ASSETS = Path(__file__).resolve().parents[1] / "kbmcp" / "setup_assets"
 _SETUP_SCRIPTS = frozenset(
-    {"install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh"}
+    {
+        "install.sh",
+        "flush-session-to-kb.sh",
+        "kb-session-brief.sh",
+        "kb-mcp-call.sh",
+        # Completion notifications (2026-07-31). Optional and inert without a
+        # notify.env, but they must be SERVABLE or a remote box can never get them
+        # — which is precisely why notifications only ever worked on this host.
+        "notify-complete.sh",
+        "turn-start.sh",
+    }
 )
 
 log = logging.getLogger("kbrest")
@@ -212,6 +223,32 @@ def _register_write(app: FastAPI) -> None:
             "project": cred.project,
             "expires_at": cred.expires_at.isoformat() if cred.expires_at else None,
         }
+
+    @app.get("/api/setup/manifest.json")
+    def api_setup_manifest() -> dict:
+        """Content digests for every shipped setup asset, so a machine can tell
+        whether its installed hooks are current WITHOUT downloading them all.
+
+        Version is derived from the CONTENT, not hand-maintained: a digest over
+        the per-file digests. A version constant someone must remember to bump is
+        a version constant that silently goes stale, and the failure is invisible
+        — a box reports itself up to date against whatever it last fetched. That
+        is exactly what happened on 2026-07-31: a remote machine compared its four
+        files against a server whose image had never been rebuilt, matched, and
+        concluded it was current while the fix it needed sat unshipped.
+
+        Cheap enough to call on every session start (one small JSON), and it needs
+        the same credential as the scripts themselves.
+        """
+        files: dict[str, str] = {}
+        for fname in sorted(_SETUP_SCRIPTS):
+            path = _SETUP_ASSETS / fname
+            if path.exists():
+                files[fname] = hashlib.sha256(path.read_bytes()).hexdigest()
+        combined = hashlib.sha256(
+            "".join(f"{k}:{v}" for k, v in sorted(files.items())).encode()
+        ).hexdigest()
+        return {"version": combined[:12], "files": files, "count": len(files)}
 
     @app.get("/api/setup/{name}", response_class=PlainTextResponse)
     def api_setup_script(name: str) -> str:

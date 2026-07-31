@@ -148,6 +148,29 @@ class Settings(BaseSettings):
     # the next run — nightly, or the boot catch-up after a power cut — picks up
     # exactly where this one stopped. Empty disables the deadline.
     kb_drain_deadline: str = "12:00"
+    # PAUSE THE DRAIN WHEN THE HOUSE IS ON BATTERY. The GPU is the largest load on
+    # this box and the UPS could not ride out a grid fluctuation (2026-07-30), so
+    # hours of inference during an outage is exactly the wrong thing to be doing.
+    # Read-only path to the sungrow monitor DB; empty disables the check entirely.
+    kb_power_db: str = "/home/usama/sungrow/db.sqlite3"
+    # Grid-healthy threshold. Measured over 219,306 readings 2026-07-31:
+    #     0-50V 0.77% (outage) | 50-150V 0.08% | 150-200V 0.07% (sag)
+    #     200-210V 0.37% | 210-220V 6.22% | 220V+ 92.50% (normal)
+    # 200 captures every abnormal band INCLUDING transitions and brownouts, while
+    # leaving ~12V of margin below the 212-213V readings seen today, so ordinary
+    # mains never trips it. Owner decision: keep the GPU down through transitional
+    # readings, not just hard outages — a sagging grid is when the UPS is least
+    # able to absorb a 150W spike.
+    kb_power_min_grid_volts: float = 200.0
+    # A reading older than this tells us nothing about NOW. Treating a stale row as
+    # "grid is fine" is precisely how you flatten a battery through an outage, so
+    # staleness is handled explicitly rather than by trusting the last known value.
+    kb_power_max_age_seconds: int = 300
+    # Readings inspected per check. ANY sample below the threshold in this window
+    # keeps the GPU down, so the drain resumes only once the grid has been
+    # consistently healthy — it will not restart into a flickering supply, which
+    # is the failure mode a single-sample check invites.
+    kb_power_window: int = 5
     # keep_alive for a model while it works through its phase of a cohort.
     # Seconds, because llm.extract_items/verify_item are typed int | None —
     # only the low-level _chat accepts Ollama's "10m" string form.

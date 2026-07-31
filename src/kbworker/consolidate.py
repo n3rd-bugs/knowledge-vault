@@ -151,6 +151,84 @@ def _past_deadline() -> bool:
     return datetime.now() >= cutoff
 
 
+def _on_battery() -> bool:
+    """True when the house is running on battery, so the drain should stand down.
+
+    The GPU is the largest load on this box and the UPS could not ride out a grid
+    fluctuation (2026-07-30, power lost mid-run). Hours of inference during an
+    outage is the wrong thing to be doing, so the drain stops between cohorts and
+    resumes when mains returns — the same stop-and-resume path as the deadline,
+    which needs no state of its own because unreached rows stay 'pending'.
+
+    Signal is grid_voltage from the sungrow monitor DB, read-only. Measured over
+    219,304 readings: normal 213-256V, outages cluster below 50V, and the 50-150V
+    band holds only ~170 readings — so the threshold sits in a sparse gap rather
+    than near either mode.
+
+    FAILS OPEN, loudly. If the DB is missing, unreadable, or its newest reading is
+    STALE, this returns False and warns. A stale row is not evidence that the grid
+    is up, but a pipeline that silently never runs because another project's
+    poller died is the worse failure — and the drain is already deadline-bounded.
+    Staleness is checked explicitly: trusting a last-known-good value is exactly
+    how you flatten a battery through an outage.
+    """
+    path = (settings.kb_power_db or "").strip()
+    if not path:
+        return False
+    try:
+        import sqlite3
+
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
+            rows = conn.execute(
+                "SELECT grid_voltage, timestamp FROM monitor_inverterreading "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (max(1, int(settings.kb_power_window)),),
+            ).fetchall()
+            row = rows[0] if rows else None
+    except Exception as e:  # noqa: BLE001 — another project's DB; never fatal here
+        logger.warning(
+            "power check unavailable (%s: %s) — proceeding on mains assumption", type(e).__name__, e
+        )
+        return False
+    if not row or row[0] is None:
+        logger.warning("power check found no readings — proceeding on mains assumption")
+        return False
+
+    volts, ts = float(row[0]), row[1]
+    age = None
+    try:
+        seen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=UTC)
+        age = (datetime.now(UTC) - seen).total_seconds()
+    except (ValueError, TypeError):
+        logger.warning("power check: unparseable timestamp %r — ignoring freshness", ts)
+
+    if age is not None and age > settings.kb_power_max_age_seconds:
+        logger.warning(
+            "power check STALE (%.0fs old, grid=%.1fV) — proceeding on mains assumption; "
+            "the sungrow poller may be down",
+            age,
+            volts,
+        )
+        return False
+
+    # ANY dip in the window keeps the GPU down: resuming into a flickering supply
+    # is worse than staying paused a few minutes longer, and a sagging grid is
+    # exactly when the UPS can least absorb a 150W spike.
+    floor = min(float(r[0]) for r in rows if r[0] is not None)
+    if floor < settings.kb_power_min_grid_volts:
+        volts = floor
+        logger.warning(
+            "ON BATTERY (grid=%.1fV < %.1fV) — drain standing down; rows stay 'pending' "
+            "and the next run resumes here",
+            volts,
+            settings.kb_power_min_grid_volts,
+        )
+        return True
+    return False
+
+
 def _batch_jobs(jobs: list[dict[str, Any]], cohort: int) -> list[list[dict[str, Any]]]:
     """Slice jobs into cohort batches, bounded by BOTH job count and total bytes.
 
@@ -362,10 +440,10 @@ def _drain_ingest_queue() -> tuple[int, int]:
     drained = 0
     saved_total = 0
     for n, batch in enumerate(batches):
-        if n and _past_deadline():
+        if n and (_past_deadline() or _on_battery()):
             left = sum(len(b) for b in batches[n:])
             logger.warning(
-                "drain stopping at %s deadline: %d cohort(s) / %d job(s) deferred — "
+                "drain stopping (deadline %s or on battery): %d cohort(s) / %d job(s) deferred — "
                 "rows stay 'pending' and the next run resumes here",
                 settings.kb_drain_deadline,
                 len(batches) - n,

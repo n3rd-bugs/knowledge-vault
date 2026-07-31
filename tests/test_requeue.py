@@ -196,3 +196,116 @@ def test_the_vendored_encoding_is_present_in_the_repo():
     assert vendored.is_dir(), "vendor/tiktoken is missing"
     blobs = list(vendored.iterdir())
     assert blobs, "vendor/tiktoken is empty — the encoding was not committed"
+
+
+# ------------------------------------------------- pause the GPU on battery
+
+
+def _power_db(tmp_path, volts, age_seconds=0):
+    """A stand-in sungrow monitor DB. `volts` may be one value or a series
+    (newest first), so the window behaviour can be exercised."""
+    import sqlite3
+    from datetime import UTC, datetime, timedelta
+
+    series = volts if isinstance(volts, (list, tuple)) else [volts]
+    p = tmp_path / "power.sqlite3"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT)")
+    base = datetime.now(UTC) - timedelta(seconds=age_seconds)
+    for i, v in enumerate(series):
+        c.execute(
+            "INSERT INTO monitor_inverterreading VALUES (?,?)",
+            (v, (base - timedelta(seconds=i)).isoformat()),
+        )
+    c.commit()
+    c.close()
+    return str(p)
+
+
+def test_a_grid_outage_pauses_the_drain(tmp_path, monkeypatch):
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, 0.0))
+    assert _on_battery() is True, "a dead grid did not pause the drain"
+
+
+def test_normal_mains_does_not_pause(tmp_path, monkeypatch):
+    """Measured normal range is 213-256V; 230 must never read as an outage."""
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, 230.0))
+    assert _on_battery() is False
+
+
+def test_a_stale_reading_fails_OPEN_and_does_not_wedge_the_drain(tmp_path, monkeypatch, caplog):
+    """A dead sungrow poller must not silently stop the KB pipeline forever.
+    Failing open is the deliberate choice; the drain is deadline-bounded anyway."""
+    import logging
+
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, 0.0, age_seconds=99_999))
+    with caplog.at_level(logging.WARNING, logger="kbworker.consolidate"):
+        assert _on_battery() is False, "a stale reading wedged the drain"
+    assert "STALE" in caplog.text, "the staleness was not surfaced"
+
+
+def test_a_missing_power_db_fails_open_loudly(monkeypatch, caplog):
+    import logging
+
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", "/nonexistent/nope.sqlite3")
+    with caplog.at_level(logging.WARNING, logger="kbworker.consolidate"):
+        assert _on_battery() is False
+    assert "power check" in caplog.text
+
+
+def test_the_check_is_disabled_when_unconfigured(monkeypatch):
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", "")
+    assert _on_battery() is False
+
+
+def test_a_transitional_sag_also_pauses(tmp_path, monkeypatch):
+    """Owner decision: keep the GPU down through TRANSITIONS, not just hard
+    outages. 195V is a sag, not an outage, and must still pause."""
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, 195.0))
+    assert _on_battery() is True, "a transitional sag did not pause the drain"
+
+
+def test_any_dip_in_the_window_keeps_it_paused(tmp_path, monkeypatch):
+    """Resuming into a flickering supply is worse than staying paused: the newest
+    sample is healthy, but the grid dipped moments ago."""
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, [230.0, 228.0, 40.0, 231.0]))
+    assert _on_battery() is True, "a recent dip did not keep the drain paused"
+
+
+def test_a_consistently_healthy_window_resumes(tmp_path, monkeypatch):
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, [230.0, 229.0, 231.0, 228.0]))
+    assert _on_battery() is False, "a healthy grid failed to resume"
+
+
+def test_the_normal_low_band_is_not_treated_as_an_outage(tmp_path, monkeypatch):
+    """212-213V is what this site reads today (6.2% of samples sit 210-220V).
+    A threshold that trips on ordinary mains would pause the drain forever."""
+    from kbcore.config import settings
+    from kbworker.consolidate import _on_battery
+
+    monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, [212.0, 213.0, 211.5]))
+    assert _on_battery() is False, "ordinary low-normal mains read as an outage"

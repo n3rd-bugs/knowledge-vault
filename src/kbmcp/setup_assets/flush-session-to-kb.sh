@@ -377,8 +377,50 @@ if [ -f "$TOKENS" ]; then
 fi
 # Fold the project slug into a legal shell variable name the same way
 # kb_project_token does when it prints the line to add.
+KB_REPO="${KB_REPO:-$HOME/data-server}"
 PROJ_KEY=$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
 PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || true)
+# AUTO-MINT. A session that finds no token for its project is knowledge SILENTLY
+# LOST — measured 2026-07-31: 8 of 22 flushes were refused (sungrow, rm3, gateway,
+# bss-backend) because nobody had minted a token for those projects, and nothing
+# surfaced it but a line in this log. Minting on demand removes a manual step that
+# was never going to keep pace with new projects.
+#
+# STRICTLY LOCAL. This runs kbcore directly, so it only works on the OWNER's box
+# where the repo exists and scope.OWNER applies. A machine that installed these
+# hooks from the skill has no repo, falls through, and still gets the explicit
+# "ask the KB for a token" message. A remote machine must never mint its own
+# credentials (Invariant 12: authority comes from kbcore.scope, never from an
+# argument). Verified by test: no repo -> no mint.
+if [ -z "$PROJ_TOKEN" ] && [ -z "${KB_TOKEN:-}" ] && [ -d "${KB_REPO:-/nonexistent}" ]; then
+  MINTED=$(cd "$KB_REPO" 2>/dev/null && timeout 45 uv run python - "$PROJECT" "$(hostname 2>/dev/null || echo this-machine)" <<'MINTPY' 2>/dev/null
+import sys
+project, machine = sys.argv[1], sys.argv[2]
+try:
+    from kbcore import project_tokens, scope
+    with scope.use_principal(scope.OWNER):
+        print(project_tokens.issue(project, machine=machine, note="auto-minted by flush hook").token)
+except Exception:
+    sys.exit(1)
+MINTPY
+)
+  if [ -n "$MINTED" ]; then
+    umask 077
+    touch "$TOKENS" 2>/dev/null || true
+    chmod 600 "$TOKENS" 2>/dev/null || true
+    # Replace any stale line: issue() REVOKES the previous credential for this
+    # (project, machine), so an old line would shadow the live one with a dead token.
+    if [ -f "$TOKENS" ]; then
+      grep -v "^KB_TOKEN_${PROJ_KEY}=" "$TOKENS" > "$TOKENS.t" 2>/dev/null && mv "$TOKENS.t" "$TOKENS"
+    fi
+    printf 'KB_TOKEN_%s=%s\n' "$PROJ_KEY" "$MINTED" >> "$TOKENS"
+    chmod 600 "$TOKENS" 2>/dev/null || true
+    PROJ_TOKEN="$MINTED"
+    # The token is NEVER logged — only that one now exists.
+    echo "$(date -Is) flush $PROJECT auto-minted a project token (stored in $TOKENS, mode 600)" >>"$LOG"
+  fi
+fi
+
 if [ -n "$PROJ_TOKEN" ]; then
   KB_TOKEN="$PROJ_TOKEN"
   KB_TOKEN_SOURCE="project token for $PROJECT"

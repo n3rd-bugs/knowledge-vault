@@ -11,10 +11,23 @@ definition splitter, then pack to size. Tree-sitter deferred (verdict V8).
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 
-import tiktoken
+# Point tiktoken at the VENDORED encoding before importing it. Without this it
+# downloads cl100k_base from openaipublic.blob.core.windows.net on first use —
+# an internet dependency inside a pipeline whose entire premise is local-only
+# models. It failed exactly where you would least want it to: the nightly drain,
+# fired by Persistent=true ten seconds after a post-power-cut boot, died with
+# ConnectionError before the network was up (2026-07-31). An explicit env var
+# already set by the operator still wins, so this is a default, not a lock.
+_VENDORED_TIKTOKEN = Path(__file__).resolve().parents[2] / "vendor" / "tiktoken"
+if not os.environ.get("TIKTOKEN_CACHE_DIR") and _VENDORED_TIKTOKEN.is_dir():
+    os.environ["TIKTOKEN_CACHE_DIR"] = str(_VENDORED_TIKTOKEN)
+
+import tiktoken  # noqa: E402 — must follow the cache-dir assignment above
 
 MIN_TOKENS = 300
 MAX_TOKENS = 500

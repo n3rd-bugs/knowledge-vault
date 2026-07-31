@@ -157,3 +157,42 @@ def test_stopping_leaves_every_unreached_job_resumable(kb, as_owner):
     qid = _mk("proj", "a job the drain never reached")
     rows = ingest_queue.pending(limit=100)
     assert any(r["id"] == qid for r in rows), "an undrained job is not resumable"
+
+
+# ------------------------------------------- offline tokenizer (no internet)
+
+
+def test_the_tokenizer_loads_without_network():
+    """The pipeline is local-only by design, but tiktoken downloaded cl100k_base
+    from Azure on first use. That killed the nightly drain when Persistent=true
+    fired it ten seconds after a post-power-cut boot, before DNS was up
+    (2026-07-31). The encoding is vendored; this proves it needs no socket."""
+    import socket
+    import subprocess
+    import sys
+
+    code = (
+        "import socket\n"
+        "class B(socket.socket):\n"
+        "    def connect(self,*a,**k): raise OSError('no network')\n"
+        "socket.socket = B\n"
+        "from kbcore.chunk import _enc\n"
+        "assert _enc.n_vocab == 100277\n"
+        "print('ok')\n"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, f"tokenizer needs the network: {r.stderr[-400:]}"
+    assert "ok" in r.stdout
+    assert socket is not None
+
+
+def test_the_vendored_encoding_is_present_in_the_repo():
+    """A fresh clone must work offline; the cache file is committed, not fetched."""
+    from pathlib import Path
+
+    import kbcore.chunk as chunk
+
+    vendored = Path(chunk.__file__).resolve().parents[2] / "vendor" / "tiktoken"
+    assert vendored.is_dir(), "vendor/tiktoken is missing"
+    blobs = list(vendored.iterdir())
+    assert blobs, "vendor/tiktoken is empty — the encoding was not committed"

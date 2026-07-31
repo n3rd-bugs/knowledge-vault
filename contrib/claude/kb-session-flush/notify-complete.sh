@@ -32,10 +32,16 @@ CWD_LOG=$(printf '%s' "$INPUT" | grep -o '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"'
 
 CWD=$(printf '%s' "$INPUT" | grep -o '"cwd"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 WHERE=$(basename "${CWD:-$PWD}")
-# How long did this turn take? turn-start.sh stamps it at UserPromptSubmit.
-# A hook that pings on EVERY response is noise you learn to ignore, which is
-# worse than no hook — the point is to be told when a run was long enough that
-# you walked away from it. NTFY_MIN_SECONDS=0 restores notify-on-everything.
+# How long did this turn take? turn-start.sh stamps it at UserPromptSubmit, and
+# the duration rides in the message so a glance tells you whether it was a quick
+# answer or a long agentic run.
+#
+# DEFAULT 0 — notify on EVERY completion (owner decision 2026-07-31). The usual
+# argument against is that a hook pinging constantly becomes noise you learn to
+# ignore; it does not apply here, because this is a private self-hosted channel
+# whose only subscriber is the owner. Nothing else competes for attention in it,
+# so a missed completion costs more than an extra ping. Set NTFY_MIN_SECONDS to a
+# positive number of seconds to suppress turns shorter than that.
 SID=$(printf '%s' "$INPUT" | grep -o '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
 MARK="${TMPDIR:-/tmp}/claude-turns/${SID:-none}"
 SECS=""
@@ -46,7 +52,7 @@ if [ -n "${SID:-}" ] && [ -r "$MARK" ]; then
   [ -n "$START" ] && SECS=$(( $(date +%s) - START ))
 fi
 
-MIN="${NTFY_MIN_SECONDS:-60}"
+MIN="${NTFY_MIN_SECONDS:-0}"
 # Unknown duration (first turn after install, or a lost marker) NOTIFIES rather
 # than stays silent: a missed ping is worse than an extra one for this purpose.
 if [ -n "$SECS" ] && [ "$SECS" -lt "$MIN" ]; then

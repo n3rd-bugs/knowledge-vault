@@ -1,10 +1,26 @@
-# kb-backup.timer — run the backup nightly (PLAN.md §9 + §6d)
+# kb-backup.timer — the PRIMARY backup schedule (PLAN.md §9 + §6d).
+#
+# 03:00, i.e. BEFORE kb-consolidate.timer's 03:30. Backup used to exist only as
+# kb-consolidate's ExecStartPost, which made it conditional on a 4.5–7h pass
+# finishing: a power cut mid-run meant no backup that night, and on this grid
+# that is the common case, not the edge case — there is no dump for 29 or 30
+# July. Running first, independently, decouples "we have a restorable copy" from
+# "the nightly completed".
+#
+# Ordering rationale: pg_dump takes no application advisory lock (scripts/backup.sh
+# runs `docker exec kb-db pg_dump` over the container socket) and the drain's
+# lock is its own, so the two never block each other. Finishing before 03:30
+# still costs less: the dump is smaller and the disk is not shared with the
+# extractor's I/O. RandomizedDelaySec is therefore SHORT (5 min, was 30) so the
+# window cannot slide into the consolidation.
 [Unit]
-Description=Nightly Knowledge Vault backup
+Description=Nightly Knowledge Vault backup (independent of the consolidation run)
 
 [Timer]
-OnCalendar=*-*-* 03:15
-RandomizedDelaySec=1800
+OnCalendar=*-*-* 03:00
+RandomizedDelaySec=300
+# Catch up a window missed while the machine was off — which, after a power cut,
+# is exactly when the missing backup matters most.
 Persistent=true
 Unit=kb-backup.service
 

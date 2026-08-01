@@ -138,4 +138,61 @@ wait_stub "$((BEFORE + 1))" 60 || fail "the enrolled machine submitted nothing"
 assert_contains "$(stub_field '.transport=="rest"' '.project')" "proj" "it submitted under the right project"
 assert_file_contains "$LOGF" "ok bytes=" "and logged a successful capture"
 
+# --------------------------- 5. the DEFAULT enrolment shape: a project-scoped box
+# Everything above enrols to a credential with no project, which install.sh writes
+# to kb-flush.env as a shared KB_TOKEN. That is NOT the default path. A per-project
+# enrolment code redeems to a project-scoped credential that lands in
+# kb-tokens.env, and NO shared KB_TOKEN is written anywhere -- so on those boxes
+# (which is most of them) every bare "$KB_TOKEN" reference is an UNBOUND VARIABLE
+# under `set -u`. That killed the stale-hook check inside its own command
+# substitution: silently, with the warning it exists to print never appearing.
+# The same class as KB item 1193, in a second place. This section reproduces the
+# shape and asserts the warning fires.
+step "a per-project enrolment writes a SCOPED token and no shared KB_TOKEN"
+new_home enrolproj
+stub_reset
+stub_enrol_project proj
+mkdir -p "$HOME/.claude/kb-setup"
+cp "$SKILL"/*.sh "$HOME/.claude/kb-setup/"
+CODE4="kbe_$(printf 'd%.0s' $(seq 1 28))"
+OUT4=$(cd "$HOME/.claude/kb-setup" && KB_ENROL_CODE="$CODE4" KB_REST_URL="$STUB" bash install.sh 2>&1)
+assert_eq "0" "$?" "install.sh exits 0"
+TOKENS_ENV="$HOME/.claude/kb-tokens.env"
+assert_file_contains "$TOKENS_ENV" "KB_TOKEN_PROJ=" "the scoped credential landed in kb-tokens.env"
+if grep -q '^KB_TOKEN=' "$CFG" 2>/dev/null; then
+  fail "a shared KB_TOKEN was written -- this is no longer the default-enrolment shape"
+else
+  pass "no shared KB_TOKEN anywhere (the shape that made \$KB_TOKEN unbound)"
+fi
+
+step "install.sh stamped the version, so it fetched with the REDEEMED credential"
+# The enrolment code is SPENT by the POST above (single use), so the old
+# ${KB_TOKEN:-$KB_ENROL_CODE} fallback authenticated with a dead credential and
+# left every enrolled box unversioned. A stamp here means the run carried the
+# token it had just redeemed.
+SERVER_V=$("$RIG_CURL" -fsS -H "Authorization: Bearer $RIG_TOKEN" \
+  "$STUB/api/setup/manifest.json" | "$RIG_JQ" -r .version)
+assert_ne "" "$SERVER_V" "the stub publishes a version"
+assert_eq "$SERVER_V" "$(cat "$HOOKS/.setup-version" 2>/dev/null)" "the installed version was recorded"
+
+step "and a STALE default-enrolled box is told its hooks are out of date"
+printf '%s\n' "deadbeefdead" >"$HOOKS/.setup-version"   # pretend it installed an older set
+WP="$HOME/work/proj"
+mkdir -p "$WP"
+fire "$HOOKS/kb-session-brief.sh" "$(start_event startup "$WP")"
+assert_eq "0" "$RC" "the brief hook exits 0"
+if printf '%s' "$OUT" | grep -q "OUT OF DATE"; then
+  pass "the stale box was warned"
+  note "$(printf '%s' "$OUT" | grep -m1 'OUT OF DATE' | head -c 160)"
+  assert_contains "$OUT" "$SERVER_V" "it names the version the server has"
+else
+  fail "a stale DEFAULT-ENROLLED box was NOT warned -- the version check ran with no bearer (or died on an unbound one): $(printf '%s' "$OUT" | head -c 200)"
+fi
+
+step "the check authenticated -- an unauthenticated manifest fetch is refused"
+# The stub answers 401 when no bearer arrives, so the warning above can only have
+# come from a request that carried the project-scoped token.
+assert_eq "0" "$(stub_count '.path=="/api/setup/manifest.json" and .status==401')" \
+  "no unauthenticated manifest fetch happened"
+
 finish

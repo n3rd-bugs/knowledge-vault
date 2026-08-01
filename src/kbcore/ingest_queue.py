@@ -45,6 +45,37 @@ MAX_REQUEUES = 3
 RESERVED_PROJECTS = frozenset({"kb-system"})
 
 
+def normalise_source_uri(value: str | None) -> str | None:
+    """Return ``value`` unless it is a DEGENERATE session identity, then ``None``.
+
+    A ``source_uri`` is a GROUPING KEY: :func:`pending_groups` concatenates every
+    row that shares one into a single extraction. That makes a valueless value
+    actively dangerous — ``'session:'`` is not an identity, it is a wildcard that
+    matches every session that ever sent one.
+
+    It is not hypothetical. The flush hook computed the session id in the parent
+    shell and forgot to export it, so the detached child interpolated an empty
+    string and every machine sent ``session_uri='session:'``. 137 rows from SIX
+    unrelated projects coalesced into cross-project mega-extractions stamped with
+    the first row's project — a confidentiality near-miss on NDA material.
+
+    Refusing the value HERE is the half of the fix that does not depend on a
+    client being correct: a degenerate URI never reaches the grouping key at all,
+    so each row falls back to its own ``queue:<kind>:<id>``. Degenerate means
+    empty/whitespace, or a bare scheme with nothing after it (``session:``,
+    ``session://``, ``file:/``).
+    """
+    if value is None:
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    _scheme, sep, tail = v.partition(":")
+    if sep and not tail.strip("/ \t"):
+        return None
+    return v
+
+
 class EnqueueResult(NamedTuple):
     """Outcome of an enqueue: ``id`` is the drainable row (None ⇒ live duplicate);
     ``requeued`` is True when a TERMINALLY-FAILED row was reset to 'pending' so
@@ -103,6 +134,9 @@ def enqueue(
     clean, redactions = scrub(content)
     content_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()
     meta: dict[str, Any] = {}
+    # A DEGENERATE session id is dropped at the door rather than stored: it is a
+    # grouping key, and an empty one groups everything (see normalise_source_uri).
+    source_uri = normalise_source_uri(source_uri)
     # Scrub the freeform meta strings too — the durable queue must hold no
     # raw secret, and these values flow into item metadata (review finding).
     for key, value in (
@@ -252,6 +286,79 @@ def requeue_failed(*, since: datetime | None = None, reason: str = "") -> list[i
     return ids
 
 
+def requeue_extracted(
+    *,
+    ids: list[int] | None = None,
+    project: str | None = None,
+    since: datetime | None = None,
+    reason: str = "",
+) -> list[int]:
+    """Return ZERO-YIELD ``extracted`` rows to ``pending`` for a supervised retry.
+
+    ``status='extracted'`` normally means "this content has been mined and the
+    knowledge is in the KB". It does NOT mean that when the extraction saved
+    nothing: those rows are terminal, no automatic path will ever revisit them,
+    and their content — retained in full, because automation only ever flips
+    ``status`` (Invariant 5) — has produced no knowledge at all.
+
+    That is the state the coalescing bug left behind. 137 rows across six
+    projects were concatenated into cross-project mega-extractions (an empty
+    session id made every submission share one grouping key), and the extractions
+    saved nothing. The rows were then stamped 'extracted' with
+    ``saved_count = 0`` — indistinguishable, to every query in the system, from
+    content that was genuinely mined and yielded nothing.
+
+    SCOPE IS THE SAFETY PROPERTY. Only rows whose extraction saved ZERO items can
+    be re-opened: a row that produced knowledge would, if re-drained, duplicate
+    it. And a selector is REQUIRED — ``ids``, a ``project``, or a ``since``
+    cutoff — so this cannot become an accidental whole-table replay of every
+    empty extraction the KB has ever done.
+
+    Like :func:`requeue_failed` this is an OWNER REPAIR: nothing calls it on a
+    schedule, it deletes nothing, it only moves knowledge rows back into reach,
+    and it records ``reason`` on the row so a status flip is never mistaken for a
+    bug. ``attempts`` is reset for the same reason as there — the previous
+    attempts were spent against a broken grouping key, not against bad content.
+    """
+    if ids is None and project is None and since is None:
+        raise InvalidOperation(
+            "requeue_extracted needs a selector (ids, project or since) — refusing "
+            "to re-open every zero-yield extraction in the queue"
+        )
+    with transaction() as conn:
+        rows = conn.execute(
+            """
+            UPDATE ingest_queue
+               SET status = 'pending', attempts = 0, deferrals = 0, processed_at = NULL,
+                   error = CASE
+                             WHEN %(reason)s = '' THEN error
+                             ELSE left(
+                               coalesce(error, '') || ' | requeued (0 items saved): '
+                               || %(reason)s, 2000)
+                           END
+             WHERE status = 'extracted'
+               AND coalesce(saved_count, 0) = 0
+               AND (%(ids)s::bigint[] IS NULL OR id = ANY(%(ids)s::bigint[]))
+               AND (%(project)s::text IS NULL OR project = %(project)s)
+               AND (%(since)s::timestamptz IS NULL OR processed_at >= %(since)s)
+            RETURNING id
+            """,
+            {
+                "ids": list(ids) if ids is not None else None,
+                "project": project,
+                "since": since,
+                "reason": reason,
+            },
+        ).fetchall()
+    out = [r[0] for r in rows]
+    logger.info(
+        "requeued %d zero-yield extracted row(s) to pending: %s",
+        len(out),
+        reason or "(no reason given)",
+    )
+    return out
+
+
 def mark_failed(queue_id: int, error: str) -> None:
     """Record a failed drain (kept 'failed', not deleted — inspectable + retried).
 
@@ -312,9 +419,28 @@ COALESCE_QUIET_MINUTES = 30
 # retry budget. Named once so the two paths cannot drift apart.
 _DRAINABLE = "(status = 'pending' OR (status = 'failed' AND attempts < %s))"
 
+# The SQL twin of :func:`normalise_source_uri`, applied to rows ALREADY STORED.
+# The enqueue guard protects new submissions; this protects the 137 rows that
+# were written before it existed, so requeueing them for a supervised recovery
+# cannot re-create the cross-project coalescing. Keep the two in step.
+_DEGENERATE_URI_SQL = """
+    btrim(coalesce(meta->>'source_uri', '')) = ''
+ OR btrim(coalesce(meta->>'source_uri', '')) ~ '^[^:]*:[/[:space:]]*$'
+"""
+
+
+def group_key(project: str, uri: str) -> str:
+    """The coalescing key: a session identity is only meaningful WITHIN a project.
+
+    Downstream (``kbworker.consolidate``) this string is the cohort key, so it
+    must be unique per group as well as stable — two groups sharing a key would
+    hand one group's pre-extraction to the other.
+    """
+    return f"{project}::{uri}"
+
 
 def pending_groups(limit: int = 200, quiet_minutes: int = COALESCE_QUIET_MINUTES):
-    """Drainable rows grouped by the SESSION they belong to.
+    """Drainable rows grouped by the SESSION they belong to, WITHIN A PROJECT.
 
     The network path windows RAW JSONL at 900 KB, while the local path assembles
     to text first — measured on a real transcript, 114 MB of JSONL is 2.7 MB of
@@ -323,22 +449,40 @@ def pending_groups(limit: int = 200, quiet_minutes: int = COALESCE_QUIET_MINUTES
     200-row nightly budget, so one large session could starve every project for
     days.
 
-    Grouping by source_uri and ordering by id restores the local path's
-    behaviour: the caller concatenates, assembles ONCE, and re-windows the
+    Grouping by (project, source_uri) and ordering by id restores the local
+    path's behaviour: the caller concatenates, assembles ONCE, and re-windows the
     assembled text. Row order is the hook's byte order, because it submits
     sequential offsets.
 
+    THE PROJECT IS PART OF THE KEY, and that is not a nicety. The consumer
+    concatenates a group's rows into ONE extraction and stamps the result with
+    ``rows[0]['project']``, so a key shared across projects does not merely mix
+    them — it files everyone's content under whichever project happened to sort
+    first. When the flush hook shipped an empty session id, 137 rows from six
+    projects met under ``'session:'`` and became cross-project mega-extractions
+    on NDA material. A session identity is only ever meaningful inside the
+    project that produced it, so it can never be the whole key.
+
     A group is returned only when its newest row has been quiet for
     ``quiet_minutes`` — a session still being written would otherwise be
-    extracted in halves. Rows with no source_uri (single ad-hoc submissions)
-    come back as groups of one, which is what they already were.
+    extracted in halves. Rows with no (or a degenerate) source_uri fall back to
+    their own ``queue:<kind>:<id>`` and come back as groups of one, which is what
+    they already were.
+
+    Each returned group carries the unique ``uri`` key (see :func:`group_key`),
+    plus the ``project`` and the raw ``source_uri`` it was derived from.
     """
     with connect() as conn:
         rows = conn.execute(
             f"""
             WITH d AS (
                 SELECT id, project, kind, content, meta, created_at,
-                       coalesce(meta->>'source_uri', 'queue:' || id::text) AS grp
+                       CASE WHEN {_DEGENERATE_URI_SQL}
+                            THEN NULL
+                            ELSE btrim(meta->>'source_uri') END AS suri,
+                       CASE WHEN {_DEGENERATE_URI_SQL}
+                            THEN 'queue:' || kind || ':' || id::text
+                            ELSE btrim(meta->>'source_uri') END AS uri
                   FROM ingest_queue
                  WHERE {_DRAINABLE}
             ),
@@ -348,28 +492,47 @@ def pending_groups(limit: int = 200, quiet_minutes: int = COALESCE_QUIET_MINUTES
                 -- it drains immediately — which also keeps every single-shot
                 -- submission (an ad-hoc ingest, a small session) as responsive
                 -- as it was before coalescing existed.
-                SELECT grp FROM d GROUP BY grp
+                SELECT project, uri FROM d GROUP BY project, uri
                  HAVING count(*) = 1
                      OR max(created_at) < now() - make_interval(mins => %s)
             )
-            SELECT d.id, d.project, d.kind, d.content, d.meta, d.grp
-              FROM d JOIN quiet USING (grp)
-             ORDER BY d.grp, d.id
-            """,  # noqa: S608 — _DRAINABLE is a constant fragment
+            SELECT d.id, d.project, d.kind, d.content, d.meta, d.uri, d.suri
+              FROM d JOIN quiet USING (project, uri)
+             ORDER BY d.project, d.uri, d.id
+            """,  # noqa: S608 — _DRAINABLE/_DEGENERATE_URI_SQL are constant fragments
             (MAX_ATTEMPTS, int(quiet_minutes)),
         ).fetchall()
 
-    groups: dict[str, list[dict[str, Any]]] = {}
-    for rid, project, kind, content, meta, grp in rows:
-        groups.setdefault(grp, []).append(
+    # Keyed by the TUPLE, so no delimiter convention can ever merge two projects.
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    source_uris: dict[tuple[str, str], str | None] = {}
+    for rid, project, kind, content, meta, uri, suri in rows:
+        groups.setdefault((project, uri), []).append(
             {"id": rid, "project": project, "kind": kind, "content": content, "meta": meta or {}}
         )
+        source_uris[(project, uri)] = suri
     # Cap on ROWS, not groups, so the nightly budget still bounds the work.
     out, taken = [], 0
-    for grp, members in groups.items():
+    seen: set[str] = set()
+    for (project, uri), members in groups.items():
         if taken + len(members) > limit and out:
             break
-        out.append({"uri": grp, "rows": members})
+        key = group_key(project, uri)
+        # Pathological only (a project name containing the delimiter), but the
+        # cohort key MUST be unique or one group's prefetch feeds another's.
+        n = 2
+        while key in seen:
+            key = f"{group_key(project, uri)}#{n}"
+            n += 1
+        seen.add(key)
+        out.append(
+            {
+                "uri": key,
+                "project": project,
+                "source_uri": source_uris[(project, uri)],
+                "rows": members,
+            }
+        )
         taken += len(members)
     return out
 

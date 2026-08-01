@@ -240,7 +240,22 @@ def _register_write(app: FastAPI) -> None:
         cannot publish elsewhere, and is revocable without touching other boxes.
         404 when unconfigured, so a deployment that does not want notifications
         simply never sets these and installers carry on without them.
+
+        WHO MAY FETCH IT (2026-08-01): the OWNER, or an unredeemed enrolment code
+        — the bootstrap case this exists for, a machine mid-install that has
+        nothing else yet. It used to answer ANY live credential, which handed the
+        publish token to every narrow per-project grantee: a read grant on one
+        project is not a reason to hold a credential for the owner's private
+        notification channel, and it is exactly the kind of quiet distribution
+        that made the 2026-07-31 rotation expensive. Everyone else gets the
+        byte-identical 404 an unconfigured deployment returns — same no-oracle
+        contract as kbweb/kbrest elsewhere, so the refusal never reveals that a
+        channel exists at all. The auth check runs FIRST so the two 404s cannot
+        be told apart by timing on the config read either.
         """
+        principal = scope.current()
+        if not (principal.is_owner or principal.name == principal_ctx.ENROLLING_NAME):
+            raise HTTPException(status_code=404, detail="not found")
         if not (settings.kb_notify_url and settings.kb_notify_topic):
             raise HTTPException(status_code=404, detail="not found")
         lines = [

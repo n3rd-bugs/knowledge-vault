@@ -495,7 +495,9 @@ def test_one_sessions_chunks_drain_as_ONE_extraction(kb, monkeypatch):
         )
 
     groups = ingest_queue.pending_groups(limit=200)
-    mine = [g for g in groups if g["uri"] == "session:big"]
+    # Groups are keyed by (project, session) now — assert on the raw session id,
+    # which the group carries alongside its composite key.
+    mine = [g for g in groups if g["source_uri"] == "session:big"]
     assert len(mine) == 1, f"the session did not coalesce: {len(mine)} groups"
     assert len(mine[0]["rows"]) == 6, "not every chunk joined the group"
     # Row order is the hook's byte order; concatenation must reconstitute it.
@@ -505,7 +507,7 @@ def test_one_sessions_chunks_drain_as_ONE_extraction(kb, monkeypatch):
 def test_a_session_still_being_written_is_NOT_drained_in_halves(kb):
     """Coalescing eagerly would extract half a session and the rest later."""
     _queue_session_chunks("coalesce-proj", "session:live", 4)
-    uris = {g["uri"] for g in ingest_queue.pending_groups(limit=200)}
+    uris = {g["source_uri"] for g in ingest_queue.pending_groups(limit=200)}
     assert "session:live" not in uris, "a fresh multi-chunk session was drained mid-flight"
 
 
@@ -514,7 +516,9 @@ def test_a_single_submission_is_never_delayed(kb):
     so an ad-hoc submission must stay as responsive as before coalescing."""
     res = ingest_queue.enqueue("coalesce-proj", "a one-shot note", kind="session")
     uris = {g["uri"] for g in ingest_queue.pending_groups(limit=200)}
-    assert f"queue:{res.id}" in uris, "a single submission was delayed by the quiet period"
+    assert ingest_queue.group_key("coalesce-proj", f"queue:session:{res.id}") in uris, (
+        "a single submission was delayed by the quiet period"
+    )
 
 
 def test_a_failed_group_fails_WHOLE(kb):

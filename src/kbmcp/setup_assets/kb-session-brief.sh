@@ -301,6 +301,43 @@ PROJECT=$(printf '%s' "$PROJECT_RAW" | tr '[:upper:]' '[:lower:]' |
   tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
 [ -n "$PROJECT" ] || exit 0
 
+# ---------------------------------------------------------- per-project token
+# The SAME resolver the flush hook uses, and it must be here too: the default
+# enrolment path writes a project-scoped credential to kb-tokens.env and
+# deliberately writes NO shared KB_TOKEN. Without this, both transport guards
+# below test an empty KB_TOKEN, evaluate false, and the hook exits silently —
+# so pre-brief and per-prompt recall are dead on arrival on every machine set up
+# the recommended way, with no output and no log line to say why.
+# Reported from the repeater project after a real reinstall (KB item 1193).
+#
+# IT RUNS HERE, BEFORE EVERYTHING THAT NEEDS A BEARER — not further down where it
+# used to live. The stale-hook version check below is bearer-authenticated, and
+# sitting ABOVE the resolver it referenced a bare $KB_TOKEN under `set -u`: on a
+# default-enrolled box (no shared KB_TOKEN anywhere) the whole check died on
+# "unbound variable" inside its own command substitution, so the warning could
+# never fire and item 1193's bug came back in a second place. Resolve first, then
+# everything downstream has a real credential. Every later reader still uses
+# ${KB_TOKEN:-} so an unset value degrades instead of aborting.
+TOKENS="$HOME/.claude/kb-tokens.env"
+if [ -f "$TOKENS" ]; then
+  # shellcheck disable=SC1090
+  . "$TOKENS"
+fi
+PROJ_KEY=$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
+PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || true)
+[ -n "$PROJ_TOKEN" ] && KB_TOKEN="$PROJ_TOKEN"
+
+# Feed a bearer to curl on STDIN, never on the command line: argv is world-visible
+# through /proc/<pid>/cmdline and `ps`, and a credential has already leaked that
+# way once on this system. `curl -K -` reads the same options from a config file,
+# so the token never becomes a process argument. Empty bearer => an empty config,
+# i.e. an unauthenticated request that the server refuses — which is what we want
+# it to do, rather than the caller silently skipping the request.
+kb_curl_auth_config() { # -> curl config on stdout
+  [ -n "${KB_TOKEN:-}" ] || return 0
+  printf 'header = "Authorization: Bearer %s"\n' "$KB_TOKEN"
+}
+
 # Per-event query + gating. K=result count; ST/HELPER_TO/CONN_TO are inner search
 # timeouts kept STRICTLY under the registered hook budget (recall 15s, brief 30s)
 # so recall never stalls a prompt; ALLOW_CONN gates the token-costly connector
@@ -380,7 +417,11 @@ else
   if [ "${KB_VERSION_CHECK:-1}" = "1" ] && [ -n "${KB_REST_URL:-}" ]; then
     _hooks_dir="$HOME/.claude/hooks"
     _stamp="$_hooks_dir/.setup-version"
-    _remote=$(curl -fsS --connect-timeout 3 --max-time 6 -H "Authorization: Bearer $KB_TOKEN" \
+    # ${KB_TOKEN:-}, via the stdin config: the resolver above ran first, so this
+    # sees the project token on a default-enrolled box — and even with nothing
+    # resolved it degrades to an unauthenticated 401 instead of killing the
+    # subshell on an unbound variable (which is how this warning went dead).
+    _remote=$(kb_curl_auth_config | curl -fsS -K - --connect-timeout 3 --max-time 6 \
       "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
       | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
     if [ -n "$_remote" ]; then
@@ -401,23 +442,6 @@ else
     fi
   fi
 fi
-
-# ---------------------------------------------------------- per-project token
-# The SAME resolver the flush hook uses, and it must be here too: the default
-# enrolment path writes a project-scoped credential to kb-tokens.env and
-# deliberately writes NO shared KB_TOKEN. Without this, both transport guards
-# below test an empty KB_TOKEN, evaluate false, and the hook exits silently —
-# so pre-brief and per-prompt recall are dead on arrival on every machine set up
-# the recommended way, with no output and no log line to say why.
-# Reported from the repeater project after a real reinstall (KB item 1193).
-TOKENS="$HOME/.claude/kb-tokens.env"
-if [ -f "$TOKENS" ]; then
-  # shellcheck disable=SC1090
-  . "$TOKENS"
-fi
-PROJ_KEY=$(printf '%s' "$PROJECT" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
-PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || true)
-[ -n "$PROJ_TOKEN" ] && KB_TOKEN="$PROJ_TOKEN"
 
 HITS=""
 if [ -n "${KB_DIR:-}" ]; then
@@ -455,8 +479,10 @@ elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # instead of consuming the full hook budget on the search request.
   if curl -sS -o /dev/null --connect-timeout 2 --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
     ENC=$(printf '%s' "$QUERY" | kb_urlencode)
-    HITS=$(curl -sS --connect-timeout 3 --max-time "$ST" "$KB_REST_URL/api/search?q=$ENC&k=$K" \
-      -H "Authorization: Bearer $KB_TOKEN" 2>/dev/null | _kb_fmt_hits) || HITS=""
+    # Bearer on STDIN (curl -K -), never on argv — see kb_curl_auth_config.
+    HITS=$(kb_curl_auth_config \
+      | curl -sS -K - --connect-timeout 3 --max-time "$ST" "$KB_REST_URL/api/search?q=$ENC&k=$K" \
+        2>/dev/null | _kb_fmt_hits) || HITS=""
   fi
 elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ] && [ "$ALLOW_CONN" = "1" ]; then
   # CONNECTOR: one small headless call through the claude.ai-bridged KB tool.

@@ -1,0 +1,23 @@
+# kb-consolidate-boot.timer — catch-up drain after an unclean shutdown.
+# (Folded in from a LIVE-ONLY unit on 2026-08-01: it ran on this machine but was
+# never in the repo, so the next install_systemd.sh run would have removed the
+# only protection against an interrupted nightly.)
+[Unit]
+Description=Knowledge Vault catch-up drain after an unclean shutdown
+
+[Timer]
+# Persistent=true on the nightly timer only covers a MISSED window. It does not
+# cover a run that STARTED and was killed: systemd counts 03:30 as having run,
+# so the interrupted work waits a full day. Power was lost at 04:02 on
+# 2026-07-30 with the drain 32 minutes in, which is exactly that case.
+#
+# 10 minutes after boot, so the network, Postgres and Ollama are up first.
+# Safe to fire when there is nothing to do: the drain takes a non-blocking
+# advisory lock and exits immediately if the nightly is already running, and an
+# empty queue is a cheap no-op. Ingest is idempotent (Invariant 3), so rows left
+# 'pending' by the cut are re-drained normally rather than duplicated.
+OnBootSec=10min
+Unit=kb-consolidate.service
+
+[Install]
+WantedBy=timers.target

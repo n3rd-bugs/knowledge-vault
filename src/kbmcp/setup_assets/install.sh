@@ -343,13 +343,38 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
   elif ! command -v curl >/dev/null 2>&1; then
     echo "enrol:    KB_ENROL_CODE set but curl is missing — cannot redeem" >&2
   else
-    ENROL_OUT=$(kb_timeout 30 curl -sS --max-time 25 -X POST "${KB_REST_URL%/}/api/enrol" \
-      -H "Authorization: Bearer $KB_ENROL_CODE" \
-      -H "Content-Type: application/json" \
-      -d "$(kb_json_build - machine s "$(hostname 2>/dev/null || echo machine)")" 2>&1)
+    # PRE-REDEMPTION FETCHES. /api/setup/notify.env admits the OWNER or an
+    # UNREDEEMED enrolment code — deliberately NOT the project-scoped grantee
+    # token the POST below returns — so these must run while the code is still
+    # live. A GET does not spend it (rig case 17 pins that); only POST /api/enrol
+    # redeems. Stashed now, written at the end with the other optional artefacts.
+    # Best-effort (|| true): an optional convenience must never fail an install.
+    PRE_MANIFEST_V=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+      | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
+      | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
+    PRE_NOTIFY=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+      | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/notify.env" 2>/dev/null || true)
+    # The code travels as a BEARER on STDIN (curl -K -), never in argv: an
+    # enrolment code is a credential, and argv is visible to every process on the
+    # box via /proc/<pid>/cmdline. Never in the URL or the body either, so it
+    # cannot land in a proxy access log.
+    ENROL_OUT=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+      | kb_timeout 30 curl -sS -K - --max-time 25 -X POST "${KB_REST_URL%/}/api/enrol" \
+        -H "Content-Type: application/json" \
+        -d "$(kb_json_build - machine s "$(hostname 2>/dev/null || echo machine)")" 2>&1)
     ENROL_TOK=$(printf '%s' "$ENROL_OUT" | kb_json_get token)
     ENROL_PROJ=$(printf '%s' "$ENROL_OUT" | kb_json_get project)
     if [ -n "$ENROL_TOK" ]; then
+      # CARRY THE REDEEMED CREDENTIAL IN-PROCESS. The manifest and notify fetches
+      # at the end of this script need a bearer, and on the default enrolment path
+      # the credential is project-scoped: it is written to kb-tokens.env and NOT
+      # to $CFG, so nothing sets KB_TOKEN in this shell. Those fetches fell back to
+      # $KB_ENROL_CODE — which the POST above has just SPENT (redemption is single
+      # use), so they authenticated with a dead credential and every enrolled box
+      # came away with no .setup-version stamp and no notify.env. The one
+      # credential this run definitely holds is the one it just redeemed; name it
+      # explicitly instead of relying on a fallback that cannot work.
+      KB_SETUP_BEARER="$ENROL_TOK"
       # 0600 at CREATION (install(1) sets the mode atomically) so the token is
       # never briefly world-readable under the default umask.
       install -m 600 /dev/null "$CFG"
@@ -406,7 +431,14 @@ fi
 if [ "${ENROL_FAILED:-0}" = "1" ]; then
   # An attempted-and-failed enrolment is NOT an unconfigured machine: writing the
   # REMOTE placeholder here is what made a broken install look finished.
-  echo "config:   left unwritten (enrolment failed)"
+  echo "config:   left unwritten (enrolment failed)" >&2
+  # EXIT NON-ZERO, DELIBERATELY. This used to fail only by ACCIDENT: the summary
+  # below referenced an unset $MODE and `set -u` killed the script. Defaulting
+  # MODE — so a real diagnosis is not replaced by an unbound-variable trace —
+  # turned that crash into a SILENT SUCCESS, which rig case 17 caught at once.
+  # An installer that could not configure the machine must say so in its EXIT
+  # CODE, not merely in its output: callers script this (KB 1198).
+  exit 3
 elif [ ! -f "$CFG" ]; then
   # Create the config with owner-only perms BEFORE the bearer token is written.
   # Under the default umask 022 a plain '>' redirect would create $CFG as 0644,
@@ -579,11 +611,25 @@ fi
 # start whether the server has moved on. Without a stamp the brief reports
 # "unversioned", which is correct and still actionable for hooks that predate
 # this. Best-effort: a machine that cannot reach the manifest is still installed.
-if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
+
+# The bearer these last two fetches use, in priority order, and stated ONCE so
+# both calls cannot drift: the credential this run just redeemed (the enrolment
+# path, where nothing else sets KB_TOKEN in this shell), then a KB_TOKEN the
+# operator already had, and only then the raw enrolment code as a last resort for
+# a server that does not hand back a token. Emitted as a curl config on STDIN, so
+# no credential ever appears in argv (/proc/<pid>/cmdline, `ps`).
+setup_auth_config() { # -> curl config on stdout; empty when we have nothing
+  _sab="${KB_SETUP_BEARER:-${KB_TOKEN:-${KB_ENROL_CODE:-}}}"
+  [ -n "$_sab" ] || return 0
+  printf 'header = "Authorization: Bearer %s"\n' "$_sab"
+}
+
+if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_SETUP_BEARER:-}${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
   # `|| true` is load-bearing: with `set -e`, a 404 from an older server (curl
   # exit 22) would abort the WHOLE install over an optional stamp. Versioning is
   # a convenience; it must never be able to break the thing it describes.
-  _v=$(curl -fsS --max-time 8 -H "Authorization: Bearer ${KB_TOKEN:-$KB_ENROL_CODE}" \
+  _v="${PRE_MANIFEST_V:-}"
+  [ -n "$_v" ] || _v=$(setup_auth_config | curl -fsS -K - --max-time 8 \
     "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
     | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
   if [ -n "$_v" ]; then
@@ -599,8 +645,9 @@ fi
 # hooks stay inert and this install is unaffected. `|| true` because an optional
 # convenience must never be able to fail an install (a 404 is curl exit 22 and
 # `set -e` would abort the whole thing).
-if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
-  _notify=$(curl -fsS --max-time 8 -H "Authorization: Bearer ${KB_TOKEN:-$KB_ENROL_CODE}" \
+if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_SETUP_BEARER:-}${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
+  _notify="${PRE_NOTIFY:-}"
+  [ -n "$_notify" ] || _notify=$(setup_auth_config | curl -fsS -K - --max-time 8 \
     "${KB_REST_URL%/}/api/setup/notify.env" 2>/dev/null || true)
   if [ -n "$_notify" ]; then
     _nf="$HOME/.claude/notify.env"
@@ -616,6 +663,12 @@ if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
   fi
 fi
 
+# MODE is only assigned on the paths that actually configure a transport. A
+# FAILED enrolment skips all of them and then died here on `set -u` — the
+# installer crashed on its own summary line while reporting the real problem,
+# turning a clear "could not enrol" into an unbound-variable trace. Default it
+# so the diagnosis survives the failure that produced it.
+MODE="${MODE:-UNCONFIGURED — no transport was set up}"
 echo "hook:     $HOOK"
 echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-prompt KB recall)"
 echo "config:   $CFG  ($MODE)"

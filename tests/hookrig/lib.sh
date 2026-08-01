@@ -68,6 +68,13 @@ finish() {
 # ------------------------------------------------------------------- stub side
 RIG_CURL="${RIG_CURL:-curl}"
 stub_reset() { "$RIG_CURL" -sS -X POST "$STUB/__reset" >/dev/null; }
+# Make the NEXT enrolment redeem to a PROJECT-SCOPED credential -- the DEFAULT
+# setup path, which writes kb-tokens.env and deliberately writes NO shared
+# KB_TOKEN. Every "a bare $KB_TOKEN is unbound here" bug only reproduces in that
+# shape, so the rig has to be able to produce it.
+stub_enrol_project() { # <project>
+  "$RIG_CURL" -sS -X POST "$STUB/__enrol_project" --data "$1" >/dev/null
+}
 stub_requests() { "$RIG_CURL" -sS "$STUB/__requests"; }
 stub_count() { # jq-filter -> count of matching records
   stub_requests | "$RIG_JQ" -c "select($1)" 2>/dev/null | wc -l | tr -d ' '

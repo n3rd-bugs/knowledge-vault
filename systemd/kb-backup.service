@@ -1,15 +1,29 @@
 # kb-backup — nightly local pg_dump→zstd backup, plus optional age-encrypted
 # offsite push via rclone when KB_OFFSITE_ENABLED=true (PLAN.md §9 + §6d)
-# Install: bash scripts/install_systemd.sh (the .timer is installed but NOT enabled;
-# enable manually with: systemctl --user enable --now kb-backup.timer)
+# Install + ENABLE: bash scripts/install_systemd.sh (kb-backup.timer is now enabled
+# by the installer — a backup that depends on someone remembering to enable it is
+# the same failure mode as a backup that depends on the nightly finishing).
 [Unit]
 Description=Knowledge Vault nightly backup (local dump + optional encrypted offsite push)
+# The offsite leg pushes over rclone, and a boot-time catch-up can fire before
+# the network is up (see kb-consolidate.service — same 2026-07-31 lesson).
 After=network.target
+# A backup that fails silently is indistinguishable from one that never ran until
+# a restore is attempted. 29–30 July had neither a dump nor a warning.
+OnFailure=kb-notify-fail@%n.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/kb/repo
 EnvironmentFile=%h/kb/repo/.env
+# network-online.target is a NO-OP here: a systemd --user manager has no
+# wait-online provider, so those lines ordered against nothing (the repo already
+# documents this in kb-cloudflared-refresh.service — the lesson just had not
+# propagated). Real readiness is the retry loop below: what this unit actually
+# needs at boot is the dockerized Postgres, and a Persistent catch-up can fire
+# before the docker daemon is up. Bounded at 5 minutes; a timeout FAILS the unit
+# so OnFailure= says so instead of a silent half-run.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker exec kb-db pg_isready -q -U kb 2>/dev/null && exit 0; sleep 5; done; echo "kb-db not ready after 5m" >&2; exit 1'
 ExecStart=%h/kb/repo/scripts/backup.sh
 NoNewPrivileges=true
 

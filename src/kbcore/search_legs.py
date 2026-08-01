@@ -4,7 +4,9 @@ Split out of search.py to keep that module lean (CLAUDE.md: files < ~300 lines),
 mirroring the search_expand split. Three legs, each walled by the SAME
 scope/status/valid-time WHERE fragment the caller (kbcore.search) builds:
 
-- vector leg: cosine over current-model chunks;
+- vector leg: cosine over current-model chunks, with the HNSW candidate window
+  widened for the leg's transaction so the post-scan status/scope wall cannot
+  starve it (see ``_tune_vector_scan``);
 - keyword leg: ``websearch_to_tsquery('simple', q)`` — 'simple' keeps Urdu and
   identifiers like TPS55288 un-stemmed (DATA-6/V7). AND semantics first; when
   AND yields fewer than KW_OR_FALLBACK_MIN rows on a multi-word query, rerun as
@@ -55,6 +57,11 @@ MAX_ID_TOKENS = 8
 # 12 is well above what carries signal: the IDF weighting means the few rarest
 # terms dominate the ranking, and the tail of common words cannot outweigh them.
 MAX_OR_LEXEMES = 12
+# Fallback HNSW candidate window when pgvector is too old for iterative scans
+# (< 0.8). Must stay comfortably ABOVE CANDIDATES — that headroom IS the fix
+# (see _tune_vector_scan); the tripwire test asserts the relationship so raising
+# CANDIDATES cannot silently re-open the hole.
+VECTOR_EF_SEARCH_FALLBACK = 120
 
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -98,7 +105,74 @@ def _token_parts(token: str) -> list[str]:
     return re.findall(r"[A-Za-z]{3,}", spaced)
 
 
+def _hnsw_capabilities(conn) -> tuple[bool, bool]:
+    """(iterative_scan available, ef_search available) for THIS connection.
+
+    pgvector registers its GUCs when its shared library is loaded, and that
+    happens on the first call INTO the library — not at connect. So a probe on a
+    fresh connection reports "unavailable" for both unless something has already
+    touched a vector value. The cheap `'[0]'::vector` cast below forces the load
+    (it calls vector_in), after which `current_setting(..., missing_ok)` answers
+    truthfully and, crucially, never raises — so this probe can never poison the
+    caller's transaction the way a bare `SET` of an unknown GUC would.
+    """
+    conn.execute("SELECT '[0]'::vector")
+    row = conn.execute(
+        "SELECT current_setting('hnsw.iterative_scan', true) IS NOT NULL,"
+        "       current_setting('hnsw.ef_search', true) IS NOT NULL"
+    ).fetchone()
+    return bool(row[0]), bool(row[1])
+
+
+def _tune_vector_scan(conn) -> str:
+    """Widen the HNSW candidate window for the vector leg's transaction.
+
+    THE BUG THIS FIXES. pgvector's default ``hnsw.ef_search`` is 40 — exactly
+    this leg's LIMIT — and the status/scope wall lives on ``items``, so it is
+    applied AFTER the index scan, not inside it. The scan hands the executor its
+    40 nearest chunks and reports end-of-scan; every non-active one among them
+    is then dropped and the leg returns FEWER than CANDIDATES rows. Supersession
+    mints non-active near-duplicates permanently by design (Inv. 5), so this
+    deepens with corpus age: live probes returned as few as 24 of 40 candidates
+    (median 38) and the nightly golden eval's hit@5 fell 0.91 -> 0.88.
+
+    ``hnsw.iterative_scan`` (pgvector >= 0.8) is the real fix: asked for more
+    tuples than the first window yielded, the scan RESUMES with a wider search
+    instead of reporting end-of-scan, so a post-scan filter can no longer
+    truncate the window; cost stays bounded by ``hnsw.max_scan_tuples``.
+    ``strict_order``, never ``relaxed_order``: RRF fusion derives each
+    candidate's rank from its ROW POSITION (``enumerate`` in _rrf_fuse), and
+    relaxed_order may emit tuples out of distance order — it would silently
+    scramble the ranks the fusion arithmetic is built on.
+
+    Older pgvector has no iterative scan, so there we only buy headroom
+    (ef_search = VECTOR_EF_SEARCH_FALLBACK, 3x the LIMIT). A FIXED window can
+    always be starved by a deep enough filter, which is why iterative_scan is
+    detected and PREFERRED rather than assumed absent.
+
+    ``set_config(..., is_local => true)`` is SET LOCAL, so the tuning dies with
+    the leg's transaction and cannot leak onto a reused connection; an
+    autocommit connection has no transaction to be local to, so it falls back to
+    session scope. Returns what was applied, for tests and logging.
+    """
+    iterative, ef_search = _hnsw_capabilities(conn)
+    is_local = not getattr(conn, "autocommit", False)
+    if iterative:
+        conn.execute("SELECT set_config('hnsw.iterative_scan', 'strict_order', %s)", (is_local,))
+        return "iterative_scan=strict_order"
+    if ef_search:
+        conn.execute(
+            "SELECT set_config('hnsw.ef_search', %s, %s)",
+            (str(VECTOR_EF_SEARCH_FALLBACK), is_local),
+        )
+        return f"ef_search={VECTOR_EF_SEARCH_FALLBACK}"
+    return "none"
+
+
 def _vector_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[int, str]]:
+    # Widen the HNSW candidate window BEFORE the scan: the WHERE wall below is
+    # applied after it, so a default-width window returns short (_tune_vector_scan).
+    _tune_vector_scan(conn)
     # embed_query, not embed_one: the QUERY side carries the instruction prefix
     # required by instruction-aware embedders (asymmetric contract, embed.py).
     qvec = json.dumps(embed_mod.embed_query(query), separators=(",", ":"))

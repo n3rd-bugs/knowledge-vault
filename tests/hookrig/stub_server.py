@@ -33,15 +33,23 @@ from typing import Any
 from stub_contract import Invalid, Queue, enqueue_result, validate_submission
 
 TOKEN = os.environ.get("RIG_TOKEN", "kbrig_0000000000000000000000000000")
+# What a PROJECT-SCOPED enrolment redeems to. Distinct from TOKEN so a case can
+# tell "the machine used the credential it just redeemed" from "it fell back to
+# something else it happened to have".
+PROJECT_TOKEN = os.environ.get("RIG_PROJECT_TOKEN", "kbg_" + "a" * 43)
 RECORD_PATH = os.environ.get("RIG_RECORD", "/tmp/requests.jsonl")
 PORT = int(os.environ.get("RIG_PORT", "8000"))
 # Where the rig mounted the skill, so the stub can serve the REAL scripts.
 SKILL_DIR = Path(os.environ.get("SKILL", "/skill"))
 SETUP_SCRIPTS = frozenset(
-    {"install.sh", "flush-session-to-kb.sh", "kb-session-brief.sh", "kb-mcp-call.sh",
-    "notify-complete.sh",
-    "turn-start.sh",
-}
+    {
+        "install.sh",
+        "flush-session-to-kb.sh",
+        "kb-session-brief.sh",
+        "kb-mcp-call.sh",
+        "notify-complete.sh",
+        "turn-start.sh",
+    }
 )
 
 SEARCH_HITS = "\n".join(
@@ -62,6 +70,11 @@ class State:
     # Enrolment codes already redeemed. Single-use is the property under test,
     # so the stub must enforce it rather than accept a code repeatedly.
     spent_codes: set[str] = set()
+    # The project the NEXT redemption hands back, set by the harness through
+    # POST /__enrol_project. Default enrolment is project-scoped — the credential
+    # goes to kb-tokens.env and NO shared KB_TOKEN is ever written — and that is
+    # precisely the shape in which a bare $KB_TOKEN reference is unbound.
+    enrol_project: str = ""
 
     @classmethod
     def reset(cls) -> None:
@@ -69,6 +82,7 @@ class State:
             cls.seq = 0
             cls.sessions = set()
             cls.spent_codes = set()
+            cls.enrol_project = ""
             with open(RECORD_PATH, "w", encoding="utf-8"):
                 pass
         Queue.reset()
@@ -221,6 +235,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"reset\n", "text/plain")
             return
         raw = self._body()
+        if path == "/__enrol_project":
+            # Harness-only: make the NEXT redemption yield a project-scoped
+            # credential (never recorded — it is rig plumbing, not a request
+            # under test).
+            State.enrol_project = raw.decode("utf-8").strip()
+            self._send(200, b"ok\n", "text/plain")
+            return
         if path == "/mcp":
             self._mcp(raw)
         elif path == "/api/ingest-session":
@@ -287,7 +308,17 @@ class Handler(BaseHTTPRequestHandler):
             self._done(rec, 400, {"error": "enrolment code is not valid"})
             return
         State.spent_codes.add(code)
-        self._done(rec, 200, {"token": TOKEN, "is_owner": True, "principal": None})
+        body: dict[str, Any] = {"token": TOKEN, "is_owner": True, "principal": None}
+        if State.enrol_project:
+            # A project-scoped grantee, exactly like the real endpoint returns for
+            # a per-project enrolment code.
+            body = {
+                "token": PROJECT_TOKEN,
+                "is_owner": False,
+                "principal": "rig-machine",
+                "project": State.enrol_project,
+            }
+        self._done(rec, 200, body)
 
     # --------------------------------------------------------------------- MCP
     def _mcp(self, raw: bytes) -> None:
@@ -366,6 +397,12 @@ class Handler(BaseHTTPRequestHandler):
         rec["project"] = args.get("project")
         rec["kind"] = args.get("kind")
         rec["encoding"] = "gz" if args.get("transcript_gz") else "plain"
+        # THE SESSION IDENTITY, recorded verbatim. Nothing in the rig used to look
+        # at it, which is how "session:" — an empty session id interpolated into
+        # the URI by a detached child that never had the variable — travelled on
+        # every flush from every machine and coalesced six projects into one
+        # extraction. Recording it is what makes that assertable.
+        rec["session_uri"] = args.get("session_uri")
         try:
             project, text = validate_submission(args)
         except (ValueError, Invalid) as e:
@@ -401,6 +438,7 @@ class Handler(BaseHTTPRequestHandler):
         rec["project"] = payload.get("project")
         rec["kind"] = payload.get("kind")
         rec["encoding"] = "gz" if payload.get("transcript_gz") else "plain"
+        rec["session_uri"] = payload.get("session_uri")
         try:
             project, text = validate_submission(payload)
         except ValueError as e:  # shape -> pydantic would have refused the model

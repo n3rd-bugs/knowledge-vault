@@ -47,6 +47,20 @@ assert_eq "gz" "$(stub_field '.tool=="kb_ingest_session"' '.encoding')" "payload
 assert_eq "kind,project,session_uri,transcript_gz" "$(stub_field '.tool=="kb_ingest_session"' '.arg_keys | join(",")')" "no extra arguments"
 assert_eq "false" "$(stub_field '.tool=="kb_ingest_session"' '.is_error')" "stub accepted the submission"
 
+step "the SESSION IDENTITY that arrives is real, not a bare scheme"
+# THE TRIPWIRE THIS CASE WAS MISSING. Every assertion above passed for weeks
+# while session_uri was literally "session:" on every machine: the hook computes
+# the key in the parent shell and the value is used inside a DETACHED child, and
+# it was never exported, so it expanded to the empty string. A bare "session:" is
+# not an identity, it is a wildcard -- the drain groups by it, so 137 rows from
+# SIX unrelated projects were concatenated into cross-project extractions stamped
+# with whichever project sorted first. Asserting "a submission arrived" cannot
+# see that; asserting the VALUE can.
+SURI=$(stub_field '.tool=="kb_ingest_session"' '.session_uri // empty')
+assert_ne "" "$SURI" "a session identity was sent at all"
+assert_ne "session:" "$SURI" "the identity is not a DEGENERATE bare scheme"
+assert_eq "session:sess-mcp" "$SURI" "the identity is this session's id"
+
 step "the decoded payload is byte-identical to what was fed in"
 stub_requests | jq -j 'select(.tool=="kb_ingest_session") | .transcript' >"$HOME/received"
 if cmp -s "$T" "$HOME/received"; then

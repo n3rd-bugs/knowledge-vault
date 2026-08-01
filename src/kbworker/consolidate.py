@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import shutil
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +46,131 @@ CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
 EVIDENCE_PAIR_CAP = 20  # max contradiction pairs evidence-judged per nightly run
 QUEUE_BATCH = 200  # max ingest_queue rows drained per nightly run
 
+# STARVATION FIX. EVIDENCE_PAIR_CAP // this is reserved, at the FRONT of each
+# nightly batch, for rows that already carry a decisive suggestion
+# (suggestion_streak >= 1). evidence.open_contradiction_rows orders
+# never-enriched rows first — right for a fresh contradiction, fatal for a
+# nearly-resolved one: with 57 open contradictions and a cap of 20, twelve
+# decisive suggestions sat at streak=1 for weeks because the window never came
+# back to them, and AUTO_RESOLVE_STREAK=2 needs exactly one more visit. This
+# changes SCHEDULING only — the suggestion thresholds and the two-night
+# stability rule (evidence.SUGGEST_* / AUTO_RESOLVE_STREAK) are untouched
+# settled design.
+EVIDENCE_STREAK_RESERVE_DIVISOR = 2  # half the cap
+# Contradiction pairs judged this run, across projects — the per-night budget is
+# shared (settings.kb_contradiction_pair_cap), so it has to be counted somewhere
+# both _contradictions and the report can see. Reset per run, like _COHORT_STATS.
+_CONTRA_STATS: dict[str, int] = {"judged": 0}
+
+# "deadline" / "battery" / None — see :func:`should_stop`.
+StopCheck = Callable[[], "str | None"]
+
+# How often a per-item loop asks :func:`should_stop`. The answer is cached
+# (_STOP_CACHE_SECONDS) so the cost is a modulo, not a SQLite read; the bound
+# that matters is the OVERSHOOT — at most this many more LLM calls after the
+# grid drops or the deadline passes.
+STOP_CHECK_EVERY = 5
+
+# --- extraction input budget -------------------------------------------------
+# Ollama truncates a chat prompt to num_ctx/2 tokens and keeps only the first
+# n_keep (4) tokens of the front, so an oversized job loses the SYSTEM PROMPT and
+# the model is handed an instruction-less tail slice. Measured 2026-07-31: a
+# 1,034,082-token prompt was cut to 8,194 tokens ("truncating input prompt" x13
+# in journald) — SILENTLY, because Ollama returns 200 with a plausible-looking
+# empty extraction. Assembled group text is therefore split into windows that
+# fit, and :func:`_warn_if_oversized` is the tripwire that keeps this class of
+# failure loud if anything ever bypasses the split again.
+EXTRACT_PROMPT_OVERHEAD_TOKENS = 1024  # system prompt + JSON schema + output headroom
+EXTRACT_BYTES_PER_TOKEN = 3.5  # FIRST-PASS sizing only — enforcement is by real token count
+MIN_WINDOW_BYTES = 4_000  # floor, so a mis-set num_ctx cannot produce absurd windows
+# cl100k (the vendored counter) is not qwen3's tokenizer. On ordinary prose/code
+# the two are close; the margin absorbs the residual mismatch so a window that
+# counts as fitting under cl100k cannot overflow the qwen ceiling.
+TOKENIZER_SAFETY = 1.15
+
+
+def window_budget_bytes() -> int:
+    """FIRST-PASS byte sizing for windows, derived from num_ctx.
+
+    A byte estimate alone is NOT a guarantee: dense content runs far below the
+    assumed bytes/token (measured with the vendored tokenizer: base64 1.23,
+    hex 1.47, log tables 1.95, diffs 2.14 — all under 3.5), so a budget-full
+    byte window can still decode to 2x the token ceiling. Bytes give cheap,
+    line-boundary-friendly splits; :func:`_fit_windows` then ENFORCES the token
+    ceiling with a real count and re-splits any window that exceeds it.
+    """
+    usable = int(settings.kb_llm_num_ctx) // 2 - EXTRACT_PROMPT_OVERHEAD_TOKENS
+    return max(MIN_WINDOW_BYTES, int(usable * EXTRACT_BYTES_PER_TOKEN))
+
+
+def window_budget_tokens() -> int:
+    """Tokens ONE extraction call may carry: num_ctx/2 minus prompt overhead.
+
+    num_ctx/2 is Ollama's prompt ceiling (measured: 8,194 tokens at num_ctx
+    16384, "truncating input prompt" in journald when exceeded, keep=4 so the
+    SYSTEM PROMPT is what truncation drops).
+    """
+    return max(512, int(settings.kb_llm_num_ctx) // 2 - EXTRACT_PROMPT_OVERHEAD_TOKENS)
+
+
+def _token_ceiling() -> int:
+    """The cl100k count a window must stay under to fit the qwen budget."""
+    return max(256, int(window_budget_tokens() / TOKENIZER_SAFETY))
+
+
+def _fit_windows(text: str) -> list[str]:
+    """Split assembled text into windows GUARANTEED to fit one extraction call.
+
+    Two passes. Byte windows first (line-boundary aware, cheap); then every
+    window is measured with the real tokenizer, and any that exceeds the ceiling
+    — dense content like base64, hex dumps or diff hunks runs as low as 1.2
+    bytes/token — is re-split by TOKEN SLICES, which cannot overshoot by
+    construction. The verifier reproduced exactly this failure against the
+    byte-only version: a "budget-full" 25 kB window decoding to ~20k tokens.
+    """
+    from kbcore.chunk import _enc, count_tokens
+
+    ceiling = _token_ceiling()
+    out: list[str] = []
+    for w in sessions._text_windows(text, window_budget_bytes()):
+        if not w.strip():
+            continue
+        if count_tokens(w) <= ceiling:
+            out.append(w)
+            continue
+        toks = _enc.encode(w, disallowed_special=())
+        for i in range(0, len(toks), ceiling):
+            piece = _enc.decode(toks[i : i + ceiling])
+            if piece.strip():
+                out.append(piece)
+    return out or [""]
+
+
+def _warn_if_oversized(key: str, text: str, budget_tokens: int | None = None) -> bool:
+    """TRIPWIRE: a job that Ollama will truncate must never be silent again.
+
+    Measures REAL tokens (the byte estimate was the bug — dense content runs at
+    1.2-2.1 bytes/token and sailed under a byte check while overflowing the
+    context). After :func:`_fit_windows` this should never fire; it exists for
+    whatever bypasses the split next.
+    """
+    from kbcore.chunk import count_tokens
+
+    budget = window_budget_tokens() if budget_tokens is None else budget_tokens
+    tokens = count_tokens(text)
+    if tokens <= budget:
+        return False
+    logger.warning(
+        "TRUNCATION RISK: job %r submits %d tokens (measured, cl100k) against the "
+        "%d-token budget from num_ctx=%d — Ollama truncates to num_ctx/2 and the "
+        "SYSTEM PROMPT is what it drops first",
+        key,
+        tokens,
+        budget,
+        settings.kb_llm_num_ctx,
+    )
+    return True
+
 
 def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
     """Union-find the dedupe pairs into clusters of mutually-similar items."""
@@ -77,7 +203,7 @@ _COHORT_STATS: dict[str, int] = {}
 
 
 def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One JOB per coalesced group, with its text assembled EXACTLY ONCE.
+    """One JOB per CONTEXT-SIZED WINDOW of each coalesced group's assembled text.
 
     COALESCED BY SESSION. The network path windows RAW JSONL at 900 KB while the
     local path assembles to text first, so the same session arrives as ~42x more
@@ -88,10 +214,25 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     the local path's behaviour. Row order is the hook's byte order (it submits
     sequential offsets), so plain concatenation reconstitutes the delta.
 
-    The cohort phases and the ingest pass now share this ONE assembly, so the
-    text a judge saw is provably the text stored as the item's ``raw`` (it used
-    to be assembled twice, in two places). Per-group isolation as everywhere else
-    in the drain: a group that will not assemble is marked failed, never fatal.
+    RE-WINDOWED (2026-08-01), which is what ``ingest_queue.pending_groups``
+    already promised and this function did not do: coalescing 350 raw rows into
+    one job produced ONE prompt of megabytes, and Ollama silently truncated it to
+    num_ctx/2 — dropping the system prompt with it (see
+    :func:`window_budget_bytes`). The assembled text is therefore split through
+    the same :func:`kbworker.sessions._text_windows` machinery the local flush
+    path uses, at a budget derived from num_ctx instead of the queue's 1 MB row
+    cap, and each window becomes its own job.
+
+    Every window of a group shares the group's ids, uri, extra_meta and detail —
+    only ``key`` (the cohort key, which must stay unique so a batch cannot hand a
+    job its neighbour's prefetch) and ``detail.window`` differ. The group's rows
+    flip status ONCE, after the LAST window lands (:func:`_drain_job`), so a
+    group is still all-or-nothing.
+
+    The cohort phases and the ingest pass share this ONE assembly, so the text a
+    judge saw is provably the text stored as the item's ``raw`` (it used to be
+    assembled twice, in two places). Per-group isolation as everywhere else in
+    the drain: a group that will not assemble is marked failed, never fatal.
     """
     jobs: list[dict[str, Any]] = []
     for group in groups:
@@ -101,27 +242,43 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         try:
             meta = row["meta"] or {}
             text = sessions.assemble_text("".join(r["content"] for r in rows), row["kind"])
-            jobs.append(
-                {
-                    "key": group["uri"],  # cohort key: the coalescing group id
-                    "ids": ids,
-                    "project": row["project"],
-                    "uri": meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}",
-                    "branch": meta.get("branch"),
-                    "text": text,
-                    # FIX 6 (audit 2026-07-26): a queued session/memory window
-                    # anchors no FILE — repo/commit ride the item meta as
-                    # provenance instead of a phantom {"path": "."} code_ref.
-                    "detail": {
-                        "ingest_queue_id": row["id"],
-                        "source": row["kind"],
-                        **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
-                    },
-                    "extra_meta": sessions._session_provenance(
-                        meta.get("repo"), meta.get("commit")
-                    ),
-                }
-            )
+            windows = _fit_windows(text)
+            # ONE state per group, shared by its window jobs: the queue flip and
+            # the failure taxonomy are group-wide, the extraction calls are not.
+            state: dict[str, Any] = {
+                "ids": ids,
+                "left": len(windows),
+                "saved": 0,
+                "rejected": 0,
+                "done": False,
+            }
+            uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
+            for i, window in enumerate(windows):
+                key = f"{group['uri']}#w{i}" if len(windows) > 1 else group["uri"]
+                _warn_if_oversized(key, window)
+                jobs.append(
+                    {
+                        "key": key,  # cohort key: unique per SUBMISSION
+                        "group": state,  # shared: the queue rows flip once, together
+                        "ids": ids,
+                        "project": row["project"],
+                        "uri": uri,
+                        "branch": meta.get("branch"),
+                        "text": window,
+                        # FIX 6 (audit 2026-07-26): a queued session/memory window
+                        # anchors no FILE — repo/commit ride the item meta as
+                        # provenance instead of a phantom {"path": "."} code_ref.
+                        "detail": {
+                            "ingest_queue_id": row["id"],
+                            "source": row["kind"],
+                            **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
+                            **({"window": i, "windows": len(windows)} if len(windows) > 1 else {}),
+                        },
+                        "extra_meta": sessions._session_provenance(
+                            meta.get("repo"), meta.get("commit")
+                        ),
+                    }
+                )
         except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
             logger.exception("assembling ingest_queue group %s failed", ids)
             for rid in ids:
@@ -132,12 +289,12 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _past_deadline() -> bool:
     """True once the configured wall-clock cutoff has passed.
 
-    Checked BETWEEN cohorts, never inside one: aborting mid-cohort would throw
-    away extraction work already paid for on the GPU, while stopping at a cohort
-    boundary costs nothing. Every job the drain has not reached is still
-    'pending', so the next run — nightly, or the boot catch-up after a power cut
-    — resumes exactly here. Resumption needs no state of its own; the queue IS
-    the checkpoint (Invariant 3: ingest is idempotent).
+    Checked between cohorts and between ITEMS of the LLM tail, never inside one
+    model call: aborting mid-call would throw away work already paid for on the
+    GPU, while stopping at an item boundary costs nothing. Every job the drain
+    has not reached is still 'pending', so the next run — nightly, or the boot
+    catch-up after a power cut — resumes exactly here. Resumption needs no state
+    of its own; the queue IS the checkpoint (Invariant 3: ingest is idempotent).
     """
     raw = (settings.kb_drain_deadline or "").strip()
     if not raw:
@@ -149,6 +306,32 @@ def _past_deadline() -> bool:
         logger.warning("KB_DRAIN_DEADLINE %r is not HH:MM — ignoring", raw)
         return False
     return datetime.now() >= cutoff
+
+
+def _reading_age_seconds(ts: Any) -> float | None:
+    """Age of one sungrow reading in seconds; None when the stamp is unparseable.
+
+    INVARIANT 7 CARVE-OUT — the single foreign-DB boundary in this codebase.
+    Everything the KB itself stores is TIMESTAMPTZ/UTC, but the sungrow monitor
+    is another project's Django app and writes NAIVE LOCAL wall-clock
+    (Asia/Karachi, UTC+5). Reading those stamps as UTC made ``now - seen`` about
+    MINUS five hours, so the staleness check could not fire during the first five
+    hours of genuine staleness: a poller that died at 03:00 still read as "fresh"
+    at 07:00, which is exactly the last-known-good trap the freshness check
+    exists to avoid.
+
+    A naive stamp is therefore interpreted in the LOCAL zone — which is what
+    :meth:`datetime.astimezone` does to a naive value — and an offset-carrying
+    stamp is honoured as written, so a future sungrow schema that starts emitting
+    UTC needs no change here. The comparison itself stays UTC-aware.
+    """
+    try:
+        seen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if seen.tzinfo is None:
+        seen = seen.astimezone()  # naive == LOCAL time (Inv. 7 carve-out, above)
+    return (datetime.now(UTC) - seen).total_seconds()
 
 
 def _on_battery() -> bool:
@@ -195,13 +378,8 @@ def _on_battery() -> bool:
         return False
 
     volts, ts = float(row[0]), row[1]
-    age = None
-    try:
-        seen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        if seen.tzinfo is None:
-            seen = seen.replace(tzinfo=UTC)
-        age = (datetime.now(UTC) - seen).total_seconds()
-    except (ValueError, TypeError):
+    age = _reading_age_seconds(ts)
+    if age is None:
         logger.warning("power check: unparseable timestamp %r — ignoring freshness", ts)
 
     if age is not None and age > settings.kb_power_max_age_seconds:
@@ -227,6 +405,58 @@ def _on_battery() -> bool:
         )
         return True
     return False
+
+
+_STOP_CACHE_SECONDS = 5.0
+_stop_cache: tuple[float, str | None] | None = None
+
+# Why each step stood down, and how much it left behind. Persisted in the run
+# report (counts["stopped"]) — a run that quietly did a third of its work is
+# indistinguishable from a broken one unless it SAYS why it stopped.
+_STOP_LOG: dict[str, dict[str, Any]] = {}
+
+
+def reset_stop_cache() -> None:
+    """Drop the memoized stand-down verdict (start of a run; tests)."""
+    global _stop_cache
+    _stop_cache = None
+
+
+def should_stop() -> str | None:
+    """``'deadline'`` / ``'battery'`` / ``None`` — the ONE stand-down question.
+
+    Both guards existed but were asked at exactly ONE site (between drain
+    cohorts, first batch exempt), so the LLM TAIL — triage, contradictions,
+    evidence, 4.6 h measured — ran unbounded: verified still on the GPU 2h19m
+    past the noon deadline. Every long loop now asks this instead of
+    re-implementing the pair, and every caller stops the same way: nothing is
+    deleted, nothing is half-written, the unreached work is simply left for the
+    next run (Invariant 3 makes the retry idempotent).
+
+    The verdict is cached for a few seconds so a per-item check costs a
+    dictionary lookup rather than a wall-clock parse plus a SQLite read; neither
+    signal can meaningfully change inside one LLM call.
+    """
+    global _stop_cache
+    now = time.monotonic()
+    if _stop_cache is not None and now - _stop_cache[0] < _STOP_CACHE_SECONDS:
+        return _stop_cache[1]
+    reason = "deadline" if _past_deadline() else ("battery" if _on_battery() else None)
+    _stop_cache = (now, reason)
+    return reason
+
+
+def _note_stop(step: str, reason: str, deferred: int) -> None:
+    """Record + log that ``step`` stood down, and how much it deferred."""
+    prior = _STOP_LOG.get(step, {}).get("deferred", 0)
+    _STOP_LOG[step] = {"reason": reason, "deferred": prior + deferred}
+    logger.warning(
+        "step %r standing down (%s): %d item(s) deferred — nothing is lost, the "
+        "next run resumes here",
+        step,
+        reason,
+        deferred,
+    )
 
 
 def _batch_jobs(jobs: list[dict[str, Any]], cohort: int) -> list[list[dict[str, Any]]]:
@@ -340,12 +570,29 @@ def _cohort_prepare(
 def _drain_job(
     job: dict[str, Any], *, pre_extracted: dict | None, planned: EnsemblePlan | None
 ) -> tuple[int, int]:
-    """Extract+ingest ONE coalesced group. Owns the queue self-heal taxonomy.
+    """Extract+ingest ONE WINDOW of a coalesced group. Owns the queue self-heal
+    taxonomy.
 
-    Returns ``(rows_drained, items_saved)`` — ``(0, 0)`` for any failure, which is
-    isolated here so one bad submission never aborts the drain.
+    Returns ``(rows_drained, items_saved)``. The group's ROWS are counted (and
+    flipped) exactly once, when its LAST window lands: a group is still
+    all-or-nothing, it just takes one extraction call per context-sized window to
+    get there (:func:`_assemble_jobs`). Failure semantics stay GROUP-wide — one
+    window's failure defers/fails every row of the group and skips its remaining
+    windows, so the next run re-extracts the whole group rather than stitching a
+    session together out of two different nights (ingest is idempotent,
+    Invariant 3, so the re-extraction cannot double-write).
     """
-    ids = job["ids"]
+    state = job["group"]
+    ids = state["ids"]
+    if state["done"]:
+        # A sibling window already resolved this group (failed or deferred).
+        # Extracting the rest would spend the 14B on rows nobody will flip.
+        return 0, 0
+    # Closed by DEFAULT and re-opened only by a successful non-final window, so
+    # every failure path below — including one nobody anticipated — resolves the
+    # whole group and skips its siblings, rather than each window discovering the
+    # same outage on the GPU.
+    state["done"] = True
     try:
         saved, rejected = sessions.extract_and_ingest(
             job["text"],
@@ -358,9 +605,15 @@ def _drain_job(
             extra_detail=job["detail"],
             extra_meta=job["extra_meta"],
         )
+        state["saved"] += saved
+        state["rejected"] += rejected
+        state["left"] -= 1
+        if state["left"] > 0:
+            state["done"] = False
+            return 0, saved  # more windows to come — the rows stay 'pending'
         # All-or-nothing: a group extracted once must never leave rows
         # pending for a second, partial extraction of the same session.
-        ingest_queue.mark_group_extracted(ids, saved, rejected)
+        ingest_queue.mark_group_extracted(ids, state["saved"], state["rejected"])
         return len(ids), saved
     except (ExtractorUnavailable, EmbedderUnavailable) as e:
         # CONNECTIVITY (Ollama down/restarting/model-not-loaded during the
@@ -413,6 +666,14 @@ def _drain_ingest_queue() -> tuple[int, int]:
     ``mark_group_extracted`` deliberately stay per job: batching those would
     widen the pre-existing "written but still pending" window for real.
 
+    The stand-down guard is asked BETWEEN cohorts here; the check before the
+    FIRST cohort belongs to the run (:func:`_drain_step`), because "should this
+    run start at all" is a question about the run, not about a batch. Stopping
+    can land mid-GROUP now that a group spans several window jobs — its rows are
+    simply still 'pending', so the next run re-extracts the group from its first
+    window and the already-ingested items dedupe on (kind, uri, content_hash)
+    (Invariant 3).
+
     Returns ``(rows_drained, items_saved)``.
     """
     groups = ingest_queue.pending_groups(limit=QUEUE_BATCH)
@@ -440,16 +701,18 @@ def _drain_ingest_queue() -> tuple[int, int]:
     drained = 0
     saved_total = 0
     for n, batch in enumerate(batches):
-        if n and (_past_deadline() or _on_battery()):
+        reason = should_stop() if n else None
+        if reason:
             left = sum(len(b) for b in batches[n:])
             logger.warning(
-                "drain stopping (deadline %s or on battery): %d cohort(s) / %d job(s) deferred — "
+                "drain stopping (%s): %d cohort(s) / %d job(s) deferred — "
                 "rows stay 'pending' and the next run resumes here",
-                settings.kb_drain_deadline,
+                reason,
                 len(batches) - n,
                 left,
             )
-            _COHORT_STATS["deadline_deferred_jobs"] = left
+            _COHORT_STATS["deadline_deferred_jobs"] = left  # never renamed (telemetry)
+            _note_stop("queued_drained", reason, left)
             break
         pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
         for job in batch:
@@ -476,10 +739,20 @@ def _dedupe(project: str) -> int:
     return marked
 
 
-def _summaries(since: datetime | None) -> int:
-    """Step 2: (re)write topic summaries for tags with >=3 new items since last run."""
+def _summaries(since: datetime | None, stop: StopCheck | None = None) -> int:
+    """Step 2: (re)write topic summaries for tags with >=3 new items since last run.
+
+    ``stop`` is the run's stand-down guard (:func:`should_stop`), asked every
+    :data:`STOP_CHECK_EVERY` tags because each tag is a summarizer call. Tags not
+    reached are simply re-selected next run — the "since" mark only advances when
+    a consolidation report is written.
+    """
     written = 0
-    for project, tag, _new in consolidation.tags_needing_summary(since):
+    todo = consolidation.tags_needing_summary(since)
+    for n, (project, tag, _new) in enumerate(todo):
+        if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
+            _note_stop("summaries_written", reason, len(todo) - n)
+            break
         sources = consolidation.active_items_with_tag(project, tag)
         if len(sources) < 3:
             continue
@@ -491,15 +764,63 @@ def _summaries(since: datetime | None) -> int:
     return written
 
 
-def _contradictions(project: str) -> int:
-    """Step 3: judge near-but-not-dup pairs; queue confirmed conflicts (never auto-supersede)."""
+def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None = None) -> int:
+    """Step 3: judge near-but-not-dup pairs; queue confirmed conflicts (never auto-supersede).
+
+    One LLM call per pair, so this is one of the three tail steps that used to
+    run past the deadline unbounded: ``stop`` is asked every
+    :data:`STOP_CHECK_EVERY` pairs and ``cap`` bounds the pairs judged (the
+    caller's REMAINING share of the per-night budget). Stopping loses nothing — a
+    pair that is still near-but-not-dup is re-offered by the same query next run,
+    and ``record_contradiction`` is idempotent for the ones already judged.
+
+    Every verdict — overwhelmingly "no contradiction" — is remembered in
+    ``contradiction_judgements`` so the next night does not re-pay for it
+    (:func:`kbcore.consolidation.record_pair_judgement`; ~90% of this step's cost
+    was re-judged negatives). It is recorded AFTER the contradiction is queued, so
+    a kill between the two loses the memory rather than the finding: the pair is
+    simply judged once more next run.
+    """
     queued = 0
-    for a_id, b_id, _sim in consolidation.contradiction_pairs(project, CONTRA_LOW, CONTRA_HIGH):
+    pairs = consolidation.contradiction_pairs(project, CONTRA_LOW, CONTRA_HIGH, limit=cap)
+    for n, (a_id, b_id, _sim) in enumerate(pairs):
+        if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
+            _note_stop("contradictions_queued", reason, len(pairs) - n)
+            break
         (a_title, a_body), (b_title, b_body) = consolidation.item_pair_texts(a_id, b_id)
-        if llm.items_contradict(
-            a_title, a_body, b_title, b_body
-        ) and consolidation.record_contradiction(a_id, b_id):
+        verdict = llm.items_contradict(a_title, a_body, b_title, b_body)
+        if verdict and consolidation.record_contradiction(a_id, b_id):
             queued += 1
+        try:
+            consolidation.record_pair_judgement(a_id, b_id, verdict)
+        except Exception:  # noqa: BLE001 — the memory is an optimisation, never a gate
+            # Same rule as the cohort path: an optimisation that can fail the
+            # step is not one. A pair whose memory did not land is simply judged
+            # again next run — the cost of the old behaviour, not a wrong answer.
+            logger.warning("recording the judgement for pair %s/%s failed", a_id, b_id)
+        _CONTRA_STATS["judged"] += 1
+    return queued
+
+
+def _contradictions_all(
+    projects: list[str], stop: StopCheck | None = None, cap: int | None = None
+) -> int:
+    """Step 3 across every project under ONE shared per-night pair budget.
+
+    The budget is per NIGHT, not per project, so a single large project cannot
+    consume the whole GPU window; projects are taken in order and whatever is not
+    reached is offered again next run (nothing is written, nothing is lost).
+    ``cap`` of 0 is the kill switch — no pair is judged at all.
+    """
+    _CONTRA_STATS["judged"] = 0
+    budget = int(settings.kb_contradiction_pair_cap) if cap is None else int(cap)
+    queued = 0
+    for project in projects:
+        remaining = budget - _CONTRA_STATS["judged"]
+        if remaining <= 0:
+            logger.info("contradiction judging hit the per-night cap of %d pairs", budget)
+            break
+        queued += _contradictions(project, stop, remaining)
     return queued
 
 
@@ -523,7 +844,36 @@ def _doc_refresh(projects: list[str]) -> int:
     return resolved
 
 
-def _evidence() -> tuple[int, int]:
+def _evidence_batch(
+    rows: list[tuple[int, int, int, dict[str, Any]]],
+) -> list[tuple[int, int, int, dict[str, Any]]]:
+    """Cap the nightly evidence batch, RESERVING a slice for near-decided rows.
+
+    A row whose last refresh produced a suggestion (``suggestion_streak >= 1``)
+    is ONE more visit away from auto-resolution, but it sorts LAST — the query
+    puts never-enriched rows first — so a cap smaller than the open set starved
+    it forever (12 suggestions stuck at streak=1 against 57 open rows and a cap
+    of 20). Up to ``EVIDENCE_PAIR_CAP // EVIDENCE_STREAK_RESERVE_DIVISOR`` of
+    those go to the FRONT of the batch, so the stop guard cannot truncate them
+    away either; the rest of the cap keeps the query's never-enriched-first
+    order, which is what stops brand-new contradictions being starved in turn.
+    Both constants are read at call time so a test (or a future knob) can lower
+    the cap and have the reserve follow it.
+    """
+    cap = EVIDENCE_PAIR_CAP
+    reserve = cap // EVIDENCE_STREAK_RESERVE_DIVISOR
+    hot = [r for r in rows if r[3].get("suggested_resolution") and r[3].get("suggestion_streak")]
+    batch = hot[:reserve]
+    picked = {r[0] for r in batch}
+    for row in rows:
+        if len(batch) >= cap:
+            break
+        if row[0] not in picked:
+            batch.append(row)
+    return batch
+
+
+def _evidence(stop: StopCheck | None = None) -> tuple[int, int]:
     """Step 3b: refresh evidence for open contradictions; auto-resolve stable ones.
 
     Counts accumulate night over night as repo seeds and session flushes add
@@ -531,12 +881,19 @@ def _evidence() -> tuple[int, int]:
     so the cap can't starve brand-new contradictions. A decisive suggestion
     that holds for AUTO_RESOLVE_STREAK consecutive refreshes is executed
     (owner V4 refinement; kill switch kb_auto_resolve_evidence). Per-pair
-    isolation. Returns ``(refreshed, auto_resolved)``.
+    isolation. ``stop`` (asked every :data:`STOP_CHECK_EVERY` pairs) bounds the
+    step by wall clock/power as well as by EVIDENCE_PAIR_CAP; an unreached row
+    is just a row whose evidence is one night older. Returns
+    ``(refreshed, auto_resolved)``.
     """
     rows = evidence.open_contradiction_rows()
     refreshed = 0
     auto_resolved = 0
-    for queue_id, a_id, b_id, prior in rows[:EVIDENCE_PAIR_CAP]:
+    batch = _evidence_batch(rows)
+    for n, (queue_id, a_id, b_id, prior) in enumerate(batch):
+        if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
+            _note_stop("evidence_refreshed", reason, len(batch) - n)
+            break
         try:
             detail = evidence.gather_evidence(a_id, b_id)
             sugg = detail.get("suggested_resolution")
@@ -567,11 +924,11 @@ def _evidence() -> tuple[int, int]:
                 )
         except Exception:  # noqa: BLE001 — one bad pair must not abort the step
             logger.exception("evidence refresh for queue row %s failed", queue_id)
-    if len(rows) > EVIDENCE_PAIR_CAP:
+    if len(rows) > len(batch):
         logger.info(
             "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",
-            EVIDENCE_PAIR_CAP,
-            len(rows) - EVIDENCE_PAIR_CAP,
+            len(batch),
+            len(rows) - len(batch),
         )
     return refreshed, auto_resolved
 
@@ -630,14 +987,63 @@ def _write_report(counts: dict[str, Any]) -> int:
     )
 
 
-def main() -> dict[str, Any]:
-    """Run the consolidation pass under the advisory lock. Returns a summary dict."""
+def _drain_step(counts: dict[str, Any], stop: StopCheck | None) -> int:
+    """Step 0, with the stand-down guard asked BEFORE the first cohort.
+
+    BOOT-CATCH-UP CONSEQUENCE, and it is the intended behaviour: the timer is
+    ``Persistent=true``, so a box that boots at 14:00 after a power cut fires the
+    missed 03:30 run immediately — already hours past the noon deadline. Asking
+    the guard before the first cohort means such a run DEFERS the whole drain to
+    the next nightly instead of putting the 14B on the GPU in the middle of the
+    working day, which is exactly what the deadline exists to prevent. Nothing is
+    lost: the rows stay 'pending' and ingest is idempotent (Invariant 3).
+    """
+    ensemble.reset_shadow_counter()  # per-run shadow accumulator (WP-B2)
+    reason = stop() if stop is not None else None
+    if reason:
+        # The long-lived watcher runs main() repeatedly in ONE process; leaving
+        # the previous run's cohort telemetry standing would report work this
+        # run never did.
+        _COHORT_STATS.clear()
+        _note_stop("queued_drained", reason, ingest_queue.queue_depth())
+        return 0
+    drained, saved = _drain_ingest_queue()
+    counts["queued_items_saved"] = saved
+    counts["ensemble_shadow_survivors"] = ensemble.shadow_survivor_total()
+    return drained
+
+
+def nightly() -> dict[str, Any]:
+    """The UNATTENDED entry point (kb-consolidate.service / ``make consolidate``).
+
+    Arms the wall-clock + power guard for the whole pass. It is armed HERE rather
+    than inside :func:`main` because standing down is a policy about unattended
+    runs: an owner who types ``kb consolidate-now`` at 14:00 asked for the run and
+    gets it, while the 03:30 timer — and the ``Persistent=true`` catch-up that
+    fires it after a midday boot — is bounded. The drain's between-cohort guard
+    is unconditional either way, so no run can keep the GPU busy through a grid
+    outage.
+    """
+    return main(stop=should_stop)
+
+
+def main(stop: StopCheck | None = None) -> dict[str, Any]:
+    """Run the consolidation pass under the advisory lock. Returns a summary dict.
+
+    ``stop`` is the run's stand-down guard (:func:`nightly` passes
+    :func:`should_stop`); ``None`` runs the pass to completion, which is what an
+    explicitly requested run wants. Whichever steps stand down are recorded in
+    ``counts["stopped"]`` — ``{step: {"reason", "deferred"}}`` — so a short run is
+    never mistaken for a broken one.
+    """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     with advisory_lock(ADVISORY_KEY) as acquired:
         if not acquired:
             logger.info("another consolidation holds lock %d; skipping this run", ADVISORY_KEY)
             return {"skipped": True}
 
+        _STOP_LOG.clear()
+        reset_stop_cache()
         since = consolidation.last_consolidation_at()
         counts: dict[str, Any] = {
             "queued_drained": 0,
@@ -658,18 +1064,22 @@ def main() -> dict[str, Any]:
             "archived": 0,
             "reembedded": 0,
             "review_expired": 0,
+            # CURATION VISIBILITY. The report said what automation did and never
+            # what it left waiting, so an owner could not see that hundreds of
+            # triage verdicts were unapplied, that known-bad items were still
+            # live, or that a wave of rows was about to age out. Defaults stand
+            # if the step fails, and no existing key is renamed — the report is
+            # persisted in consolidation_requests.result and read night-over-night.
+            "contradiction_pairs_judged": 0,
+            "triage_awaiting_apply": 0,
+            "reject_suggestions_pending": 0,
+            "contradiction_suggestions_pending": 0,
+            "first_expiry_date": None,
         }
 
         # Step 0: extract remote submissions BEFORE dedupe so the new items take
         # part in this run's dedupe/summary/contradiction passes.
-        def _drain() -> int:
-            ensemble.reset_shadow_counter()  # per-run shadow accumulator (WP-B2)
-            drained, saved = _drain_ingest_queue()
-            counts["queued_items_saved"] = saved
-            counts["ensemble_shadow_survivors"] = ensemble.shadow_survivor_total()
-            return drained
-
-        _run_step(counts, "queued_drained", _drain)
+        _run_step(counts, "queued_drained", lambda: _drain_step(counts, stop))
         # Persisted in consolidation_requests.result, so a later run can be
         # compared without re-deriving anything from logs.
         counts.update(_COHORT_STATS)
@@ -693,7 +1103,7 @@ def main() -> dict[str, Any]:
         _run_step(
             counts,
             "review_triaged",
-            lambda: review_triage.run_triage(settings.kb_review_triage_batch),
+            lambda: review_triage.run_triage(settings.kb_review_triage_batch, should_stop=stop),
         )
         # Housekeeping for the two non-knowledge stores this system creates.
         # Both sweeps existed with NO call site, so their TTLs were fiction:
@@ -702,15 +1112,19 @@ def main() -> dict[str, Any]:
         # Neither touches knowledge, so neither is an Invariant-5 concern.
         _run_step(counts, "upload_parts_swept", documents.sweep_staging)
         _run_step(counts, "enrolment_codes_swept", enrolment.sweep_expired)
-        _run_step(counts, "summaries_written", lambda: _summaries(since))
-        _run_step(
-            counts, "contradictions_queued", lambda: sum(_contradictions(p) for p in projects)
-        )
+        _run_step(counts, "summaries_written", lambda: _summaries(since, stop))
+
+        def _contra() -> int:
+            queued = _contradictions_all(projects, stop)
+            counts["contradiction_pairs_judged"] = _CONTRA_STATS["judged"]
+            return queued
+
+        _run_step(counts, "contradictions_queued", _contra)
 
         # Step 3b AFTER contradictions so rows queued seconds ago get evidence
         # in the same run (open_contradiction_rows orders never-enriched first).
         def _ev() -> int:
-            refreshed, auto_resolved = _evidence()
+            refreshed, auto_resolved = _evidence(stop)
             counts["evidence_auto_resolved"] = auto_resolved
             return refreshed
 
@@ -731,12 +1145,23 @@ def main() -> dict[str, Any]:
             lambda: review_auto.expire_quiet_rows(settings.kb_review_expire_days),
         )
 
+        # AFTER quiet-expiry, so the four curation counts describe the queue the
+        # owner will actually wake up to (kbcore.review_auto.curation_counts).
+        def _curation() -> int:
+            counts.update(review_auto.curation_counts(settings.kb_review_expire_days))
+            return counts["triage_awaiting_apply"]
+
+        _run_step(counts, "triage_awaiting_apply", _curation)
+
         # Search-quality regression sentinel (§8): replay the golden eval, record
         # hit@5/MRR, flag a drop vs the previous run. Advisory — never aborts the
         # run. Runs before the counts below so a freshly-enqueued regression row
         # is reflected in review_queue_open.
         eval_sentinel.run_sentinel(counts)
 
+        # WHY the run is as short as it is, and how much it left behind. Rides
+        # into consolidation_requests.result with the rest of the report.
+        counts["stopped"] = {k: dict(v) for k, v in _STOP_LOG.items()}
         counts["review_queue_open"] = consolidation.open_review_count()
         counts["ingest_queue_pending"] = ingest_queue.queue_depth()
         counts["disk_pct"] = _disk_pct()
@@ -750,4 +1175,4 @@ def main() -> dict[str, Any]:
 
 
 if __name__ == "__main__":
-    print(main())
+    print(nightly())

@@ -2,7 +2,15 @@
 # Install: bash scripts/install_systemd.sh   (systemd user unit; triggered by the timer)
 [Unit]
 Description=Knowledge Vault nightly consolidation (dedupe/summarize/archive) + backup
+# Persistent=true on the timer runs a MISSED window immediately at boot. On
+# 2026-07-31 that fired the service 10 SECONDS after a post-power-cut boot,
+# before DNS was up, and it died on a network call. On a box whose UPS cannot
+# ride out grid fluctuations, "boot follows a missed window" is the COMMON case,
+# not the edge case — so the catch-up must wait for connectivity.
+# (Folded in from a LIVE-ONLY edit on 2026-08-01: it existed on this machine but
+# not in the repo, so the next install_systemd.sh run would have reverted it.)
 After=network.target
+OnFailure=kb-notify-fail@%n.service
 
 [Service]
 Type=oneshot
@@ -10,7 +18,31 @@ WorkingDirectory=%h/kb/repo
 EnvironmentFile=%h/kb/repo/.env
 # The 14B extractor loads here (Invariant 8) — do NOT cap memory at 1G.
 MemoryMax=16G
+# tiktoken's default cache lives under /tmp, which is tmpfs here: every boot
+# wipes it, so the first chunk of the first post-boot run re-downloads the BPE —
+# and a post-power-cut catch-up (network not up yet) HARD-FAILED on exactly that.
+# Pinned to a persistent path under $HOME, seeded from the vendored copy both at
+# install time and by the ExecStartPre below.
+Environment=TIKTOKEN_CACHE_DIR=%h/kb/cache/tiktoken
+# Seed that cache from the vendored copy on EVERY start, not just at install:
+# pinning the variable overrides kbcore.chunk's own vendored-directory fallback,
+# so an empty cache dir would send the first chunk of the night to the network —
+# the exact failure being fixed. `cp -n` never overwrites, so this is a no-op
+# once warm, and it must never fail the run.
+# network-online.target is a NO-OP here: a systemd --user manager has no
+# wait-online provider, so those lines ordered against nothing (the repo already
+# documents this in kb-cloudflared-refresh.service — the lesson just had not
+# propagated). Real readiness is the retry loop below: what this unit actually
+# needs at boot is the dockerized Postgres, and a Persistent catch-up can fire
+# before the docker daemon is up. Bounded at 5 minutes; a timeout FAILS the unit
+# so OnFailure= says so instead of a silent half-run.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker exec kb-db pg_isready -q -U kb 2>/dev/null && exit 0; sleep 5; done; echo "kb-db not ready after 5m" >&2; exit 1'
+ExecStartPre=/bin/sh -c 'mkdir -p %h/kb/cache/tiktoken && cp -n %h/kb/repo/vendor/tiktoken/* %h/kb/cache/tiktoken/ 2>/dev/null || true'
 ExecStart=%h/kb/repo/.venv/bin/python -m kbworker.consolidate
+# The post-run backup is a BONUS, not the backup strategy: kb-backup.timer owns
+# that at 03:00, before this starts. This one only means "a lot of rows just
+# changed, take a fresh dump" — and, unlike the timer, it cannot run at all if
+# the 4.5–7h pass is interrupted, which is why it stopped being the only one.
 ExecStartPost=%h/kb/repo/scripts/backup.sh
 NoNewPrivileges=true
 

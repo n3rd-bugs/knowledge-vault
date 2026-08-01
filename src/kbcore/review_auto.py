@@ -14,12 +14,42 @@ promote/reject, which :func:`bulk_resolve` merely batches for an owner.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
-from kbcore import review
+from kbcore import llm, review
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 
 BULK_ACTIONS = ("promote", "reject", "dismiss")
+
+# Triage suggestions that ask for the ITEM to be retired. Derived from
+# llm.TRIAGE_ACTIONS rather than hand-listed so a future reject_* action is
+# exempt from quiet expiry the day it ships, not the day someone remembers.
+REJECT_TRIAGE_ACTIONS = tuple(a for a in llm.TRIAGE_ACTIONS if a.startswith("reject"))
+
+# The quiet-expiry predicate, shared by the sweep and the "when does the first
+# row expire" report count so the two can never drift. Constant SQL text with
+# named placeholders — no value is ever formatted in (Invariant 2). ``i`` is the
+# joined items row; ``%(reject)s`` is the REJECT_TRIAGE_ACTIONS array.
+_QUIET_ELIGIBLE = """
+              rq.resolved = false
+              AND rq.reason = 'unverified_extraction'
+              AND i.status = 'active'
+              -- HARD DEADLINE FIX: a row carrying a reject_* triage suggestion is
+              -- a KNOWN-BAD item waiting on a human to apply it. Expiring it
+              -- closes the evidence and leaves the item live, unverified and
+              -- searchable forever — the exact opposite of what the suggestion
+              -- asked for. Those rows therefore never expire; they stay open
+              -- until an owner applies or dismisses them.
+              -- A 'keep'-suggested row DOES still expire: applying a keep closes
+              -- the row and leaves the item active + unverified, which is
+              -- byte-for-byte the end state quiet expiry produces, so holding it
+              -- open buys nothing. An untriaged row expires as before.
+              AND NOT (COALESCE(rq.detail->'triage'->>'action', '') = ANY(%(reject)s))
+              AND NOT EXISTS (
+                  SELECT 1 FROM access_log al WHERE al.item_id = rq.item_id
+              )
+"""
 
 
 def close_moot_rows() -> int:
@@ -66,34 +96,87 @@ def expire_quiet_rows(older_than_days: int) -> int:
     remains available"). Stamps ``auto_resolution = {kind: 'quiet_expiry',
     age_days, at}`` via jsonb merge. ``older_than_days <= 0`` is the kill
     switch: return 0 without touching the DB. Returns the rows closed.
+
+    EXEMPT: rows whose ``detail.triage`` carries a reject_* suggestion — see
+    :data:`_QUIET_ELIGIBLE` for why those must never quietly close, and why a
+    'keep'-suggested row may.
     """
     if older_than_days <= 0:
         return 0
     at = datetime.now(UTC).isoformat()
     with transaction() as conn:
         rows = conn.execute(
-            """
+            f"""
             UPDATE review_queue rq
             SET resolved = true,
-                detail = COALESCE(rq.detail, '{}'::jsonb) || jsonb_build_object(
+                detail = COALESCE(rq.detail, '{{}}'::jsonb) || jsonb_build_object(
                     'auto_resolution', jsonb_build_object(
                         'kind', 'quiet_expiry',
                         'age_days', %(days)s::int,
                         'at', %(at)s::text))
             FROM items i
             WHERE i.id = rq.item_id
-              AND rq.resolved = false
-              AND rq.reason = 'unverified_extraction'
-              AND i.status = 'active'
+              AND {_QUIET_ELIGIBLE}
               AND rq.created_at < now() - make_interval(days => %(days)s)
-              AND NOT EXISTS (
-                  SELECT 1 FROM access_log al WHERE al.item_id = rq.item_id
-              )
             RETURNING rq.id
-            """,
-            {"days": older_than_days, "at": at},
+            """,  # noqa: S608 — _QUIET_ELIGIBLE is constant SQL text, values are bound
+            {"days": older_than_days, "at": at, "reject": list(REJECT_TRIAGE_ACTIONS)},
         ).fetchall()
     return len(rows)
+
+
+def curation_counts(expire_days: int) -> dict[str, Any]:
+    """The four numbers that say whether the CURATION LOOP is actually moving.
+
+    The nightly report counted what automation DID (rows triaged, evidence
+    refreshed) but never what it left WAITING, so a backlog of known-bad items
+    with unapplied verdicts, and a wave of rows about to age out, were both
+    invisible until someone went looking in SQL. Read-only; returns
+
+    * ``triage_awaiting_apply`` — open unverified_extraction rows that already
+      carry a stored triage suggestion. Every one is a human keystroke away
+      from being resolved (``kb review apply-triage``).
+    * ``reject_suggestions_pending`` — the subset asking for the item to be
+      RETIRED. These are known-bad items still live in retrieval.
+    * ``first_expiry_date`` — the date the oldest quiet-expiry-eligible row
+      reaches ``expire_days`` (ISO date, possibly in the past = "next run").
+      None when expiry is off (``expire_days <= 0``) or nothing is eligible.
+    * ``contradiction_suggestions_pending`` — open contradiction rows carrying a
+      decisive ``suggested_resolution`` that has not been executed yet.
+    """
+    reject = list(REJECT_TRIAGE_ACTIONS)
+    with connect() as conn:
+        triaged, rejecting = conn.execute(
+            """
+            SELECT count(*) FILTER (WHERE COALESCE(rq.detail, '{}'::jsonb) ? 'triage'),
+                   count(*) FILTER (WHERE rq.detail->'triage'->>'action' = ANY(%(reject)s))
+            FROM review_queue rq
+            WHERE rq.resolved = false AND rq.reason = 'unverified_extraction'
+            """,
+            {"reject": reject},
+        ).fetchone()
+        first_expiry = None
+        if expire_days > 0:
+            row = conn.execute(
+                f"""
+                SELECT min(rq.created_at) + make_interval(days => %(days)s)
+                FROM review_queue rq JOIN items i ON i.id = rq.item_id
+                WHERE {_QUIET_ELIGIBLE}
+                """,  # noqa: S608 — _QUIET_ELIGIBLE is constant SQL text, values are bound
+                {"days": expire_days, "reject": reject},
+            ).fetchone()
+            first_expiry = row[0].date().isoformat() if row and row[0] else None
+        (contra,) = conn.execute(
+            "SELECT count(*) FROM review_queue "
+            "WHERE resolved = false AND reason = 'contradiction' "
+            "  AND jsonb_typeof(detail->'suggested_resolution') = 'object'"
+        ).fetchone()
+    return {
+        "triage_awaiting_apply": int(triaged),
+        "reject_suggestions_pending": int(rejecting),
+        "first_expiry_date": first_expiry,
+        "contradiction_suggestions_pending": int(contra),
+    }
 
 
 def bulk_resolve(

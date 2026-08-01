@@ -7,6 +7,7 @@ item carries ``meta.redactions`` and can be flagged in review.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 # Order matters: specific token formats first, the generic assignment last so
 # e.g. `token=ghp_...` redacts as a github token, not a generic credential —
@@ -36,12 +37,115 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # durable storage. Adding kbg_ without kbe_ left the newer of the two
     # credentials this system mints unredactable.
     ("kb_enrol_code", re.compile(r"kbe_[A-Za-z0-9\-_]{20,}")),
+    # ntfy access tokens (`tk_…`) — the credential this system DISTRIBUTES to
+    # every machine it enrols, so it travels through exactly the transcripts the
+    # session hooks flush. It was unredactable until 2026-08-01: an ntfy admin
+    # password leaked into a transcript on 2026-07-31 (a `bash -x` trace) and had
+    # to be rotated, and items 1589/2176 still returned plaintext credentials
+    # afterwards because nothing here matched the shape.
+    ("ntfy_token", re.compile(r"tk_[A-Za-z0-9]{8,}")),
+    # Google OAuth client secrets ship with their own prefix; matched by shape so
+    # one quoted from ANOTHER project's console is caught too, not just this
+    # deployment's (which the config layer below already covers).
+    ("google_secret", re.compile(r"GOCSPX-[A-Za-z0-9_\-]{10,}")),
+    # …and the third shape the same credential travels in: inline URL userinfo
+    # (`postgresql://kb:pw@host`, `https://admin:pw@ntfy…`). The config layer
+    # below catches THIS deployment's db password wherever it appears, but a URL
+    # pasted from another box or another project is only catchable by shape. The
+    # lookbehind/lookahead keep the scheme and host readable — the note stays
+    # useful, the credential does not survive.
+    (
+        "url_credentials",
+        re.compile(r"(?<=://)[^\s:/@]{1,64}:(?!\[REDACTED:)[^\s@/]{1,128}(?=@)"),
+    ),
+    # The same leak's OTHER shape: HTTP basic auth, both as curl types it
+    # (`-u user:password`, separated OR glued as `-uuser:password`) and as the
+    # header it becomes. Two guards keep it off ordinary text: `(?!//)` stops a
+    # URL (`-u https://host`) looking like user:password, and the password must
+    # be 6+ chars (same floor as the generic credential rule) so a flag-like
+    # `--update:main` is not mistaken for one. It is still deliberately
+    # over-inclusive — `docker run -u www-data:www-data` redacts too — because the
+    # two errors are not symmetric: a redacted note is a small loss, a leaked
+    # password costs a rotation across every enrolled machine.
+    (
+        "basic_auth",
+        re.compile(
+            r"(?<![\w-])(?:-{1,2}u(?:ser)?[ =]\s*|-u)"
+            r"[^\s:/@]{1,64}:(?!//)(?!\[REDACTED:)\S{6,128}"
+        ),
+    ),
+    (
+        "auth_header",
+        re.compile(
+            r"(?i)authorization\s*:\s*(?:basic|bearer|token)\s+(?!\[REDACTED:)[A-Za-z0-9+/=._\-]{8,}"
+        ),
+    ),
     ("jwt", re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+")),
     (
         "credential",
         re.compile(r"(?i)(?:password|passwd|secret|token)\s*[=:]\s*(?!\[REDACTED:)\S{6,}"),
     ),
 ]
+
+
+# --- this deployment's OWN secrets, by exact value ----------------------------
+#
+# The shape patterns above catch a credential wherever it appears, including ones
+# this box never held. They cannot catch a secret with no distinctive shape — a
+# database password, a Google client secret, a web signing secret — unless it
+# happens to be written as `password=…`. Those ARE known to this process: they
+# are Settings fields. So the second layer walks the config and redacts the
+# literal values, generalizing what used to be a hand-written special case for
+# ``kb_token`` alone. Adding a credential to config now makes it redactable
+# without touching this file (tests/test_scrub_credentials.py is the tripwire
+# that says so out loud).
+_CREDENTIAL_FIELD_RE = re.compile(r"(?i)token|password|secret")
+
+# Values that are placeholders, not secrets — redacting them would mangle prose
+# and, worse, teach reviewers to ignore [REDACTED] markers.
+_PLACEHOLDER_VALUES = frozenset(
+    {"change-me", "change-me-long-random", "changeme", "none", "null", "unset"}
+)
+# Short strings are far more likely to be an English word than a credential.
+_MIN_OWN_SECRET_LEN = 12
+
+
+@lru_cache(maxsize=1)
+def credential_setting_fields() -> tuple[str, ...]:
+    """Names of every ``Settings`` field that holds a credential (str-typed and
+    named ``*token*``/``*password*``/``*secret*``).
+
+    Derived from the model, never hand-listed: a new credential setting is picked
+    up automatically. Field NAMES are cached (they are fixed at import); the
+    VALUES are read per call, so a test that monkeypatches settings still works.
+    """
+    from kbcore.config import Settings
+
+    return tuple(
+        sorted(
+            name
+            for name, field in Settings.model_fields.items()
+            if _CREDENTIAL_FIELD_RE.search(name) and field.annotation is str
+        )
+    )
+
+
+def own_secrets() -> list[tuple[str, str]]:
+    """``[(label, value)]`` for the credentials THIS deployment holds, longest
+    value first so a secret that contains another is redacted whole."""
+    from kbcore.config import settings  # local import — scrub stays dependency-light
+
+    found: list[tuple[str, str]] = []
+    for name in credential_setting_fields():
+        value = getattr(settings, name, None)
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        if len(value) < _MIN_OWN_SECRET_LEN or value.lower() in _PLACEHOLDER_VALUES:
+            continue
+        found.append((name, value))
+    found.sort(key=lambda pair: len(pair[1]), reverse=True)
+    return found
 
 
 def merge_redactions(dst: dict[str, int], src: dict[str, int]) -> None:
@@ -89,16 +193,16 @@ def scrub(text: str) -> tuple[str, dict[str, int]]:
     if "\x00" in text:
         redactions["nul_stripped"] = text.count("\x00")
         text = text.replace("\x00", "")
-    # The KB's OWN bearer, wherever it appears (bare, in a config snippet, in a
-    # flushed transcript of a kb_setup conversation) — the generic token= pattern
-    # only catches prefixed forms. Exact match, no regex risk.
-    from kbcore.config import settings  # local import — scrub stays dependency-light
-
-    own = settings.kb_token
-    if own and len(own) >= 16 and own in text:
-        n = text.count(own)
-        text = text.replace(own, "[REDACTED:kb_token]")
-        redactions["kb_token"] = redactions.get("kb_token", 0) + n
+    # This deployment's OWN secrets, wherever they appear (bare, in a config
+    # snippet, in a flushed transcript of a kb_setup conversation) — the generic
+    # token= pattern only catches prefixed forms, and a db password has no shape
+    # at all. Exact match, no regex risk. Runs BEFORE the shape patterns so the
+    # redaction is labelled with the setting it came from.
+    for label, value in own_secrets():
+        if value in text:
+            n = text.count(value)
+            text = text.replace(value, f"[REDACTED:{label}]")
+            redactions[label] = redactions.get(label, 0) + n
     for label, pattern in SECRET_PATTERNS:
         text, n = pattern.subn(f"[REDACTED:{label}]", text)
         if n:

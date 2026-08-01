@@ -262,7 +262,7 @@ def test_a_chunked_session_shares_one_source_uri_end_to_end(client):
         assert r.status_code == 202, r.text
 
     groups = ingest_queue.pending_groups(limit=100, quiet_minutes=0)
-    mine = [g for g in groups if g["uri"] == "session:abc"]
+    mine = [g for g in groups if g["source_uri"] == "session:abc"]
     assert len(mine) == 1, f"the session did not coalesce: {[g['uri'] for g in groups]}"
     assert len(mine[0]["rows"]) == 3, "not every chunk joined the group"
 

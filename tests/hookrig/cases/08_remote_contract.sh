@@ -42,6 +42,15 @@ assert_eq "restrepo" "$(stub_field '.transport=="rest"' '.project')" "project fr
 assert_eq "gz" "$(stub_field '.transport=="rest"' '.encoding')" "sent as transcript_gz"
 assert_eq "$(wc -c <"$T")" "$(stub_field '.transport=="rest"' '.transcript_bytes')" "full transcript delivered"
 assert_file_contains "$LOGF" "ok bytes=" "success logged"
+
+step "the SESSION IDENTITY on the wire is real, not a bare scheme"
+# Same tripwire as case 05, on the other bearer transport: both share one branch
+# in the hook, so both shipped "session:" and neither noticed. See 05 for why a
+# degenerate identity is worse than a missing one.
+SURI=$(stub_field '.transport=="rest"' '.session_uri // empty' | tail -1)
+assert_ne "" "$SURI" "a session identity was sent at all"
+assert_ne "session:" "$SURI" "the identity is not a DEGENERATE bare scheme"
+assert_eq "session:sess-rest" "$SURI" "the identity is this session's id"
 assert_eq "$(wc -c <"$T")" "$(cat "$HOME/.claude/hooks/state/sess-rest.offset")" "offset checkpointed"
 
 step "WRONG bearer through the HOOK -> 401, offset not advanced, session survives"

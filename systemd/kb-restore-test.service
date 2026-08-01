@@ -4,6 +4,9 @@
 [Unit]
 Description=Knowledge Vault monthly restore drill (backup verification)
 After=network.target
+# The drill exists to tell you the backups are restorable. A drill that fails
+# unnoticed inverts its own purpose.
+OnFailure=kb-notify-fail@%n.service
 
 [Service]
 Type=oneshot

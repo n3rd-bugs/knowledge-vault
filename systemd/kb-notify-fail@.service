@@ -1,0 +1,24 @@
+# kb-notify-fail@ — the failure notifier every kb unit hands OnFailure= to.
+#
+# Instance name is the FAILED unit: `OnFailure=kb-notify-fail@%n.service` expands
+# %n to e.g. kb-consolidate.service, so one template covers every unit and the
+# alert says which one died.
+#
+# WHY THIS EXISTS: the nightly work (consolidate, backup, the boot catch-up, the
+# monthly edge refresh) runs unattended at 03:00 on a box with an unreliable
+# grid. A failure used to be silent — no backup existed for 29 or 30 July and
+# nobody knew until someone went looking. Silence is the bug; this is the fix.
+#
+# Deliberately has NO OnFailure of its own: a notifier that notifies about its
+# own failure is a loop, and the script exits 0 unconditionally anyway.
+[Unit]
+Description=Knowledge Vault failure notification for %i
+
+[Service]
+Type=oneshot
+# The script reads ~/.claude/notify.env itself and feeds curl its auth on stdin
+# (never argv). No EnvironmentFile: this must work even when .env is the problem.
+ExecStart=%h/kb/repo/systemd/kb-notify-fail.sh %i
+NoNewPrivileges=true
+# Bounded: a hung notifier must not sit in the failure path forever.
+TimeoutStartSec=60

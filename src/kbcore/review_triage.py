@@ -16,6 +16,7 @@ both call :func:`run_triage`, the single shared loop.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -34,6 +35,10 @@ from kbcore.errors import (
 logger = logging.getLogger("kbcore.review_triage")
 
 TRIAGE_SIMILAR_K = 5  # neighbor candidates offered to the judge as dup targets
+# Rows between stand-down checks — the bound is the OVERSHOOT (at most this many
+# more 14B calls after the deadline passes or the grid drops), not the cost: the
+# guard memoizes its answer for a few seconds.
+STOP_CHECK_EVERY = 5
 
 
 def pending_triage(limit: int) -> list[dict[str, Any]]:
@@ -112,7 +117,7 @@ def store_triage(queue_id: int, triage: dict[str, Any]) -> bool:
     return row is not None
 
 
-def run_triage(batch: int) -> int:
+def run_triage(batch: int, should_stop: Callable[[], str | None] | None = None) -> int:
     """Drain up to ``batch`` pending rows through the 14B judge; store suggestions.
 
     The SHARED loop behind the nightly ``review_triaged`` step and the explicit
@@ -124,11 +129,29 @@ def run_triage(batch: int) -> int:
     pending for the next night, no penalty); ExtractionFailed skips just that
     row (retried next night — acceptable, no penalty mechanism by design); a
     validation-rejected verdict stores nothing. Returns suggestions stored.
+
+    ``should_stop`` is the caller's stand-down guard (the nightly passes
+    :func:`kbworker.consolidate.should_stop`, which answers 'deadline' /
+    'battery' / None). It is asked every :data:`STOP_CHECK_EVERY` rows — this is
+    a 14B call per row and it used to run unbounded past the drain's deadline —
+    and a stop leaves the remaining rows exactly as an outage does: open,
+    untriaged, no penalty, re-selected by :func:`pending_triage` next run. The
+    default (None) never stops, so an explicitly requested ``kb review triage``
+    is not wall-clock-bounded.
     """
     if batch <= 0:
         return 0
     stored = 0
-    for row in pending_triage(batch):
+    rows = pending_triage(batch)
+    for n, row in enumerate(rows):
+        if should_stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := should_stop()):
+            logger.warning(
+                "triage standing down (%s) after %d row(s): %d left open for the next run",
+                reason,
+                n,
+                len(rows) - n,
+            )
+            break
         item = row["item"]
         try:
             similar = [

@@ -72,16 +72,27 @@ MSG="Claude finished — ${WHERE} @ ${MACHINE}${TOOK}"
 if [ -n "${NTFY_TOPIC:-}" ]; then
   BASE="${NTFY_URL:-https://ntfy.sh}"
   # Bounded and backgrounded: a slow or dead push must never delay the session.
-  AUTH=()
-    # A scoped WRITE-ONLY token is the right credential for a remote machine: it
-    # can announce completions and nothing else — it cannot read your notification
-    # history (which carries client project names) and cannot publish to another
-    # topic. Basic auth remains for the owner box, which holds the admin account.
+  #
+  # NOTHING SECRET GOES ON THE COMMAND LINE. `-u user:pass` and
+  # `-H "Authorization: ..."` put the credential in argv, which is world-readable
+  # through /proc/<pid>/cmdline and shows up in `ps` — on this system an admin
+  # password has already leaked into a transcript exactly that way, and a
+  # transcript is what these hooks flush into the KB. `curl -K -` reads the same
+  # options from a config file; feeding that file on STDIN keeps the credential
+  # in a pipe, out of argv and off disk. The URL and everything non-secret stay
+  # as normal arguments so the invocation is still readable in a process list.
+  #
+  # A scoped WRITE-ONLY token is the right credential for a remote machine: it
+  # can announce completions and nothing else — it cannot read your notification
+  # history (which carries client project names) and cannot publish to another
+  # topic. Basic auth remains for the owner box, which holds the admin account.
+  ntfy_auth_config() { # -> a curl config on stdout; empty when unauthenticated
     if [ -n "${NTFY_TOKEN:-}" ]; then
-      AUTH=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+      printf 'header = "Authorization: Bearer %s"\n' "$NTFY_TOKEN"
     elif [ -n "${NTFY_USER:-}" ] && [ -n "${NTFY_PASSWORD:-}" ]; then
-      AUTH=(-u "${NTFY_USER}:${NTFY_PASSWORD}")
+      printf 'user = "%s:%s"\n' "$NTFY_USER" "$NTFY_PASSWORD"
     fi
+  }
     # NTFY_TOKEN / NTFY_USER+NTFY_PASSWORD authenticate against a SELF-HOSTED ntfy.
     # Required there and harmless on ntfy.sh: an instance reachable from the
     # internet must run auth-default-access=deny-all, or the topic name alone lets
@@ -99,7 +110,7 @@ if [ -n "${NTFY_TOPIC:-}" ]; then
     # tunnel blip. The exit code is LOGGED: `|| true` alone made every failure
     # invisible, which is why a broken push looked identical to a working one for
     # two rounds of debugging.
-    ERR=$(curl -fsS -4 --max-time 8 --retry 2 --retry-delay 1 "${AUTH[@]}" \
+    ERR=$(ntfy_auth_config | curl -fsS -4 -K - --max-time 8 --retry 2 --retry-delay 1 \
         -H "Title: Claude Code" -H "Priority: default" \
         -d "$MSG" "${BASE%/}/$NTFY_TOPIC" 2>&1 >/dev/null)
     RC=$?

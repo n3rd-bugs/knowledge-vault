@@ -7,6 +7,9 @@ After=network.target
 # (RestartSec=3 outpaces the user manager's default 5-in-10s window).
 StartLimitIntervalSec=60
 StartLimitBurst=5
+# Fires when the restart budget is exhausted: a dead collector means the inbox
+# silently stops being ingested, which looks like "nothing happened lately".
+OnFailure=kb-notify-fail@%n.service
 
 [Service]
 Type=simple

@@ -308,7 +308,19 @@ BRANCH=$(git -C "${CWD:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$BRANCH" = "HEAD" ] && BRANCH="" # detached HEAD names no branch
 COMMIT=$(git -C "${CWD:-.}" rev-parse --short HEAD 2>/dev/null)
 LOG="$HOME/.claude/hooks/flush-session.log"
-export T CWD SID PROJECT LOG REPO BRANCH COMMIT
+# EVERY variable the detached children read must be EXPORTED. The children are
+# `setsid/nohup bash -c '<single-quoted>'` — a FRESH shell that inherits only the
+# environment, so a var set in this parent but not exported expands to EMPTY
+# there, silently and with no error under `set -u` (the child does not set -u).
+# That is not a hypothetical: OKEY was computed here and used as the session
+# identity in the child, so every network flush from every machine sent
+# session_uri='session:' and 137 rows from six projects coalesced into
+# cross-project mega-extractions. CFG is exported for the same reason — the
+# connector child names it in two "here is how to fix this" lines that were
+# printing a bare "in " with no path. tests/test_capture_funnel.py now derives
+# the reference set mechanically from the script, so the whole CLASS is guarded,
+# not the one instance.
+export T CWD SID PROJECT LOG REPO BRANCH COMMIT CFG
 # The detached child is a FRESH bash: hand it the JSON backend (which may be
 # python3, with no jq anywhere on the box) as exported vars + functions.
 export KB_JQ_BIN KB_PY_BIN KB_JSON_PROBED
@@ -490,7 +502,11 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   # be tested at all (a 200 MB fixture per run is not a test, it is a wait).
   export KB_FLUSH_CHUNK="${KB_FLUSH_CHUNK:-900000}"
   export KB_FLUSH_MAX="${KB_FLUSH_MAX:-209715200}"
-  export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF HELPER EV
+  # OKEY IS THE SESSION IDENTITY and it MUST be exported: the child below stamps
+  # every chunk with "session:$OKEY", and an unexported OKEY made that literally
+  # "session:" on every machine — a degenerate URI that coalesced unrelated
+  # projects into one extraction (see the export note above).
+  export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF OKEY HELPER EV
   "$DETACH" bash -c '
     CHUNK="$KB_FLUSH_CHUNK"; MAX_PER_FIRING="$KB_FLUSH_MAX"   # rest resumes next firing
     [ "$EV" = "SessionEnd" ] && MAX_PER_FIRING=1099511627776   # terminal firing: drain all
@@ -520,7 +536,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     # session monopolise a 200-row nightly budget. OKEY is already the
     # sanitised session id (or the transcript path when there is none), so it is
     # stable across every firing for this session and unique between sessions.
-    set -- "$@" session_uri s "session:$OKEY"
+    # BELT AND BRACES: never put a DEGENERATE identity on the wire. A bare
+    # "session:" is not an identity, it is a wildcard — the server groups by it,
+    # so every session that ever sent one would be concatenated with every other.
+    # Omit the field entirely instead; the server then falls back to a per-row
+    # key. (kbcore.ingest_queue also refuses a degenerate value at enqueue, so
+    # this is two independent guards, not one.)
+    [ -n "${OKEY:-}" ] && set -- "$@" session_uri s "session:$OKEY"
     [ -n "$REPO" ] && set -- "$@" repo s "$REPO"
     [ -n "$BRANCH" ] && set -- "$@" branch s "$BRANCH"
     [ -n "$COMMIT" ] && set -- "$@" commit s "$COMMIT"
@@ -628,9 +650,13 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   mkdir -p "$STATE"
   OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
   OFFF="$STATE/${OKEY:-default}.offset"
-  export CLAUDE_BIN OFFF EV
+  export CLAUDE_BIN OFFF OKEY EV
   export KB_CONNECTOR_CHUNK="${KB_CONNECTOR_CHUNK:-24000}"
   export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
+  # Same class as OKEY: the child bounds its relay with this, and an unexported
+  # value meant a KB_CONNECTOR_TIMEOUT set in kb-flush.env was silently ignored
+  # and every box quietly used 120.
+  export KB_CONNECTOR_TIMEOUT="${KB_CONNECTOR_TIMEOUT:-120}"
   # An ABSOLUTE ceiling per firing, including the terminal one. SessionEnd used
   # to lift the cap to 1 TB so the tail could never be stranded — correct for a
   # normal session, catastrophic for a large one: at 24 KB per model call a

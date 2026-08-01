@@ -387,11 +387,24 @@ def test_scripts_syntax_and_static_guards():
     assert "Persistent=true" in timer
     assert "RandomizedDelaySec" in timer
     install = INSTALL.read_text()
-    assert "systemd/kb-backup.service" in install
-    assert "systemd/kb-backup.timer" in install
+    # The installer now GLOBS systemd/*.service|*.timer rather than listing each
+    # unit, so a new unit can never be forgotten. Assert the mechanism plus the
+    # thing that actually matters here — the backup timer is enabled, not left
+    # for someone to remember (test_unit_files covers the glob's coverage).
+    assert "systemd/*.service" in install and "systemd/*.timer" in install
+    assert "enable --now kb-backup.timer" in install
     enable_lines = [
         ln
         for ln in install.splitlines()
         if ln.strip().startswith("systemctl") and "enable" in ln and "kb-backup" in ln
     ]
-    assert enable_lines == [], f"kb-backup must be install-only, found: {enable_lines}"
+    # ENABLED, deliberately (2026-08-01). This used to assert install-only, on the
+    # theory that a backup is the owner's decision to switch on. The three-week
+    # review priced that theory: backup ran ONLY as ExecStartPost of the 4.5-7h
+    # consolidation, so an interrupted night produced nothing — there is no dump
+    # for 29 or 30 July on a box whose UPS cannot ride out a grid fluctuation.
+    # A backup that depends on someone remembering to enable it has the same
+    # failure mode as one that depends on the nightly finishing. The offsite leg
+    # stays gated by KB_OFFSITE_ENABLED, so enabling the timer only guarantees a
+    # LOCAL dump exists.
+    assert enable_lines, "kb-backup.timer must be enabled by the installer"

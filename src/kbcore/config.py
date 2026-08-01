@@ -320,6 +320,16 @@ class Settings(BaseSettings):
     kb_git_repos: str = ""
     kb_archive_after_days: int = 180
     kb_dup_threshold: float = 0.97
+    # Contradiction pairs the 14B may judge per NIGHT, across all projects — the
+    # sibling of kbworker.consolidate.EVIDENCE_PAIR_CAP for the step BEFORE it.
+    # The step had no bound at all and grew 4,972s -> 8,194s in two days. It is a
+    # per-night budget rather than a per-project one so one large project cannot
+    # eat the whole GPU window. 200 is roughly a 10-20 minute step at measured
+    # per-pair cost, and it is a CATCH-UP bound rather than a steady-state one:
+    # with the judged-pair memory (migration 017) a normal night only sees pairs
+    # that are genuinely new, so the cap binds only while a backlog drains.
+    # Unreached pairs are simply offered again next run. Kill switch: 0.
+    kb_contradiction_pair_cap: int = 200
 
     @model_validator(mode="after")
     def _check_embed_pairing(self) -> Settings:

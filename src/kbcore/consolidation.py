@@ -74,7 +74,14 @@ def previous_eval_metrics() -> dict[str, float] | None:
     return None
 
 
-def _lead_pairs(project: str, low: float, high: float) -> list[tuple[int, int, float]]:
+def _lead_pairs(
+    project: str,
+    low: float,
+    high: float,
+    *,
+    skip_judged: bool = False,
+    limit: int | None = None,
+) -> list[tuple[int, int, float]]:
     """Active-item pairs whose lead-chunk cosine is in ``[low, high)`` (pass ``high``
     >= 1.0 for no upper bound). Only current-model embeddings compared (DATA-3).
 
@@ -82,8 +89,17 @@ def _lead_pairs(project: str, low: float, high: float) -> list[tuple[int, int, f
     is not source knowledge to be re-consolidated. Otherwise nightly reports
     (near-identical boilerplate, ~0.98 cosine on real embeddings) would dedup
     each other and collapse the audit trail; this matches the summary/staleness
-    steps, which already exclude those types (review finding)."""
-    sql = """
+    steps, which already exclude those types (review finding).
+
+    ``skip_judged`` drops pairs already recorded in ``contradiction_judgements``
+    AT THE CURRENT EMBED MODEL (migration 017) — the contradiction step is one
+    LLM call per pair and was re-paying for the same negatives every night. Only
+    that step passes it: dedupe is pure SQL and costs nothing to redo.
+    ``limit`` bounds the returned pairs; the ``sim DESC`` order means a capped
+    run spends its budget on the closest (most likely) pairs first.
+    """
+    sql = [
+        """
         SELECT ia.id, ib.id, 1 - (ca.embedding <=> cb.embedding) AS sim
         FROM items ia
         JOIN chunks ca ON ca.item_id = ia.id AND ca.ord = 0
@@ -96,13 +112,33 @@ def _lead_pairs(project: str, low: float, high: float) -> list[tuple[int, int, f
           AND ca.embed_model = %(model)s AND cb.embed_model = %(model)s
           AND (1 - (ca.embedding <=> cb.embedding)) >= %(low)s
           AND (1 - (ca.embedding <=> cb.embedding)) < %(high)s
-        ORDER BY sim DESC, ia.id, ib.id
-    """
+        """
+    ]
+    params: dict[str, Any] = {
+        "project": project,
+        "model": settings.kb_embed_model,
+        "low": low,
+        "high": high,
+    }
+    if skip_judged:
+        # ib.id > ia.id above, so the stored pair is always (smaller, larger) —
+        # record_pair_judgement normalizes to the same order. Matching on
+        # embed_model is what makes a re-embed re-open every pair: judgements
+        # written under the previous model simply stop matching (migration 017).
+        sql.append(
+            """
+          AND NOT EXISTS (
+              SELECT 1 FROM contradiction_judgements cj
+              WHERE cj.a_id = ia.id AND cj.b_id = ib.id AND cj.embed_model = %(model)s
+          )
+            """
+        )
+    sql.append("ORDER BY sim DESC, ia.id, ib.id")
+    if limit is not None:
+        sql.append("LIMIT %(limit)s")
+        params["limit"] = max(0, int(limit))
     with connect() as conn:
-        rows = conn.execute(
-            sql,
-            {"project": project, "model": settings.kb_embed_model, "low": low, "high": high},
-        ).fetchall()
+        rows = conn.execute("\n".join(sql), params).fetchall()
     return [(a, b, float(s)) for a, b, s in rows]
 
 
@@ -112,10 +148,38 @@ def duplicate_pairs(project: str, threshold: float) -> list[tuple[int, int, floa
 
 
 def contradiction_pairs(
-    project: str, low: float = 0.80, high: float = 0.95
+    project: str, low: float = 0.80, high: float = 0.95, limit: int | None = None
 ) -> list[tuple[int, int, float]]:
-    """Active-item pairs with lead-chunk cosine in ``[low, high)`` (near-but-not-dup)."""
-    return _lead_pairs(project, low, high)
+    """Active-item pairs with lead-chunk cosine in ``[low, high)`` (near-but-not-dup),
+    MINUS every pair already judged at the current embed model (migration 017).
+
+    ``limit`` is the caller's remaining per-night judging budget.
+    """
+    return _lead_pairs(project, low, high, skip_judged=True, limit=limit)
+
+
+def record_pair_judgement(a_id: int, b_id: int, verdict: bool) -> bool:
+    """Remember that this pair was judged at the CURRENT embed model. INSERT-only.
+
+    Written the moment the judge answers, so an interrupted step (power cut,
+    deadline, kill) loses at most the pair in flight instead of the whole
+    night's judging. ``ON CONFLICT DO NOTHING`` keeps this purely additive
+    (Invariant 5): a verdict is never updated or deleted, and the memory is
+    invalidated only by re-embedding under a new model, which changes the key.
+    Returns True when a new row landed.
+    """
+    lo, hi = (a_id, b_id) if a_id <= b_id else (b_id, a_id)
+    with transaction() as conn:
+        row = conn.execute(
+            """
+            INSERT INTO contradiction_judgements (a_id, b_id, embed_model, verdict)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (a_id, b_id, embed_model) DO NOTHING
+            RETURNING a_id
+            """,
+            (lo, hi, settings.kb_embed_model, verdict),
+        ).fetchone()
+    return row is not None
 
 
 def active_projects() -> list[str]:

@@ -7,6 +7,10 @@ After=network.target
 # (RestartSec=3 outpaces the user manager's default 5-in-10s window).
 StartLimitIntervalSec=60
 StartLimitBurst=5
+# Fires when the restart budget is exhausted and the unit gives up — i.e. the
+# MCP surface is down and staying down. That is exactly the state nobody notices
+# until they try to use it.
+OnFailure=kb-notify-fail@%n.service
 
 [Service]
 Type=simple

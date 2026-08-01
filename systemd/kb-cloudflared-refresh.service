@@ -17,11 +17,25 @@
 # no-op. Real readiness is gated by the ExecStartPre retry loop instead.
 [Unit]
 Description=Knowledge Vault monthly cloudflared edge refresh (re-pull + recreate)
+# This unit had never once done its job (see COMPOSE_PROJECT_NAME below) and
+# nothing said so. A monthly security refresh that fails silently is worse than
+# no refresh: it is a security refresh you believe you have.
+OnFailure=kb-notify-fail@%n.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=%h/kb/repo
 EnvironmentFile=%h/kb/repo/.env
+# WHY THIS LINE EXISTS: with `-f %h/kb/repo/docker-compose.yml`, compose derives
+# the project name from that path's directory — and %h/kb/repo is a SYMLINK, so
+# the project came out as "repo" while the running stack is "data-server". Every
+# invocation therefore addressed an empty project: `pull` fetched nothing useful
+# and `up -d` would have created a SECOND, parallel edge container rather than
+# refreshing the live one. The unit has never worked since it was written.
+# Pinning the name (equivalent to `-p data-server`) makes it address the real
+# stack. Compose's own default for the running stack is the directory basename
+# of the repo checkout, /home/usama/data-server → data-server.
+Environment=COMPOSE_PROJECT_NAME=data-server
 # Respect the kill switch: skip (do not fail) unless kb-cloudflared is RUNNING.
 # `docker inspect` prints "true"/"false" and exits 0 for any existing container, so
 # gate on the STRING — a stopped or absent edge yields non-"true" and the unit is

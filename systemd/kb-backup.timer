@@ -9,7 +9,7 @@
 #
 # Ordering rationale: pg_dump takes no application advisory lock (scripts/backup.sh
 # runs `docker exec kb-db pg_dump` over the container socket) and the drain's
-# lock is its own, so the two never block each other. Finishing before 03:30
+# lock is its own, so the two never block each other. Finishing before 01:00
 # still costs less: the dump is smaller and the disk is not shared with the
 # extractor's I/O. RandomizedDelaySec is therefore SHORT (5 min, was 30) so the
 # window cannot slide into the consolidation.
@@ -17,7 +17,7 @@
 Description=Nightly Knowledge Vault backup (independent of the consolidation run)
 
 [Timer]
-OnCalendar=*-*-* 03:00
+OnCalendar=*-*-* 00:30
 RandomizedDelaySec=300
 # Catch up a window missed while the machine was off — which, after a power cut,
 # is exactly when the missing backup matters most.

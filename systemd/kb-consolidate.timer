@@ -3,7 +3,11 @@
 Description=Nightly Knowledge Vault consolidation at 03:30
 
 [Timer]
-OnCalendar=*-*-* 03:30
+# 01:00 (owner decision 2026-08-01, was 03:30): the drain stops starting new
+# work at the NOON deadline, so every hour earlier is an hour more of window —
+# 11h instead of 8.5h. At 150W with cohort 30 that margin is what clears a
+# backlog night (recovery/backfill) instead of deferring half of it.
+OnCalendar=*-*-* 01:00
 Persistent=true
 Unit=kb-consolidate.service
 

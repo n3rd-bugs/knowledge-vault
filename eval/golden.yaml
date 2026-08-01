@@ -87,7 +87,7 @@
 - q: "upload markdown or HTML content as Google Doc, create_file textContent conversion, docx export best practice"
   expect_item_id: 383
 - q: "stream push status sensor settings on-change realtime"
-  expect_item_id: 81
+  expect_item_id: 470  # was 81; doc-refresh superseded it 81->470 — a golden case must track the ACTIVE revision
 - q: "mTLS fleet agent deferred config-sync"
   expect_item_id: 68
 

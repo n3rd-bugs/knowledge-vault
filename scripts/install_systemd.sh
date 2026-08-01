@@ -37,7 +37,13 @@ if compgen -G "${REPO_DIR}/vendor/tiktoken/*" > /dev/null; then
 fi
 
 systemctl --user daemon-reload
-systemctl --user enable --now kb-mcp.service
+# kb-mcp.service is NOT enabled: the MCP server runs as the kb-mcp CONTAINER
+# (docker compose), and both bind 127.0.0.1:8321 — the loser dies with
+# "[Errno 98] address already in use" on every boot. The unit is kept for a
+# docker-less deployment, but enabling it here silently re-broke a fix that had
+# already been applied live (disabled 2026-07-31, re-enabled by this installer
+# 2026-08-01). Enable it only if you are NOT running the container.
+# systemctl --user enable --now kb-mcp.service
 systemctl --user enable --now kb-worker.service
 # The consolidation is timer-driven: enable the TIMER (not the oneshot service).
 systemctl --user enable --now kb-consolidate.timer
@@ -70,7 +76,7 @@ systemctl --user --no-pager status kb-mcp.service || true
 systemctl --user --no-pager status kb-worker.service || true
 systemctl --user --no-pager list-timers 'kb-*' || true
 echo "installed: every unit in ${REPO_DIR}/systemd (services + timers)"
-echo "  enabled: kb-mcp, kb-worker, kb-consolidate.timer, kb-consolidate-boot.timer, kb-backup.timer"
+echo "  enabled: kb-worker, kb-consolidate.timer, kb-consolidate-boot.timer, kb-backup.timer"
 echo "  installed but not enabled: kb-restore-test.timer, kb-cloudflared-refresh.timer"
 echo "  kb-notify-fail@.service is a template invoked via OnFailure= (never enabled directly)"
 echo "  tiktoken cache: ${TIKTOKEN_DIR} (pre-warmed from vendor/tiktoken)"

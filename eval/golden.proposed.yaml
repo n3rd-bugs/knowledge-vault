@@ -17,3 +17,55 @@
   # top-5 for a hardware identifier query (e.g. via graph expansion) must fail.
   forbid_item_id: 0
   kwargs: {expand: true}
+
+# =============================================================================
+# GRAPH-EXPANSION A/B FIXTURES — rank-sensitive, relation-reachable cases.
+#
+# WHY. The nightly sentinel now runs the golden set with expansion OFF and ON and
+# reports the delta (eval_ab_delta_hit_at_5 / _mrr), so the owner can decide from
+# THIS corpus whether the >20k curated relation edges earn a non-zero
+# KB_GRAPH_EXPAND_HOPS. Cases whose answer the lexical/vector legs already find
+# score identically on both sides and contribute nothing to that delta. These
+# three are the shape that does move it: the expected item is reachable only over
+# a relation EDGE from a strong lexical match, and expect_rank_le makes a
+# demotion visible (plain hit@5 sees found/not-found and nothing else).
+#
+# HOW TO RESOLVE THE IDS (this file is never loaded by the eval; golden.yaml is):
+#   1. Pick a query Q that already retrieves well:  kb search "<Q>"
+#      → note the rank-1 item S (the strong lexical match / "seed").
+#   2. List S's relation neighbours:  kb trace <S> --depth 1
+#      → pick a neighbour T on a real typed edge (fixes / depends_on / part_of /
+#        derived_from — NOT a 'mentions' entity edge; expansion skips those).
+#   3. Confirm T is NOT already retrievable for Q:  kb search "<Q>" | grep <T>
+#      must find nothing in the top-5. If it does, T is a direct hit and the case
+#      measures nothing — pick another neighbour.
+#   4. Replace the 0 placeholders below with T's id, uncomment, and move the case
+#      into eval/golden.yaml.
+#   5. Sanity-check the pair before trusting it: `make eval` (hops default 0) must
+#      FAIL the case, and the sentinel's ON side must pass it. That contrast IS
+#      the measurement.
+#
+# Keep these SMALL in number. Each one is deliberately unreachable without
+# expansion, so with the shipped hops=0 default it fails nightly and drags the
+# headline hit@5 down toward the KB_EVAL_MIN_HIT5 floor. Two or three is enough
+# signal; a dozen would turn the regression sentinel into a false alarm.
+# =============================================================================
+
+# - q: "how did we fix the UART byte loss"
+#   # FIXME: live id of the FIX item linked to the bug item by a 'fixes' edge —
+#   # the bug carries the query's words, the fix does not (that asymmetry is the
+#   # point: only the edge connects them).
+#   expect_item_id: 0
+#   expect_rank_le: 5
+#
+# - q: "DNP3 outstation poll interval register map"
+#   # FIXME: live id of an item one 'depends_on'/'part_of' hop from the DNP3 doc
+#   # (e.g. the transport/link-layer note that never spells out "DNP3").
+#   expect_item_id: 0
+#   expect_rank_le: 5
+#
+# - q: "ollama gpu memory keep alive unload"
+#   # FIXME: live id of the item linked to the keep-alive gotcha by a
+#   # 'supersedes'/'derived_from' edge (the correction that cites it).
+#   expect_item_id: 0
+#   expect_rank_le: 5

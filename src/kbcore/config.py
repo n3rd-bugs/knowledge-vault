@@ -237,6 +237,15 @@ class Settings(BaseSettings):
     kb_rerank_url: str = ""
     kb_rerank_top_n: int = 20
     kb_rerank_timeout: float = 2.0
+    # Rerank EVIDENCE source (A/B PENDING — do not flip the default without one).
+    # False (today's behaviour): the reranker scores `title + body prefix` read
+    # back from items. True: it scores `title + the best-matching CHUNK` that the
+    # RRF fusion already computed and then threw away — the passage that actually
+    # matched the query, at the cost of less surrounding context (a chunk is
+    # 300-500 tokens, the body prefix is 1500 chars). Which wins is empirical, so
+    # this ships OFF: flip it, run `make eval` against the real corpus, compare
+    # hit@5/MRR with the OFF baseline, and only then consider a new default.
+    kb_rerank_use_chunk: bool = False
     # Cross-family judge for PRIMARY-sourced ensemble singletons (probe-benched
     # 2026-07-18: granite4.1:8b approved 7/7 reals, caught 6/6 fabricated
     # probes, ~2.7s/item). Empty = primary singletons pass unjudged (the

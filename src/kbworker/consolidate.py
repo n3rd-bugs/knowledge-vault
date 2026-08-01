@@ -44,7 +44,25 @@ logger = logging.getLogger("kbworker.consolidate")
 ADVISORY_KEY = 42
 CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
 EVIDENCE_PAIR_CAP = 20  # max contradiction pairs evidence-judged per nightly run
-QUEUE_BATCH = 200  # max ingest_queue rows drained per nightly run
+
+# MEANING CHANGED 2026-08-01: this is the ceiling on ingest_queue ROWS one REFILL
+# may materialise — a memory bound — and no longer the budget for a whole run.
+# It was both, and the two units are not the same thing: a run stopped after 200
+# ROWS, but the work is measured in JOBS (a coalesced session of 350 rows is one
+# group, a one-row note is also one group), so a night of small submissions
+# stopped at 200 rows with hours of window left and a night of one big session
+# spent the whole budget on it. The drain now refills until the queue is empty or
+# the stand-down guard fires; this only bounds how much is read per refill.
+QUEUE_BATCH = 200
+
+# Backstop on the refill loop. Each refill is bounded, but the SUPPLY is not:
+# clients can enqueue while the drain runs, and a single-row submission is
+# eligible immediately (no quiet period), so "refill until pending is empty"
+# could in principle never terminate. The real bound is the deadline/battery
+# guard; this exists so a run without one (an owner-requested `main(stop=None)`)
+# still ends. At kb_drain_cohort=30 this is 6,000 groups — orders of magnitude
+# past what a night's GPU window can extract, so hitting it is a loud anomaly.
+MAX_REFILLS = 200
 
 # STARVATION FIX. EVIDENCE_PAIR_CAP // this is reserved, at the FRONT of each
 # nightly batch, for rows that already carry a decisive suggestion
@@ -659,6 +677,25 @@ def _drain_ingest_queue() -> tuple[int, int]:
     """Step 0: extract queued remote submissions — the ONLY place the 14B runs on
     remote content (Invariant 8). Per-group isolation: one bad group logs + continues.
 
+    A REFILL LOOP (2026-08-01), not one poll. The old shape asked
+    ``pending_groups`` once for :data:`QUEUE_BATCH` ROWS and processed whatever
+    that returned, which conflated two units: the budget was rows, the work is
+    jobs. A night of small submissions therefore stopped after 200 one-row groups
+    with most of its window unused, while a night holding one 350-row coalesced
+    session spent the entire budget on that single session. Each iteration now
+    asks for enough groups to fill ONE cohort, processes them through the
+    unchanged cohort machinery, and asks again — until the queue is drained, the
+    stand-down guard fires, or :data:`MAX_REFILLS` trips.
+
+    PROCESSED GROUPS ARE EXCLUDED FOR THE REST OF THE RUN, and this is load
+    bearing rather than an optimisation. A group that DEFERS (extractor/embedder
+    outage) is left 'pending' on purpose, and a content failure under the attempts
+    cap is left retryable-'failed' — both are still drainable a millisecond
+    later, so a naive refill would re-fetch the group it just failed and retry it
+    until the deferral/attempts cap retired it, collapsing a policy of "one
+    attempt per NIGHT" into "N attempts per run". The keys are tracked here, for
+    this run only, and passed to ``pending_groups`` as ``exclude``.
+
     THREE PASSES PER COHORT (2026-07-29), then ingest job by job. Batching is per
     cohort and never per run: the crash window stays one cohort wide (the same
     exposure the extraction prefetch already had) and only ``kb_drain_cohort``
@@ -666,19 +703,17 @@ def _drain_ingest_queue() -> tuple[int, int]:
     ``mark_group_extracted`` deliberately stay per job: batching those would
     widen the pre-existing "written but still pending" window for real.
 
-    The stand-down guard is asked BETWEEN cohorts here; the check before the
-    FIRST cohort belongs to the run (:func:`_drain_step`), because "should this
-    run start at all" is a question about the run, not about a batch. Stopping
-    can land mid-GROUP now that a group spans several window jobs — its rows are
-    simply still 'pending', so the next run re-extracts the group from its first
-    window and the already-ingested items dedupe on (kind, uri, content_hash)
-    (Invariant 3).
+    The stand-down guard is asked BETWEEN cohorts here — across refills too, so
+    the exemption is for the run's FIRST cohort only, not for the first cohort of
+    every refill; the check before that first one belongs to the run
+    (:func:`_drain_step`), because "should this run start at all" is a question
+    about the run, not about a batch. Stopping can land mid-GROUP now that a
+    group spans several window jobs — its rows are simply still 'pending', so the
+    next run re-extracts the group from its first window and the already-ingested
+    items dedupe on (kind, uri, content_hash) (Invariant 3).
 
     Returns ``(rows_drained, items_saved)``.
     """
-    groups = ingest_queue.pending_groups(limit=QUEUE_BATCH)
-    jobs = _assemble_jobs(groups)
-
     cohort = max(1, int(settings.kb_drain_cohort))
     _COHORT_STATS.clear()
     _COHORT_STATS.update(
@@ -691,38 +726,76 @@ def _drain_ingest_queue() -> tuple[int, int]:
             "cohort_plan_failures": 0,
             "cohort_judge_batches": 0,
             "cohort_judge_failures": 0,
-            "cohort_eligible": len(groups),
+            "cohort_eligible": 0,
             "cohort_mode": ensemble.mode(),
+            # Refill telemetry (added, never renamed): how many times the drain
+            # went back for more, and how many groups it took up in total. A run
+            # that did one refill on a deep queue is the old rows-vs-jobs bug
+            # coming back, and there would otherwise be no way to see it.
+            "cohort_refills": 0,
+            "cohort_groups_considered": 0,
         }
     )
-    cohorting = cohort > 1 and ensemble.mode() == "live" and bool(jobs)
-    batches = _batch_jobs(jobs, cohort) if cohorting else [jobs]
+    live = ensemble.mode() == "live"
 
     drained = 0
     saved_total = 0
-    for n, batch in enumerate(batches):
-        reason = should_stop() if n else None
-        if reason:
-            left = sum(len(b) for b in batches[n:])
-            logger.warning(
-                "drain stopping (%s): %d cohort(s) / %d job(s) deferred — "
-                "rows stay 'pending' and the next run resumes here",
-                reason,
-                len(batches) - n,
-                left,
-            )
-            _COHORT_STATS["deadline_deferred_jobs"] = left  # never renamed (telemetry)
-            _note_stop("queued_drained", reason, left)
+    batches_done = 0  # across ALL refills: only the run's FIRST cohort is exempt
+    processed: set[tuple[str, str]] = set()
+    stopped = False
+    for _refill in range(MAX_REFILLS):
+        groups = ingest_queue.pending_groups(
+            limit=QUEUE_BATCH, max_groups=cohort, exclude=processed
+        )
+        # Belt and braces for the exclusion: whatever the SQL returns, a group
+        # this run has already touched is never processed twice, so the loop
+        # always makes progress and therefore always terminates.
+        groups = [g for g in groups if (g["project"], g["group_uri"]) not in processed]
+        if not groups:
             break
-        pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
-        for job in batch:
-            rows, saved = _drain_job(
-                job,
-                pre_extracted=pre_by_key.get(job["key"]),
-                planned=plan_by_key.get(job["key"]),
-            )
-            drained += rows
-            saved_total += saved
+        processed.update((g["project"], g["group_uri"]) for g in groups)
+        _COHORT_STATS["cohort_refills"] += 1
+        _COHORT_STATS["cohort_groups_considered"] += len(groups)
+        _COHORT_STATS["cohort_eligible"] += len(groups)
+
+        jobs = _assemble_jobs(groups)
+        cohorting = cohort > 1 and live and bool(jobs)
+        batches = _batch_jobs(jobs, cohort) if cohorting else ([jobs] if jobs else [])
+
+        for n, batch in enumerate(batches):
+            reason = should_stop() if batches_done else None
+            if reason:
+                left = sum(len(b) for b in batches[n:])
+                logger.warning(
+                    "drain stopping (%s) after %d refill(s): %d cohort(s) / %d job(s) "
+                    "deferred — rows stay 'pending' and the next run resumes here",
+                    reason,
+                    _COHORT_STATS["cohort_refills"],
+                    len(batches) - n,
+                    left,
+                )
+                _COHORT_STATS["deadline_deferred_jobs"] = left  # never renamed (telemetry)
+                _note_stop("queued_drained", reason, left)
+                stopped = True
+                break
+            batches_done += 1
+            pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
+            for job in batch:
+                rows, saved = _drain_job(
+                    job,
+                    pre_extracted=pre_by_key.get(job["key"]),
+                    planned=plan_by_key.get(job["key"]),
+                )
+                drained += rows
+                saved_total += saved
+        if stopped:
+            break
+    else:
+        logger.warning(
+            "drain hit the %d-refill backstop with work still pending — the queue is "
+            "being filled at least as fast as it drains",
+            MAX_REFILLS,
+        )
     return drained, saved_total
 
 

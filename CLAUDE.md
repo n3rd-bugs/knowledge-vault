@@ -51,7 +51,7 @@ You are implementing the system specified in `PLAN.md` (v2.1 — primary use cas
 - Type hints on all public functions; `pydantic` models in `kbcore/models.py` for tool/CLI I/O shapes.
 - Errors: raise domain exceptions in kbcore; MCP layer converts to clean tool errors (message + no stack traces to clients). Log full traces to journald/stderr.
 - Every new behavior lands with at least one test. Prefer real-DB tests against the compose Postgres (test schema `kb_test`, created/dropped by fixture) over mocks; mock only Ollama.
-- Keep files under ~300 lines; split modules rather than growing gods.
+- Keep files under ~300 lines; split modules rather than growing gods. This is **ratcheted, not aspirational**: `tests/test_size_ratchet.py` fails any new `src/**/*.py` over 300 lines, and fails any already-oversized file that grows past its recorded size in `tests/size_ratchet.json` (25-line slack). The baseline only moves DOWN — split a file, then lower its entry.
 
 ## Secrets & data hygiene
 - Never commit `.env`, dumps, `~/kb/raw` contents, or anything under `backups/`. Keep `.gitignore` current.

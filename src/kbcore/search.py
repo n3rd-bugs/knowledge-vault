@@ -173,7 +173,13 @@ def search(
         # reorders only, fail-open, scores remapped so the order survives the
         # _to_hits re-sort (see kbcore.rerank). Reuses the legs' connection.
         if settings.kb_rerank_url and fused:
-            fused = rerank_mod.rerank_fused(conn, query, fused, settings.kb_rerank_top_n)
+            fused = rerank_mod.rerank_fused(
+                conn,
+                query,
+                fused,
+                settings.kb_rerank_top_n,
+                evidence=_rerank_evidence(fused),
+            )
     # Materialize ALL fused candidates before truncating: the verified >=
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
@@ -184,6 +190,28 @@ def search(
     if tool is not None:
         _log_access(hits, tool, query)
     return hits
+
+
+def _rerank_evidence(fused: list[tuple[int, float, str]]) -> dict[int, str] | None:
+    """Best-matching CHUNK text per candidate for the reranker, or None when OFF.
+
+    The fusion step already collapsed each item to the chunk that actually
+    matched the query (``_rrf_fuse`` keeps the best chunk's text as the third
+    tuple element), and that text was then DISCARDED: kbcore.rerank re-reads a
+    body PREFIX from ``items``, so the reranker never sees the matching passage
+    of a long item. Handing it that passage is a plausible retrieval win and a
+    plausible loss (less surrounding context), so it is gated on
+    ``kb_rerank_use_chunk`` — default False, awaiting the owner's A/B on the real
+    corpus (config.py). With the flag OFF this returns None and the reranker's
+    inputs stay BYTE-IDENTICAL to the pre-flag behaviour (regression-pinned in
+    tests/test_eval_plumbing.py).
+
+    Candidates with no chunk text (pure graph neighbours, identifier title
+    matches) are omitted and keep the body-prefix document.
+    """
+    if not settings.kb_rerank_use_chunk:
+        return None
+    return {item_id: snippet for item_id, _score, snippet in fused if snippet}
 
 
 def _apply_bonuses(

@@ -32,13 +32,24 @@ logger = logging.getLogger("kbcore.rerank")
 _DOC_BODY_CHARS = 1500  # title + this much body per candidate document
 
 
-def _documents(conn, item_ids: list[int]) -> dict[int, str]:
-    """title + body-prefix per candidate, one parameterized query."""
+def _documents(conn, item_ids: list[int], evidence: dict[int, str] | None = None) -> dict[int, str]:
+    """title + body-prefix per candidate, one parameterized query.
+
+    ``evidence`` (search._rerank_evidence, gated on ``kb_rerank_use_chunk``,
+    default None/OFF) optionally supplies the best-matching CHUNK text per item
+    to score INSTEAD of the body prefix. Absent/empty entries fall back to the
+    body prefix, and with ``evidence=None`` every document is byte-identical to
+    the pre-flag behaviour.
+    """
     rows = conn.execute(
         "SELECT id, title, left(body, %s) FROM items WHERE id = ANY(%s)",
         (_DOC_BODY_CHARS, item_ids),
     ).fetchall()
-    return {r[0]: f"{r[1]}\n{r[2]}" for r in rows}
+    docs: dict[int, str] = {}
+    for item_id, title, body in rows:
+        chunk = evidence.get(item_id) if evidence else None
+        docs[item_id] = f"{title}\n{chunk[:_DOC_BODY_CHARS] if chunk else body}"
+    return docs
 
 
 def _scores(query: str, documents: list[str]) -> list[float] | None:
@@ -65,18 +76,25 @@ def _scores(query: str, documents: list[str]) -> list[float] | None:
 
 
 def rerank_fused(
-    conn, query: str, fused: list[tuple[int, float, str]], top_n: int
+    conn,
+    query: str,
+    fused: list[tuple[int, float, str]],
+    top_n: int,
+    evidence: dict[int, str] | None = None,
 ) -> list[tuple[int, float, str]]:
     """Reorder the top ``top_n`` fused candidates by cross-encoder relevance.
 
     Returns ``fused`` unchanged on any failure or when there is nothing to
-    reorder. The tail beyond ``top_n`` is never touched.
+    reorder. The tail beyond ``top_n`` is never touched. ``evidence`` is the
+    optional per-item chunk text to score instead of the body prefix (see
+    :func:`_documents`); None — the default and the shipped configuration —
+    keeps the documents byte-identical to the pre-flag behaviour.
     """
     if top_n < 2 or len(fused) < 2:
         return fused
     ordered = sorted(fused, key=lambda t: -t[1])
     head, tail = ordered[:top_n], ordered[top_n:]
-    docs_by_id = _documents(conn, [t[0] for t in head])
+    docs_by_id = _documents(conn, [t[0] for t in head], evidence)
     if len(docs_by_id) < 2:
         return fused
     ranked_ids = [t[0] for t in head if t[0] in docs_by_id]

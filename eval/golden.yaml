@@ -90,3 +90,22 @@
   expect_item_id: 81
 - q: "mTLS fleet agent deferred config-sync"
   expect_item_id: 68
+
+# --- GRAPH-EXPANSION A/B (kbworker.eval_sentinel._graph_expansion_ab) ---------
+# Every night the sentinel now replays THIS set twice more — once with expansion
+# forced OFF (hops=0) and once ON (expand=true → max(KB_GRAPH_EXPAND_HOPS, 1)) —
+# and reports eval_ab_off_* / eval_ab_on_* / eval_ab_delta_* in the consolidation
+# report. That is the evidence for (or against) raising KB_GRAPH_EXPAND_HOPS, and
+# it OVERRIDES each case's own kwargs.expand on both sides so the two numbers stay
+# comparable.
+#
+# The delta is only as informative as the cases behind it. A case whose expected
+# item is found by the lexical/vector legs anyway scores the same on both sides
+# and tells you nothing; what moves the delta is a case whose expected item is
+# reachable ONLY over a relation edge from a strong lexical match, plus
+# expect_rank_le so a demotion is visible. This file's format supports exactly
+# that (expect_item_id + expect_rank_le) but NOT fixtures — it pins LIVE item ids,
+# which cannot be resolved from the repo — so such cases are staged, with the
+# recipe for resolving them, in eval/golden.proposed.yaml. Move them here once the
+# ids are filled in. tests/test_eval_plumbing.py exercises the same shape against
+# a seeded kb_test corpus.

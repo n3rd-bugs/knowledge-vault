@@ -1,4 +1,4 @@
-"""kbworker.eval_sentinel — search-quality regression sentinel (§8).
+"""kbworker.eval_sentinel — search-quality regression sentinel + instruments (§8).
 
 At the END of a successful nightly consolidation, replays the golden retrieval
 eval (hit@5 + MRR) and compares it against the PREVIOUS run's metrics — read back
@@ -8,24 +8,41 @@ row so the owner sees it in `kb review list`; quality climbing back to baseline
 auto-resolves that row. It NEVER fails or aborts consolidation — every path is
 caught.
 
-GPU courtesy (Invariant 8): real searches → bge-m3 embeds only; kbcore.search has
-no extractor path, so the 14B is never invoked. Kill switch:
-``kb_eval_in_consolidation``.
+Two REPORT-ONLY instruments ride along after the primary metrics, each behind its
+own guard so a broken instrument can never cost us the metric that gates
+regressions: the graph-expansion A/B (:func:`_graph_expansion_ab`) and the
+top-5 trust composition (:func:`_trust_composition`).
+
+Cost: the nightly eval now replays the golden set FOUR times (primary + two A/B
+sides + the trust pass) — ~120 searches for a 30-case set, each one embed + SQL.
+GPU courtesy (Invariant 8) is unchanged: real searches → bge-m3 embeds only;
+kbcore.search has no extractor path, so the 14B is never invoked. Kill switches:
+``kb_eval_in_consolidation`` (whole eval), :data:`GRAPH_AB_ENABLED`,
+:data:`TRUST_METRIC_ENABLED`.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
-from kbcore import consolidation, eval_harness
+from kbcore import consolidation, eval_harness, search_expand
 from kbcore import review as review_mod
 from kbcore.config import settings
+from kbcore.search import search
 
 logger = logging.getLogger("kbworker.eval_sentinel")
 
 REGRESSION_EPSILON = 0.05  # absolute hit@5 / MRR drop vs the prior run that trips it
 REVIEW_REASON = "search_regression"
+# Instrument switches. Deliberately module constants, not config knobs: these
+# only decide whether a measurement is TAKEN — no production retrieval path
+# reads them, and a .env-tunable measurement is one more thing that can silently
+# be off when the owner goes looking for the number.
+GRAPH_AB_ENABLED = True
+TRUST_METRIC_ENABLED = True
+TRUST_K = 5  # top-K window the trust composition is measured over
 
 
 def run_sentinel(counts: dict[str, Any]) -> None:
@@ -61,6 +78,33 @@ def _run(counts: dict[str, Any]) -> None:
         "search-quality eval: hit@5=%.3f MRR=%.3f over %d queries", hit_at_5, mrr, len(golden)
     )
     _detect_regression(counts, hit_at_5, mrr)
+    # Instruments LAST and independently guarded: the regression flag above is
+    # the load-bearing output, and a measurement that errors must cost nothing.
+    if GRAPH_AB_ENABLED:
+        _instrument(counts, "eval_ab_status", lambda: _graph_expansion_ab(golden))
+    else:
+        counts["eval_ab_status"] = "disabled"
+    if TRUST_METRIC_ENABLED:
+        _instrument(counts, "eval_trust_status", lambda: _trust_composition(golden))
+    else:
+        counts["eval_trust_status"] = "disabled"
+
+
+def _instrument(
+    counts: dict[str, Any], status_key: str, measure: Callable[[], dict[str, Any]]
+) -> None:
+    """Run one report-only measurement, folding its result into ``counts``.
+
+    The measurement returns its whole result dict, so a failure leaves NO partial
+    metrics behind — the owner reads either a complete instrument or
+    ``<status_key> = error``, never half a number they might act on.
+    """
+    try:
+        counts.update(measure())
+        counts[status_key] = "ok"
+    except Exception:  # noqa: BLE001 — an instrument must never break the sentinel
+        logger.exception("%s: instrument failed; primary eval metrics unaffected", status_key)
+        counts[status_key] = "error"
 
 
 def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> None:
@@ -128,3 +172,126 @@ def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> N
             logger.info(
                 "search-quality recovered to baseline; auto-resolved review row %d", queue_id
             )
+
+
+# --- instrument 1: graph-expansion A/B ---------------------------------------
+
+
+def _ab_side(golden: list[dict], expand: bool) -> tuple[float, float]:
+    """(hit@5, MRR) for the golden set with expansion FORCED to ``expand``.
+
+    Reuses the SHIPPED knob end-to-end — the case's ``kwargs.expand`` channel,
+    which eval_harness maps through ``search_expand.hops_from_expand`` into
+    ``search(hops=...)`` exactly as the MCP surface does. Nothing about
+    expansion is reimplemented here, so the A/B measures production code.
+
+    The force is UNIFORM: a case that pins its own ``expand`` (eval/golden.yaml
+    has one) is overridden on BOTH sides. That is what makes the two numbers
+    comparable — a per-case knob would leave the sides measuring different
+    configurations. Cases are copied, never mutated in place: the primary
+    metrics were computed from the originals and must stay reproducible.
+    """
+    forced = [
+        {**case, "kwargs": {**(case.get("kwargs") or {}), "expand": expand}} for case in golden
+    ]
+    _results, hit_at_5, mrr = eval_harness.evaluate(golden=forced)
+    return hit_at_5, mrr
+
+
+def _graph_expansion_ab(golden: list[dict]) -> dict[str, Any]:
+    """Answer "does graph expansion help on THIS corpus?" from data, per night.
+
+    The KB holds >20k curated relation edges that influence ZERO production
+    queries: ``KB_GRAPH_EXPAND_HOPS`` defaults to 0 and no caller passes
+    ``expand``. Turning that on is a ranking change nobody should make on a
+    hunch, so the sentinel runs the golden set both ways every night and reports
+    each side's hit@5/MRR plus the delta (ON − OFF). REPORT-ONLY — it flips no
+    default, feeds no regression check, and the primary metrics above are still
+    the ones the sentinel gates on.
+
+    The ON side uses ``hops_from_expand(True)`` = ``max(KB_GRAPH_EXPAND_HOPS, 1)``
+    — one hop with the shipped default, and never NARROWER than the configured
+    default (same rule the MCP ``expand=true`` follows).
+
+    Reading it: a delta at or near zero means the edges are inert for these
+    queries; a positive delta is the evidence for raising the hop default; a
+    negative one means expansion is displacing direct hits (add a
+    ``forbid_item_id`` case to catch WHICH neighbour). Because plain hit@5 only
+    sees found/not-found, rank-sensitive cases (``expect_rank_le``) are what make
+    the delta informative — see eval/golden.proposed.yaml for how to add them.
+    """
+    hops_on = search_expand.hops_from_expand(True)
+    off_hit, off_mrr = _ab_side(golden, expand=False)
+    on_hit, on_mrr = _ab_side(golden, expand=True)
+    logger.info(
+        "graph-expansion A/B over %d queries: OFF(hops=0) hit@5=%.3f MRR=%.3f | "
+        "ON(hops=%s) hit@5=%.3f MRR=%.3f | delta %+.3f/%+.3f",
+        len(golden),
+        off_hit,
+        off_mrr,
+        hops_on,
+        on_hit,
+        on_mrr,
+        on_hit - off_hit,
+        on_mrr - off_mrr,
+    )
+    return {
+        "eval_ab_hops_on": hops_on,
+        "eval_ab_off_hit_at_5": round(off_hit, 4),
+        "eval_ab_off_mrr": round(off_mrr, 4),
+        "eval_ab_on_hit_at_5": round(on_hit, 4),
+        "eval_ab_on_mrr": round(on_mrr, 4),
+        "eval_ab_delta_hit_at_5": round(on_hit - off_hit, 4),
+        "eval_ab_delta_mrr": round(on_mrr - off_mrr, 4),
+    }
+
+
+# --- instrument 2: trust composition of the top-5 ----------------------------
+
+
+def _trust_composition(golden: list[dict]) -> dict[str, Any]:
+    """Share of the golden queries' top-5 results that carry trust='unverified'.
+
+    ~91% of the corpus is unverified (automatic quote-grounded extractions,
+    Invariant 4) and NOTHING measured whether the verified minority actually
+    SURFACES. hit@5/MRR cannot see it: a golden case passes identically whether
+    the answer came from a hand-verified decision or an unreviewed extraction.
+    This number makes the composition visible night over night, so a drift
+    toward an all-unverified top-5 is noticed rather than discovered.
+
+    REPORT-ONLY, and structurally so: it replays the golden QUERIES read-only
+    with ``tool=None`` (no access_log write — eval reads are not usage), touches
+    no ranking input, and returns numbers. Retrieval order is unchanged; the
+    verified >= unverified tie-break in ``search`` remains the only place trust
+    affects ranking.
+
+    Measured on the PRODUCTION DEFAULT configuration — plain query, default
+    hops, no per-case ``boost_project``/``as_of``/``expand`` — because the
+    question is what an ordinary agent query surfaces, not what the eval's tuned
+    knobs surface. POOLED (micro) over all hits rather than a mean of per-query
+    shares, so a query that returns one hit does not weigh as much as one that
+    returns five.
+    """
+    unverified = 0
+    total = 0
+    for case in golden:
+        query = case.get("q")
+        if not query:
+            continue
+        for hit in search(query, k=TRUST_K, tool=None):
+            total += 1
+            unverified += int(hit.trust != "verified")
+    share = round(unverified / total, 4) if total else 0.0
+    logger.info(
+        "trust composition of top-%d over %d queries: %d/%d unverified (%.1f%%)",
+        TRUST_K,
+        len(golden),
+        unverified,
+        total,
+        100 * share,
+    )
+    return {
+        "eval_top5_unverified_share": share,
+        "eval_top5_unverified": unverified,
+        "eval_top5_results": total,
+    }

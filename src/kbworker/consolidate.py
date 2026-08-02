@@ -34,7 +34,7 @@ from kbcore.errors import EmbedderUnavailable, ExtractionFailed, ExtractorUnavai
 from kbcore.ingest import ingest
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
-from kbworker import ensemble, eval_sentinel, sessions
+from kbworker import allocator, ensemble, eval_sentinel, sessions, tail_steps
 
 if TYPE_CHECKING:
     from kbworker.judging import EnsemblePlan
@@ -314,7 +314,10 @@ def _past_deadline() -> bool:
     catch-up after a power cut — resumes exactly here. Resumption needs no state
     of its own; the queue IS the checkpoint (Invariant 3: ingest is idempotent).
     """
-    raw = (settings.kb_drain_deadline or "").strip()
+    # Day-aware: weekends run unbounded (kbcore.drainsched — owner 2026-08-02).
+    from kbcore.drainsched import effective_deadline
+
+    raw = effective_deadline()
     if not raw:
         return False
     try:
@@ -740,6 +743,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
 
     drained = 0
     saved_total = 0
+    reserve = allocator.TailReserve.for_run()  # window left for the LLM tail
     batches_done = 0  # across ALL refills: only the run's FIRST cohort is exempt
     processed: set[tuple[str, str]] = set()
     stopped = False
@@ -763,7 +767,9 @@ def _drain_ingest_queue() -> tuple[int, int]:
         batches = _batch_jobs(jobs, cohort) if cohorting else ([jobs] if jobs else [])
 
         for n, batch in enumerate(batches):
-            reason = should_stop() if batches_done else None
+            # Same exemption as the guard, for the same reason: the run's first
+            # cohort is _drain_step's call, not a batch's.
+            reason = (should_stop() or reserve.deny_reason(batches[n:])) if batches_done else None
             if reason:
                 left = sum(len(b) for b in batches[n:])
                 logger.warning(
@@ -779,6 +785,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
                 stopped = True
                 break
             batches_done += 1
+            t0 = time.monotonic()
             pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
             for job in batch:
                 rows, saved = _drain_job(
@@ -788,6 +795,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
                 )
                 drained += rows
                 saved_total += saved
+            reserve.record(len(batch), time.monotonic() - t0)  # this run's s/job
         if stopped:
             break
     else:
@@ -1130,6 +1138,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             "duplicates_marked": 0,
             "review_moot_closed": 0,
             "review_triaged": 0,
+            "auto_applied": 0,
             "summaries_written": 0,
             "contradictions_queued": 0,
             "evidence_refreshed": 0,
@@ -1178,6 +1187,10 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             "review_triaged",
             lambda: review_triage.run_triage(settings.kb_review_triage_batch, should_stop=stop),
         )
+        # P0-2: apply the triage verdicts that have COOLED (kbcore.review_apply),
+        # right after the step that writes them — status flips only, never a
+        # delete (Invariant 5). Stop-gated inside; see kbworker.allocator.
+        _run_step(counts, "auto_applied", lambda: tail_steps.auto_apply_step(counts, stop))
         # Housekeeping for the two non-knowledge stores this system creates.
         # Both sweeps existed with NO call site, so their TTLs were fiction:
         # abandoned upload parts accumulated in the raw volume (which is tarred
@@ -1243,6 +1256,8 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         report_id = _write_report(counts)
         counts["report_item_id"] = report_id
         counts["skipped"] = False
+        # P0-2: the only part of the pass an owner sees without going looking.
+        counts["digest_pushed"] = tail_steps.push_run_digest(counts)
         logger.info("consolidation done: %s", counts)
         return counts
 

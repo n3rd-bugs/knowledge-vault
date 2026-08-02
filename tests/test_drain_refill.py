@@ -40,6 +40,9 @@ def _no_stand_down(monkeypatch):
     deadline would otherwise stop every multi-cohort test after its first batch.
     """
     monkeypatch.setattr(settings, "kb_drain_deadline", "")
+    monkeypatch.setattr(
+        settings, "kb_drain_deadline_days", ""
+    )  # day-independent: the weekend rule must not flip tests by calendar
     monkeypatch.setattr(settings, "kb_power_db", "")
     consolidate.reset_stop_cache()
     consolidate._STOP_LOG.clear()

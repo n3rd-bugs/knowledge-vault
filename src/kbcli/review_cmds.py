@@ -7,9 +7,11 @@ domain errors become clean exit messages.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import typer
 
-from kbcore import render, review_auto, review_triage
+from kbcore import render, review_apply, review_auto, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import KBError
@@ -153,8 +155,61 @@ def review_apply_triage(
     )
 
 
+@review_app.command("auto-apply")
+def review_auto_apply(
+    cap: int | None = typer.Option(
+        None, "--cap", help="max rows to apply (default: KB_AUTO_APPLY_CAP)"
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="report only; write nothing"),
+) -> None:
+    """Apply aged reject_noise/reject_duplicate triage suggestions automatically.
+
+    The same entry point the nightly worker calls (owner decision 2026-08-02).
+    Only reject_* suggestions past the cooling-off window, never recalled in 30
+    days, with a live dup target — 'keep' is never touched and trust is never
+    raised. Every application is stamped and reversible via ``undo-auto``.
+    """
+    try:
+        counts = review_apply.auto_apply_rejects(cap, dry_run=dry_run)
+    except KBError as e:
+        _fail(e)
+    prefix = "would apply" if dry_run else "applied"
+    typer.echo(
+        f"{prefix}: {counts['applied_noise']} noise, {counts['applied_duplicate']} duplicate"
+    )
+    typer.echo(
+        f"skipped: {counts['skipped_cooling']} cooling, "
+        f"{counts['skipped_accessed']} accessed, {counts['skipped_target_gone']} target gone"
+    )
+    typer.echo(f"eligible remaining: {counts['eligible_remaining']}")
+
+
+@review_app.command("undo-auto")
+def review_undo_auto(
+    since: str = typer.Option(..., "--since", help="ISO timestamp, e.g. 2026-08-02T00:00:00+00:00"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="report only; write nothing"),
+) -> None:
+    """Reverse auto-applied rejects stamped at/after --since (owner escape hatch).
+
+    Items go back to active (only from the status the automation set), rows
+    reopen, and each reversed row is permanently vetoed against re-application.
+    """
+    try:
+        when = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    except ValueError:
+        _fail(KBError(f"--since must be an ISO timestamp, got {since!r}"))
+    if when.tzinfo is None:
+        _fail(KBError("--since must carry a timezone offset (UTC), e.g. ...T00:00:00+00:00"))
+    try:
+        qids = review_apply.undo_auto_applied(when, dry_run=dry_run)
+    except KBError as e:
+        _fail(e)
+    verb = "would reverse" if dry_run else "reversed"
+    typer.echo(f"{verb} {len(qids)} auto-applied row(s): {', '.join(str(q) for q in qids) or '-'}")
+
+
 @review_app.command("apply")
-def review_apply(
+def review_apply_suggestion(
     queue_id: int | None = typer.Argument(None, help="queue row whose suggestion to apply"),
     apply_all: bool = typer.Option(False, "--all", help="apply every open suggestion"),
 ) -> None:

@@ -119,6 +119,9 @@ def test_the_deadline_is_ignored_when_unset(monkeypatch):
     from kbworker.consolidate import _past_deadline
 
     monkeypatch.setattr(settings, "kb_drain_deadline", "")
+    monkeypatch.setattr(
+        settings, "kb_drain_deadline_days", ""
+    )  # day-independent: the weekend rule must not flip tests by calendar
     assert _past_deadline() is False
 
 
@@ -129,6 +132,9 @@ def test_a_malformed_deadline_does_not_stop_the_drain(monkeypatch):
 
     for bad in ("noon", "12", "12:xx", "::"):
         monkeypatch.setattr(settings, "kb_drain_deadline", bad)
+        monkeypatch.setattr(
+            settings, "kb_drain_deadline_days", ""
+        )  # day-independent: the weekend rule must not flip tests by calendar
         assert _past_deadline() is False, f"{bad!r} was not treated as 'no deadline'"
 
 
@@ -143,11 +149,17 @@ def test_the_deadline_fires_only_after_the_cutoff(monkeypatch):
     future = (now + timedelta(minutes=90)).strftime("%H:%M")
 
     monkeypatch.setattr(settings, "kb_drain_deadline", past)
+    monkeypatch.setattr(
+        settings, "kb_drain_deadline_days", ""
+    )  # day-independent: the weekend rule must not flip tests by calendar
     assert consolidate._past_deadline() is True, "a cutoff already passed did not fire"
 
     # Skip the wrap-around case near midnight, where +90min is tomorrow.
     if (now + timedelta(minutes=90)).date() == now.date():
         monkeypatch.setattr(settings, "kb_drain_deadline", future)
+        monkeypatch.setattr(
+            settings, "kb_drain_deadline_days", ""
+        )  # day-independent: the weekend rule must not flip tests by calendar
         assert consolidate._past_deadline() is False, "a future cutoff fired early"
 
 

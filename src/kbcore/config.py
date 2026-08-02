@@ -158,6 +158,18 @@ class Settings(BaseSettings):
     # the next run — nightly, or the boot catch-up after a power cut — picks up
     # exactly where this one stopped. Empty disables the deadline.
     kb_drain_deadline: str = "12:00"
+    # Days the deadline APPLIES (local). Weekends default to unbounded: the box
+    # is free, so the nightly may run past noon and finally clear the LLM tail.
+    kb_drain_deadline_days: str = "mon,tue,wed,thu,fri"
+    # MINUTES OF THE WINDOW RESERVED FOR THE LLM TAIL. The 01:00-12:00 window is
+    # subscribed at 100-110% on a median night (drain 5.9-7.1 h + tail 5.0-6.0 h
+    # against 11 h), so whichever runs last gets nothing — today the tail (report
+    # 9684: 99.5% of the window drained, every tail step stood down). The drain
+    # therefore stops admitting NEW refill cohorts once
+    # now + estimated_next_cohort_cost > deadline - reserve; 0 disables it. See
+    # kbworker.allocator for why the DRAIN is the right residual claimant. Never
+    # extends past kb_drain_deadline — deadline/battery still preempt the tail.
+    kb_tail_reserve_minutes: int = 180
     # PAUSE THE DRAIN WHEN THE HOUSE IS ON BATTERY. The GPU is the largest load on
     # this box and the UPS could not ride out a grid fluctuation (2026-07-30), so
     # hours of inference during an outage is exactly the wrong thing to be doing.
@@ -283,6 +295,14 @@ class Settings(BaseSettings):
     # and lets the backlog drain instead of grow. Cost is ~500 LLM calls, which is
     # minutes now that model-major cohorting landed. Kill switch: 0.
     kb_review_triage_batch: int = 500
+    # AUTOMATED reject-apply (owner decision 2026-08-02, kbcore.review_apply),
+    # revising "a human applies in bulk": that loop sat dead 15 days while 853
+    # reject-suggested items stayed live and expiry-exempt. Cooling days = the
+    # nightly digests the owner sees a queued application in before the machine
+    # acts (veto = resolve the row); cap bounds one run; enabled is the switch.
+    kb_auto_apply_cooling_days: int = 3
+    kb_auto_apply_cap: int = 300
+    kb_auto_apply_enabled: bool = True
     # Search-quality regression sentinel (§8): the nightly consolidation replays
     # the golden retrieval eval and flags a hit@5/MRR drop vs the prior run. Set
     # False to skip the eval entirely (kill switch).

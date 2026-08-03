@@ -29,39 +29,71 @@ _ACTIVE = ("pending", "running")
 # queue rows (227 MB) sat at attempts=0 for 13 hours while each nightly request
 # returned the dead id.
 #
-# DURATION ALONE IS THE WRONG TEST, and a first attempt at this got it wrong: a
-# 6-hour ceiling was set from a 14-minute baseline taken when the queue was
-# nearly empty. Measured on a real backlog the drain runs at ~0.5 rows/min, so a
-# full QUEUE_BATCH of 200 takes ~6.2 hours — the reaper would have killed a
-# HEALTHY run that was still working, which is a worse failure than the one it
-# was written to fix.
+# DURATION ALONE IS THE WRONG TEST, and a first attempt got it wrong: a 6-hour
+# ceiling set from a 14-minute baseline taken on a nearly-empty queue. Measured
+# on a real backlog the drain runs ~0.5 rows/min, so a full QUEUE_BATCH of 200
+# takes ~6.2 hours — the reaper would have killed a HEALTHY run still working,
+# which is worse than the failure it was written to fix.
 #
-# So the test is LIVENESS, not age: a run is dead only if it is old AND nothing
-# has been extracted recently. ingest_queue.processed_at is already a heartbeat
-# written by the work itself, so this needs no schema change and cannot drift
-# from reality the way a separate heartbeat column would.
+# So the test is LIVENESS, not age: dead only if old AND nothing has moved
+# recently. ingest_queue.processed_at is that heartbeat — written by the work
+# itself, so it needs no schema change and cannot drift the way a separate
+# heartbeat column would.
 STALE_RUN_HOURS = 6
-# Must EXCEED the longest a healthy cohort can run with zero completions: no row
-# reaches 'extracted' until its cohort finishes its phases, so a long cohort looks
-# dead to a liveness check that only watches processed_at. At kb_drain_cohort=46
-# and 77.6 s/job a cohort is ~60 min, so 45 would have reaped a healthy run
-# (measured 2026-07-29). 90 keeps a 1.5x margin over that.
+# CALIBRATION, corrected 2026-08-02. The window must exceed the longest a healthy
+# run can go between heartbeats. That was once a COHORT (~60 min at
+# kb_drain_cohort=46 and 77.6 s/job, measured 2026-07-29) — why 45 would have
+# reaped a working run and 90 was chosen. Re-windowing (2026-08-01) moved
+# completion from the ROW to the GROUP: a coalesced session's rows flip ONCE,
+# after its LAST window, so the silent interval became a whole GROUP — an
+# 83-window group has already drained here, ~108 min at ~78 s/window. A healthy
+# drain looked DEAD, and a boot catch-up's reaper (request_consolidation runs it
+# too, not only the claim) would have failed it. Widening the window only moves the
+# cliff, so the DRAIN beats per WINDOW now (:func:`touch_drain_heartbeat`).
 PROGRESS_WINDOW_MINUTES = 90
+
+
+def touch_drain_heartbeat(queue_ids: list[int]) -> int:
+    """Stamp liveness on a group's rows WITHOUT flipping their status.
+
+    Called by the drain as each WINDOW of a multi-window group completes; a
+    group's rows stay 'pending' until the last one lands, so without this a long
+    group is indistinguishable from a dead worker. INVARIANT 5 CLEAN: nothing is
+    deleted and no ``status`` moves. It lives beside the reaper that reads it so
+    the two cannot drift; the only other reader is the owner-invoked
+    ``ingest_queue.requeue_failed(since=…)``, whose window this can only widen.
+
+    NEVER RAISES: the caller is inside the drain's try/except, where an exception
+    would fail the whole group — a heartbeat must not be able to retire the work
+    it reports on. Returns rows touched (0 on an empty list or a fault).
+    """
+    if not queue_ids:
+        return 0
+    try:
+        with transaction() as conn:
+            cur = conn.execute(
+                "UPDATE ingest_queue SET processed_at = now() WHERE id = ANY(%s)",
+                (list(queue_ids),),
+            )
+        return cur.rowcount or 0
+    except Exception:  # noqa: BLE001 — a missed beat costs liveness, not the group
+        log.warning("drain heartbeat failed for rows %s", queue_ids, exc_info=True)
+        return 0
 
 
 def _reap_stale_runs(conn) -> int:
     """Fail 'running' requests that are old AND have stopped making progress.
 
     Returns how many were reaped. Called before both the dedupe check and the
-    claim, so a dead run can never block the queue — while a slow one, which
-    looks identical by age alone, is left to finish.
+    claim, so a dead run can never block the queue — while a slow one, identical
+    by age alone, is left to finish.
     """
     recent = conn.execute(
         "SELECT count(*) FROM ingest_queue WHERE processed_at > now() - make_interval(mins => %s)",
         (PROGRESS_WINDOW_MINUTES,),
     ).fetchone()[0]
     if recent:
-        return 0  # something is still being extracted: a run is alive, however slow
+        return 0  # a row moved (a flip, or a window heartbeat): alive, however slow
     cur = conn.execute(
         """
         UPDATE consolidation_requests
@@ -84,9 +116,8 @@ def _reap_stale_runs(conn) -> int:
 def request_consolidation(requested_by: str = "unknown") -> tuple[int, bool]:
     """Enqueue a run request, deduping against an already pending/running one.
 
-    Returns ``(request_id, created)``. If a run is already pending or running,
-    that row's id is returned with ``created=False`` — button spam can never
-    stack multiple runs.
+    Returns ``(request_id, created)``; an already pending/running run's id comes
+    back with ``created=False``, so button spam can never stack runs.
     """
     with transaction() as conn:
         _reap_stale_runs(conn)
@@ -106,8 +137,8 @@ def request_consolidation(requested_by: str = "unknown") -> tuple[int, bool]:
 def claim_pending_consolidation() -> int | None:
     """Atomically claim the oldest pending request (→ 'running'). Worker-only.
 
-    ``FOR UPDATE SKIP LOCKED`` so two workers never double-claim the same row.
-    Returns the claimed id, or None when nothing is pending.
+    ``FOR UPDATE SKIP LOCKED`` so two workers never double-claim. Returns the
+    claimed id, or None when nothing is pending.
     """
     with transaction() as conn:
         _reap_stale_runs(conn)
@@ -166,8 +197,8 @@ def enqueue_deep_search(
     """Enqueue a 'pending' deep-search job; the host worker runs it. Returns the id.
 
     Each call is a distinct job (deep-search is question-specific and cheap to
-    re-ask); unlike consolidation there is no in-flight dedupe. Rejects an empty
-    question up front so a doomed job is never queued.
+    re-ask): unlike consolidation there is no in-flight dedupe. An empty question
+    is rejected up front so a doomed job is never queued.
     """
     if not question or not question.strip():
         raise InvalidOperation("deep search needs a non-empty question")
@@ -185,8 +216,7 @@ def claim_pending_deep_search() -> dict[str, Any] | None:
     """Atomically claim the oldest pending deep-search job (→ 'running'). Worker-only.
 
     ``FOR UPDATE SKIP LOCKED`` so two workers never double-claim. Returns
-    ``{id, question, params}``, or None when nothing is pending.
-    """
+    ``{id, question, params}``, or None when nothing is pending."""
     with transaction() as conn:
         row = conn.execute(
             """
@@ -219,13 +249,12 @@ def finish_deep_search(job_id: int, result: dict[str, Any], ok: bool = True) -> 
 def list_deep_search_jobs(limit: int = 20) -> list[dict[str, Any]]:
     """Recent deep-search jobs — STATUS FIELDS ONLY, never the stored report text.
 
-    Read surface for the owner-only web /jobs viewer (WEBUI_TIERED_ACCESS_PLAN
-    §5 Phase 3): worker jobs run under implicit OWNER scope and ``result``
-    carries whole-KB synthesis, so this SELECT deliberately extracts only the
-    saved report's ITEM ID (``result->>'item_id'``) — a UI links through the
-    scope-gated ``/item/{id}`` read path and the report BODY never travels via
-    this function. Parameterized SELECT, newest first; ``limit`` is clamped so
-    a caller can never turn the list into a bulk dump.
+    Read surface for the owner-only web /jobs viewer (WEBUI_TIERED_ACCESS_PLAN §5
+    Phase 3): worker jobs run under implicit OWNER scope and ``result`` carries
+    whole-KB synthesis, so this SELECT extracts only the saved report's ITEM ID
+    (``result->>'item_id'``) — a UI links through the scope-gated ``/item/{id}``
+    read path and the report BODY never travels via this function. Newest first;
+    ``limit`` is clamped so the list can never become a bulk dump.
     """
     lim = max(1, min(int(limit), 100))
     with connect() as conn:

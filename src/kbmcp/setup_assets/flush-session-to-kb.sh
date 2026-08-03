@@ -685,6 +685,39 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     fi
     [ "$SIZE" -le "$OFFSET" ] && exit 0
     SENT=0
+    # THE SESSION IDENTITY (and the git context) on the CONNECTOR transport.
+    # The bearer branches put these in the request body; here the data path is a
+    # MODEL, so they have to travel as an instruction instead — but they must
+    # travel. Without them every connector chunk reached the queue with no
+    # source_uri, so a 40-chunk session became 40 degenerate singleton rows: 40
+    # separate 14B extractions, no cohort, and no code_ref anchor on anything it
+    # learned. That is the exact shape the OKEY export closed for MCP/REST, and
+    # it stayed open here because nothing on this branch ever named the fields.
+    # OKEY/REPO/BRANCH/COMMIT were already exported into this child; only the
+    # prompt was silent.
+    #
+    # EMPTY FIELDS ARE OMITTED, never sent blank. A bare session: is not an
+    # identity, it is a wildcard the server would group every session by. kbcore
+    # normalises such a value away at enqueue, and this must not lean on that:
+    # the field simply does not exist when there is nothing to put in it.
+    #
+    # ESCAPING. These values are interpolated into a natural-language prompt that
+    # the model has to turn back into a JSON tool call, and a repo directory or
+    # branch containing a space, a quote or a backslash would otherwise break the
+    # JSON it emits. Same discipline as the bearer branches: never hand-write the
+    # JSON — let kb_json_build encode it (it is exported into this child) and
+    # hand the model the encoded object verbatim. jq pretty-prints, so the
+    # newlines are folded to spaces to keep the prompt one line; only formatting
+    # whitespace is affected, since every value is JSON-escaped by then.
+    set --
+    [ -n "${OKEY:-}" ] && set -- "$@" session_uri s "session:$OKEY"
+    [ -n "$REPO" ] && set -- "$@" repo s "$REPO"
+    [ -n "$BRANCH" ] && set -- "$@" branch s "$BRANCH"
+    [ -n "$COMMIT" ] && set -- "$@" commit s "$COMMIT"
+    META=""
+    [ "$#" -gt 0 ] && META=$(kb_json_build - "$@" | tr "\n" " ")
+    METAI=""
+    [ -n "$META" ] && METAI=" Pass these EXTRA ARGUMENTS to the same tool call, copying every key and value from the JSON object below exactly as written, adding no key that is not in it and dropping none that is -- EXTRA ARGUMENTS (JSON): $META ."
     # SessionEnd still gets a LARGER budget than a mid-session firing (it is the
     # last chance for this session), but no longer an unbounded one. In practice
     # the backlog gate below is what enforces the bound — it trims the delta to
@@ -737,7 +770,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       # BOUNDED: this was the only unbounded network call in the script, and the
       # one place where hanging is invisible — every summary line below is
       # written AFTER the loop, so a wedged relay reports nothing at all, ever.
-      OUT=$(kb_timeout "${KB_CONNECTOR_TIMEOUT:-120}" "$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM. Reply ONLY with the queue id number, or the single word DUPLICATE if the tool reports it was already queued, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
+      OUT=$(kb_timeout "${KB_CONNECTOR_TIMEOUT:-120}" "$CLAUDE_BIN" -p "The stdin content is a session transcript delta. Call the kb_ingest_session tool (mcp__claude_ai_Knowledge_Base__kb_ingest_session, or any tool named kb_ingest_session) with project='"'"'$PROJECT'"'"', kind='"'"'session'"'"', transcript = the stdin content VERBATIM.$METAI Reply ONLY with the queue id number, or the single word DUPLICATE if the tool reports it was already queued, or FAILED."             --allowedTools "mcp__claude_ai_Knowledge_Base__kb_ingest_session,mcp__kb__kb_ingest_session"             <"$TMPC" 2>>"$LOG" | tail -1)
       rm -f "$TMPC"
       # OUT is untrusted model output: a headless claude -p run whose stdin is the
       # raw transcript delta, so an adversarial tool-result/webpage seen during the

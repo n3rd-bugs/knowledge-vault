@@ -85,7 +85,27 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     expiry = counts.get("first_expiry_date")
     if expiry and _expiring_soon(expiry):
         lines.append(f"review rows start expiring {expiry}")
+    stale = _stale_hook_projects(counts.get("fleet_degenerate_by_project"))
+    if stale:
+        # NAMED, not counted: the action is "go update that machine's hooks", and
+        # a bare number tells an owner nothing about which box to walk over to.
+        lines.append(f"STALE HOOKS suspected: {', '.join(stale)}")
     return lines
+
+
+def _stale_hook_projects(report: Any) -> list[str]:
+    """Projects whose queue rows show a machine still on pre-fix hooks.
+
+    ONE definition of "nonzero", which lives in :mod:`kbcore.fleet_health` beside
+    the query that produced the report — a second copy here would be a second
+    thing to keep in step. Lazily imported like the other tail steps, so a
+    missing module costs this ONE line and not the digest.
+    """
+    try:
+        from kbcore import fleet_health
+    except ImportError:
+        return []
+    return fleet_health.stale_hook_projects(report)
 
 
 def push_run_digest(counts: Mapping[str, Any]) -> bool:

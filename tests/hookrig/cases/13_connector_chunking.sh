@@ -27,6 +27,13 @@ install_hooks >/dev/null
 
 WORK="$HOME/work/connrepo"
 mkdir -p "$WORK"
+# A REAL git repo. The relay must convey repo/branch/commit alongside the session
+# identity, and a plain directory has none of that to convey — the connector
+# cases all used one, which is part of why the missing fields went unnoticed.
+git -C "$WORK" init -q -b rig-main
+git -C "$WORK" -c user.email=rig@example.invalid -c user.name=rig commit -q --allow-empty -m init
+GITSHA=$(git -C "$WORK" rev-parse --short HEAD)
+note "git context: repo=connrepo branch=rig-main commit=$GITSHA"
 T="$WORK/transcript.jsonl"
 
 # Ragged line lengths on purpose: a chunk boundary must never land on a line
@@ -121,10 +128,61 @@ assert_contains "$ARGV" "--allowedTools" "the child is restricted to an allowlis
 # transcript that may itself carry injected instructions.
 assert_not_contains "$ARGV" "--dangerously" "no permission bypass on the relay child"
 
+# ------------------------------------------------------------ session identity
+step "the relay conveys the SESSION IDENTITY and the git context"
+# THE DEFECT THIS PINS. The connector prompt named only project/kind/transcript,
+# so every chunk reached the queue with NO source_uri: a 3-chunk session became 3
+# degenerate singleton rows, 3 separate 14B extractions, no cohort, and nothing
+# carrying a code_ref anchor. MCP/REST were fixed by exporting OKEY; this
+# transport was never told to send the fields at all, and nothing here looked.
+assert_contains "$ARGV" "session_uri" "the prompt names session_uri"
+assert_contains "$ARGV" "session:conn-1" "it carries THIS session id, not a bare session:"
+assert_not_contains "$ARGV" '"session:"' "never a DEGENERATE identity on the wire"
+assert_contains "$ARGV" "connrepo" "the repo is conveyed"
+assert_contains "$ARGV" "rig-main" "the branch is conveyed"
+assert_contains "$ARGV" "$GITSHA" "the commit is conveyed"
+
+step "EVERY chunk of the session carries the SAME identity"
+# One session must be ONE cohort. A missing (or per-chunk) identity is exactly
+# what turns a 60 KB session into N unrelated extractions.
+i=1
+MISSING=0
+while [ "$i" -le "$N" ]; do
+  case "$(cat "$HOME/relay/argv.$i" 2>/dev/null)" in
+    *"session:conn-1"*) : ;;
+    *) MISSING=$((MISSING + 1)); note "chunk $i carries no session identity" ;;
+  esac
+  i=$((i + 1))
+done
+assert_eq "0" "$MISSING" "all $N chunks carry session:conn-1"
+
 step "a re-firing with no new bytes relays nothing"
 BEFORE=$(relay_count)
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T" "$WORK" conn-1)"
 settle
 assert_eq "$BEFORE" "$(relay_count)" "nothing re-sent once the transcript is drained"
+
+# ------------------------------------------- absent git context: OMITTED, not ""
+# The server normalises a degenerate URI (and would ignore an empty repo), but
+# the hook must never lean on that: a field with nothing to say is not sent.
+new_home connnogit
+fake_claude_relay
+cfg_connector
+install_hooks >/dev/null
+W2="$HOME/work/plaindir" # deliberately NOT a git repo
+mkdir -p "$W2"
+mk_transcript "$W2/t.jsonl" 20 nogit
+
+step "with no git context, the omitted fields are ABSENT, never empty strings"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$W2/t.jsonl" "$W2" nogit-1 SessionEnd)"
+assert_eq "0" "$RC" "the hook exits 0"
+wait_relay 1 45 || fail "the no-git session was never relayed"
+settle
+A=$(cat "$HOME/relay/argv.1")
+assert_contains "$A" "session:nogit-1" "the identity still travels when git says nothing"
+assert_not_contains "$A" '"repo"' "an absent repo is omitted entirely"
+assert_not_contains "$A" '"branch"' "an absent branch is omitted entirely"
+assert_not_contains "$A" '"commit"' "an absent commit is omitted entirely"
+assert_not_contains "$A" '""' "no key is sent with an empty value"
 
 finish

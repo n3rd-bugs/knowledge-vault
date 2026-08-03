@@ -94,6 +94,24 @@ else
   fail "resumed reassembly differs: $(cmp "$T" "$HOME/reassembled" 2>&1 | head -1)"
 fi
 
+step "every firing of the SAME session relays the SAME identity"
+# A resumed session spans several firings, each a fresh detached child that
+# recomputes the identity from the event. If any of them dropped it (or derived a
+# different one) the chunks would land in the queue as unrelated rows and be
+# extracted separately — the fragmentation the identity exists to prevent, just
+# spread across firings instead of chunks.
+NALL=$(relay_count)
+i=1
+MISSING=0
+while [ "$i" -le "$NALL" ]; do
+  case "$(cat "$HOME/relay/argv.$i" 2>/dev/null)" in
+    *"session:cap-1"*) : ;;
+    *) MISSING=$((MISSING + 1)); note "chunk $i carries no session identity" ;;
+  esac
+  i=$((i + 1))
+done
+assert_eq "0" "$MISSING" "all $NALL chunks across every firing carry session:cap-1"
+
 # ================================================= 2. SessionEnd ignores the cap
 new_home connend
 fake_claude_relay
@@ -127,6 +145,14 @@ if grep -q "per-firing cap reached" "$LOGF"; then
 else
   pass "SessionEnd ignored the cap, as the terminal firing must"
 fi
+
+step "the terminal firing carries the identity, and no empty git keys"
+# endrepo is a plain directory, so repo/branch/commit have nothing to say: they
+# must be ABSENT from the tool call, not present and blank.
+AEND=$(cat "$HOME/relay/argv.1")
+assert_contains "$AEND" "session:end-1" "SessionEnd stamps the session identity too"
+assert_not_contains "$AEND" '"session:"' "never a degenerate identity, even on the last firing"
+assert_not_contains "$AEND" '""' "no key is sent with an empty value"
 
 step "a fully-drained SessionEnd retires the offset file"
 # Leaving it behind would make a future session with a recycled id resume from

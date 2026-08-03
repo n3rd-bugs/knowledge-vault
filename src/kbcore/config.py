@@ -358,7 +358,9 @@ class Settings(BaseSettings):
     # with the judged-pair memory (migration 017) a normal night only sees pairs
     # that are genuinely new, so the cap binds only while a backlog drains.
     # Unreached pairs are simply offered again next run. Kill switch: 0.
-    kb_contradiction_pair_cap: int = 200
+    kb_contradiction_pair_cap: int = 500
+    # 500 (was 200, 2026-08-03): measured 9.2 s/pair (not the 41 inferred) => ~77
+    # min; safe to widen because judged pairs PERSIST across a deadline cut.
 
     @model_validator(mode="after")
     def _check_embed_pairing(self) -> Settings:

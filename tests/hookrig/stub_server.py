@@ -105,6 +105,22 @@ def _rpc_text(rid: Any, text: str, is_error: bool = False) -> dict[str, Any]:
     }
 
 
+def _record_meta(rec: dict[str, Any], args: dict[str, Any]) -> None:
+    """The identity + git context AS PRESENTED, plus any blank-valued key.
+
+    Recorded verbatim for the same reason ``session_uri`` is: nothing used to
+    look at these, which is how ``session:`` — a wildcard grouping key that
+    coalesced six projects into one extraction — travelled on every flush from
+    every machine. ``empty_keys`` makes the other half assertable: a field with
+    nothing to say must be OMITTED, never sent blank for the server to normalise
+    away.
+    """
+    rec["session_uri"] = args.get("session_uri")
+    for k in ("repo", "branch", "commit"):
+        rec[k] = args.get(k)
+    rec["empty_keys"] = sorted(k for k, v in args.items() if isinstance(v, str) and not v.strip())
+
+
 def _accepted(rec: dict[str, Any], project: str, text: str, res: dict[str, Any]) -> None:
     rec.update(
         project=project,
@@ -397,12 +413,7 @@ class Handler(BaseHTTPRequestHandler):
         rec["project"] = args.get("project")
         rec["kind"] = args.get("kind")
         rec["encoding"] = "gz" if args.get("transcript_gz") else "plain"
-        # THE SESSION IDENTITY, recorded verbatim. Nothing in the rig used to look
-        # at it, which is how "session:" — an empty session id interpolated into
-        # the URI by a detached child that never had the variable — travelled on
-        # every flush from every machine and coalesced six projects into one
-        # extraction. Recording it is what makes that assertable.
-        rec["session_uri"] = args.get("session_uri")
+        _record_meta(rec, args)
         try:
             project, text = validate_submission(args)
         except (ValueError, Invalid) as e:
@@ -438,7 +449,7 @@ class Handler(BaseHTTPRequestHandler):
         rec["project"] = payload.get("project")
         rec["kind"] = payload.get("kind")
         rec["encoding"] = "gz" if payload.get("transcript_gz") else "plain"
-        rec["session_uri"] = payload.get("session_uri")
+        _record_meta(rec, payload)
         try:
             project, text = validate_submission(payload)
         except ValueError as e:  # shape -> pydantic would have refused the model

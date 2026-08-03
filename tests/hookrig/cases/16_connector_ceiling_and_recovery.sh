@@ -37,6 +37,10 @@ assert_file_contains "$HOOKS/flush-session-to-kb.sh" 'KB_CONNECTOR_SESSION_MAX:-
 
 WORK="$HOME/work/hugerepo"
 mkdir -p "$WORK"
+# A real git repo, so the git context the relay must convey actually exists.
+git -C "$WORK" init -q -b ceiling-main
+git -C "$WORK" -c user.email=rig@example.invalid -c user.name=rig commit -q --allow-empty -m init
+GITSHA=$(git -C "$WORK" rev-parse --short HEAD)
 T="$WORK/transcript.jsonl"
 mk_big_transcript "$T" 900000
 SIZE=$(wc -c <"$T")
@@ -86,6 +90,23 @@ if printf '%s' "$FIRSTKEPT" | "$RIG_JQ" -e . >/dev/null 2>&1; then
 else
   fail "the skip landed mid-line: $(printf '%s' "$FIRSTKEPT" | head -c 120)"
 fi
+
+step "what survived the ceiling still carries the identity and the git context"
+# The backlog gate rewrites the offset before the loop runs. If the surviving
+# bytes arrived without a session identity they would be extracted as unrelated
+# singletons — the ceiling would have paid for capture and got fragments.
+i=1
+MISSING=0
+NREL=$(relay_count)
+while [ "$i" -le "$NREL" ]; do
+  A=$(cat "$HOME/relay/argv.$i" 2>/dev/null)
+  case "$A" in *"session:huge-1"*) : ;; *) MISSING=$((MISSING + 1)); note "chunk $i lost the identity" ;; esac
+  case "$A" in *"$GITSHA"*) : ;; *) MISSING=$((MISSING + 1)); note "chunk $i lost the commit" ;; esac
+  i=$((i + 1))
+done
+assert_eq "0" "$MISSING" "all $NREL surviving chunks carry session:huge-1 and $GITSHA"
+assert_contains "$(cat "$HOME/relay/argv.1")" "ceiling-main" "the branch survives the skip too"
+assert_contains "$(cat "$HOME/relay/argv.1")" "hugerepo" "the repo survives the skip too"
 
 step "a normal-sized session is untouched by the ceiling"
 new_home connnormal
@@ -140,6 +161,9 @@ fi
 
 step "and the session goes on to complete rather than stalling"
 assert_eq "$S3" "$OFFD" "the whole transcript drained despite the duplicate reply"
+# duperepo is a plain directory: the git keys have nothing to say and must be
+# absent rather than blank.
+assert_not_contains "$(cat "$HOME/relay/argv.1")" '""' "no key is sent with an empty value"
 
 step "but a FAILURE that merely MENTIONS a duplicate must NOT advance the offset"
 # The order of the case arms is the whole guarantee here: this reply contains
@@ -188,6 +212,8 @@ wait_relay "$((BEFORE + 1))" 45 || fail "the shrunk transcript was never re-sent
 settle
 assert_file_contains "$LOGF" "transcript shrank" "the restart is announced, not silent"
 assert_eq "$S4" "$(read_offset)" "the offset was reset and the new content drained"
+assert_contains "$(cat "$HOME/relay/argv.$(relay_count)")" "session:shrink-1" \
+  "the restarted session is still stamped with its identity"
 
 # ==================================== 4. overlapping firings cannot race
 new_home connlock

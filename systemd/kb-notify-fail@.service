@@ -4,13 +4,22 @@
 # %n to e.g. kb-consolidate.service, so one template covers every unit and the
 # alert says which one died.
 #
-# WHY THIS EXISTS: the nightly work (consolidate, backup, the boot catch-up, the
-# monthly edge refresh) runs unattended at 03:00 on a box with an unreliable
-# grid. A failure used to be silent — no backup existed for 29 or 30 July and
-# nobody knew until someone went looking. Silence is the bug; this is the fix.
+# WHY THIS EXISTS: the unattended work — the backup at 00:30, the consolidation at
+# 01:00, the OnBootSec catch-up, the monthly edge refresh — runs on a box with an
+# unreliable grid, at hours when nobody is awake to watch a unit go red. A failure
+# used to be silent: no backup existed for 29 or 30 July and nobody knew until
+# someone went looking. Silence is the bug; this is the fix.
+#
+# The times above are the LIVE ones (they moved on 2026-08-01; this comment named
+# the old window until 2026-08-02). The schedule itself lives in the .timer files
+# and nowhere else — tests/test_ops_health.py fails this file if it names an hour
+# no timer actually uses.
 #
 # Deliberately has NO OnFailure of its own: a notifier that notifies about its
-# own failure is a loop, and the script exits 0 unconditionally anyway.
+# own failure is a loop, and the script exits 0 unconditionally anyway. That
+# unconditional success is precisely why the script logs every attempt's curl
+# exit code to ~/.claude/hooks/notify-fail.log — without it, "the notifier ran"
+# and "the alert arrived" are indistinguishable.
 [Unit]
 Description=Knowledge Vault failure notification for %i
 
@@ -20,5 +29,10 @@ Type=oneshot
 # (never argv). No EnvironmentFile: this must work even when .env is the problem.
 ExecStart=%h/kb/repo/systemd/kb-notify-fail.sh %i
 NoNewPrivileges=true
-# Bounded: a hung notifier must not sit in the failure path forever.
-TimeoutStartSec=60
+# Bounded, and sized to the script's retry budget rather than guessed. The push
+# races cloudflared and ntfy coming up after a boot, so it retries 3 times with a
+# 10s/30s backoff: 3 x 10s of curl plus 40s of sleeping = 70s worst case. This
+# must sit ABOVE that — a timeout below the budget kills the notifier mid-retry
+# and the failure is silent again, which is the bug — while still bounding a hung
+# notifier. tests/test_ops_health.py checks the two numbers against each other.
+TimeoutStartSec=120

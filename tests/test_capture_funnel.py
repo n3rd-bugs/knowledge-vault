@@ -167,6 +167,58 @@ def test_the_session_identity_is_exported_and_guarded():
     )
 
 
+def _connector_child(script: str) -> list[str]:
+    """The body of the ``claude -p`` relay child, identified by CLAUDE_BIN."""
+    blocks = [b for b in _detached_children(script) if any("CLAUDE_BIN" in ln for ln in b[1])]
+    assert len(blocks) == 1, f"expected exactly one connector relay child, found {len(blocks)}"
+    return blocks[0][1]
+
+
+def test_the_export_class_guard_actually_covers_the_connector_child():
+    """The class test asserts ``>= 3`` detached children, which stays true even if
+    the connector block stops being recognised (its opener changes, its terminator
+    moves). Name it explicitly, or the one transport whose relay is a MODEL could
+    drift out of the guard without a single test going red."""
+    blocks = _detached_children(FLUSH.read_text())
+    assert any(any("CLAUDE_BIN" in ln for ln in body) for _s, body, _p in blocks), (
+        "no detached child mentions CLAUDE_BIN — the connector relay is no longer "
+        "covered by the unexported-variable guard"
+    )
+
+
+def test_the_connector_relay_names_the_identity_and_git_fields():
+    """THE DEFECT. OKEY/REPO/BRANCH/COMMIT were already exported into the relay
+    child; the prompt simply never mentioned them, so every connector chunk
+    reached the queue with no source_uri and no code_ref anchor — one 14B
+    extraction per 24 KB instead of one per session. The export-class guard cannot
+    see this: an exported-but-unused variable is not a missing one."""
+    body = "\n".join(_connector_child(FLUSH.read_text()))
+    for name in ("OKEY", "REPO", "BRANCH", "COMMIT"):
+        assert f"${name}" in body or f"${{{name}" in body, (
+            f"the connector relay never reads {name} — a connector session will "
+            "fragment into degenerate singleton rows"
+        )
+    assert '[ -n "${OKEY:-}" ] && set -- "$@" session_uri s "session:$OKEY"' in body, (
+        "the connector child no longer builds the session identity the way the "
+        "bearer branches do (and so may put a bare 'session:' on the wire)"
+    )
+    for field in ("repo", "branch", "commit"):
+        assert f'set -- "$@" {field} s ' in body, f"the connector relay omits {field}"
+
+
+def test_the_connector_relay_lets_the_json_encoder_do_the_escaping():
+    """The prompt is assembled in shell and has to survive being turned back into
+    JSON by a model. A repo directory or branch holding a space, a quote or a
+    backslash would break a hand-written ``key='value'`` instruction, so the
+    fields go through the same builder the bearer branches use."""
+    body = "\n".join(_connector_child(FLUSH.read_text()))
+    assert "kb_json_build -" in body, (
+        "the connector relay hand-writes its extra arguments instead of letting "
+        "kb_json_build escape them"
+    )
+    assert "$METAI" in body, "the built object never reaches the relay prompt"
+
+
 # ---------------------------------------------------------------------------
 # Structural: no credential on a command line
 # ---------------------------------------------------------------------------
@@ -434,6 +486,209 @@ def test_the_flush_bearer_never_appears_in_the_hook_log(tmp_path):
         assert rec.wait(1)
     log = (home / ".claude/hooks/flush-session.log").read_text(errors="replace")
     assert FAKE_PROJECT_TOKEN not in log
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: the CONNECTOR relay, whose wire format is a prompt
+# ---------------------------------------------------------------------------
+#
+# CONNECTOR is the zero-config transport: no bearer, no URL, just the claude.ai
+# connector bridged into Claude Code. Its data path is a headless `claude -p`, so
+# "what goes on the wire" is the text of a prompt — and for a long time that text
+# named only project/kind/transcript. Every chunk therefore reached the queue with
+# no session identity and no git context: N degenerate singleton rows, N separate
+# 14B extractions, nothing anchored to code. Exactly the shape the OKEY export
+# closed for MCP/REST, left open on the one transport nothing asserted against.
+#
+# CLAUDE_BIN is just a path to an executable, so the relay is exercisable with a
+# recorder standing in for the model — no egress, no Claude usage.
+
+_RELAY_RECORDER = r"""#!/usr/bin/env bash
+# Stand-in for the headless `claude -p` relay. Records the chunk it was handed on
+# stdin and its argv (NUL-separated, so a prompt containing spaces or newlines is
+# recovered exactly), then answers the way the model is asked to: a bare queue id.
+D="$RELAY_REC"
+mkdir -p "$D"
+N=$(( $(cat "$D/.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$N" >"$D/.n"
+cat >"$D/chunk.$N"
+: >"$D/argv.$N"
+for a in "$@"; do printf '%s\0' "$a" >>"$D/argv.$N"; done
+echo $((4000 + N))
+"""
+
+_META_MARKER = "EXTRA ARGUMENTS (JSON): "
+
+requires_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+def _relay_recorder(home: Path, rec_dir: Path) -> Path:
+    binp = home / "bin"
+    binp.mkdir(parents=True, exist_ok=True)
+    relay = binp / "claude"
+    relay.write_text(_RELAY_RECORDER)
+    relay.chmod(0o755)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    return relay
+
+
+def _wait_relay(rec_dir: Path, n: int = 1, timeout: float = 60.0) -> bool:
+    """The relay runs in the DETACHED child, so it lands after the hook exits."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if int((rec_dir / ".n").read_text()) >= n:
+                return True
+        except (FileNotFoundError, ValueError):
+            pass
+        time.sleep(0.1)
+    return False
+
+
+def _relay_prompt(rec_dir: Path, n: int = 1) -> str:
+    args = [a.decode("utf-8") for a in (rec_dir / f"argv.{n}").read_bytes().split(b"\0") if a]
+    assert "-p" in args, f"the relay was not invoked in headless print mode: {args}"
+    return args[args.index("-p") + 1]
+
+
+def _relay_meta(prompt: str) -> dict:
+    """The extra tool arguments, parsed back out of the prompt.
+
+    Parsing is the point: the hook interpolates shell values into natural
+    language, and the model has to turn them back into a JSON tool call. If the
+    object does not survive ``json.loads`` here, it will not survive the model
+    either — which is how a repo path with a quote in it would silently strip the
+    session identity off every chunk.
+    """
+    if _META_MARKER not in prompt:
+        return {}
+    obj, _end = json.JSONDecoder().raw_decode(
+        prompt, prompt.index(_META_MARKER) + len(_META_MARKER)
+    )
+    return obj
+
+
+def _connector_home(tmp_path: Path) -> tuple[Path, Path]:
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "relay"
+    relay = _relay_recorder(home, rec_dir)
+    (home / ".claude" / "kb-flush.env").write_text(f"KB_CONNECTOR=1\nCLAUDE_BIN={relay}\n")
+    return home, rec_dir
+
+
+def _git(path: Path, *args: str, **kw) -> subprocess.CompletedProcess:
+    identity = ["-c", "user.email=rig@example.invalid", "-c", "user.name=rig"]
+    return subprocess.run(
+        ["git", "-C", str(path), *identity, "-c", "commit.gpgsign=false", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+        **kw,
+    )
+
+
+def _git_repo(path: Path, branch: str) -> str:
+    """A real repo on a named branch with one commit -> a real repo/branch/commit."""
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "-b", branch)
+    _git(path, "commit", "-q", "--allow-empty", "-m", "init")
+    return _git(path, "rev-parse", "--short", "HEAD").stdout.strip()
+
+
+@requires_git
+def test_a_connector_flush_conveys_the_session_identity_and_git_context(tmp_path):
+    """THE TRIPWIRE for this transport. The repo name and branch are deliberately
+    hostile — a space, an apostrophe — because the fields travel through a
+    natural-language instruction assembled in shell. Asserting the parsed VALUES
+    (not merely that the words appear) is what proves the escaping holds."""
+    home, rec_dir = _connector_home(tmp_path)
+    work = tmp_path / "we ird's repo"
+    sha = _git_repo(work, "feat/o'brien")
+    _transcript(work / "t.jsonl")
+
+    res = _run_hook(
+        FLUSH,
+        {
+            "transcript_path": str(work / "t.jsonl"),
+            "cwd": str(work),
+            "session_id": "conn-abc123",
+            "hook_event_name": "SessionEnd",
+        },
+        home,
+        {"RELAY_REC": str(rec_dir)},
+    )
+    assert res.returncode == 0, res.stderr
+    assert _wait_relay(rec_dir), "the connector relay was never invoked; flush log: " + (
+        home / ".claude/hooks/flush-session.log"
+    ).read_text(errors="replace")
+
+    meta = _relay_meta(_relay_prompt(rec_dir))
+    assert meta.get("session_uri") == "session:conn-abc123", (
+        f"the connector relay carried {meta.get('session_uri')!r} — a chunk with no "
+        "identity is extracted as its own singleton, so the session fragments"
+    )
+    assert meta.get("repo") == "we ird's repo", f"repo did not survive escaping: {meta!r}"
+    assert meta.get("branch") == "feat/o'brien", f"branch did not survive escaping: {meta!r}"
+    assert meta.get("commit") == sha
+
+
+@requires_git
+def test_every_connector_chunk_of_one_session_carries_the_same_identity(tmp_path):
+    """A session relayed as N chunks must be ONE cohort. A per-chunk (or missing)
+    identity is what turned a large session into N unrelated 14B extractions."""
+    home, rec_dir = _connector_home(tmp_path)
+    work = tmp_path / "chunky"
+    _git_repo(work, "main")
+    _transcript(work / "t.jsonl", lines=400)
+
+    res = _run_hook(
+        FLUSH,
+        {
+            "transcript_path": str(work / "t.jsonl"),
+            "cwd": str(work),
+            "session_id": "multi-chunk",
+            "hook_event_name": "SessionEnd",
+        },
+        home,
+        {"RELAY_REC": str(rec_dir), "KB_CONNECTOR_CHUNK": "4000"},
+    )
+    assert res.returncode == 0, res.stderr
+    assert _wait_relay(rec_dir, 3), "the transcript was not relayed in several chunks"
+    time.sleep(1.5)
+    n = int((rec_dir / ".n").read_text())
+    assert n >= 3
+    uris = {_relay_meta(_relay_prompt(rec_dir, i)).get("session_uri") for i in range(1, n + 1)}
+    assert uris == {"session:multi-chunk"}, f"chunks disagreed about the session: {uris}"
+
+
+def test_a_connector_flush_without_git_sends_NO_empty_keys(tmp_path):
+    """kbcore normalises a degenerate identity away at enqueue, and the hook must
+    not lean on that. A field with nothing to say is OMITTED — not sent blank for
+    someone downstream to remember to ignore."""
+    home, rec_dir = _connector_home(tmp_path)
+    work = tmp_path / "plaindir"  # deliberately not a git repo
+    _transcript(work / "t.jsonl")
+
+    res = _run_hook(
+        FLUSH,
+        {
+            "transcript_path": str(work / "t.jsonl"),
+            "cwd": str(work),
+            "session_id": "s-nogit",
+            "hook_event_name": "SessionEnd",
+        },
+        home,
+        {"RELAY_REC": str(rec_dir)},
+    )
+    assert res.returncode == 0, res.stderr
+    assert _wait_relay(rec_dir)
+
+    prompt = _relay_prompt(rec_dir)
+    meta = _relay_meta(prompt)
+    assert meta == {"session_uri": "session:s-nogit"}, (
+        f"an absent git context was sent as empty keys instead of omitted: {meta!r}"
+    )
+    assert '"session:"' not in prompt, "a degenerate identity reached the relay prompt"
 
 
 # ---------------------------------------------------------------------------

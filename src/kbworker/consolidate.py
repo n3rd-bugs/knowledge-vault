@@ -22,7 +22,9 @@ from kbcore import (
     documents,
     enrolment,
     evidence,
+    fleet_health,
     ingest_queue,
+    jobs,
     llm,
     review_auto,
     review_triage,
@@ -631,6 +633,7 @@ def _drain_job(
         state["left"] -= 1
         if state["left"] > 0:
             state["done"] = False
+            jobs.touch_drain_heartbeat(ids)  # the rows won't flip for a while yet
             return 0, saved  # more windows to come — the rows stay 'pending'
         # All-or-nothing: a group extracted once must never leave rows
         # pending for a second, partial extraction of the same session.
@@ -1250,6 +1253,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         counts["stopped"] = {k: dict(v) for k, v in _STOP_LOG.items()}
         counts["review_queue_open"] = consolidation.open_review_count()
         counts["ingest_queue_pending"] = ingest_queue.queue_depth()
+        _run_step(counts, "fleet_degenerate_by_project", fleet_health.degenerate_by_project)
         counts["disk_pct"] = _disk_pct()
         counts["extraction_rejection_rate"] = _rejection_rate()
 

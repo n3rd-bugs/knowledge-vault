@@ -56,6 +56,25 @@ def fake_vector(text: str) -> list[float]:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_notifications(monkeypatch):
+    """Tests must NEVER reach the owner's real ntfy channel.
+
+    consolidate.main() ends with a digest push, and settings load the REAL .env
+    (the known test-hermeticity gotcha) — so every integration test driving
+    main() published an all-zero 'KB nightly' digest to the owner's phone. A
+    parallel agent wave re-running those suites produced 101 pushes in 6 hours
+    at one per ~6s (2026-08-03). Blank the channel config for every test; the
+    push helper then no-ops. Tests that WANT to exercise push_digest set their
+    own fake URL explicitly.
+    """
+    from kbcore.config import settings as _s
+
+    monkeypatch.setattr(_s, "kb_notify_url", "")
+    monkeypatch.setattr(_s, "kb_notify_topic", "")
+    monkeypatch.setattr(_s, "kb_notify_token", "")
+
+
+@pytest.fixture(autouse=True)
 def fake_embeddings(monkeypatch):
     """Mock Ollama for every test: embed_texts returns deterministic vectors."""
     # **kw so the stub keeps matching the real signature: embed_texts gained a

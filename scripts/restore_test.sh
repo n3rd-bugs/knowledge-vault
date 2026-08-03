@@ -38,8 +38,17 @@ esac
 
 TMP_FETCH=""
 fail() { echo "restore_test: FAIL — $*" >&2; cleanup; exit 1; }
-cleanup() {
+# Two scopes on purpose. The mid-script call below must clear only a LEFTOVER
+# CONTAINER from a previous run — the first offsite drill (2026-08-03) failed
+# because the single cleanup() also removed TMP_FETCH, deleting the freshly
+# fetched+decrypted dump moments before zstd read it. Local mode never noticed:
+# local dumps live in backups/, outside the temp dir. The temp dir is the EXIT
+# trap's job alone.
+cleanup_container() {
   docker rm -fv "${CONT}" >/dev/null 2>&1 || true
+}
+cleanup() {
+  cleanup_container
   if [[ -n "${TMP_FETCH}" ]]; then rm -rf "${TMP_FETCH}"; fi
 }
 trap cleanup EXIT
@@ -58,7 +67,7 @@ else
   echo "restore_test: using $(basename "${NEWEST}")"
 fi
 
-cleanup
+cleanup_container
 docker run -d --name "${CONT}" \
   -e POSTGRES_DB=kb -e POSTGRES_USER=kb -e POSTGRES_PASSWORD="${DBPASS}" \
   -p 127.0.0.1:5599:5432 "${IMAGE}" >/dev/null

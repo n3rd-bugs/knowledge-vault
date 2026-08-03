@@ -69,6 +69,12 @@ _SETUP_SCRIPTS = frozenset(
         # — which is precisely why notifications only ever worked on this host.
         "notify-complete.sh",
         "turn-start.sh",
+        # The backfill sweep (2026-08-03). Not a hook, but it is exactly what a
+        # re-onboarded box runs right after install.sh — so it has to be
+        # SERVABLE, or that box can only ever capture sessions started after the
+        # install and everything already on its disk stays invisible. Same gap
+        # class as the notify pair above.
+        "kb-flush-backfill.sh",
     }
 )
 

@@ -49,6 +49,7 @@ SETUP_SCRIPTS = frozenset(
         "kb-mcp-call.sh",
         "notify-complete.sh",
         "turn-start.sh",
+        "kb-flush-backfill.sh",
     }
 )
 

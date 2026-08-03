@@ -39,7 +39,8 @@ note "enrolment code: ${CODE:0:8}… (single use)"
 step "the four scripts download using the CODE as bearer"
 cd "$HOME/.claude/kb-setup" || exit 1
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
-         kb-mcp-call.sh notify-complete.sh turn-start.sh; do
+         kb-mcp-call.sh notify-complete.sh turn-start.sh \
+         kb-flush-backfill.sh; do
   if "$RIG_CURL" -fsS -H "Authorization: Bearer $CODE" "$STUB/api/setup/$f" -o "$f"; then
     pass "fetched $f ($(wc -c <"$f") bytes)"
   else
@@ -49,7 +50,8 @@ done
 
 step "what arrived is the real script, byte for byte"
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
-         kb-mcp-call.sh notify-complete.sh turn-start.sh; do
+         kb-mcp-call.sh notify-complete.sh turn-start.sh \
+         kb-flush-backfill.sh; do
   if cmp -s "$f" "$SKILL/$f"; then
     pass "$f matches the shipped copy"
   else

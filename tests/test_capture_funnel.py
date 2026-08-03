@@ -42,6 +42,7 @@ FLUSH = CONTRIB / "flush-session-to-kb.sh"
 BRIEF = CONTRIB / "kb-session-brief.sh"
 INSTALL = CONTRIB / "install.sh"
 NOTIFY = CONTRIB / "notify-complete.sh"
+BACKFILL = CONTRIB / "kb-flush-backfill.sh"
 
 # Fake, shaped like the real thing so the scrubber and every "is this a token?"
 # assertion has something realistic to bite on. Never a live credential.
@@ -302,13 +303,205 @@ def test_install_names_the_credential_it_fetches_with():
 
 @pytest.mark.parametrize(
     "name",
-    ["flush-session-to-kb.sh", "kb-session-brief.sh", "install.sh", "notify-complete.sh"],
+    [
+        "flush-session-to-kb.sh",
+        "kb-session-brief.sh",
+        "install.sh",
+        "notify-complete.sh",
+        "kb-flush-backfill.sh",
+    ],
 )
 def test_contrib_and_shipped_copies_stay_identical(name: str):
     """contrib/ is canonical, setup_assets/ is what the container serves. A box
     that fetches from /api/setup/ must get the script that was tested."""
     assert (CONTRIB / name).read_bytes() == (SHIPPED / name).read_bytes(), (
         f"{name} drifted from its setup_assets twin — run `make sync-assets`"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural: an asset that is shipped but not listed is an asset no remote box
+# can ever get
+# ---------------------------------------------------------------------------
+#
+# THE GAP CLASS. notify-complete.sh and turn-start.sh existed, were installed by
+# install.sh and worked on the owner's box for weeks — while every REMOTE box got
+# no notifications at all, because the two scripts were missing from the REST
+# allowlist and from the bootstrap fetch loop. Nothing failed; the files simply
+# were not there. The set of served assets and the set of names in every fetch
+# list have to be the same set, and the only way to keep them so is to derive
+# both mechanically.
+
+_ASSET_LISTS = {
+    "kbrest allowlist": (REPO / "src/kbrest/server.py", "_SETUP_SCRIPTS"),
+    "hookrig stub": (REPO / "tests/hookrig/stub_server.py", "SETUP_SCRIPTS"),
+}
+_FETCH_LOOPS = {
+    "kb_setup bootstrap block": REPO / "src/kbmcp/tools_setup.py",
+    "rig case 00 (skill completeness)": REPO / "tests/hookrig/cases/00_hermetic_isolation.sh",
+    "rig case 17 (enrolment bootstrap)": REPO / "tests/hookrig/cases/17_enrolment_bootstrap.sh",
+}
+
+
+def _frozenset_literal(text: str, name: str) -> str:
+    """The braced body of ``<name> = frozenset({...})``, so a mention of a script
+    in a nearby comment cannot pass for membership."""
+    i = text.index(f"{name} = frozenset(")
+    j = text.index("{", i)
+    depth = 0
+    for k in range(j, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j : k + 1]
+    raise AssertionError(f"{name} literal is unterminated")
+
+
+def _fetch_loop_bodies(text: str) -> str:
+    bodies = re.findall(r"for f in (.*?);\s*do", text, re.S)
+    assert bodies, "no `for f in ...; do` asset loop found"
+    return "\n".join(bodies)
+
+
+@pytest.mark.parametrize("asset", sorted(p.name for p in SHIPPED.glob("*.sh")))
+def test_every_served_asset_appears_in_every_fetch_and_allowlist(asset: str):
+    """One parametrised case per shipped script, across every list that has to
+    name it. A new asset that lands in setup_assets/ and nowhere else fails here
+    instead of failing silently on someone else's machine."""
+    missing = []
+    for label, (path, symbol) in _ASSET_LISTS.items():
+        if f'"{asset}"' not in _frozenset_literal(path.read_text(), symbol):
+            missing.append(label)
+    for label, path in _FETCH_LOOPS.items():
+        if asset not in _fetch_loop_bodies(path.read_text()):
+            missing.append(label)
+    assert not missing, (
+        f"{asset} is served from setup_assets/ but is not named in: {', '.join(missing)} "
+        "— a remote box will never receive it, and nothing will report that"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural: the backfill sweep only ever FEEDS THE HOOK
+# ---------------------------------------------------------------------------
+#
+# kb-flush-backfill.sh walks every transcript on a box and pushes each one's
+# unflushed remainder into the KB. The whole safety argument for it is that it
+# owns none of the transport: offsets, chunking, the per-project token, the
+# scrubber and the wire format all stay in flush-session-to-kb.sh, and the sweep
+# only decides WHICH transcripts still have bytes and hands the hook an event.
+# A second implementation of the submission — even a small one — would be a
+# second place for 'session:' to be reinvented, on the one path that touches
+# EVERY project on the machine at once.
+
+
+def _backfill_code() -> str:
+    """The sweep's OWN executable lines: the shared portable block removed (it is
+    tested as one unit elsewhere) and comment lines dropped — so a script merely
+    NAMED in a comment can never look like a script being CALLED."""
+    text = BACKFILL.read_text()
+    start = text.index("# >>> KB PORTABLE BLOCK")
+    end = text.index("# <<< END KB PORTABLE BLOCK")
+    own = text[:start] + text[end:]
+    return "\n".join(ln for ln in own.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def test_the_backfill_never_puts_anything_on_the_wire_itself():
+    """No socket, no credential, no request body. If any of these ever appear,
+    the sweep has grown its own transport and the guarantees above are void."""
+    text = _backfill_code()
+    assert not _executed_curl_lines(text), "the backfill invokes curl directly"
+    for forbidden in (
+        "KB_TOKEN",
+        "KB_MCP_URL",
+        "KB_REST_URL",
+        "kb_ingest_session",
+        "kb-mcp-call.sh",
+        "transcript_gz",
+        "session_uri",
+    ):
+        assert forbidden not in text, (
+            f"the backfill references {forbidden} — it is reimplementing the "
+            "submission instead of feeding the hook"
+        )
+
+
+def test_the_only_json_the_backfill_builds_is_the_HOOK_EVENT():
+    """And it is built by kb_json_build, not by hand: a cwd or session id holding
+    a quote, a backslash or a newline has to reach the hook exactly as Claude
+    Code would have delivered it."""
+    body = _backfill_code()
+    calls = re.findall(r"kb_json_build\b(?:[^\n]*\\\n)*[^\n]*", body)
+    assert len(calls) == 1, f"expected exactly one JSON object to be built, found {len(calls)}"
+    call = " ".join(calls[0].split())
+    for field in ("transcript_path", "cwd", "session_id", "hook_event_name"):
+        assert f"{field} s " in call, f"the hook event omits {field}: {call}"
+    assert "SessionEnd" in call, "the event is not SessionEnd-shaped"
+    for wire_key in ("project", "transcript ", "kind", "repo", "branch", "commit"):
+        assert wire_key not in call, (
+            f"the built object carries {wire_key!r} — that is a SUBMISSION, not a hook event"
+        )
+    assert not re.search(r"""printf\s+['"]\{""", body), "the backfill hand-writes JSON somewhere"
+
+
+def test_the_backfill_fires_the_REAL_hook_and_waits_for_it():
+    """Sequential, foreground, and pointed at the installed hook. Backgrounding
+    the firings would put N detached drains on one box, racing for the same
+    per-session locks — the very thing the hook's own lock exists to prevent."""
+    text = BACKFILL.read_text()
+    assert 'BF_HOOK="${KB_BACKFILL_HOOK:-$HOOKS/flush-session-to-kb.sh}"' in text, (
+        "the sweep no longer defaults to the installed flush hook"
+    )
+    fire = [ln for ln in text.splitlines() if 'bash "$BF_HOOK"' in ln]
+    assert len(fire) == 1, f"expected exactly one hook firing, found {fire}"
+    assert fire[0].rstrip().endswith("2>&1"), f"the firing was changed: {fire[0]}"
+    assert not fire[0].rstrip().endswith("&"), "the sweep backgrounds the hook instead of waiting"
+
+
+def test_the_backfill_clears_the_hook_recursion_guard():
+    """KB_HOOK_GUARD is the hooks' anti-recursion flag and the flush hook exits 0
+    on sight of it. The sweep is invoked by a PERSON, quite possibly from inside a
+    Claude Code session that exported it — inheriting it would make every firing
+    a silent no-op, which is the exact failure the sweep exists to repair."""
+    assert re.search(r"^unset KB_HOOK_GUARD$", BACKFILL.read_text(), re.M), (
+        "the backfill no longer clears KB_HOOK_GUARD"
+    )
+
+
+def _portable_block(path: Path) -> str:
+    text = path.read_text()
+    start = text.index("# >>> KB PORTABLE BLOCK")
+    end = text.index("# <<< END KB PORTABLE BLOCK")
+    return text[start:end]
+
+
+def test_the_backfill_carries_the_SAME_portable_block():
+    """Shell has no import, so the block is duplicated verbatim — which is only
+    safe while a test proves the copies match. Rig case 26 diffs four copies and
+    does not know about this fifth one; case 27 does, but the rig needs docker.
+    This is the copy of that check that runs in the ordinary suite."""
+    assert _portable_block(BACKFILL) == _portable_block(FLUSH), (
+        "kb-flush-backfill.sh's portable block has drifted from the hooks' — the "
+        "platform/timeout/JSON primitives are no longer defined once"
+    )
+
+
+def test_the_backfill_exports_whatever_any_detached_child_would_read():
+    """The OKEY class guard, applied here BEFORE there is anything to guard. The
+    sweep has no detached child today; the day one is added (a parallel mode, a
+    background reporter) it inherits only the environment, and a name that was
+    merely assigned expands to the empty string with no error at all."""
+    problems: list[str] = []
+    for start, body, preceding in _detached_children(BACKFILL.read_text()):
+        available = _exported_names(preceding) | _assigned_names(body) | _SHELL_PROVIDED
+        missing = sorted({n for ln in body for n in _VAR_REF.findall(ln)} - available)
+        if missing:
+            problems.append(f"child at line {start}: {missing}")
+    assert not problems, (
+        "the backfill reads variables inside a DETACHED child without exporting "
+        "them, so they are empty at runtime: " + "; ".join(problems)
     )
 
 

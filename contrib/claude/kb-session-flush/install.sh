@@ -11,8 +11,8 @@
 set -euo pipefail
 
 # >>> KB PORTABLE BLOCK v1 — BYTE-IDENTICAL in install.sh, flush-session-to-kb.sh,
-# kb-session-brief.sh and kb-mcp-call.sh. tests/hookrig/cases/26 extracts it from
-# all four and diffs, so never hand-edit one copy. It exists because a locked-down
+# kb-session-brief.sh, kb-mcp-call.sh and kb-flush-backfill.sh. tests/hookrig/
+# cases/26 extracts it from all five and diffs, so never hand-edit one copy. It exists because a locked-down
 # box (no sudo, no jq) used to be a dead end: install.sh aborted with "apt install
 # jq" and both hooks exited 0 in SILENCE, capturing nothing forever.
 # Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
@@ -265,6 +265,15 @@ TURNSTART="$HOOKS/turn-start.sh"
 [ -f "$SKILL_DIR/notify-complete.sh" ] && install -m 0755 "$SKILL_DIR/notify-complete.sh" "$NOTIFY"
 [ -f "$SKILL_DIR/turn-start.sh" ] && install -m 0755 "$SKILL_DIR/turn-start.sh" "$TURNSTART"
 install -m 0755 "$SKILL_DIR/kb-mcp-call.sh" "$HOOKS/kb-mcp-call.sh"
+# The backfill sweep. NOT A HOOK -- it is installed but deliberately registered
+# for NO event in settings.json: it is an owner-run recovery that walks every
+# transcript on the box and pushes each one's unflushed remainder through the
+# hook above. A freshly (re-)onboarded machine has a disk full of sessions the
+# hooks never saw, and until this shipped that recovery was a manual per-file
+# hook-firing. Optional (`[ -f ]`) like the notify pair, so an older skill
+# directory still installs.
+BACKFILL="$HOOKS/kb-flush-backfill.sh"
+[ -f "$SKILL_DIR/kb-flush-backfill.sh" ] && install -m 0755 "$SKILL_DIR/kb-flush-backfill.sh" "$BACKFILL"
 
 # Co-locate the jq we just used NEXT TO THE HOOKS (originally a Windows fix, KB
 # item 496: Claude Code may have inherited a PATH from before jq was installed).
@@ -674,6 +683,13 @@ echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-promp
 echo "config:   $CFG  ($MODE)"
 echo "json:     $JSON_MODE"
 echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart + UserPromptSubmit + Stop registered)"
+if [ -f "$BACKFILL" ]; then
+  echo "backfill: $BACKFILL  (owner-run, NOT registered as a hook)"
+  echo
+  echo "this box already has transcripts the hooks never saw. Sweep them in:"
+  echo "  $BACKFILL            # dry run: what would be flushed"
+  echo "  $BACKFILL --push     # flush every remainder, oldest first"
+fi
 echo
 echo "smoke test (feeds a fake PreCompact event to the hook):"
 echo "  T=\$(ls -t \"\$HOME\"/.claude/projects/*/*.jsonl | head -1)"

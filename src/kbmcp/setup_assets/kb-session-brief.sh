@@ -20,8 +20,8 @@ CFG="$HOME/.claude/kb-flush.env"
 . "$CFG"
 
 # >>> KB PORTABLE BLOCK v1 — BYTE-IDENTICAL in install.sh, flush-session-to-kb.sh,
-# kb-session-brief.sh and kb-mcp-call.sh. tests/hookrig/cases/26 extracts it from
-# all four and diffs, so never hand-edit one copy. It exists because a locked-down
+# kb-session-brief.sh, kb-mcp-call.sh and kb-flush-backfill.sh. tests/hookrig/
+# cases/26 extracts it from all five and diffs, so never hand-edit one copy. It exists because a locked-down
 # box (no sudo, no jq) used to be a dead end: install.sh aborted with "apt install
 # jq" and both hooks exited 0 in SILENCE, capturing nothing forever.
 # Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
@@ -434,7 +434,7 @@ else
         printf 'Re-run the installer to pick up the current scripts:\n'
         printf '  cd ~/.claude/kb-setup 2>/dev/null || mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup\n'
         printf '  for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \\\n'
-        printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh; do\n'
+        printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do\n'
         printf '    curl -fsS -H "Authorization: Bearer $KB_TOKEN" "%s/api/setup/$f" -o "$f"\n' "${KB_REST_URL%/}"
         printf '  done && bash install.sh\n'
         printf 'This is FYI — nothing is broken, but newer scripts may capture more.\n\n'

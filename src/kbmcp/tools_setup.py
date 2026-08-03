@@ -151,10 +151,13 @@ export KB_REST_URL={url}
 export KB_ENROL_CODE={enrol.code}   # single use, expires in ~{mins} min
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
-         kb-mcp-call.sh notify-complete.sh turn-start.sh; do
+         kb-mcp-call.sh notify-complete.sh turn-start.sh \
+         kb-flush-backfill.sh; do
   curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh
+~/.claude/hooks/kb-flush-backfill.sh          # what this box never captured
+~/.claude/hooks/kb-flush-backfill.sh --push   # send it
 ```
 
 That fetches the hooks, redeems the code for {auth}, writes `~/.claude/kb-flush.env`
@@ -192,7 +195,10 @@ rather than reusing this message.
             "- `install.sh` — idempotent installer; detects the mode and registers the hooks\n"
             "- `flush-session-to-kb.sh` — PreCompact + SessionEnd capture\n"
             "- `kb-session-brief.sh` — SessionStart pre-brief + UserPromptSubmit recall\n"
-            "- `kb-mcp-call.sh` — MCP transport helper\n\n"
+            "- `kb-mcp-call.sh` — MCP transport helper\n"
+            "- `kb-flush-backfill.sh` — owner-run sweep: pushes the unflushed "
+            "remainder of EVERY transcript already on the box through the flush "
+            "hook (not registered as a hook; run it right after install)\n\n"
             "Each is served at `GET {url}/api/setup/<name>` and lives in the repo at "
             "`contrib/claude/kb-session-flush/`. Call `kb_setup(include_scripts=true)` "
             "to get them inline instead (for a machine with no HTTP access to the KB)."

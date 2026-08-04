@@ -42,7 +42,9 @@ STOP_CHECK_EVERY = 5
 
 
 def pending_triage(limit: int) -> list[dict[str, Any]]:
-    """Open ``unverified_extraction`` rows with NO stored triage, oldest first.
+    """Open ``unverified_extraction`` rows with NO stored triage — priority-stamped
+    rows first (``yield_hygiene.prioritize_judge_failed``; existence check, the stamp
+    is an object), then oldest first.
 
     Each row joins its item (id/project/type/title/body/tags) plus the item's
     access_log count — the judge weighs whether the knowledge was ever recalled.
@@ -66,7 +68,7 @@ def pending_triage(limit: int) -> list[dict[str, Any]]:
             WHERE rq.resolved = false
               AND rq.reason = 'unverified_extraction'
               AND NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage')
-            ORDER BY rq.id
+            ORDER BY (COALESCE(rq.detail, '{}'::jsonb) ? 'priority') DESC, rq.id
             LIMIT %s
             """,
             (limit,),
@@ -300,9 +302,12 @@ def apply_triage(
     # Priority-stamped rows (kbcore.yield_hygiene.prioritize_judge_failed marks
     # judge-flagged items 'secondary-judge-failed' that were ingested anyway) sort
     # FIRST so a bounded nightly batch examines the known-suspect ones before the
-    # FIFO tail. The stamp is detail->'priority'; absent = 0, so unstamped rows
-    # keep their existing rq.id order among themselves.
-    sql.append("ORDER BY COALESCE((rq.detail->'priority')::int, 0) DESC, rq.id")
+    # FIFO tail. EXISTENCE check, not a cast: yield_hygiene stamps an OBJECT
+    # ({reason, source, at}), and `(detail->'priority')::int` raises "cannot cast
+    # jsonb object to type integer" the moment one stamped row is in the batch —
+    # which took the whole nightly triage down with it. Key present sorts first;
+    # unstamped rows keep their rq.id order among themselves.
+    sql.append("ORDER BY (COALESCE(rq.detail, '{}'::jsonb) ? 'priority') DESC, rq.id")
     with connect() as conn:
         rows = conn.execute("\n".join(sql), params).fetchall()
 

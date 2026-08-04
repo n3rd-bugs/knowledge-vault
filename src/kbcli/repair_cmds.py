@@ -245,9 +245,9 @@ _JUDGE_HEADER = f"{'queue':>8}  {'item':>8}  {'project':16}  {'decision':16}  ti
 _JUDGE_NOTE = """
 priority marker written
   Nothing resolved — rows stay OPEN, no item changed (Inv 5, no promotion); each row gained
-  a detail->'priority' marker. HEADS-UP: review_triage.pending_triage orders by rq.id ONLY,
-  so the marker is inert until that one-line ORDER BY honors it:
-      ORDER BY (COALESCE(rq.detail, '{}'::jsonb) ? 'priority') DESC, rq.id
+  a detail->'priority' marker. review_triage.pending_triage sorts stamped rows first (key
+  EXISTENCE, not a cast — the stamp is an object), so the next nightly triage batch takes
+  these before the FIFO tail.
   Inspect: kb review list.   Re-check: kb repair judge-flagged.
 """.strip()
 

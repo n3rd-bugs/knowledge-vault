@@ -335,6 +335,35 @@ def test_prioritize_stamps_the_marker_without_resolving_or_hiding_from_triage(kb
     assert fq in {r["queue_id"] for r in pending_triage(50)}
 
 
+def test_a_REAL_stamp_sorts_first_in_triage_and_does_not_crash_the_query(kb):
+    """The integration seam that broke live: yield_hygiene stamps an OBJECT
+    ({reason, source, at}) while pending_triage's first ORDER BY form cast the
+    stamp ::int — 'cannot cast jsonb object to type integer', taking the whole
+    nightly triage down the first night a stamped row entered the batch. The
+    two sides MUST be exercised together: stamp through the real writer, read
+    through the real query, and the stamped row outranks OLDER unstamped rows."""
+    older_id, older_q = _judge_failed(title="older unstamped")
+    # Strip the judge-failed label from the older item so the bulk stamp skips
+    # it — leaving one stamped and one unstamped row in the same triage pool.
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE items SET meta = meta - 'extraction_pipeline' WHERE id = %s",
+            (older_id,),
+        )
+    newer_id, newer_q = _judge_failed(title="newer stamped")
+    assert older_q < newer_q, "the unstamped row must be the OLDER (lower-id) one"
+
+    outcomes = yield_hygiene.prioritize_judge_failed(dry_run=False)
+    assert [(o.row.queue_id, o.stamped) for o in outcomes] == [(newer_q, True)]
+
+    rows = pending_triage(50)
+    order = [r["queue_id"] for r in rows if r["queue_id"] in (older_q, newer_q)]
+    assert order == [newer_q, older_q], (
+        "the stamped row must outrank the older unstamped one — FIFO would have "
+        f"put it last: {order!r}"
+    )
+
+
 def test_prioritize_is_idempotent(kb):
     _fid, fq = _judge_failed()
     yield_hygiene.prioritize_judge_failed(dry_run=False)
@@ -418,7 +447,7 @@ def test_cli_judge_flagged_default_is_a_dry_run_table(kb):
     assert _resolved(fq) is False
 
 
-def test_cli_judge_flagged_apply_stamps_and_flags_the_ordering_gap(kb):
+def test_cli_judge_flagged_apply_stamps_and_names_the_triage_effect(kb):
     _fid, fq = _judge_failed()
 
     result = runner.invoke(app, ["repair", "judge-flagged", "--apply"], input="y\n")
@@ -428,6 +457,9 @@ def test_cli_judge_flagged_apply_stamps_and_flags_the_ordering_gap(kb):
     assert "PRIORITIZED" in result.output
     assert "1 stamped" in result.output
     assert "priority marker written" in result.output
-    assert "ORDER BY" in result.output, "the CLI must flag the one-line pending_triage fix"
+    # The ordering gap the note used to flag is CLOSED: pending_triage sorts on
+    # key existence (the stamp is an object — a ::int cast crashes). The note
+    # now states the effect; the integration test above proves it.
+    assert "sorts stamped rows first" in result.output, result.output
     assert "priority" in _detail(fq)
     assert _resolved(fq) is False

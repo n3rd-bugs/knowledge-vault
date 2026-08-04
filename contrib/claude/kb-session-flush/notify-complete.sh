@@ -203,7 +203,14 @@ fi
 # WHICH MACHINE. With this hook shipped to every box (linux, windows, rm1) the
 # project alone is ambiguous — the same repo is worked on from more than one.
 MACHINE="${NTFY_MACHINE:-$(hostname 2>/dev/null || echo unknown)}"
-MSG="Claude finished — ${WHERE} @ ${MACHINE}${DETAIL}"
+# THE BODY IS PURE ASCII — DELIBERATELY (KB 12885). On Windows the MSYS->native
+# argv conversion runs through the ANSI codepage, which rewrites an em dash into
+# the single CP-1252 byte 0x97. That byte is invalid UTF-8, so ntfy classifies
+# the whole body as a binary attachment and, with attachments disabled, rejects
+# the push (400, code 40014) — silently, because this hook exits 0 by contract.
+# This was patched locally on the Windows box four times and reintroduced by
+# every release; tests now assert every published body is ASCII, so keep it so.
+MSG="Claude finished - ${WHERE} @ ${MACHINE}${DETAIL}"
 
 if [ -n "${NTFY_TOPIC:-}" ]; then
   BASE="${NTFY_URL:-https://ntfy.sh}"

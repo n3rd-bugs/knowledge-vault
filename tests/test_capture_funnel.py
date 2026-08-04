@@ -1192,7 +1192,7 @@ def test_the_kb_part_is_OMITTED_when_this_session_has_no_state_of_its_own(tmp_pa
         f"a neighbour session's bytes were attributed to this one: {msg!r} — this is "
         "the misattribution the backfill sweep already had to fix"
     )
-    assert msg == "Claude finished — proj @ testbox", f"the base message changed: {msg!r}"
+    assert msg == "Claude finished - proj @ testbox", f"the base message changed: {msg!r}"
 
 
 def test_a_corrupt_offset_file_degrades_to_omission_and_still_exits_zero(tmp_path):
@@ -1219,7 +1219,7 @@ def test_a_corrupt_offset_file_degrades_to_omission_and_still_exits_zero(tmp_pat
     assert res.returncode == 0, res.stderr
     msg = _notify_message(rec_dir)
     assert "kb" not in msg, f"a corrupt checkpoint was rendered as a figure: {msg!r}"
-    assert msg == "Claude finished — proj @ testbox", f"the base message changed: {msg!r}"
+    assert msg == "Claude finished - proj @ testbox", f"the base message changed: {msg!r}"
 
 
 @pytest.mark.parametrize(
@@ -1254,6 +1254,48 @@ def test_the_notify_hook_derives_the_offset_key_exactly_like_the_flush_hook(sid:
     assert run(flush_pipe) == run(notify_pipe) != "", (
         f"the two offset-key derivations disagree for {sid!r}: "
         f"{run(flush_pipe)!r} vs {run(notify_pipe)!r}"
+    )
+
+
+def test_the_published_body_is_pure_ascii_in_its_fullest_shape(tmp_path):
+    """KB 12885: an em dash in the message broke every push from the Windows box —
+    the MSYS->native argv conversion rewrites non-ASCII through the ANSI codepage
+    (em dash -> CP-1252 0x97, invalid UTF-8), ntfy classifies the body as a binary
+    attachment and rejects it (400/40014), and the hook's exit-0 contract makes
+    the loss silent. It was patched locally four times and reintroduced by every
+    release. ASCII is immune to every codepage, so the WHOLE body must be ASCII —
+    asserted on the recorded wire body, in the shape with every segment present
+    (duration + kb progress), so a fancy dash in ANY segment fails here."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    (state / f"{_flush_okey('s-ascii')}.offset").write_text(str(_KB_FLUSHED))
+    mark_dir = tmp_path / "claude-turns"
+    mark_dir.mkdir()
+    (mark_dir / "s-ascii").write_text(str(int(time.time()) - 200))
+
+    res = _run_hook(
+        NOTIFY,
+        {
+            "session_id": "s-ascii",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+        home,
+        {
+            "PATH": f"{binp}:{os.environ.get('PATH', '')}",
+            "CURL_REC": str(rec_dir),
+            "TMPDIR": str(tmp_path),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert "kb " in msg and "m" in msg, f"expected the fullest shape, got {msg!r}"
+    assert msg.isascii(), (
+        f"a non-ASCII byte is back in the published body — this is the Windows-killing "
+        f"regression KB 12885 documents: {msg!r}"
     )
 
 

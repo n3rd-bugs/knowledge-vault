@@ -12,10 +12,9 @@ from __future__ import annotations
 import logging
 import shutil
 import time
-from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from kbcore import (
     consolidation,
@@ -24,27 +23,70 @@ from kbcore import (
     evidence,
     fleet_health,
     ingest_queue,
-    jobs,
-    llm,
+    llm,  # noqa: F401 — patch surface: tests patch `consolidate.llm.*`
     review_auto,
     review_triage,
 )
 from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
-from kbcore.errors import EmbedderUnavailable, ExtractionFailed, ExtractorUnavailable
 from kbcore.ingest import ingest
-from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
-from kbcore.supersede import same_uri_active_pairs, supersede
-from kbworker import allocator, ensemble, eval_sentinel, sessions, tail_steps
+from kbcore.review import auto_resolve_contradiction
+from kbworker import (
+    allocator,
+    ensemble,
+    eval_sentinel,
+    sessions,  # noqa: F401 — patch surface: tests patch `consolidate.sessions.*`
+    tail_steps,
+)
 
-if TYPE_CHECKING:
-    from kbworker.judging import EnsemblePlan
+# MECHANICAL SPLIT (2026-08-04): the extraction-input prep, the per-cohort
+# machinery and the LLM-tail steps moved to their own modules. Every moved name
+# is re-imported HERE because this module is the established seam: call sites
+# below and the test suite's monkeypatches all resolve through consolidate's
+# globals (patching `consolidate._summaries` rebinds the name main() looks up),
+# and the shared dicts (_COHORT_STATS/_CONTRA_STATS/_STOP_LOG) are one object
+# mutated in place on both sides, never rebound. `sessions` and `llm` above are
+# likewise part of the patch surface (tests patch attributes ON those modules
+# via `consolidate.sessions` / `consolidate.llm`) even where this file no
+# longer calls them directly.
+from kbworker.cohort import (  # noqa: F401
+    _COHORT_STATS,
+    _cohort_prepare,
+    _drain_job,
+)
+from kbworker.prep import (  # noqa: F401
+    EXTRACT_BYTES_PER_TOKEN,
+    EXTRACT_PROMPT_OVERHEAD_TOKENS,
+    MIN_WINDOW_BYTES,
+    TOKENIZER_SAFETY,
+    _assemble_jobs,
+    _batch_jobs,
+    _fit_windows,
+    _token_ceiling,
+    _warn_if_oversized,
+    window_budget_bytes,
+    window_budget_tokens,
+)
+from kbworker.tail_ops import (  # noqa: F401
+    _CONTRA_STATS,
+    _STOP_LOG,
+    CONTRA_HIGH,
+    CONTRA_LOW,
+    STOP_CHECK_EVERY,
+    StopCheck,
+    _canonical_clusters,
+    _contradictions,
+    _contradictions_all,
+    _dedupe,
+    _doc_refresh,
+    _note_stop,
+    _summaries,
+)
 
 logger = logging.getLogger("kbworker.consolidate")
 
 ADVISORY_KEY = 42
-CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
 EVIDENCE_PAIR_CAP = 20  # max contradiction pairs evidence-judged per nightly run
 
 # MEANING CHANGED 2026-08-01: this is the ceiling on ingest_queue ROWS one REFILL
@@ -77,233 +119,6 @@ MAX_REFILLS = 200
 # stability rule (evidence.SUGGEST_* / AUTO_RESOLVE_STREAK) are untouched
 # settled design.
 EVIDENCE_STREAK_RESERVE_DIVISOR = 2  # half the cap
-# Contradiction pairs judged this run, across projects — the per-night budget is
-# shared (settings.kb_contradiction_pair_cap), so it has to be counted somewhere
-# both _contradictions and the report can see. Reset per run, like _COHORT_STATS.
-_CONTRA_STATS: dict[str, int] = {"judged": 0}
-
-# "deadline" / "battery" / None — see :func:`should_stop`.
-StopCheck = Callable[[], "str | None"]
-
-# How often a per-item loop asks :func:`should_stop`. The answer is cached
-# (_STOP_CACHE_SECONDS) so the cost is a modulo, not a SQLite read; the bound
-# that matters is the OVERSHOOT — at most this many more LLM calls after the
-# grid drops or the deadline passes.
-STOP_CHECK_EVERY = 5
-
-# --- extraction input budget -------------------------------------------------
-# Ollama truncates a chat prompt to num_ctx/2 tokens and keeps only the first
-# n_keep (4) tokens of the front, so an oversized job loses the SYSTEM PROMPT and
-# the model is handed an instruction-less tail slice. Measured 2026-07-31: a
-# 1,034,082-token prompt was cut to 8,194 tokens ("truncating input prompt" x13
-# in journald) — SILENTLY, because Ollama returns 200 with a plausible-looking
-# empty extraction. Assembled group text is therefore split into windows that
-# fit, and :func:`_warn_if_oversized` is the tripwire that keeps this class of
-# failure loud if anything ever bypasses the split again.
-EXTRACT_PROMPT_OVERHEAD_TOKENS = 1024  # system prompt + JSON schema + output headroom
-EXTRACT_BYTES_PER_TOKEN = 3.5  # FIRST-PASS sizing only — enforcement is by real token count
-MIN_WINDOW_BYTES = 4_000  # floor, so a mis-set num_ctx cannot produce absurd windows
-# cl100k (the vendored counter) is not qwen3's tokenizer. On ordinary prose/code
-# the two are close; the margin absorbs the residual mismatch so a window that
-# counts as fitting under cl100k cannot overflow the qwen ceiling.
-TOKENIZER_SAFETY = 1.15
-
-
-def window_budget_bytes() -> int:
-    """FIRST-PASS byte sizing for windows, derived from num_ctx.
-
-    A byte estimate alone is NOT a guarantee: dense content runs far below the
-    assumed bytes/token (measured with the vendored tokenizer: base64 1.23,
-    hex 1.47, log tables 1.95, diffs 2.14 — all under 3.5), so a budget-full
-    byte window can still decode to 2x the token ceiling. Bytes give cheap,
-    line-boundary-friendly splits; :func:`_fit_windows` then ENFORCES the token
-    ceiling with a real count and re-splits any window that exceeds it.
-    """
-    usable = int(settings.kb_llm_num_ctx) // 2 - EXTRACT_PROMPT_OVERHEAD_TOKENS
-    return max(MIN_WINDOW_BYTES, int(usable * EXTRACT_BYTES_PER_TOKEN))
-
-
-def window_budget_tokens() -> int:
-    """Tokens ONE extraction call may carry: num_ctx/2 minus prompt overhead.
-
-    num_ctx/2 is Ollama's prompt ceiling (measured: 8,194 tokens at num_ctx
-    16384, "truncating input prompt" in journald when exceeded, keep=4 so the
-    SYSTEM PROMPT is what truncation drops).
-    """
-    return max(512, int(settings.kb_llm_num_ctx) // 2 - EXTRACT_PROMPT_OVERHEAD_TOKENS)
-
-
-def _token_ceiling() -> int:
-    """The cl100k count a window must stay under to fit the qwen budget."""
-    return max(256, int(window_budget_tokens() / TOKENIZER_SAFETY))
-
-
-def _fit_windows(text: str) -> list[str]:
-    """Split assembled text into windows GUARANTEED to fit one extraction call.
-
-    Two passes. Byte windows first (line-boundary aware, cheap); then every
-    window is measured with the real tokenizer, and any that exceeds the ceiling
-    — dense content like base64, hex dumps or diff hunks runs as low as 1.2
-    bytes/token — is re-split by TOKEN SLICES, which cannot overshoot by
-    construction. The verifier reproduced exactly this failure against the
-    byte-only version: a "budget-full" 25 kB window decoding to ~20k tokens.
-    """
-    from kbcore.chunk import _enc, count_tokens
-
-    ceiling = _token_ceiling()
-    out: list[str] = []
-    for w in sessions._text_windows(text, window_budget_bytes()):
-        if not w.strip():
-            continue
-        if count_tokens(w) <= ceiling:
-            out.append(w)
-            continue
-        toks = _enc.encode(w, disallowed_special=())
-        for i in range(0, len(toks), ceiling):
-            piece = _enc.decode(toks[i : i + ceiling])
-            if piece.strip():
-                out.append(piece)
-    return out or [""]
-
-
-def _warn_if_oversized(key: str, text: str, budget_tokens: int | None = None) -> bool:
-    """TRIPWIRE: a job that Ollama will truncate must never be silent again.
-
-    Measures REAL tokens (the byte estimate was the bug — dense content runs at
-    1.2-2.1 bytes/token and sailed under a byte check while overflowing the
-    context). After :func:`_fit_windows` this should never fire; it exists for
-    whatever bypasses the split next.
-    """
-    from kbcore.chunk import count_tokens
-
-    budget = window_budget_tokens() if budget_tokens is None else budget_tokens
-    tokens = count_tokens(text)
-    if tokens <= budget:
-        return False
-    logger.warning(
-        "TRUNCATION RISK: job %r submits %d tokens (measured, cl100k) against the "
-        "%d-token budget from num_ctx=%d — Ollama truncates to num_ctx/2 and the "
-        "SYSTEM PROMPT is what it drops first",
-        key,
-        tokens,
-        budget,
-        settings.kb_llm_num_ctx,
-    )
-    return True
-
-
-def _canonical_clusters(pairs: list[tuple[int, int, float]]) -> list[set[int]]:
-    """Union-find the dedupe pairs into clusters of mutually-similar items."""
-    parent: dict[int, int] = {}
-
-    def find(x: int) -> int:
-        parent.setdefault(x, x)
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a: int, b: int) -> None:
-        parent[find(a)] = find(b)
-
-    for a, b, _ in pairs:
-        union(a, b)
-    clusters: dict[int, set[int]] = {}
-    for node in parent:
-        clusters.setdefault(find(node), set()).add(node)
-    return [c for c in clusters.values() if len(c) > 1]
-
-
-# Cohort telemetry for the run report. The FIRST attempt at cohorting shipped
-# with only a logger.info, and when throughput did not improve there was no way
-# to answer "did it even run?" without grepping journald — the same blind spot
-# that let 40% of embeddings run on CPU unnoticed. An optimisation you cannot
-# observe is an optimisation you cannot trust.
-_COHORT_STATS: dict[str, int] = {}
-
-
-def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """One JOB per CONTEXT-SIZED WINDOW of each coalesced group's assembled text.
-
-    COALESCED BY SESSION. The network path windows RAW JSONL at 900 KB while the
-    local path assembles to text first, so the same session arrives as ~42x more
-    rows over MCP/REST (measured: 114 MB of JSONL is 2.7 MB of conversation —
-    350 rows vs 9 for a 300 MB session). Extracting each raw window separately
-    spent the whole 200-row nightly budget on one session and fed the 14B mostly
-    JSON scaffolding. Concatenating a session's rows and assembling ONCE restores
-    the local path's behaviour. Row order is the hook's byte order (it submits
-    sequential offsets), so plain concatenation reconstitutes the delta.
-
-    RE-WINDOWED (2026-08-01), which is what ``ingest_queue.pending_groups``
-    already promised and this function did not do: coalescing 350 raw rows into
-    one job produced ONE prompt of megabytes, and Ollama silently truncated it to
-    num_ctx/2 — dropping the system prompt with it (see
-    :func:`window_budget_bytes`). The assembled text is therefore split through
-    the same :func:`kbworker.sessions._text_windows` machinery the local flush
-    path uses, at a budget derived from num_ctx instead of the queue's 1 MB row
-    cap, and each window becomes its own job.
-
-    Every window of a group shares the group's ids, uri, extra_meta and detail —
-    only ``key`` (the cohort key, which must stay unique so a batch cannot hand a
-    job its neighbour's prefetch) and ``detail.window`` differ. The group's rows
-    flip status ONCE, after the LAST window lands (:func:`_drain_job`), so a
-    group is still all-or-nothing.
-
-    The cohort phases and the ingest pass share this ONE assembly, so the text a
-    judge saw is provably the text stored as the item's ``raw`` (it used to be
-    assembled twice, in two places). Per-group isolation as everywhere else in
-    the drain: a group that will not assemble is marked failed, never fatal.
-    """
-    jobs: list[dict[str, Any]] = []
-    for group in groups:
-        rows = group["rows"]
-        row = rows[0]
-        ids = [r["id"] for r in rows]
-        try:
-            meta = row["meta"] or {}
-            text = sessions.assemble_text("".join(r["content"] for r in rows), row["kind"])
-            windows = _fit_windows(text)
-            # ONE state per group, shared by its window jobs: the queue flip and
-            # the failure taxonomy are group-wide, the extraction calls are not.
-            state: dict[str, Any] = {
-                "ids": ids,
-                "left": len(windows),
-                "saved": 0,
-                "rejected": 0,
-                "done": False,
-            }
-            uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
-            for i, window in enumerate(windows):
-                key = f"{group['uri']}#w{i}" if len(windows) > 1 else group["uri"]
-                _warn_if_oversized(key, window)
-                jobs.append(
-                    {
-                        "key": key,  # cohort key: unique per SUBMISSION
-                        "group": state,  # shared: the queue rows flip once, together
-                        "ids": ids,
-                        "project": row["project"],
-                        "uri": uri,
-                        "branch": meta.get("branch"),
-                        "text": window,
-                        # FIX 6 (audit 2026-07-26): a queued session/memory window
-                        # anchors no FILE — repo/commit ride the item meta as
-                        # provenance instead of a phantom {"path": "."} code_ref.
-                        "detail": {
-                            "ingest_queue_id": row["id"],
-                            "source": row["kind"],
-                            **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
-                            **({"window": i, "windows": len(windows)} if len(windows) > 1 else {}),
-                        },
-                        "extra_meta": sessions._session_provenance(
-                            meta.get("repo"), meta.get("commit")
-                        ),
-                    }
-                )
-        except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
-            logger.exception("assembling ingest_queue group %s failed", ids)
-            for rid in ids:
-                ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
-    return jobs
 
 
 def _past_deadline() -> bool:
@@ -439,11 +254,6 @@ def _on_battery() -> bool:
 _STOP_CACHE_SECONDS = 5.0
 _stop_cache: tuple[float, str | None] | None = None
 
-# Why each step stood down, and how much it left behind. Persisted in the run
-# report (counts["stopped"]) — a run that quietly did a third of its work is
-# indistinguishable from a broken one unless it SAYS why it stopped.
-_STOP_LOG: dict[str, dict[str, Any]] = {}
-
 
 def reset_stop_cache() -> None:
     """Drop the memoized stand-down verdict (start of a run; tests)."""
@@ -473,216 +283,6 @@ def should_stop() -> str | None:
     reason = "deadline" if _past_deadline() else ("battery" if _on_battery() else None)
     _stop_cache = (now, reason)
     return reason
-
-
-def _note_stop(step: str, reason: str, deferred: int) -> None:
-    """Record + log that ``step`` stood down, and how much it deferred."""
-    prior = _STOP_LOG.get(step, {}).get("deferred", 0)
-    _STOP_LOG[step] = {"reason": reason, "deferred": prior + deferred}
-    logger.warning(
-        "step %r standing down (%s): %d item(s) deferred — nothing is lost, the "
-        "next run resumes here",
-        step,
-        reason,
-        deferred,
-    )
-
-
-def _batch_jobs(jobs: list[dict[str, Any]], cohort: int) -> list[list[dict[str, Any]]]:
-    """Slice jobs into cohort batches, bounded by BOTH job count and total bytes.
-
-    The count is the throughput bound (per-job cost is dominated by model loading,
-    so jobs/hour is what sizes a cohort). The byte budget is purely an OOM GUARD:
-    a cohort holds every job's assembled text in memory at once, so one unusually
-    large transcript must not be able to make a full-sized cohort exhaust RAM.
-
-    A job larger than the whole budget is still taken, ALONE. Skipping it would
-    return an empty batch and the drain would make no progress — one oversized row
-    would wedge the queue permanently, which is a worse failure than a big cohort.
-    """
-    budget = max(1, int(settings.kb_drain_cohort_bytes))
-    batches: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    used = 0
-    for job in jobs:
-        size = len(job.get("text") or "")
-        if current and (len(current) >= cohort or used + size > budget):
-            batches.append(current)
-            current, used = [], 0
-        if not current and size > budget:
-            logger.warning(
-                "cohort: job %r is %.1f MB, over the %.1f MB budget — taken alone",
-                job.get("key"),
-                size / 1e6,
-                budget / 1e6,
-            )
-        current.append(job)
-        used += size
-    if current:
-        batches.append(current)
-    return batches
-
-
-def _cohort_prepare(
-    batch: list[dict[str, Any]],
-) -> tuple[dict[str, dict], dict[str, EnsemblePlan]]:
-    """The three MODEL-MAJOR phases for one cohort batch, before any ingest.
-
-    Phase 1 EXTRACT (``prefetch_extractions``): every extractor, model-major
-    across the batch. Phase 2 PLAN (``plan_ensemble``): gate + cluster + policy,
-    which touches only the EMBEDDER. Phase 3 JUDGE (``judge_cohort``): every
-    job's judgements grouped by judge model, so each judge loads ONCE for the
-    whole batch instead of once per job. Measured 2026-07-29: the drain issued 50
-    model loads for 37 chat calls because judging alternated per job.
-
-    Returns ``({key: pre_extracted}, {key: EnsemblePlan})``. EVERY phase is
-    swallow-and-count: a job with no plan simply falls back to the per-job path,
-    which is exactly today's behaviour. Cohorting is an optimisation, and an
-    optimisation that can break the drain is not one.
-    """
-    pre_by_key: dict[str, dict] = {}
-    plan_by_key: dict[str, EnsemblePlan] = {}
-    try:
-        texts = [job["text"] for job in batch]
-        for job, pre in zip(batch, ensemble.prefetch_extractions(texts), strict=True):
-            pre_by_key[job["key"]] = pre
-        _COHORT_STATS["cohort_batches"] += 1
-        _COHORT_STATS["cohort_jobs"] += len(batch)
-        logger.warning(
-            "cohort prefetch: batch %d, %d job(s) — each extractor loaded once",
-            _COHORT_STATS["cohort_batches"],
-            len(batch),
-        )
-    except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
-        _COHORT_STATS["cohort_failures"] += 1
-        logger.warning("cohort prefetch failed; falling back per job", exc_info=True)
-        return pre_by_key, plan_by_key
-
-    for job in batch:
-        pre = pre_by_key.get(job["key"])
-        if pre is None:
-            continue  # no prefetch for this job — the per-job path owns it
-        try:
-            plan_by_key[job["key"]] = ensemble.plan_ensemble(
-                job["text"],
-                job["project"],
-                job["uri"],
-                code_ref=None,
-                branch=job["branch"],
-                extra_detail=job["detail"],
-                pre_extracted=pre,
-            )
-        except Exception as e:  # noqa: BLE001 — one unplannable job falls back, alone
-            _COHORT_STATS["cohort_plan_failures"] += 1
-            logger.warning(
-                "cohort plan failed for %s (%s: %s); falling back per job",
-                job["uri"],
-                type(e).__name__,
-                e,
-            )
-    _COHORT_STATS["cohort_plans"] += len(plan_by_key)
-
-    if plan_by_key:
-        try:
-            ensemble.judge_cohort(list(plan_by_key.values()))
-            _COHORT_STATS["cohort_judge_batches"] += 1
-        except Exception:  # noqa: BLE001 — never let an optimisation fail the drain
-            # Plans are mutated in place, so a half-judged plan would ingest
-            # UNJUDGED representatives as if approved. Drop them all: the per-job
-            # path re-judges from scratch, which is today's behaviour.
-            _COHORT_STATS["cohort_judge_failures"] += 1
-            logger.warning("cohort judging failed; falling back per job", exc_info=True)
-            plan_by_key.clear()
-    return pre_by_key, plan_by_key
-
-
-def _drain_job(
-    job: dict[str, Any], *, pre_extracted: dict | None, planned: EnsemblePlan | None
-) -> tuple[int, int]:
-    """Extract+ingest ONE WINDOW of a coalesced group. Owns the queue self-heal
-    taxonomy.
-
-    Returns ``(rows_drained, items_saved)``. The group's ROWS are counted (and
-    flipped) exactly once, when its LAST window lands: a group is still
-    all-or-nothing, it just takes one extraction call per context-sized window to
-    get there (:func:`_assemble_jobs`). Failure semantics stay GROUP-wide — one
-    window's failure defers/fails every row of the group and skips its remaining
-    windows, so the next run re-extracts the whole group rather than stitching a
-    session together out of two different nights (ingest is idempotent,
-    Invariant 3, so the re-extraction cannot double-write).
-    """
-    state = job["group"]
-    ids = state["ids"]
-    if state["done"]:
-        # A sibling window already resolved this group (failed or deferred).
-        # Extracting the rest would spend the 14B on rows nobody will flip.
-        return 0, 0
-    # Closed by DEFAULT and re-opened only by a successful non-final window, so
-    # every failure path below — including one nobody anticipated — resolves the
-    # whole group and skips its siblings, rather than each window discovering the
-    # same outage on the GPU.
-    state["done"] = True
-    try:
-        saved, rejected = sessions.extract_and_ingest(
-            job["text"],
-            job["project"],
-            job["uri"],
-            pre_extracted=pre_extracted,
-            planned=planned,
-            code_ref=None,
-            branch=job["branch"],
-            extra_detail=job["detail"],
-            extra_meta=job["extra_meta"],
-        )
-        state["saved"] += saved
-        state["rejected"] += rejected
-        state["left"] -= 1
-        if state["left"] > 0:
-            state["done"] = False
-            jobs.touch_drain_heartbeat(ids)  # the rows won't flip for a while yet
-            return 0, saved  # more windows to come — the rows stay 'pending'
-        # All-or-nothing: a group extracted once must never leave rows
-        # pending for a second, partial extraction of the same session.
-        ingest_queue.mark_group_extracted(ids, state["saved"], state["rejected"])
-        return len(ids), saved
-    except (ExtractorUnavailable, EmbedderUnavailable) as e:
-        # CONNECTIVITY (Ollama down/restarting/model-not-loaded during the
-        # nightly window — including a judge that went dark mid-cohort, which
-        # leaves fail-closed representatives without a verdict): do NOT
-        # mark_failed — leave the row 'pending' with attempts UNCHANGED so an
-        # outage never burns a row's retry budget; the next run retries once the
-        # model is back. mark_deferred bumps a bounded deferral counter and, if a
-        # "transient" failure never heals (a payload-deterministic 5xx /
-        # mid-response crash), escalates the row to 'failed' so it can't re-drain
-        # every night forever (review finding). Every row in the group, not just
-        # the first: deferring one and leaving the rest pending would split the
-        # session and extract it in pieces on the next run — the exact thing
-        # coalescing prevents.
-        escalated = [
-            rid for rid in ids if ingest_queue.mark_deferred(rid, f"{type(e).__name__}: {e}")
-        ]
-        if escalated:
-            logger.error(
-                "rows %s escalated to failed after %d deferrals (transient never healed): %s",
-                escalated,
-                ingest_queue.DEFERRAL_CAP,
-                e,
-            )
-        else:
-            logger.warning("%d row(s) deferred (extractor/embedder unavailable): %s", len(ids), e)
-    except ExtractionFailed as e:
-        # CONTENT-DETERMINISTIC (unparseable output, unterminated <think>, a
-        # per-row read timeout, a 4xx): re-running the 14B on this exact row
-        # fails identically, so bound it with the attempts cap instead of
-        # retrying every nightly run forever (queue self-heal taxonomy).
-        logger.warning("group %s extraction failed (content): %s", ids, e)
-        for rid in ids:
-            ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
-    except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
-        logger.exception("draining ingest_queue group %s failed", ids)
-        for rid in ids:
-            ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
-    return 0, 0
 
 
 def _drain_ingest_queue() -> tuple[int, int]:
@@ -814,124 +414,6 @@ def _drain_ingest_queue() -> tuple[int, int]:
             MAX_REFILLS,
         )
     return drained, saved_total
-
-
-def _dedupe(project: str) -> int:
-    """Step 1: collapse near-dupes to one canonical (oldest verified, else oldest)."""
-    pairs = consolidation.duplicate_pairs(project, settings.kb_dup_threshold)
-    marked = 0
-    for cluster in _canonical_clusters(pairs):
-        ranks = consolidation.item_ranks(list(cluster))
-        canonical = min(cluster, key=lambda i: ranks[i])
-        for dup in cluster:
-            if dup != canonical and consolidation.mark_duplicate(dup, canonical):
-                marked += 1
-    return marked
-
-
-def _summaries(since: datetime | None, stop: StopCheck | None = None) -> int:
-    """Step 2: (re)write topic summaries for tags with >=3 new items since last run.
-
-    ``stop`` is the run's stand-down guard (:func:`should_stop`), asked every
-    :data:`STOP_CHECK_EVERY` tags because each tag is a summarizer call. Tags not
-    reached are simply re-selected next run — the "since" mark only advances when
-    a consolidation report is written.
-    """
-    written = 0
-    todo = consolidation.tags_needing_summary(since)
-    for n, (project, tag, _new) in enumerate(todo):
-        if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
-            _note_stop("summaries_written", reason, len(todo) - n)
-            break
-        sources = consolidation.active_items_with_tag(project, tag)
-        if len(sources) < 3:
-            continue
-        body = llm.summarize_items(tag, sources)
-        if not body.strip():
-            continue
-        consolidation.create_summary(project, tag, body, [s["id"] for s in sources])
-        written += 1
-    return written
-
-
-def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None = None) -> int:
-    """Step 3: judge near-but-not-dup pairs; queue confirmed conflicts (never auto-supersede).
-
-    One LLM call per pair, so this is one of the three tail steps that used to
-    run past the deadline unbounded: ``stop`` is asked every
-    :data:`STOP_CHECK_EVERY` pairs and ``cap`` bounds the pairs judged (the
-    caller's REMAINING share of the per-night budget). Stopping loses nothing — a
-    pair that is still near-but-not-dup is re-offered by the same query next run,
-    and ``record_contradiction`` is idempotent for the ones already judged.
-
-    Every verdict — overwhelmingly "no contradiction" — is remembered in
-    ``contradiction_judgements`` so the next night does not re-pay for it
-    (:func:`kbcore.consolidation.record_pair_judgement`; ~90% of this step's cost
-    was re-judged negatives). It is recorded AFTER the contradiction is queued, so
-    a kill between the two loses the memory rather than the finding: the pair is
-    simply judged once more next run.
-    """
-    queued = 0
-    pairs = consolidation.contradiction_pairs(project, CONTRA_LOW, CONTRA_HIGH, limit=cap)
-    for n, (a_id, b_id, _sim) in enumerate(pairs):
-        if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
-            _note_stop("contradictions_queued", reason, len(pairs) - n)
-            break
-        (a_title, a_body), (b_title, b_body) = consolidation.item_pair_texts(a_id, b_id)
-        verdict = llm.items_contradict(a_title, a_body, b_title, b_body)
-        if verdict and consolidation.record_contradiction(a_id, b_id):
-            queued += 1
-        try:
-            consolidation.record_pair_judgement(a_id, b_id, verdict)
-        except Exception:  # noqa: BLE001 — the memory is an optimisation, never a gate
-            # Same rule as the cohort path: an optimisation that can fail the
-            # step is not one. A pair whose memory did not land is simply judged
-            # again next run — the cost of the old behaviour, not a wrong answer.
-            logger.warning("recording the judgement for pair %s/%s failed", a_id, b_id)
-        _CONTRA_STATS["judged"] += 1
-    return queued
-
-
-def _contradictions_all(
-    projects: list[str], stop: StopCheck | None = None, cap: int | None = None
-) -> int:
-    """Step 3 across every project under ONE shared per-night pair budget.
-
-    The budget is per NIGHT, not per project, so a single large project cannot
-    consume the whole GPU window; projects are taken in order and whatever is not
-    reached is offered again next run (nothing is written, nothing is lost).
-    ``cap`` of 0 is the kill switch — no pair is judged at all.
-    """
-    _CONTRA_STATS["judged"] = 0
-    budget = int(settings.kb_contradiction_pair_cap) if cap is None else int(cap)
-    queued = 0
-    for project in projects:
-        remaining = budget - _CONTRA_STATS["judged"]
-        if remaining <= 0:
-            logger.info("contradiction judging hit the per-night cap of %d pairs", budget)
-            break
-        queued += _contradictions(project, stop, remaining)
-    return queued
-
-
-def _doc_refresh(projects: list[str]) -> int:
-    """Step 0b: retire stale doc revisions + close their moot contradiction rows.
-
-    Backlog counterpart of the scan-time hook (supersede_doc_refresh): any
-    same-uri active pairs that predate the hook get resolved here — BEFORE
-    dedupe (which would mislabel a revision pair 'duplicate') and before the
-    contradiction scan wastes LLM calls on them. Per-pair isolation.
-    """
-    resolved = 0
-    for project in projects:
-        for stale, newest in same_uri_active_pairs(project):
-            try:
-                supersede(stale, new_item_id=newest, reason="auto: newer revision of same document")
-                close_contradiction_rows_for(stale, newest)
-                resolved += 1
-            except Exception:  # noqa: BLE001 — one bad pair must not abort the sweep
-                logger.exception("doc-refresh sweep failed for %s -> %s", stale, newest)
-    return resolved
 
 
 def _evidence_batch(

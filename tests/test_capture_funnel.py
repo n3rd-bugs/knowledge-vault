@@ -22,6 +22,7 @@ The tests are therefore of three kinds:
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -1467,6 +1468,691 @@ def test_a_box_with_no_credential_at_all_still_exits_cleanly(tmp_path):
     assert res.returncode == 0, res.stderr
     assert "OUT OF DATE" not in res.stdout
     assert "unbound variable" not in res.stderr
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: recall is never FAIL-SILENT (KB item 12885)
+# ---------------------------------------------------------------------------
+#
+# THE BUG, reported by the owner from another box. kb-session-brief.sh serves
+# BOTH hook events, and when its search timed out or errored it emitted exactly
+# what a genuinely empty KB emits — nothing. A struggling server was therefore
+# invisible while it charged its whole timeout to every single prompt, and the
+# owner's local patch for it died on every asset refetch.
+#
+# The fix is deliberately narrow, and these tests pin all three halves of it:
+# a detected failure writes ONE log line and trips a short breaker; while that
+# breaker is hot the remote call is SKIPPED (asserted against a recording stub
+# that would have recorded it) and one ASCII line says so; and a search that
+# answered with zero rows is a SUCCESS that must touch neither. That last one is
+# the false positive that would turn a quiet KB into a permanently disabled one.
+
+# A recording curl for the recall paths. Every invocation is written down, which
+# is the only way to prove a hot breaker made NO call rather than a fast one.
+# CURL_SEARCH_* drive the search response; CURL_PROBE_RC drives the cheap
+# reachability probe the hook makes first.
+_RECALL_CURL = r"""#!/usr/bin/env bash
+D="$CURL_REC"
+mkdir -p "$D"
+N=$(( $(cat "$D/.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$N" >"$D/.n"
+printf '%s\n' "$*" >"$D/argv.$N"
+: >"$D/stdin.$N"
+for a in "$@"; do
+  if [ "$a" = "-K" ]; then cat >"$D/stdin.$N"; break; fi
+done
+URL=""
+WANT_W=0
+for a in "$@"; do
+  case "$a" in http://*|https://*) URL="$a" ;; esac
+  [ "$a" = "-w" ] && WANT_W=1
+done
+printf '%s\n' "$URL" >"$D/url.$N"
+case "$URL" in
+  *"/api/setup/manifest.json") exit 22 ;;   # unversioned box: nothing to report
+  *"/api/search"*)
+    printf '%s' "${CURL_SEARCH_BODY-}"
+    # CURL_SEARCH_NO_TRAILER simulates curl dying before the -w trailer is
+    # written (signal, crash, a shim) — stdout ends on the body's own last line.
+    if [ "$WANT_W" = 1 ] && [ -z "${CURL_SEARCH_NO_TRAILER-}" ]; then
+      printf '\n%s' "${CURL_SEARCH_STATUS:-200}"
+    fi
+    exit "${CURL_SEARCH_RC:-0}" ;;
+  *) exit "${CURL_PROBE_RC:-0}" ;;          # the reachability probe
+esac
+"""
+
+# One row, in the shape /api/search really answers with.
+_ONE_HIT = json.dumps(
+    [
+        {
+            "type": "decision",
+            "project": "recallproj",
+            "trust": "verified",
+            "title": "the drain deadline",
+            "snippet": "bounded refills, measured 2026-07",
+        }
+    ]
+)
+
+
+def _recall_curl(home: Path, rec_dir: Path) -> Path:
+    binp = home / "bin"
+    binp.mkdir(parents=True, exist_ok=True)
+    curl = binp / "curl"
+    curl.write_text(_RECALL_CURL)
+    curl.chmod(0o755)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    return binp
+
+
+def _recall_home(tmp_path: Path, url: str = "http://kb.invalid") -> tuple[Path, Path]:
+    """A throwaway HOME configured for the REST transport, plus a work dir whose
+    basename is the project."""
+    home = _hook_home(tmp_path)
+    (home / ".claude" / "kb-flush.env").write_text(
+        f"KB_REST_URL={url}\nKB_TOKEN={FAKE_PROJECT_TOKEN}\n"
+    )
+    work = tmp_path / "recallproj"
+    work.mkdir(exist_ok=True)
+    return home, work
+
+
+def _breaker(home: Path) -> Path:
+    return home / ".claude" / "hooks" / "state" / ".recall-breaker.stamp"
+
+
+def _hooklog(home: Path) -> str:
+    log = home / ".claude" / "hooks" / "flush-session.log"
+    return log.read_text(errors="replace") if log.exists() else ""
+
+
+def _recall_lines(home: Path) -> list[str]:
+    return [ln for ln in _hooklog(home).splitlines() if "RECALL UNAVAILABLE" in ln]
+
+
+def _calls(rec_dir: Path) -> int:
+    stamp = rec_dir / ".n"
+    return int(stamp.read_text()) if stamp.exists() else 0
+
+
+def _prompt(text: str, work: Path, sid: str = "s-recall") -> dict:
+    return {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": text,
+        "cwd": str(work),
+        "session_id": sid,
+    }
+
+
+def _start(work: Path, sid: str = "s-recall") -> dict:
+    return {
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+        "cwd": str(work),
+        "session_id": sid,
+    }
+
+
+# A prompt that clears every noise gate: long enough, not a slash command, and
+# carrying well over two content words.
+_REAL_PROMPT = "why does the drain refill stall after the deadline expires"
+
+
+def _recall_env(binp: Path, rec_dir: Path, **kw: str) -> dict:
+    env = {"PATH": f"{binp}:{os.environ.get('PATH', '')}", "CURL_REC": str(rec_dir)}
+    env.update(kw)
+    return env
+
+
+def _assert_ascii(text: str, what: str) -> None:
+    for line in text.splitlines():
+        assert line.isascii(), (
+            f"{what} emitted a non-ASCII line: {line!r} — the Windows ANSI-codepage "
+            "argv conversion mangles any non-ASCII byte (KB 12885)"
+        )
+
+
+@requires_curl
+def test_a_timed_out_recall_is_logged_and_trips_the_breaker(tmp_path):
+    """THE TRIPWIRE for 12885. A search that times out must stop being
+    indistinguishable from an empty KB: one line in the hook family's log, and a
+    breaker marker recording when it happened."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_RC="28"),  # 28 = curl's own timeout
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "", "a failed recall must still print nothing into the prompt"
+
+    lines = _recall_lines(home)
+    assert len(lines) == 1, f"expected exactly one failure line, got {lines!r}"
+    line = lines[0]
+    assert "event=UserPromptSubmit" in line, line
+    assert "transport=rest" in line, line
+    assert "/api/search" in line, line
+    assert "rc=28" in line, line
+    _assert_ascii(line, "the failure log line")
+
+    marker = _breaker(home)
+    assert marker.exists(), "the failure did not trip the breaker"
+    assert marker.read_text().strip().isdigit(), (
+        f"the breaker marker must record WHEN it tripped, got {marker.read_text()!r}"
+    )
+
+
+@requires_curl
+def test_a_five_hundred_is_a_failure_even_though_curl_exits_zero(tmp_path):
+    """`curl -sS` (no -f, which would discard the body) exits 0 on a 503 exactly
+    as on a 200. Without the status the error page is simply a body with no rows
+    in it — the fail-silent bug wearing a different hat."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(
+            binp,
+            rec_dir,
+            CURL_SEARCH_RC="0",
+            CURL_SEARCH_STATUS="503",
+            CURL_SEARCH_BODY="<html>Service Unavailable</html>",
+        ),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == ""
+    lines = _recall_lines(home)
+    assert len(lines) == 1, f"a 503 was swallowed as 'no knowledge': {_hooklog(home)!r}"
+    assert "status=503" in lines[0], lines[0]
+    assert _breaker(home).exists()
+
+
+@requires_curl
+def test_an_auth_rejection_is_logged_but_NEVER_trips_the_breaker(tmp_path):
+    """Rig case 18's catch. A 401/403 is answered instantly (there is no dead
+    wait for the breaker to protect the prompt from), it will not heal within a
+    breaker window, and the hot-breaker note's 'kb_search still works' would be
+    untrue precisely when the credential is bad. So: a loud log line, no stamp —
+    and the NEXT prompt must still reach the KB."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    env = _recall_env(
+        binp,
+        rec_dir,
+        CURL_SEARCH_RC="0",
+        CURL_SEARCH_STATUS="401",
+        CURL_SEARCH_BODY='{"detail":"unauthorized"}',
+    )
+    res = _run_hook(BRIEF, _prompt(_REAL_PROMPT, work), home, env)
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == ""
+    lines = _recall_lines(home)
+    assert len(lines) == 1, f"the 401 was swallowed in silence: {_hooklog(home)!r}"
+    assert "credential refused" in lines[0] and "status=401" in lines[0], lines[0]
+    _assert_ascii(lines[0], "the auth-failure log line")
+    assert not _breaker(home).exists(), "an auth rejection must not lock recall out"
+
+    searches_before = (rec_dir / ".n").read_text()
+    res = _run_hook(BRIEF, _prompt(_REAL_PROMPT, work), home, env)
+    assert res.returncode == 0, res.stderr
+    assert (rec_dir / ".n").read_text() != searches_before, (
+        "the next prompt made NO request — the 401 locked recall out after all"
+    )
+
+
+@requires_curl
+def test_a_missing_status_trailer_never_puts_the_body_in_the_log(tmp_path):
+    """If curl dies before writing the -w trailer, the last line of stdout is the
+    last line of a SERVER-CONTROLLED body. Unchecked, interpolating it into the
+    log leaks the user's prompt (an error page that echoes the request URL — the
+    query string IS the prompt) and can forge the pre-brief's 'capture may be
+    incomplete' warning via a scanner token. The shape-check (three digits or it
+    never existed) must keep every server byte out of the log."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    hostile_last_line = (
+        "http://kb.invalid/api/search?q=confidential%20merger%20plan FAILED NOT CAPTURED"
+    )
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(
+            binp,
+            rec_dir,
+            CURL_SEARCH_RC="0",
+            CURL_SEARCH_NO_TRAILER="1",
+            CURL_SEARCH_BODY=f"<html>error</html>\n{hostile_last_line}",
+        ),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "", "a failed recall must still print nothing into the prompt"
+    lines = _recall_lines(home)
+    assert len(lines) == 1, f"the trailer-less failure was swallowed: {_hooklog(home)!r}"
+    assert "status=none" in lines[0], lines[0]
+    log = _hooklog(home)
+    for hostile in ("confidential", "merger", "FAILED", "NOT CAPTURED"):
+        assert hostile not in log, f"server-controlled bytes reached the log: {log!r}"
+    assert _breaker(home).exists(), "a trailer-less response is still a failure"
+
+
+@requires_curl
+def test_an_unreachable_host_is_logged_rather_than_skipped_in_silence(tmp_path):
+    """The reachability probe already bailed in ~2s; it just never said so."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_PROBE_RC="7"),  # 7 = could not connect
+    )
+    assert res.returncode == 0, res.stderr
+    lines = _recall_lines(home)
+    assert len(lines) == 1, f"an unreachable KB logged nothing: {_hooklog(home)!r}"
+    assert "unreachable" in lines[0] and "rc=7" in lines[0], lines[0]
+    assert _breaker(home).exists()
+
+
+@requires_curl
+def test_zero_hits_trips_NOTHING(tmp_path):
+    """THE FALSE POSITIVE THAT MUST NEVER HAPPEN. An empty result is a healthy
+    KB answering honestly. If that tripped the breaker, every quiet project would
+    switch its own recall off — strictly worse than the bug being fixed."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY="[]", CURL_SEARCH_STATUS="200"),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "", "zero hits must stay silent, exactly as before"
+    assert _recall_lines(home) == [], "an EMPTY search was logged as a failure"
+    assert not _breaker(home).exists(), "an EMPTY search tripped the circuit breaker"
+
+
+# A `jq` that fails the hook's own probe, so the JSON backend chain falls all
+# the way through to python3 — the locked-down box rig case 20 covers.
+_BROKEN_JQ = "#!/usr/bin/env bash\nexit 1\n"
+
+
+def _shadow_jq(binp: Path) -> None:
+    fake = binp / "jq"
+    fake.write_text(_BROKEN_JQ)
+    fake.chmod(0o755)
+
+
+@requires_curl
+@pytest.mark.parametrize("backend", ["jq", "python"])
+def test_zero_hits_stays_a_SUCCESS_on_EITHER_json_backend(tmp_path, backend: str):
+    """The two backends must agree about what an empty KB looks like, or the
+    false positive comes back on exactly the boxes that have no jq."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    if backend == "python":
+        _shadow_jq(binp)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY="[]", CURL_SEARCH_STATUS="200"),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "", res.stdout
+    assert _recall_lines(home) == [], f"{backend} backend logged an empty search"
+    assert not _breaker(home).exists(), f"{backend} backend tripped on an empty search"
+    # Proof the backend under test really parsed the event rather than falling
+    # back to the SessionStart branch: per-prompt recall asks for k=3, the
+    # pre-brief for k=5.
+    assert any("k=3" in u for u in _recorded(rec_dir, "url")), (
+        f"the {backend} backend never parsed the event: {_recorded(rec_dir, 'url')}"
+    )
+
+
+@requires_curl
+@pytest.mark.parametrize("backend", ["jq", "python"])
+def test_an_unparseable_200_is_a_FAILURE_on_either_json_backend(tmp_path, backend: str):
+    """A 200 carrying something that is not the search array — a proxy error
+    page, a truncated body — is a failure, not an empty KB. The python branch
+    used to swallow the parse error as `sys.exit(0)` and so was the quiet one;
+    jq has always exited non-zero."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    if backend == "python":
+        _shadow_jq(binp)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(
+            binp,
+            rec_dir,
+            CURL_SEARCH_BODY="<html>gateway had a bad day</html>",
+            CURL_SEARCH_STATUS="200",
+        ),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout == "", res.stdout
+    lines = _recall_lines(home)
+    assert len(lines) == 1, f"{backend} backend read a broken body as an empty KB"
+    assert "unparseable" in lines[0], lines[0]
+    # Same proof as above: only a working backend can name the event.
+    assert "event=UserPromptSubmit" in lines[0], (
+        f"the {backend} backend never parsed the event: {lines[0]}"
+    )
+    assert _breaker(home).exists()
+
+
+@requires_curl
+def test_a_hot_breaker_makes_NO_call_and_says_so_in_one_ascii_line(tmp_path):
+    """The point of the breaker: while it is hot the hook must not pay the
+    remote call at all. Asserted against the recording stub — a fast failure
+    would still show up there."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    state = home / ".claude" / "hooks" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _breaker(home).write_text(f"{int(time.time())}\n")
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY=_ONE_HIT),
+    )
+    assert res.returncode == 0, res.stderr
+    assert _calls(rec_dir) == 0, (
+        f"a hot breaker still called out {_calls(rec_dir)} time(s): {_recorded(rec_dir, 'url')}"
+    )
+    assert res.stdout.count("\n") == 1, f"expected ONE context line, got {res.stdout!r}"
+    assert res.stdout.startswith("[KB recall] skipped:"), res.stdout
+    assert "breaker hot" in res.stdout and "retry after" in res.stdout, res.stdout
+    assert "kb_search still works" in res.stdout, res.stdout
+    _assert_ascii(res.stdout, "the hot-breaker context line")
+
+
+@requires_curl
+def test_the_two_events_SHARE_one_breaker(tmp_path):
+    """SessionStart and UserPromptSubmit hit the same server, so a failure on
+    either is a failure for both — one marker, not two."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    tripped = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_RC="28"),
+    )
+    assert tripped.returncode == 0, tripped.stderr
+    assert _breaker(home).exists()
+
+    before = _calls(rec_dir)
+    res = _run_hook(BRIEF, _start(work, "s-next"), home, _recall_env(binp, rec_dir))
+    assert res.returncode == 0, res.stderr
+    assert _calls(rec_dir) == before, (
+        "SessionStart ignored the breaker the prompt hook tripped and called out anyway"
+    )
+    assert res.stdout.startswith("[KB recall] skipped:"), res.stdout
+    _assert_ascii(res.stdout, "the hot-breaker context line on SessionStart")
+
+
+@requires_curl
+def test_an_expired_breaker_retries_and_a_SUCCESS_clears_the_marker(tmp_path):
+    """The breaker is a pause, never a verdict: the next prompt after the window
+    tries again, and a search that answers removes the marker."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    state = home / ".claude" / "hooks" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _breaker(home).write_text(f"{int(time.time()) - 1000}\n")  # long expired
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY=_ONE_HIT, CURL_SEARCH_STATUS="200"),
+    )
+    assert res.returncode == 0, res.stderr
+    assert _calls(rec_dir) >= 1, "an EXPIRED breaker still suppressed the call"
+    assert "[KB recall] skipped" not in res.stdout, res.stdout
+    assert "[KB recall" in res.stdout, f"the retry printed no hits: {res.stdout!r}"
+    assert "the drain deadline" in res.stdout, res.stdout
+    assert not _breaker(home).exists(), "a successful search left the breaker armed"
+
+
+@requires_curl
+def test_the_breaker_window_is_configurable(tmp_path):
+    """KB_RECALL_BREAKER_SECS follows the family's config convention (a KB_* key
+    in kb-flush.env or the environment), and 0 disables the breaker outright."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    state = home / ".claude" / "hooks" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _breaker(home).write_text(f"{int(time.time()) - 30}\n")  # 30s old
+
+    # Default window (300s): still hot at 30s.
+    hot = _run_hook(BRIEF, _prompt(_REAL_PROMPT, work), home, _recall_env(binp, rec_dir))
+    assert hot.stdout.startswith("[KB recall] skipped:"), hot.stdout
+    assert _calls(rec_dir) == 0
+
+    # A 10s window: the same 30s-old marker is cold.
+    short = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work, "s-short"),
+        home,
+        _recall_env(binp, rec_dir, KB_RECALL_BREAKER_SECS="10", CURL_SEARCH_BODY=_ONE_HIT),
+    )
+    assert short.stdout.startswith("[KB recall"), short.stdout
+    assert "skipped" not in short.stdout, short.stdout
+    assert _calls(rec_dir) >= 1, "a 10s window still treated a 30s-old marker as hot"
+
+
+@requires_curl
+def test_a_garbage_marker_can_never_become_a_PERMANENT_skip(tmp_path):
+    """A corrupt stamp must fail OPEN. A breaker that cannot prove it is fresh
+    and still suppresses would silently disable recall forever — the one outcome
+    worse than the bug."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    state = home / ".claude" / "hooks" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _breaker(home).write_text("not-a-number\n")
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY=_ONE_HIT),
+    )
+    assert res.returncode == 0, res.stderr
+    assert _calls(rec_dir) >= 1, "a garbage marker suppressed the call"
+    assert "skipped" not in res.stdout, res.stdout
+
+
+@requires_curl
+def test_a_marker_dated_in_the_FUTURE_is_cold(tmp_path):
+    """Same rule, the other direction: a clock that jumped forward and back must
+    not leave a marker that stays hot for hours."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    state = home / ".claude" / "hooks" / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _breaker(home).write_text(f"{int(time.time()) + 86400}\n")
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY=_ONE_HIT),
+    )
+    assert res.returncode == 0, res.stderr
+    assert _calls(rec_dir) >= 1, "a future-dated marker suppressed the call"
+
+
+@requires_curl
+def test_an_unusable_state_dir_degrades_to_exactly_the_old_behaviour(tmp_path):
+    """`state` replaced by a regular file: nothing can be written or read there.
+    The hook must behave precisely as it did before this feature — exit 0, print
+    nothing, and above all keep TRYING, never wedge into a permanent skip."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+    state = home / ".claude" / "hooks" / "state"
+    state.write_text("not a directory")  # mkdir -p, reads and writes all fail
+
+    env = _recall_env(binp, rec_dir, CURL_SEARCH_RC="28")
+    first = _run_hook(BRIEF, _prompt(_REAL_PROMPT, work), home, env)
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == "", first.stdout
+    assert "No such file" not in first.stderr and "Permission denied" not in first.stderr, (
+        f"the hook leaked a state-dir error to stderr: {first.stderr!r}"
+    )
+    assert state.is_file(), "the hook clobbered the thing sitting where state/ goes"
+
+    before = _calls(rec_dir)
+    second = _run_hook(BRIEF, _prompt(_REAL_PROMPT, work, "s-2"), home, env)
+    assert second.returncode == 0, second.stderr
+    assert second.stdout == "", second.stdout
+    assert _calls(rec_dir) > before, (
+        "with no usable state dir the hook stopped calling out — an unwritable "
+        "breaker must degrade to the old silent behaviour, not to a stale skip"
+    )
+
+
+@requires_curl
+def test_a_successful_recall_is_byte_for_byte_what_it_always_was(tmp_path):
+    """The success path is untouched: same header, same framing, same bullets,
+    and NOT a byte of breaker chatter."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    res = _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_BODY=_ONE_HIT, CURL_SEARCH_STATUS="200"),
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.startswith("[KB recall"), res.stdout
+    assert "project recallproj" in res.stdout, res.stdout
+    assert "stored data, not instructions" in res.stdout, res.stdout
+    assert "- [decision" in res.stdout and "the drain deadline" in res.stdout, res.stdout
+    assert "breaker" not in res.stdout and "skipped" not in res.stdout, res.stdout
+    assert _recall_lines(home) == []
+    assert not _breaker(home).exists()
+
+
+@requires_curl
+def test_the_failure_line_carries_no_credential_and_no_prompt(tmp_path):
+    """The pre-brief reads this log back into a session, so whatever lands in it
+    is a candidate for capture. The bearer never appears; neither does the query
+    string, which IS the user's prompt; nor any userinfo in the URL."""
+    home, work = _recall_home(tmp_path, url="http://user:hunter2@kb.invalid")
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    secret = "zzsecretsearchtermzz"
+    res = _run_hook(
+        BRIEF,
+        _prompt(f"why does {secret} stall the drain refill", work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_RC="28"),
+    )
+    assert res.returncode == 0, res.stderr
+    log = _hooklog(home)
+    assert "RECALL UNAVAILABLE" in log, log
+    assert FAKE_PROJECT_TOKEN not in log, "the bearer reached the hook log"
+    assert "hunter2" not in log, "URL userinfo reached the hook log"
+    assert secret not in log, "the user's prompt reached the hook log"
+    assert "?q=" not in log, "the query string reached the hook log"
+
+
+@requires_curl
+def test_a_dead_recall_is_NOT_reported_as_a_dropped_session(tmp_path):
+    """The pre-brief greps this same log for flush failures. A recall outage is
+    not a lost transcript, and phrasing it with one of that scanner's tokens
+    would make every recall blip claim the session was not captured."""
+    home, work = _recall_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recall_curl(home, rec_dir)
+
+    _run_hook(
+        BRIEF,
+        _prompt(_REAL_PROMPT, work),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_RC="28"),
+    )
+    line = _recall_lines(home)[0]
+    for token in ("FAILED", "BUG:", "NOT CONFIGURED", "NOT CAPTURED", "NEEDS TOKEN"):
+        assert token not in line, (
+            f"the recall failure line contains {token!r}, which the pre-brief's "
+            "flush-failure scanner treats as a session that was never captured"
+        )
+
+    # And prove it end to end, with the breaker disabled so the skip line cannot
+    # stand in for the warning we are asserting is absent.
+    res = _run_hook(
+        BRIEF,
+        _start(work, "s-after"),
+        home,
+        _recall_env(binp, rec_dir, CURL_SEARCH_RC="28", KB_RECALL_BREAKER_SECS="0"),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "session-flush reported a recent failure" not in res.stdout, res.stdout
+
+
+def test_the_breaker_marker_is_not_swept_by_the_recall_dedup_prune():
+    """The prune deletes `recall-*.last` older than 7 days. The breaker stamp
+    must not be named into that pattern — and it is short-lived anyway."""
+    text = BRIEF.read_text()
+    assert "-name 'recall-*.last'" in text, "the dedup prune pattern changed"
+    marker = re.search(r'BRK_FILE="\$BRK_DIR/([^"]+)"', text)
+    assert marker, "the breaker marker is no longer a single named file"
+    assert not fnmatch.fnmatch(marker.group(1), "recall-*.last"), (
+        f"the breaker marker {marker.group(1)!r} is swept by the dedup prune"
+    )
+
+
+def test_every_line_the_breaker_paths_can_emit_is_ascii_by_construction():
+    """Structural half of the ASCII rule: the two lines this feature can print
+    are ASCII in the SOURCE, so no locale or code path can smuggle a wide
+    character into an argv that Windows will mangle (KB 12885's other lesson)."""
+    text = BRIEF.read_text()
+    for needle in ("[KB recall] skipped:", "RECALL UNAVAILABLE:"):
+        idx = text.index(needle)
+        line = text[text.rindex("\n", 0, idx) + 1 : text.index("\n", idx)]
+        assert line.isascii(), f"the {needle!r} line is not ASCII in the source: {line!r}"
 
 
 # ---------------------------------------------------------------------------

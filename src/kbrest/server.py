@@ -46,6 +46,7 @@ from kbcore.errors import (
 from kbcore.models import ItemDetail, ProjectInfo, ReviewEntry, SearchHit, SimilarHit
 from kbmcp import principal_ctx
 from kbmcp.server import BearerAuthMiddleware, _validate_runtime_config
+from kbrest import auth_alert
 from kbrest.schemas import (
     EnrolRequest,
     IngestSessionRequest,
@@ -413,6 +414,10 @@ def build_app():
     """
     _validate_runtime_config()
     app = BearerAuthMiddleware(create_app())
+    # Package O: observe-only 401-burst alerting, wrapped OUTSIDE the bearer so its
+    # send-side hook sees the 401s the bearer emits. The response is forwarded
+    # byte-for-byte, so the no-oracle 401 contract (Inv. 10/12) is unchanged.
+    app = auth_alert.AuthAlertMiddleware(app)
     origin = settings.kb_web_public_url.rstrip("/")
     if origin:
         app = CORSMiddleware(

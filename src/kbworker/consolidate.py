@@ -371,12 +371,16 @@ def _on_battery() -> bool:
     band holds only ~170 readings — so the threshold sits in a sparse gap rather
     than near either mode.
 
-    FAILS OPEN, loudly. If the DB is missing, unreadable, or its newest reading is
-    STALE, this returns False and warns. A stale row is not evidence that the grid
-    is up, but a pipeline that silently never runs because another project's
-    poller died is the worse failure — and the drain is already deadline-bounded.
-    Staleness is checked explicitly: trusting a last-known-good value is exactly
-    how you flatten a battery through an outage.
+    FAIL-SAFE ON UNKNOWN-BUT-CONFIGURED STATE. A MISSING or unreadable power DB
+    fails OPEN (returns False, warns): the feature is simply not configured on
+    that box, and a pipeline that silently never runs is the worse failure there.
+    But a DB that IS configured whose newest reading is STALE fails SAFE (returns
+    True, ON BATTERY): a reading older than the freshness window right after a
+    grid outage is exactly when the sungrow poller is most likely down, so the ONE
+    time staleness matters the guard used to say 'mains' and kept the GPU running
+    into the outage. A stale value is not evidence the grid is up; on a UPS that
+    cannot ride out a fluctuation, pausing the GPU when house-power state is
+    unknown-but-configured is the safe default. Both branches warn loudly.
     """
     path = (settings.kb_power_db or "").strip()
     if not path:
@@ -407,12 +411,14 @@ def _on_battery() -> bool:
 
     if age is not None and age > settings.kb_power_max_age_seconds:
         logger.warning(
-            "power check STALE (%.0fs old, grid=%.1fV) — proceeding on mains assumption; "
-            "the sungrow poller may be down",
+            "power check STALE (%.0fs old, grid=%.1fV) — treating as ON BATTERY and standing "
+            "down; the sungrow poller may be down, and a last-known-good value is not evidence "
+            "the grid is up. Pausing the GPU is the safe default on a UPS that cannot ride out a "
+            "fluctuation; rows stay 'pending' and the next run resumes here",
             age,
             volts,
         )
-        return False
+        return True
 
     # ANY dip in the window keeps the GPU down: resuming into a flickering supply
     # is worse than staying paused a few minutes longer, and a sagging grid is

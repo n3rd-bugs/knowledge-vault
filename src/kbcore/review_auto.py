@@ -143,6 +143,19 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
       None when expiry is off (``expire_days <= 0``) or nothing is eligible.
     * ``contradiction_suggestions_pending`` — open contradiction rows carrying a
       decisive ``suggested_resolution`` that has not been executed yet.
+
+    EXAMINED-BEFORE-EXPIRY (Package O). The 08-19..09-01 expiry cliff had to be
+    reconstructed by hand, so the pool quiet-expiry silently drains is now
+    first-class (read-only; nothing here changes any expiry behavior):
+
+    * ``untriaged_expiring_7d`` / ``untriaged_expiring_30d`` — quiet-expiry-eligible
+      rows NOT yet triaged whose item reaches ``expire_days`` within 7 / 30 days:
+      the ones at risk of aging out UNEXAMINED into a live, unverified, searchable
+      item nobody looked at. Both 0 when expiry is off (``expire_days <= 0``).
+    * ``eligible_entered_1d`` / ``eligible_left_1d`` / ``eligible_flow_net_1d`` —
+      the net daily flow of that pool: rows minted in the last day, versus rows
+      that LEFT it by being triaged or having their item recalled. ``net`` > 0
+      means the backlog grows faster than it is examined.
     """
     reject = list(REJECT_TRIAGE_ACTIONS)
     with connect() as conn:
@@ -156,26 +169,67 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
             {"reject": reject},
         ).fetchone()
         first_expiry = None
+        expiring_7d = expiring_30d = 0
         if expire_days > 0:
+            # first_expiry counts EVERY eligible row (a keep-triaged row still
+            # expires); the two horizon counts narrow to UNTRIAGED-and-eligible
+            # rows — the ones at risk of aging out never having been examined.
+            untriaged = "NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage')"
+            expiry = "rq.created_at + make_interval(days => %(days)s)"
             row = conn.execute(
                 f"""
-                SELECT min(rq.created_at) + make_interval(days => %(days)s)
+                SELECT
+                    min(rq.created_at) + make_interval(days => %(days)s),
+                    count(*) FILTER (
+                        WHERE {untriaged} AND {expiry} <= now() + make_interval(days => 7)),
+                    count(*) FILTER (
+                        WHERE {untriaged} AND {expiry} <= now() + make_interval(days => 30))
                 FROM review_queue rq JOIN items i ON i.id = rq.item_id
                 WHERE {_QUIET_ELIGIBLE}
-                """,  # noqa: S608 — _QUIET_ELIGIBLE is constant SQL text, values are bound
+                """,  # noqa: S608 — every interpolated fragment is constant SQL text, values bound
                 {"days": expire_days, "reject": reject},
             ).fetchone()
             first_expiry = row[0].date().isoformat() if row and row[0] else None
+            expiring_7d, expiring_30d = int(row[1]), int(row[2])
         (contra,) = conn.execute(
             "SELECT count(*) FROM review_queue "
             "WHERE resolved = false AND reason = 'contradiction' "
             "  AND jsonb_typeof(detail->'suggested_resolution') = 'object'"
+        ).fetchone()
+        # Net daily flow of the untriaged-eligible pool. ENTERED = rows minted in
+        # the last day; LEFT = rows that were triaged or whose item was recalled in
+        # the last day (either removes a row from the at-risk-of-silent-expiry set).
+        (entered,) = conn.execute(
+            "SELECT count(*) FROM review_queue "
+            "WHERE reason = 'unverified_extraction' "
+            "  AND created_at >= now() - make_interval(days => 1)"
+        ).fetchone()
+        (left,) = conn.execute(
+            """
+            SELECT count(DISTINCT rq.id)
+            FROM review_queue rq
+            WHERE rq.reason = 'unverified_extraction'
+              AND (
+                  (rq.detail->'triage'->>'at')::timestamptz >= now() - make_interval(days => 1)
+                  OR EXISTS (
+                      SELECT 1 FROM access_log al
+                      WHERE al.item_id = rq.item_id
+                        AND al.ts >= now() - make_interval(days => 1)
+                  )
+              )
+            """
         ).fetchone()
     return {
         "triage_awaiting_apply": int(triaged),
         "reject_suggestions_pending": int(rejecting),
         "first_expiry_date": first_expiry,
         "contradiction_suggestions_pending": int(contra),
+        # Examined-before-expiry (Package O): the pool quiet-expiry drains.
+        "untriaged_expiring_7d": expiring_7d,
+        "untriaged_expiring_30d": expiring_30d,
+        "eligible_entered_1d": int(entered),
+        "eligible_left_1d": int(left),
+        "eligible_flow_net_1d": int(entered) - int(left),
     }
 
 

@@ -309,9 +309,11 @@ def requeue_extracted(
     ``saved_count = 0`` — indistinguishable, to every query in the system, from
     content that was genuinely mined and yielded nothing.
 
-    SCOPE IS THE SAFETY PROPERTY. Only rows whose extraction saved ZERO items can
-    be re-opened: a row that produced knowledge would, if re-drained, duplicate
-    it. And a selector is REQUIRED — ``ids``, a ``project``, or a ``since``
+    SCOPE IS THE SAFETY PROPERTY. Only rows whose GROUP produced ZERO items can be
+    re-opened: a row that produced knowledge would, if re-drained, duplicate it.
+    Because :func:`mark_group_extracted` books a group's total on ONE row and 0 on
+    the rest, "zero" is judged over the whole (project, source_uri) group. And a
+    selector is REQUIRED — ``ids``, a ``project``, or a ``since``
     cutoff — so this cannot become an accidental whole-table replay of every
     empty extraction the KB has ever done.
 
@@ -339,6 +341,21 @@ def requeue_extracted(
                            END
              WHERE status = 'extracted'
                AND coalesce(saved_count, 0) = 0
+               -- GROUP-AWARE zero-yield: a per-row 0 re-opens only when NO row in
+               -- its (project, source_uri) group produced anything (else re-mining
+               -- a productive session duplicates it); a degenerate uri has none.
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM ingest_queue sib
+                    WHERE sib.status = 'extracted'
+                      AND coalesce(sib.saved_count, 0) > 0
+                      AND sib.project = ingest_queue.project
+                      AND btrim(coalesce(sib.meta->>'source_uri', '')) <> ''
+                      AND btrim(coalesce(sib.meta->>'source_uri', ''))
+                            !~ '^[^:]*:[/[:space:]]*$'
+                      AND btrim(coalesce(sib.meta->>'source_uri', ''))
+                            = btrim(coalesce(ingest_queue.meta->>'source_uri', ''))
+               )
                AND (%(ids)s::bigint[] IS NULL OR id = ANY(%(ids)s::bigint[]))
                AND (%(project)s::text IS NULL OR project = %(project)s)
                AND (%(since)s::timestamptz IS NULL OR processed_at >= %(since)s)
@@ -611,16 +628,24 @@ def pending_groups(
 
 
 def mark_group_extracted(ids: list[int], saved: int, rejected: int) -> None:
-    """Flip a whole coalesced group in ONE transaction.
+    """Flip a whole coalesced group to 'extracted' in ONE transaction, booking the
+    group's totals on ONE row. All-or-nothing: every id flips together, so a group
+    extracted once cannot leave rows pending for a partial re-extraction.
 
-    All-or-nothing matters: a group extracted once must not leave some rows
-    pending for a second, partial extraction of the same session.
+    THE TOTALS BELONG TO THE GROUP, NOT EACH ROW. Writing ``saved`` / ``rejected``
+    to EVERY row multiplied ``sum(saved_count)`` by the coalesce factor (a 648-item
+    session reported 26,972 across ~42 rows). They are booked on the FIRST id and 0
+    on the rest, so the column sums to the real total; that zero on a productive
+    group's other rows is told apart from a genuinely zero-yield row by
+    :func:`requeue_extracted`, whose predicate is group-aware for exactly this.
     """
     if not ids:
         return
     with transaction() as conn:
         conn.execute(
-            "UPDATE ingest_queue SET status='extracted', saved_count=%s, "
-            "rejected_count=%s, processed_at=now() WHERE id = ANY(%s)",
-            (saved, rejected, list(ids)),
+            "UPDATE ingest_queue SET status='extracted', "
+            "saved_count = CASE WHEN id = %(first)s THEN %(saved)s ELSE 0 END, "
+            "rejected_count = CASE WHEN id = %(first)s THEN %(rejected)s ELSE 0 END, "
+            "processed_at = now() WHERE id = ANY(%(ids)s)",
+            {"first": ids[0], "saved": saved, "rejected": rejected, "ids": list(ids)},
         )

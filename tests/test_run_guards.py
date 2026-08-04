@@ -285,24 +285,52 @@ def test_a_fresh_naive_local_reading_is_fresh(karachi):
 
 def test_a_two_hour_old_naive_local_reading_is_stale(tmp_path, monkeypatch, caplog, karachi):
     """THE bug: within one UTC offset of staleness the check was neutered, so a
-    dead poller's last value was trusted as the state of the grid right now."""
+    dead poller's last value was trusted as the state of the grid right now. The
+    freshness fix detects the staleness; the FAIL-SAFE fix then stands the drain
+    down rather than assuming mains at the one moment the state is unknown."""
     monkeypatch.setattr(
         settings, "kb_power_db", _naive_local_power_db(tmp_path, karachi, 0.0, 7_200)
     )
     with caplog.at_level(logging.WARNING, logger="kbworker.consolidate"):
-        assert consolidate._on_battery() is False, "a 2h-old reading was trusted as current"
+        assert consolidate._on_battery() is True, "a 2h-old reading must fail SAFE, not open"
     assert "STALE" in caplog.text
 
 
-def test_a_six_hour_old_naive_local_reading_fails_OPEN_loudly(
+def test_a_stale_reading_fails_SAFE_on_battery_even_at_normal_voltage(
     tmp_path, monkeypatch, caplog, karachi
 ):
+    """A configured poller that DIED right after a grid outage is the exact case
+    the old fail-open handled wrong: the last reading shows a healthy 230V but is
+    six hours old, and trusting it kept the GPU running into the outage. A stale
+    reading now stands the drain down regardless of the last voltage it saw."""
     monkeypatch.setattr(
         settings, "kb_power_db", _naive_local_power_db(tmp_path, karachi, 230.0, 21_600)
     )
     with caplog.at_level(logging.WARNING, logger="kbworker.consolidate"):
-        assert consolidate._on_battery() is False, "a stale reading must not wedge the drain"
+        assert consolidate._on_battery() is True, (
+            "a stale reading must be treated as ON BATTERY, not trusted as mains"
+        )
     assert "STALE" in caplog.text and "sungrow poller may be down" in caplog.text
+
+
+def test_a_missing_power_db_fails_OPEN():
+    """Not configured on this box: the feature is off, so the drain must run — a
+    pipeline that silently never runs is the worse failure when there is no UPS
+    telemetry at all (distinct from 'configured but the poller died')."""
+    from unittest.mock import patch
+
+    with patch.object(settings, "kb_power_db", ""):
+        assert consolidate._on_battery() is False, "an unconfigured power check must fail OPEN"
+
+
+def test_an_unreadable_power_db_fails_OPEN(tmp_path, monkeypatch, caplog):
+    """Configured but the file cannot be opened (missing/corrupt): still fail OPEN.
+    Only a reading that IS present but STALE fails safe; an absent DB is the
+    'not configured' case, not the 'poller died mid-outage' case."""
+    monkeypatch.setattr(settings, "kb_power_db", str(tmp_path / "does-not-exist.sqlite3"))
+    with caplog.at_level(logging.WARNING, logger="kbworker.consolidate"):
+        assert consolidate._on_battery() is False, "an unreadable power DB must fail OPEN"
+    assert "power check unavailable" in caplog.text
 
 
 def test_a_fresh_naive_local_outage_still_pauses_the_drain(tmp_path, monkeypatch, karachi):

@@ -1,6 +1,6 @@
 # kb-backup.timer — the PRIMARY backup schedule (PLAN.md §9 + §6d).
 #
-# 03:00, i.e. BEFORE kb-consolidate.timer's 03:30. Backup used to exist only as
+# 00:30, i.e. BEFORE kb-consolidate.timer's 01:00. Backup used to exist only as
 # kb-consolidate's ExecStartPost, which made it conditional on a 4.5–7h pass
 # finishing: a power cut mid-run meant no backup that night, and on this grid
 # that is the common case, not the edge case — there is no dump for 29 or 30

@@ -297,7 +297,12 @@ def apply_triage(
     if project:
         sql.append("AND i.project = %s")
         params.append(project)
-    sql.append("ORDER BY rq.id")
+    # Priority-stamped rows (kbcore.yield_hygiene.prioritize_judge_failed marks
+    # judge-flagged items 'secondary-judge-failed' that were ingested anyway) sort
+    # FIRST so a bounded nightly batch examines the known-suspect ones before the
+    # FIFO tail. The stamp is detail->'priority'; absent = 0, so unstamped rows
+    # keep their existing rq.id order among themselves.
+    sql.append("ORDER BY COALESCE((rq.detail->'priority')::int, 0) DESC, rq.id")
     with connect() as conn:
         rows = conn.execute("\n".join(sql), params).fetchall()
 

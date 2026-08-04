@@ -1,0 +1,39 @@
+# kb-boot-check.service — detect an unclean prior shutdown and push ONE ntfy line.
+#
+# After a power cut the box restarts with no signal it went down hard (four
+# silent reboots on 2026-08-01). This oneshot arms a persistent dirty-flag at
+# boot (ExecStart) and clears it at a clean stop (ExecStop); a marker that
+# survives to the next boot is an unclean shutdown, and the ExecStart script
+# pushes exactly one notification. RemainAfterExit keeps the unit "active"
+# between boot and shutdown so ExecStop fires on an orderly stop — and does NOT
+# on a crash, which is the entire signal.
+#
+# NOT a boot loop: kb-boot-check.sh exits 0 unconditionally, and the marker is
+# idempotent per boot (it stores the running boot id), so the unit can never emit
+# two pushes for one recovery. See systemd/kb-boot-check.sh and src/kbcore/boot.py.
+[Unit]
+Description=Knowledge Vault unclean-shutdown detector (one ntfy line on recovery)
+# The push needs the network; the script retries across the boot-time race while
+# ntfy/cloudflared come up (same budget as kb-notify-fail.sh).
+After=network.target
+OnFailure=kb-notify-fail@%n.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=%h/kb/repo
+# The marker path follows KB_RAW when .env is present, but its default is fine —
+# a missing/broken .env must not stop crash detection (leading '-' = optional).
+EnvironmentFile=-%h/kb/repo/.env
+ExecStart=%h/kb/repo/systemd/kb-boot-check.sh
+# Clean stop only: this runs on `systemctl stop` and an orderly shutdown, NOT on
+# a power loss — so a marker still present at the next boot means it never ran.
+ExecStop=%h/kb/repo/.venv/bin/python -m kbcore.boot clean
+NoNewPrivileges=true
+# Sized to the script's retry budget (3 x 10s + 40s backoff = 70s), same as
+# kb-notify-fail@.service — a timeout below the budget would kill the push
+# mid-retry and lose the alert. tests/test_boot_edges.py re-derives this.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target

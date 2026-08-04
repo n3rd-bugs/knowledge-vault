@@ -88,6 +88,8 @@ class Settings(BaseSettings):
     kb_notify_url: str = ""
     kb_notify_topic: str = ""
     kb_notify_token: str = ""
+    # 401-burst alert (Package O): >N failed-auth/10min pushes one ntfy line, 1/h max; 0=off.
+    kb_auth_alert_threshold: int = 20
     # Lifetime of the FastMCP-issued access token. Decoupled from Google's ~1h
     # upstream expiry so a client hiccup doesn't surface as an hourly logout;
     # the proxy refreshes Google underneath (access_type=offline).

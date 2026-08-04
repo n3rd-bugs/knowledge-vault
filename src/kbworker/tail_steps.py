@@ -85,6 +85,11 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     expiry = counts.get("first_expiry_date")
     if expiry and _expiring_soon(expiry):
         lines.append(f"review rows start expiring {expiry}")
+    # The urgent cut of the above (Package O): rows that will age out UNEXAMINED
+    # within a week — each becomes permanently-unverified knowledge if not triaged.
+    expiring_7d = counts.get("untriaged_expiring_7d")
+    if expiring_7d:
+        lines.append(f"EXPIRY: {expiring_7d} untriaged rows expire within 7d")
     stale = _stale_hook_projects(counts.get("fleet_degenerate_by_project"))
     if stale:
         # NAMED, not counted: the action is "go update that machine's hooks", and

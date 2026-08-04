@@ -551,7 +551,12 @@ def test_marking_a_group_extracted_is_atomic(kb):
     ingest_queue.mark_group_extracted(ids, saved=2, rejected=1)
     with connect() as conn:
         rows = conn.execute(
-            "SELECT status, saved_count FROM ingest_queue WHERE id = ANY(%s)", (ids,)
+            "SELECT id, status, saved_count FROM ingest_queue WHERE id = ANY(%s)", (ids,)
         ).fetchall()
-    assert {r[0] for r in rows} == {"extracted"}, "not every row in the group was flipped"
-    assert {r[1] for r in rows} == {2}
+    assert {r[1] for r in rows} == {"extracted"}, "not every row in the group was flipped"
+    # The group total is attributed to ONE row (the first id) and 0 to the rest,
+    # so sum(saved_count) equals the real total instead of total*rows (the
+    # per-row over-reporting fix). Atomicity — every row flipped — is unchanged.
+    by_id = {r[0]: r[2] for r in rows}
+    assert sum(by_id.values()) == 2, "the group total must not be multiplied per row"
+    assert by_id[ids[0]] == 2 and all(by_id[i] == 0 for i in ids[1:])

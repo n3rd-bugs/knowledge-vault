@@ -251,9 +251,14 @@ def test_normal_mains_does_not_pause(tmp_path, monkeypatch):
     assert _on_battery() is False
 
 
-def test_a_stale_reading_fails_OPEN_and_does_not_wedge_the_drain(tmp_path, monkeypatch, caplog):
-    """A dead sungrow poller must not silently stop the KB pipeline forever.
-    Failing open is the deliberate choice; the drain is deadline-bounded anyway."""
+def test_a_stale_reading_fails_SAFE_and_pauses_the_gpu(tmp_path, monkeypatch, caplog):
+    """REVERSED 2026-08-04: a configured-but-STALE reading now stands the drain
+    down, not proceeds. The old fail-OPEN fired at exactly the wrong moment —
+    right after a grid outage the sungrow poller is the thing most likely dead,
+    so 'proceed on mains' kept the GPU running into the outage the guard exists
+    to catch. On a UPS that cannot ride out a fluctuation, an UNKNOWN house-power
+    state is treated as on-battery. (A MISSING db still fails open — feature off,
+    a different case: test_a_missing_power_db_fails_open_loudly.)"""
     import logging
 
     from kbcore.config import settings
@@ -261,7 +266,7 @@ def test_a_stale_reading_fails_OPEN_and_does_not_wedge_the_drain(tmp_path, monke
 
     monkeypatch.setattr(settings, "kb_power_db", _power_db(tmp_path, 0.0, age_seconds=99_999))
     with caplog.at_level(logging.WARNING, logger="kbworker.consolidate"):
-        assert _on_battery() is False, "a stale reading wedged the drain"
+        assert _on_battery() is True, "a stale reading no longer pauses the GPU"
     assert "STALE" in caplog.text, "the staleness was not surfaced"
 
 

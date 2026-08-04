@@ -2,7 +2,9 @@
 # Install/refresh the Knowledge Vault systemd user units (PLAN.md §9).
 # kb-mcp (Ph2), kb-worker (Ph3), kb-consolidate.{service,timer} (Ph4),
 # kb-restore-test.{service,timer} + kb-cloudflared-refresh.{service,timer}
-# + kb-backup.{service,timer} (§6d) + kb-consolidate-boot.timer (catch-up)
+# + kb-backup.{service,timer} (§6d) + kb-consolidate-boot.{timer,service}
+#   (catch-up drain + its boot-path guard: backup runs before the drain)
+# + kb-boot-check.service (fires one ntfy line after an unclean shutdown)
 # + kb-notify-fail@.service (the OnFailure notifier every unit hands off to).
 #
 # EVERY unit file in systemd/ is installed by the loop below — deliberately, not
@@ -19,10 +21,12 @@ for unit in "${REPO_DIR}"/systemd/*.service "${REPO_DIR}"/systemd/*.timer; do
   [[ -e "${unit}" ]] || continue
   install -m 644 "${unit}" "${UNIT_DIR}/"
 done
-# The failure notifier is executed from the repo (like scripts/backup.sh), so it
-# only needs to be executable — but a lost +x turns every failure alert into a
-# second failure, so assert it here rather than trusting the checkout.
+# The notifier scripts are executed from the repo (like scripts/backup.sh), so
+# they only need to be executable — but a lost +x turns an alert into a second
+# failure (or a silent boot recovery), so assert it here rather than trusting the
+# checkout. kb-boot-check.sh is the unclean-shutdown notifier's ExecStart.
 chmod 755 "${REPO_DIR}/systemd/kb-notify-fail.sh"
+chmod 755 "${REPO_DIR}/systemd/kb-boot-check.sh"
 
 # --- tiktoken cache: persistent, and warm before the first run ----------------
 # tiktoken's default cache lives under /tmp (tmpfs), so every boot wipes it and
@@ -60,6 +64,16 @@ systemctl --user enable kb-consolidate-boot.timer
 # interrupted night produced nothing at all (29 + 30 July have no dump). The
 # local dump needs no configuration; the offsite leg stays opt-in via .env.
 systemctl --user enable --now kb-backup.timer
+# kb-boot-check detects an unclean prior shutdown and pushes ONE ntfy line.
+# Enabled WITH --now on purpose (unlike the boot catch-up timer): --now arms the
+# dirty-flag marker immediately, so a clean shutdown TODAY is recorded and the
+# first run cannot false-positive (an absent marker reads as clean). It does no
+# heavy work — it only touches a marker file and, at most, sends one push.
+# RemainAfterExit keeps it active so its ExecStop fires on an orderly shutdown.
+systemctl --user enable --now kb-boot-check.service
+# kb-consolidate-boot.service (the boot-path guard the boot timer triggers) is
+# deliberately NOT enabled here: it has no [Install] and is started only by
+# kb-consolidate-boot.timer's Unit=. Installing the file (loop above) is enough.
 # kb-restore-test is intentionally left DISABLED (it spins a throwaway container);
 # enable manually: systemctl --user enable --now kb-restore-test.timer
 # kb-cloudflared-refresh is also left DISABLED (it re-pulls + recreates the public
@@ -76,8 +90,15 @@ systemctl --user --no-pager status kb-mcp.service || true
 systemctl --user --no-pager status kb-worker.service || true
 systemctl --user --no-pager list-timers 'kb-*' || true
 echo "installed: every unit in ${REPO_DIR}/systemd (services + timers)"
-echo "  enabled: kb-worker, kb-consolidate.timer, kb-consolidate-boot.timer, kb-backup.timer"
+echo "  enabled: kb-worker, kb-consolidate.timer, kb-consolidate-boot.timer, kb-backup.timer, kb-boot-check.service"
 echo "  installed but not enabled: kb-restore-test.timer, kb-cloudflared-refresh.timer"
+echo "  kb-consolidate-boot.service is the boot guard, started only by kb-consolidate-boot.timer"
 echo "  kb-notify-fail@.service is a template invoked via OnFailure= (never enabled directly)"
 echo "  tiktoken cache: ${TIKTOKEN_DIR} (pre-warmed from vendor/tiktoken)"
-echo "logs: journalctl --user -u kb-mcp -f | -u kb-worker -f | -u kb-consolidate -f"
+echo "logs: journalctl --user -u kb-mcp -f | -u kb-worker -f | -u kb-consolidate -f | -u kb-boot-check -f"
+# MANUAL CLEANUP — this installer runs NO docker. The compose stack pins its
+# network to 'kbnet' (docker-compose.yml), which orphaned the old auto-created
+# default network 'data-server_default'. Remove it by hand once nothing uses it:
+echo "manual cleanup (no docker is run here): the orphaned compose network"
+echo "  'data-server_default' can be removed once nothing is attached —"
+echo "    docker network rm data-server_default"

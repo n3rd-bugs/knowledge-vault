@@ -383,13 +383,19 @@ def create_summary(project: str, topic: str, body: str, source_item_ids: list[in
     knowledge" from "auto-generated from unreviewed extractions". Now it does.
     """
     ts = datetime.now(UTC)
+    # A namespace-only topic ('lang:python', 'tool:docker') titles the summary
+    # 'Summary — lang:python', which reads as noise and leaked 213 such items into
+    # the corpus (cleaned 2026-08-04). Strip the namespace prefix for the TITLE;
+    # the topic itself is unchanged everywhere else it is used.
+    _ns, _sep, _rest = topic.partition(":")
+    title_topic = _rest if _sep and " " not in _ns else topic
     ids = list(dict.fromkeys(source_item_ids))
     with transaction() as conn:
         new_id = ingest_in(
             conn,
             project,
             "summary",
-            f"Summary — {topic}",
+            f"Summary — {title_topic}",
             body,
             kind="chat",
             uri=f"summary:{project}:{topic}:{ts.isoformat()}",

@@ -240,10 +240,15 @@ def test_the_post_run_backup_is_kept_as_a_bonus():
 def test_the_boot_catchup_timer_is_in_the_repo():
     """Persistent=true covers a MISSED window, not a run that started and was
     killed 32 minutes in (2026-07-30). This timer covers the second case; it
-    existed only on the live machine until 2026-08-01."""
+    existed only on the live machine until 2026-08-01.
+
+    It now triggers the boot-path GUARD (kb-consolidate-boot.service), which
+    orders the day's backup ahead of the drain, rather than kb-consolidate.service
+    directly — see tests/test_boot_edges.py for the ordering. The catch-up still
+    reaches the drain, just through the guard."""
     timer = parse_unit("kb-consolidate-boot.timer")["Timer"]
     assert timer["OnBootSec"], "no OnBootSec — this timer's entire purpose"
-    assert timer["Unit"] == ["kb-consolidate.service"]
+    assert timer["Unit"] == ["kb-consolidate-boot.service"]
     assert parse_unit("kb-consolidate-boot.timer")["Install"]["WantedBy"] == ["timers.target"]
 
 

@@ -1,0 +1,35 @@
+# kb-consolidate-boot.service — boot-path GUARD: the day's backup runs before the
+# catch-up drain does.
+#
+# The boot catch-up (kb-consolidate-boot.timer, OnBootSec=10min) can start a
+# 4.5-7h drain. A boot between 00:00 and 00:30 fires that catch-up BEFORE the
+# 00:30 backup window; the drain would then run heavy extractor I/O across the
+# backup and — worse on this grid — could push the day's only backup late. So the
+# timer now triggers THIS guard instead of kb-consolidate.service directly.
+#
+# ORDERING (the systemd-idiomatic "run B, then me, then C"):
+#   Wants=/After=kb-backup.service        — ensure a backup has RUN, and wait for it.
+#   Wants=/Before=kb-consolidate.service  — then let the catch-up drain proceed.
+# Wants (not a bare After=) is required because at OnBootSec the backup is not yet
+# in any transaction to order against: in the 00:15-boot case its 00:30 timer has
+# not fired, and after a daytime power cut its Persistent catch-up has already
+# FINISHED and gone inactive. Pulling it in guarantees the ordering in every case.
+# The cost is one extra pg_dump per boot — cheap, and a fresh dump taken right
+# after a power event, before a 7h drain, is if anything desirable on this box.
+#
+# The drain itself still runs as kb-consolidate.service (its readiness wait,
+# tiktoken seeding, OnFailure and post-run backup all apply unchanged); this unit
+# is a pure ordering barrier and does no work of its own. It has no [Install]:
+# only kb-consolidate-boot.timer starts it, never a boot target directly.
+[Unit]
+Description=Knowledge Vault boot catch-up guard (backup before the catch-up drain)
+Wants=kb-backup.service
+After=kb-backup.service
+Wants=kb-consolidate.service
+Before=kb-consolidate.service
+OnFailure=kb-notify-fail@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+NoNewPrivileges=true

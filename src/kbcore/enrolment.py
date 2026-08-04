@@ -219,8 +219,7 @@ def redeem(
         # repeater after three codes were burned in a row (KB 1198).
         with transaction() as conn:
             conn.execute(
-                "UPDATE enrolment_codes SET redeemed_at = NULL, redeemed_from = NULL "
-                "WHERE id = %s",
+                "UPDATE enrolment_codes SET redeemed_at = NULL, redeemed_from = NULL WHERE id = %s",
                 (code_id,),
             )
         raise InvalidOperation(

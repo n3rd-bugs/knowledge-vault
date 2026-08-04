@@ -16,6 +16,11 @@
 - q: "drv_spi_write gotcha"                            # identifier query 2 (symbol lookup)
   expect_substr: ["DRV8706"]
 - q: "have we hit SPI problems anywhere"               # cross-project gotcha phrasing 2
+  # KNOWN RED (2026-08-04): code-symbol dilution — the i-redis stack-pointer
+  # ("sp") corpus outranks the DRV8706 gotcha for this vague phrasing (the
+  # dilution itself is recorded as item 6858). Kept red on purpose: it is the
+  # canary for vague cross-project recall; do not repoint it to whatever
+  # happens to rank — fixing it means fixing retrieval, not the case.
   expect_substr: ["DRV8706"]
 - q: "systemd service keeps restarting how to debug"
   expect_substr: ["journalctl"]
@@ -79,15 +84,28 @@
 
 # --- mined from access_log 2026-07-18 (kb eval mine; real search→get confirmations) ---
 - q: "supersede does not auto-close valid_to valid-time bitemporal as_of design decision"
-  expect_item_id: 775                                   # 3 confirmations
+  # was 775 ("no auto-close in v1", 3 confirmations). The BEHAVIOR then
+  # reversed: supersede now auto-closes the old validity window (gateway
+  # decision, item 8163; kbcore/supersede.py). The query keeps the historical
+  # phrasing a user would still type; the case tracks the item that answers
+  # it correctly TODAY — a golden case must track the ACTIVE revision.
+  expect_item_id: 8163
 - q: "extractor model selection qwen3 14b embedding bge-m3 choice rationale ollama"
   expect_item_id: 313
 - q: "bare-metal redis GET benchmark verify-qemu zebu-layout UART hash pass fail known issue"
-  expect_item_id: 124
+  # was 124 (unroll). The same gotcha was re-captured richer by a later session
+  # (858, muhammadusama) and now outranks the original everywhere; both are
+  # active — cross-project near-twins are invisible to the per-project dedupe.
+  expect_item_id: 858
 - q: "upload markdown or HTML content as Google Doc, create_file textContent conversion, docx export best practice"
-  expect_item_id: 383
+  # was 383 (unroll runbook). Same knowledge re-captured sharper as 488
+  # (redis-riscv-qemu gotcha: upload text/html, NOT text/markdown), rank 1.
+  expect_item_id: 488
 - q: "stream push status sensor settings on-change realtime"
-  expect_item_id: 470  # was 81; doc-refresh superseded it 81->470 — a golden case must track the ACTIVE revision
+  # was 81 -> 470 (doc-refresh supersede), now 470 -> ... -> 6431: the chain
+  # moved twice more. A golden case must track the ACTIVE revision — the head
+  # of the supersession chain, not any link inside it.
+  expect_item_id: 6431
 - q: "mTLS fleet agent deferred config-sync"
   expect_item_id: 68
 
@@ -109,3 +127,17 @@
 # recipe for resolving them, in eval/golden.proposed.yaml. Move them here once the
 # ids are filled in. tests/test_eval_plumbing.py exercises the same shape against
 # a seeded kb_test corpus.
+
+# --- promoted from golden.proposed.yaml 2026-08-04 (ids resolved live) -------
+- q: "UART dropping bytes at high baud rate"
+  # rank-sensitive twin of the expect_substr case above: 984 is the gotcha
+  # itself; a slide below rank 3 is a ranking regression hit@5 cannot see.
+  expect_item_id: 984
+  expect_rank_le: 3
+- q: "TPS55288 I2C output voltage"
+  expect_substr: ["TPS55288"]
+  # Guard: cross-domain leakage — the Urdu teaching item creeping into the
+  # top-5 for a hardware identifier query (e.g. via graph expansion) must
+  # fail loudly. forbid-only criteria never inflate hit@5.
+  forbid_item_id: 987
+  kwargs: {expand: true}

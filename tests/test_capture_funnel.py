@@ -985,6 +985,338 @@ def test_the_notify_hook_keeps_basic_auth_off_the_command_line_too(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Behavioural: "how much of this session is in the KB?" in the completion ping
+# ---------------------------------------------------------------------------
+#
+# THE MISATTRIBUTION CLASS. The obvious source for "bytes flushed" is the shared
+# flush log — and it is the wrong one: every session on the box appends its
+# "ok bytes=" lines there, so the newest line usually belongs to a NEIGHBOUR.
+# The backfill sweep shipped with exactly that bug. The number must come from
+# this session's OWN offset file, whose name IS the session identity, and the
+# tests below plant neighbour evidence to prove nothing else is consulted.
+#
+# The other half is knowing what cannot be known: LOCAL-mode flushes never write
+# an offset, and the flush hook DELETES the offset after a terminal drain. A
+# missing number is reported by SAYING NOTHING, never by printing a zero or a
+# question mark that a human would read as "the session was lost".
+
+# 5452595 B / 1048576 = 5.19… -> "5.2MB"; 4299161 B -> "4.1MB". Hardcoded on
+# purpose: these pin the human formatting (shared unit, one decimal at MB), not
+# merely the arithmetic.
+_KB_SIZE = 5452595
+_KB_FLUSHED = 4299161
+
+
+def _notify_home(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A throwaway HOME with a recording curl and a configured ntfy channel."""
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recording_curl(home, rec_dir)
+    # NTFY_MACHINE pins the one part of the message that would otherwise be this
+    # developer's hostname — the "no kb segment" assertions read the whole body.
+    (home / ".claude" / "notify.env").write_text(
+        "NTFY_URL=http://127.0.0.1:9\nNTFY_TOPIC=some-topic\nNTFY_MACHINE=testbox\n"
+    )
+    (home / ".claude" / "hooks" / "state").mkdir(parents=True, exist_ok=True)
+    return home, rec_dir, binp
+
+
+def _run_notify(home: Path, binp: Path, rec_dir: Path, event: dict):
+    return _run_hook(
+        NOTIFY,
+        event,
+        home,
+        {"PATH": f"{binp}:{os.environ.get('PATH', '')}", "CURL_REC": str(rec_dir)},
+    )
+
+
+def _notify_message(rec_dir: Path) -> str:
+    """The exact notification body, lifted back out of the recorded curl argv."""
+    argvs = _recorded(rec_dir, "argv")
+    assert argvs, "the notify hook never invoked curl"
+    m = re.search(r"-d (.*?) https?://", argvs[0])
+    assert m, f"no -d payload in the recorded argv: {argvs[0]!r}"
+    return m.group(1)
+
+
+def _okey_pipeline(script: Path, var: str) -> str:
+    """The offset-key derivation AS WRITTEN in <script>, as a runnable pipeline.
+
+    Derived from the source rather than restated, so the two scripts are compared
+    against each other and never against this test's idea of the sanitisation.
+    """
+    m = re.search(
+        rf"""{var}=\$\(printf '%s' "\$\{{SID:-\$\w+\}}"\s*(\|[^)]*)\)""",
+        script.read_text(),
+    )
+    assert m, f"the {var} derivation in {script.name} no longer has the expected shape"
+    return m.group(1)
+
+
+def _flush_okey(sid: str) -> str:
+    """The offset-file key for <sid>, computed by the FLUSH hook's own code."""
+    pipeline = _okey_pipeline(FLUSH, "OKEY")
+    out = subprocess.run(
+        ["bash", "-c", f'printf %s "$SID" {pipeline}'],
+        env={"SID": sid, "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return out.stdout
+
+
+def _sized_transcript(path: Path, size: int) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({"type": "user", "text": "x" * 200}) + "\n"
+    path.write_text((line * (size // len(line) + 1))[:size], encoding="utf-8")
+    assert path.stat().st_size == size
+    return path
+
+
+def test_the_notify_message_reports_this_sessions_own_flushed_bytes(tmp_path):
+    """Offset file present -> "kb <flushed>/<size>", read from THIS session's
+    checkpoint. A neighbour's finished flush is planted in the shared log and in
+    the ledger; neither may influence the number."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    (state / f"{_flush_okey('s-mine')}.offset").write_text(str(_KB_FLUSHED))
+    # A neighbour session that IS fully flushed, in both shared records.
+    (state / f"{_flush_okey('s-neighbour')}.offset").write_text(str(_KB_SIZE))
+    (state / ".backfill-done").write_text(f"{_flush_okey('s-neighbour')}\t{_KB_SIZE}\n")
+    (home / ".claude" / "hooks" / "flush-session.log").write_text(
+        "2026-08-04T09:00:00+00:00 flush other ok bytes=5452595 (offset 5452595/5452595)\n"
+    )
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-mine",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert "kb 4.1/5.2MB" in msg, f"the flushed/total figure is wrong or absent: {msg!r}"
+    assert msg.endswith("(kb 4.1/5.2MB)"), f"unexpected message shape: {msg!r}"
+
+
+def test_kb_progress_survives_a_transcript_path_with_spaces(tmp_path):
+    """Claude Code's project dirs are derived from real working directories, and
+    those have spaces in them. An unquoted path here would stat the wrong file
+    (or nothing) and silently drop the figure."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "my project dir"
+    transcript = _sized_transcript(work / "a session.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    (state / f"{_flush_okey('s-spaces')}.offset").write_text(str(_KB_FLUSHED))
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-spaces",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    assert "kb 4.1/5.2MB" in _notify_message(rec_dir)
+
+
+def test_a_fully_drained_session_reports_synced_from_the_backfill_ledger(tmp_path):
+    """The flush hook DELETES the offset after a terminal SessionEnd drain, so
+    "no offset file" does not mean "nothing was captured". The backfill ledger is
+    the durable record that survives it — a hit for THIS key means fully in."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    assert not (state / f"{_flush_okey('s-done')}.offset").exists()
+    (state / ".backfill-done").write_text(
+        f"{_flush_okey('s-other')}\t42\n{_flush_okey('s-done')}\t{_KB_SIZE}\n"
+    )
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-done",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert "kb 5.2MB synced" in msg, f"a fully drained session was not reported: {msg!r}"
+
+
+def test_the_kb_part_is_OMITTED_when_this_session_has_no_state_of_its_own(tmp_path):
+    """LOCAL-mode flushes write no offset at all. With no checkpoint and no
+    ledger entry for THIS session the honest report is silence — and the
+    neighbour evidence sitting right next to it must not be borrowed."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    (state / f"{_flush_okey('s-neighbour')}.offset").write_text(str(_KB_SIZE))
+    (state / ".backfill-done").write_text(f"{_flush_okey('s-neighbour')}\t{_KB_SIZE}\n")
+    (home / ".claude" / "hooks" / "flush-session.log").write_text(
+        "2026-08-04T09:00:00+00:00 flush other ok bytes=5452595 (offset 5452595/5452595)\n"
+    )
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-unknown",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert "kb" not in msg, (
+        f"a neighbour session's bytes were attributed to this one: {msg!r} — this is "
+        "the misattribution the backfill sweep already had to fix"
+    )
+    assert msg == "Claude finished — proj @ testbox", f"the base message changed: {msg!r}"
+
+
+def test_a_corrupt_offset_file_degrades_to_omission_and_still_exits_zero(tmp_path):
+    """A non-numeric checkpoint means "we cannot tell", which is NOT the same as
+    zero: printing "kb 0.0/5.2MB" would report a lost session. Say nothing, and
+    never let the parse failure reach the hook's exit status."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    (state / f"{_flush_okey('s-corrupt')}.offset").write_text("not-a-number\n")
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-corrupt",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert "kb" not in msg, f"a corrupt checkpoint was rendered as a figure: {msg!r}"
+    assert msg == "Claude finished — proj @ testbox", f"the base message changed: {msg!r}"
+
+
+@pytest.mark.parametrize(
+    "sid",
+    [
+        "0f3c9a12-4b7e-4d21-9a55-6c2e8d10ab77",  # the ordinary shape
+        "sess/with spaces:and*stars",  # every character the hook rewrites
+        "x" * 300,  # longer than the 120-byte cap
+        "",  # absent id -> both fall back to the transcript path
+    ],
+)
+def test_the_notify_hook_derives_the_offset_key_exactly_like_the_flush_hook(sid: str):
+    """The key is the JOIN between the two scripts: notify reads the file flush
+    writes. Approximating the sanitisation (it is `tr -c` based and length-capped)
+    would read a path that never exists for any id containing a rewritten
+    character, and the figure would silently never appear. Both derivations are
+    extracted from their own source and RUN, so agreement is proved, not assumed.
+    """
+    flush_pipe = _okey_pipeline(FLUSH, "OKEY")
+    notify_pipe = _okey_pipeline(NOTIFY, "_okey")
+    env = {"SID": sid, "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
+
+    def run(pipeline: str) -> str:
+        return subprocess.run(
+            ["bash", "-c", f'printf %s "${{SID:-/home/u/.claude/projects/p/t.jsonl}}" {pipeline}'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    assert run(flush_pipe) == run(notify_pipe) != "", (
+        f"the two offset-key derivations disagree for {sid!r}: "
+        f"{run(flush_pipe)!r} vs {run(notify_pipe)!r}"
+    )
+
+
+def _shell_fn(script: Path, name: str) -> str:
+    """The function <name> AS WRITTEN in <script>, extracted for execution.
+
+    Source-extracted rather than restated, so the test proves what the shipped
+    script does, never what this file believes it does.
+    """
+    m = re.search(rf"^{name}\(\) \{{.*?^\}}", script.read_text(), re.S | re.M)
+    assert m, f"{name}() not found in {script.name}"
+    return m.group(0)
+
+
+@pytest.mark.parametrize(
+    ("escaped", "native"),
+    [
+        # The JSON-escaped native form the notify hook's grep/sed keeps, next to
+        # the unescaped form the flush hook's JSON backend hands to kb_winpath.
+        (r"C:\\Users\\Usama Masood\\.claude\\t.jsonl", r"C:\Users\Usama Masood\.claude\t.jsonl"),
+        # Some builds emit forward slashes — no escaping involved, same file.
+        ("C:/Users/u/.claude/projects/p/t.jsonl", "C:/Users/u/.claude/projects/p/t.jsonl"),
+    ],
+)
+def test_a_windows_transcript_maps_exactly_like_the_flush_hooks_winpath(escaped: str, native: str):
+    """Windows is the one box where the two hooks see DIFFERENT spellings of the
+    same transcript: notify gets the JSON-escaped drive path, flush gets the
+    unescaped one. Both must land on the same POSIX path, or notify stats a file
+    flush is checkpointing under another name and the figure never appears."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
+
+    def run(fn_src: str, fn: str, arg: str) -> str:
+        return subprocess.run(
+            ["bash", "-c", f'{fn_src}\n{fn} "$1"', "-", arg],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    ours = run(_shell_fn(NOTIFY, "kb_posixpath"), "kb_posixpath", escaped)
+    theirs = run(_shell_fn(FLUSH, "kb_winpath"), "kb_winpath", native)
+    assert ours == theirs != "", f"path mapping diverged: {ours!r} vs {theirs!r}"
+    assert ours.startswith("/c/"), f"expected a POSIX drive path, got {ours!r}"
+
+
+def test_a_posix_path_passes_through_kb_posixpath_untouched():
+    """Only drive-letter paths are rewritten. A Linux path — even one containing
+    a literal backslash, which is a legal filename byte — must come out
+    byte-identical, or the hook corrupts the very path it is about to stat."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"}
+    for weird in ("/home/u/.claude/projects/p/t.jsonl", r"/home/u/di\r/t.jsonl"):
+        out = subprocess.run(
+            ["bash", "-c", f'{_shell_fn(NOTIFY, "kb_posixpath")}\nkb_posixpath "$1"', "-", weird],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert out == weird, f"a POSIX path was rewritten: {weird!r} -> {out!r}"
+
+
+# ---------------------------------------------------------------------------
 # Behavioural: the stale-hook detector on a DEFAULT-ENROLLED box
 # ---------------------------------------------------------------------------
 

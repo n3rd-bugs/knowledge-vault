@@ -60,14 +60,150 @@ if [ -n "$SECS" ] && [ "$SECS" -lt "$MIN" ]; then
 fi
 
 if [ -n "$SECS" ]; then
-  if [ "$SECS" -ge 60 ]; then TOOK=" ($((SECS / 60))m$((SECS % 60))s)"; else TOOK=" (${SECS}s)"; fi
+  if [ "$SECS" -ge 60 ]; then TOOK="$((SECS / 60))m$((SECS % 60))s"; else TOOK="${SECS}s"; fi
 else
   TOOK=""
 fi
+
+# ------------------------------------------------------ how much reached the KB
+# "kb 4.1/5.2MB" — of this transcript's 5.2 MB, 4.1 MB have been accepted by the
+# Knowledge Vault. It answers the one question the completion ping could not:
+# whether the work just done is captured, or is still sitting on this disk.
+#
+# THE NUMBER COMES FROM THIS SESSION'S OWN CHECKPOINT FILE, never from the shared
+# flush log. That log is append-only and machine-wide: every session on the box
+# writes "ok bytes=" lines into it, so reading the last one attributes a
+# NEIGHBOUR's flush to this session. That is precisely the misattribution the
+# backfill sweep shipped with and had to fix; do not reintroduce it by grepping
+# the log. The per-session offset file has no such ambiguity — its name IS the
+# session identity.
+#
+# EVERY read here is a local stat/cat/awk on files the hooks themselves own, and
+# every failure path returns EMPTY rather than guessing, so the worst case is a
+# notification that looks exactly like the one before this feature existed.
+
+kb_human() { # <bytes> [<denominator bytes>] -> "437B" | "812KB" | "4.1MB" | "1.2GB"
+  # With two arguments the pair SHARES one unit, chosen from the second (the
+  # larger, i.e. the transcript size): "4.1/5.2MB" reads at a glance, where
+  # "4.1MB/5.2MB" makes the reader compare units before values.
+  awk -v a="$1" -v b="${2:-}" 'BEGIN {
+    s = (b == "" ? a : b)
+    if      (s >= 1073741824) { d = 1073741824; u = "GB"; p = 1 }
+    else if (s >= 1048576)    { d = 1048576;    u = "MB"; p = 1 }
+    else if (s >= 1024)       { d = 1024;       u = "KB"; p = 0 }
+    else                      { d = 1;          u = "B";  p = 0 }
+    if (b == "") printf "%.*f%s", p, a / d, u
+    else         printf "%.*f/%.*f%s", p, a / d, p, b / d, u
+  }' 2>/dev/null
+}
+
+kb_posixpath() { # JSON-escaped native Windows path -> POSIX; anything else passes through
+  # A Windows event carries "C:\\Users\\..." and our grep/sed extraction keeps
+  # the doubled backslashes (the flush hook never sees them — its jq/python3
+  # backend unescapes during parsing). Collapse them, then map the drive path
+  # the way flush-session-to-kb.sh's kb_winpath does: cygpath when it exists,
+  # else the pure-shell C:\x -> /c/x fallback. Non-drive paths pass through
+  # untouched, so a Linux path containing a backslash is never corrupted.
+  case "${1:-}" in [A-Za-z]:*) ;; *)
+    printf '%s' "${1:-}"
+    return 0
+    ;;
+  esac
+  _kbp=$(printf '%s' "$1" | sed 's/\\\\/\\/g')
+  if command -v cygpath >/dev/null 2>&1; then
+    _kbw=$(cygpath -u "$_kbp" 2>/dev/null) || _kbw=""
+  else
+    _kbw=""
+  fi
+  [ -n "$_kbw" ] || _kbw="/$(printf '%s' "$_kbp" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$_kbp" | cut -c3- | tr '\\' '/')"
+  printf '%s' "$_kbw"
+}
+
+kb_progress() { # -> "kb <flushed>/<size>" | "kb <size> synced" | nothing at all
+  _tp=$(printf '%s' "$INPUT" | grep -o '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+  _tp=$(kb_posixpath "$_tp")
+  # No transcript in the event, or a path this shell cannot open (a deleted
+  # file): we know nothing, so we say nothing.
+  [ -n "$_tp" ] && [ -r "$_tp" ] || return 0
+  _size=$(stat -c%s "$_tp" 2>/dev/null || stat -f%z "$_tp" 2>/dev/null || wc -c <"$_tp" 2>/dev/null | tr -d ' ')
+  case "$_size" in '' | *[!0-9]*) return 0 ;; esac
+  [ "$_size" -gt 0 ] || return 0
+
+  _state="$HOME/.claude/hooks/state"
+  # THE KEY IS DERIVED EXACTLY AS flush-session-to-kb.sh DERIVES IT (`OKEY`, the
+  # MCP/REST branch) — same `tr -c` sanitisation, same 120-byte cap, same
+  # ${OKEY:-default} fallback. Approximating it would read a file that does not
+  # exist for any session id containing a character the hook rewrites, and the
+  # feature would silently never fire. tests/test_capture_funnel.py generates the
+  # key both ways and compares.
+  _okey=$(printf '%s' "${SID:-$_tp}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
+  _off="$_state/${_okey:-default}.offset"
+
+  # BRANCH 1 — the checkpoint file exists: the network transports (MCP/REST) own
+  # it and advance it after each accepted chunk, so it is exactly "bytes of this
+  # transcript the KB has taken". Report progress against the current size.
+  if [ -e "$_off" ]; then
+    _flushed=$(cat "$_off" 2>/dev/null || true)
+    # A corrupt (non-numeric, or unreadable) checkpoint is NOT reported as zero:
+    # the hook itself treats it as "restart from 0", but printing "0/5.2MB" would
+    # claim nothing is captured when the truth is that we cannot tell. Omit.
+    case "$_flushed" in '' | *[!0-9]*) return 0 ;; esac
+    # A transcript that shrank (rotated/replaced) can leave the checkpoint above
+    # the size; the hook restarts from 0 next firing. "6.0/5.2MB" is nonsense, so
+    # clamp rather than print it.
+    [ "$_flushed" -gt "$_size" ] && _flushed="$_size"
+    _h=$(kb_human "$_flushed" "$_size") || return 0
+    [ -n "$_h" ] || return 0
+    printf 'kb %s' "$_h"
+    return 0
+  fi
+
+  # BRANCH 2 — no checkpoint file. Two very different situations produce that,
+  # and only one of them is knowable:
+  #   * the flush hook DELETED it after a terminal SessionEnd drain (fully
+  #     captured), or
+  #   * this box flushes in LOCAL mode, which enqueues through the CLI and never
+  #     writes an offset at all (unknowable from here).
+  # The backfill ledger is the one durable record that survives the deletion: it
+  # holds "<session key><TAB><bytes accounted for>" for every session a sweep
+  # finished. A hit means the session is fully in; a miss means we cannot tell.
+  _led="$_state/.backfill-done"
+  [ -f "$_led" ] || return 0
+  # Split on TAB *or* US (0x1F): the ledger is written TAB-separated, and the US
+  # is accepted so a record written with the sweep's other field separator still
+  # parses. Built with printf so no awk has to interpret an escape sequence.
+  _fs=$(printf '[\t\037]')
+  _acct=$(awk -F"$_fs" -v k="$_okey" '$1 == k { v = $2 } END { print v }' "$_led" 2>/dev/null)
+  case "$_acct" in '' | *[!0-9]*) return 0 ;; esac
+  if [ "$_acct" -ge "$_size" ]; then
+    _h=$(kb_human "$_size") || return 0
+    [ -n "$_h" ] || return 0
+    printf 'kb %s synced' "$_h"
+  else
+    # Accounted for less than the file now holds (it grew after the sweep) — say
+    # so in the same progress shape rather than calling it synced.
+    _h=$(kb_human "$_acct" "$_size") || return 0
+    [ -n "$_h" ] || return 0
+    printf 'kb %s' "$_h"
+  fi
+}
+
+# Belt and braces around the whole computation: a stat that errors, an awk that
+# is missing, a $HOME that is not writable — none of it may cost the ping.
+KBPART=$(kb_progress 2>/dev/null || true)
+
+# "(3m20s, kb 4.1/5.2MB)", "(3m20s)", "(kb 4.1/5.2MB)" or nothing — the
+# parenthetical carries whatever is actually known.
+DETAIL="$TOOK"
+if [ -n "$KBPART" ]; then
+  if [ -n "$DETAIL" ]; then DETAIL="$DETAIL, $KBPART"; else DETAIL="$KBPART"; fi
+fi
+[ -n "$DETAIL" ] && DETAIL=" ($DETAIL)"
+
 # WHICH MACHINE. With this hook shipped to every box (linux, windows, rm1) the
 # project alone is ambiguous — the same repo is worked on from more than one.
 MACHINE="${NTFY_MACHINE:-$(hostname 2>/dev/null || echo unknown)}"
-MSG="Claude finished — ${WHERE} @ ${MACHINE}${TOOK}"
+MSG="Claude finished — ${WHERE} @ ${MACHINE}${DETAIL}"
 
 if [ -n "${NTFY_TOPIC:-}" ]; then
   BASE="${NTFY_URL:-https://ntfy.sh}"

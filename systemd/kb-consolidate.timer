@@ -1,6 +1,6 @@
-# kb-consolidate.timer — fire the nightly consolidation at 03:30 (PLAN.md §9)
+# kb-consolidate.timer — fire the nightly consolidation at 01:00 (PLAN.md §9)
 [Unit]
-Description=Nightly Knowledge Vault consolidation at 03:30
+Description=Nightly Knowledge Vault consolidation at 01:00
 
 [Timer]
 # 01:00 (owner decision 2026-08-01, was 03:30): the drain stops starting new

@@ -15,6 +15,14 @@ OnFailure=kb-notify-fail@%n.service
 Type=simple
 WorkingDirectory=%h/kb/repo
 EnvironmentFile=%h/kb/repo/.env
+# WAIT FOR THE DB before the watcher's first query, exactly as
+# kb-consolidate.service does: network-online.target is a NO-OP in a --user
+# manager and the kb-db CONTAINER races this unit at boot, so without the guard
+# every reboot produced one connection-refused crash, one OnFailure ntfy push
+# ("kb failure" on each reboot, owner-reported 2026-08-06), and a silent
+# self-heal 3s later. The guard turns that into a clean first start and leaves
+# the failure ping meaning what it should: the worker actually broke.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker exec kb-db pg_isready -q -U kb 2>/dev/null && exit 0; sleep 5; done; echo "kb-db not ready after 5m" >&2; exit 1'
 ExecStart=%h/kb/repo/.venv/bin/python -m kbworker.watcher
 Restart=on-failure
 RestartSec=3

@@ -265,6 +265,15 @@ TURNSTART="$HOOKS/turn-start.sh"
 [ -f "$SKILL_DIR/notify-complete.sh" ] && install -m 0755 "$SKILL_DIR/notify-complete.sh" "$NOTIFY"
 [ -f "$SKILL_DIR/turn-start.sh" ] && install -m 0755 "$SKILL_DIR/turn-start.sh" "$TURNSTART"
 install -m 0755 "$SKILL_DIR/kb-mcp-call.sh" "$HOOKS/kb-mcp-call.sh"
+# THE ONLY THING REGISTERED WITH CLAUDE CODE (2026-08-06). Claude Code on Windows
+# has an open upstream bug (GH #77078 + siblings): with MORE THAN ONE hook on one
+# event, only one of the processes gets the event JSON on stdin and the rest read
+# empty. We used to put two hooks on UserPromptSubmit (recall + turn stamp), so on
+# Windows recall regularly ran with no prompt -- printing nothing, exactly like a
+# healthy empty KB. The dispatcher reads stdin ONCE and fans the same bytes out to
+# the event's scripts itself, which is the documented workaround.
+DISPATCH="$HOOKS/kb-hook-dispatch.sh"
+install -m 0755 "$SKILL_DIR/kb-hook-dispatch.sh" "$DISPATCH"
 # The backfill sweep. NOT A HOOK -- it is installed but deliberately registered
 # for NO event in settings.json: it is an owner-run recovery that walks every
 # transcript on the box and pushes each one's unflushed remainder through the
@@ -514,49 +523,77 @@ fi
 BASHW=""
 if kb_is_windows; then BASHW="$(kb_nativepath "$(command -v bash)")"; fi
 
-# Append our entries (idempotent: any prior copy removed first) while preserving
-# other hooks the user has. The brief hook self-filters resume/compact sources,
-# so its matcher stays empty. The jq and python3 implementations below MUST
-# produce byte-identical settings.json for the same input -- rig case 20 runs the
-# installer once per backend and diffs the result.
+# Register the DISPATCHER, and ONLY the dispatcher, once per event (idempotent:
+# any prior copy removed first) while preserving other hooks the user has. The
+# brief hook self-filters resume/compact sources, so its matcher stays empty.
+#
+# TIMEOUTS are per event and unchanged, except UserPromptSubmit: it now runs BOTH
+# children in one process (5 s turn stamp + 35 s recall), so its bound is 40.
+#
+# MIGRATION. `ours` must recognise the dispatcher in EITHER registration form AND
+# every LEGACY per-script entry this installer has ever written, or a re-install
+# on an old box leaves the previous brief entry beside the new dispatcher and
+# recall FIRES TWICE per prompt (two searches, two injected blocks, two budgets).
+# Legacy entries name the script in `command` (POSIX) or in `args[0]` (Windows);
+# the dispatcher's POSIX `command` is "<path> <event>", so it is matched by
+# prefix rather than equality.
+#
+# The jq and python3 implementations below MUST produce byte-identical
+# settings.json for the same input -- rig case 20 runs the installer once per
+# backend and diffs the result.
 tmp="$SETTINGS.kbtmp.$$"
 if [ -n "$KB_JQ_BIN" ]; then
-  if [ -n "$BASHW" ]; then
-    entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$HOOK" \
-      '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
-    brief_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$BRIEF" \
-      '{matcher:"startup|clear",hooks:[{type:"command",command:$b,args:[$c],timeout:35}]}')
-    recall_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$BRIEF" \
-      '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:35}]}')
-      notify_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$NOTIFY" \
-        '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:15}]}')
-      turn_entry=$("$KB_JQ_BIN" -n --arg b "$BASHW" --arg c "$TURNSTART" \
-        '{matcher:"",hooks:[{type:"command",command:$b,args:[$c],timeout:5}]}')
-  else
-    entry=$("$KB_JQ_BIN" -n --arg c "$HOOK" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
-    brief_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"startup|clear",hooks:[{type:"command",command:$c,timeout:35}]}')
-    recall_entry=$("$KB_JQ_BIN" -n --arg c "$BRIEF" '{matcher:"",hooks:[{type:"command",command:$c,timeout:35}]}')
-      notify_entry=$("$KB_JQ_BIN" -n --arg c "$NOTIFY" '{matcher:"",hooks:[{type:"command",command:$c,timeout:15}]}')
-      turn_entry=$("$KB_JQ_BIN" -n --arg c "$TURNSTART" '{matcher:"",hooks:[{type:"command",command:$c,timeout:5}]}')
-  fi
-  "$KB_JQ_BIN" --argjson e "$entry" --argjson b "$brief_entry" --argjson r "$recall_entry" --argjson n "$notify_entry" --argjson t "$turn_entry" \
-    --arg c "$HOOK" --arg bc "$BRIEF" --arg nc "$NOTIFY" --arg tc "$TURNSTART" '
-    def ours($p): (.hooks[0].command == $p) or ((.hooks[0].args[0]? // "") == $p);
+  # <event> <matcher> <timeout> -> one settings.json entry, in the exec form
+  # Windows needs (Claude Code spawns hooks via CreateProcess, not a shell, so a
+  # bare .sh never runs there) or a single command string everywhere else.
+  kb_entry() {
+    if [ -n "$BASHW" ]; then
+      "$KB_JQ_BIN" -n --arg b "$BASHW" --arg d "$DISPATCH" --arg ev "$1" --arg m "$2" --argjson t "$3" \
+        '{matcher:$m,hooks:[{type:"command",command:$b,args:[$d,$ev],timeout:$t}]}'
+    else
+      "$KB_JQ_BIN" -n --arg d "$DISPATCH" --arg ev "$1" --arg m "$2" --argjson t "$3" \
+        '{matcher:$m,hooks:[{type:"command",command:($d+" "+$ev),timeout:$t}]}'
+    fi
+  }
+  pre_entry=$(kb_entry PreCompact "" 15)
+  end_entry=$(kb_entry SessionEnd "" 15)
+  start_entry=$(kb_entry SessionStart "startup|clear" 35)
+  ups_entry=$(kb_entry UserPromptSubmit "" 40)
+  stop_entry=$(kb_entry Stop "" 15)
+  "$KB_JQ_BIN" --argjson pre "$pre_entry" --argjson sessend "$end_entry" --argjson start "$start_entry" \
+    --argjson ups "$ups_entry" --argjson stop "$stop_entry" \
+    --arg d "$DISPATCH" --arg c "$HOOK" --arg bc "$BRIEF" --arg nc "$NOTIFY" --arg tc "$TURNSTART" '
+    # A non-array under an event key is malformed, and `// []` would NOT catch
+    # it -- jq map()s an object over its VALUES, so the jq branch used to keep
+    # garbage the python branch dropped. Same rule in both, explicitly.
+    def arr: if type == "array" then . else [] end;
+    def ours:
+      (if type == "object" then (.hooks // []) else [] end) as $hs
+      | (if ($hs | type) == "array" and ($hs | length) > 0 and (($hs[0] | type) == "object")
+         then $hs[0] else {} end) as $h
+      | (if (($h.command // "") | type) == "string" then ($h.command // "") else "" end) as $cc
+      | (if (($h.args // []) | type) == "array" and (($h.args // []) | length) > 0
+         then ($h.args[0]) else "" end) as $a0
+      | (if ($a0 | type) == "string" then $a0 else "" end) as $aa
+      | ([$d, $c, $bc, $nc, $tc] | map(select(. != ""))) as $known
+      | (($known | index($cc)) != null)
+        or (($known | index($aa)) != null)
+        or ($cc | startswith($d + " "));
     .hooks = (.hooks // {})
-    | .hooks.PreCompact = (((.hooks.PreCompact // []) | map(select(ours($c) | not))) + [$e])
-    | .hooks.SessionEnd = (((.hooks.SessionEnd // []) | map(select(ours($c) | not))) + [$e])
-    | .hooks.SessionStart = (((.hooks.SessionStart // []) | map(select(ours($bc) | not))) + [$b])
-      | .hooks.UserPromptSubmit = (((.hooks.UserPromptSubmit // [])
-            | map(select((ours($bc) or ours($tc)) | not))) + [$r, $t])
-      | .hooks.Stop = (((.hooks.Stop // []) | map(select(ours($nc) | not))) + [$n])
+    | .hooks.PreCompact = ((((.hooks.PreCompact // []) | arr) | map(select(ours | not))) + [$pre])
+    | .hooks.SessionEnd = ((((.hooks.SessionEnd // []) | arr) | map(select(ours | not))) + [$sessend])
+    | .hooks.SessionStart = ((((.hooks.SessionStart // []) | arr) | map(select(ours | not))) + [$start])
+    | .hooks.UserPromptSubmit = ((((.hooks.UserPromptSubmit // []) | arr) | map(select(ours | not))) + [$ups])
+    | .hooks.Stop = ((((.hooks.Stop // []) | arr) | map(select(ours | not))) + [$stop])
   ' "$SETTINGS" >"$tmp" && mv "$tmp" "$SETTINGS"
 else
-  "$KB_PY_BIN" - "$SETTINGS" "$tmp" "$HOOK" "$BRIEF" "$BASHW" "$NOTIFY" "$TURNSTART" <<'PY' && mv "$tmp" "$SETTINGS"
+  "$KB_PY_BIN" - "$SETTINGS" "$tmp" "$HOOK" "$BRIEF" "$BASHW" "$NOTIFY" "$TURNSTART" "$DISPATCH" <<'PY' && mv "$tmp" "$SETTINGS"
 import json, sys
 
 src, tmp, hook, brief, bashw = sys.argv[1:6]
 notify = sys.argv[6] if len(sys.argv) > 6 else ""
 turnstart = sys.argv[7] if len(sys.argv) > 7 else ""
+dispatch = sys.argv[8] if len(sys.argv) > 8 else ""
 try:
     data = json.load(open(src, encoding="utf-8"))
 except Exception:
@@ -565,50 +602,59 @@ if not isinstance(data, dict):
     data = {}
 
 
-def entry(script, matcher, timeout):
+def entry(event, matcher, timeout):
     """Same shape, same KEY ORDER as the jq branch (byte-identical output)."""
     inner = {"type": "command"}
     if bashw:
         inner["command"] = bashw
-        inner["args"] = [script]
+        inner["args"] = [dispatch, event]
     else:
-        inner["command"] = script
+        inner["command"] = dispatch + " " + event
     inner["timeout"] = timeout
     return {"matcher": matcher, "hooks": [inner]}
 
 
-def ours(item, script):
+# Every path this installer has ever registered, in either field. Empties are
+# dropped: a "" in here would match a foreign entry that simply has no command.
+KNOWN = [p for p in (dispatch, hook, brief, notify, turnstart) if p]
+
+
+def ours(item):
     if not isinstance(item, dict):
         return False
     hooks = item.get("hooks")
     h = hooks[0] if isinstance(hooks, list) and hooks and isinstance(hooks[0], dict) else {}
-    if h.get("command") == script:
-        return True
+    cmd = h.get("command")
+    cmd = cmd if isinstance(cmd, str) else ""
     args = h.get("args")
     first = args[0] if isinstance(args, list) and args else ""
-    return first == script
+    first = first if isinstance(first, str) else ""
+    if cmd in KNOWN or first in KNOWN:
+        return True
+    return bool(dispatch) and cmd.startswith(dispatch + " ")
 
 
 hooks = data.get("hooks")
 if not isinstance(hooks, dict):
     hooks = {}
 data["hooks"] = hooks
-for ev, script, matcher, timeout in (
-    ("PreCompact", hook, "", 15),
-    ("SessionEnd", hook, "", 15),
-    ("SessionStart", brief, "startup|clear", 35),
-    ("UserPromptSubmit", brief, "", 35),
+for ev, matcher, timeout in (
+    ("PreCompact", "", 15),
+    ("SessionEnd", "", 15),
+    ("SessionStart", "startup|clear", 35),
+    # 40 = the turn stamp (5) plus the recall budget (35); one process now runs
+    # both, because two hooks on one event is what the Windows stdin bug eats.
+    ("UserPromptSubmit", "", 40),
     # Stop fires when Claude finishes responding. This is what tells you a long
     # run is done on a machine you have walked away from — and it was the piece
     # missing from every REMOTE box: the notify hook existed only where it had
     # been hand-placed, so notifications looked "flaky" when they were simply
     # absent (2026-07-31). Inert unless notify.env names a channel.
-    *((("Stop", notify, "", 15),) if notify else ()),
-    *((("UserPromptSubmit", turnstart, "", 5),) if turnstart else ()),
+    ("Stop", "", 15),
 ):
     cur = hooks.get(ev)
     cur = cur if isinstance(cur, list) else []
-    hooks[ev] = [x for x in cur if not ours(x, script)] + [entry(script, matcher, timeout)]
+    hooks[ev] = [x for x in cur if not ours(x)] + [entry(ev, matcher, timeout)]
 
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -680,6 +726,7 @@ fi
 MODE="${MODE:-UNCONFIGURED — no transport was set up}"
 echo "hook:     $HOOK"
 echo "brief:    $BRIEF (SessionStart -> pre-brief; UserPromptSubmit -> per-prompt KB recall)"
+echo "dispatch: $DISPATCH (the ONLY hook registered per event; it fans stdin out)"
 echo "config:   $CFG  ($MODE)"
 echo "json:     $JSON_MODE"
 echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart + UserPromptSubmit + Stop registered)"

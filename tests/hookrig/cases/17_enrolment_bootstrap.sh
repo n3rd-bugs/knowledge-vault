@@ -40,7 +40,7 @@ step "the four scripts download using the CODE as bearer"
 cd "$HOME/.claude/kb-setup" || exit 1
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
          kb-mcp-call.sh notify-complete.sh turn-start.sh \
-         kb-flush-backfill.sh; do
+         kb-hook-dispatch.sh kb-flush-backfill.sh; do
   if "$RIG_CURL" -fsS -H "Authorization: Bearer $CODE" "$STUB/api/setup/$f" -o "$f"; then
     pass "fetched $f ($(wc -c <"$f") bytes)"
   else
@@ -51,7 +51,7 @@ done
 step "what arrived is the real script, byte for byte"
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
          kb-mcp-call.sh notify-complete.sh turn-start.sh \
-         kb-flush-backfill.sh; do
+         kb-hook-dispatch.sh kb-flush-backfill.sh; do
   if cmp -s "$f" "$SKILL/$f"; then
     pass "$f matches the shipped copy"
   else
@@ -89,14 +89,13 @@ assert_not_contains "$OUT" "$RIG_TOKEN" "install.sh did not echo the credential"
 [ -f "$LOGF" ] && assert_not_contains "$(cat "$LOGF")" "$RIG_TOKEN" "not in the hook log" \
   || pass "no hook log yet"
 
-step "the hooks are registered for all four events"
-for ev in PreCompact SessionEnd SessionStart UserPromptSubmit; do
+step "the hooks are registered for all the events, ONE dispatcher entry each"
+for ev in PreCompact SessionEnd SessionStart Stop UserPromptSubmit; do
   N=$("$RIG_JQ" -r --arg e "$ev" '[.hooks[$e][]?.hooks[]?] | length' "$SETTINGS")
-  # UserPromptSubmit carries TWO after the notification hooks shipped: the KB
-  # per-prompt recall AND turn-start.sh, which stamps the turn so the Stop notice
-  # can report how long the run took.
-  EXPECT=1; [ "$ev" = "UserPromptSubmit" ] && EXPECT=2
-  assert_eq "$EXPECT" "$N" "$ev registered the expected number of times"
+  # ONE entry per event since the dispatcher (KB 14508): turn-start + brief now
+  # ride behind a single UserPromptSubmit hook, because Claude Code on Windows
+  # loses stdin when several hooks share an event (GH #77078).
+  assert_eq "1" "$N" "$ev registered exactly once (the dispatcher)"
 done
 
 # ------------------------------------------------------ 3. the code is now spent

@@ -29,6 +29,10 @@ _SCRIPTS = (
     "flush-session-to-kb.sh",
     "kb-session-brief.sh",
     "kb-mcp-call.sh",
+    # The dispatcher is the ONLY thing install.sh registers with Claude Code, so
+    # the air-gapped embed is incomplete without it (a box would end up with five
+    # registered hooks pointing at a file it was never given). It is ~100 lines.
+    "kb-hook-dispatch.sh",
     "install.sh",
 )
 _PLACEHOLDER_URL = "https://api.example.com"
@@ -152,7 +156,7 @@ export KB_ENROL_CODE={enrol.code}   # single use, expires in ~{mins} min
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
          kb-mcp-call.sh notify-complete.sh turn-start.sh \
-         kb-flush-backfill.sh; do
+         kb-hook-dispatch.sh kb-flush-backfill.sh; do
   curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh
@@ -196,6 +200,10 @@ rather than reusing this message.
             "- `flush-session-to-kb.sh` — PreCompact + SessionEnd capture\n"
             "- `kb-session-brief.sh` — SessionStart pre-brief + UserPromptSubmit recall\n"
             "- `kb-mcp-call.sh` — MCP transport helper\n"
+            "- `kb-hook-dispatch.sh` — the ONLY script registered with Claude Code: "
+            "one hook per event, reading the event JSON once and fanning it out "
+            "(Claude Code on Windows delivers stdin to only ONE of several hooks "
+            "registered on the same event)\n"
             "- `kb-flush-backfill.sh` — owner-run sweep: pushes the unflushed "
             "remainder of EVERY transcript already on the box through the flush "
             "hook (not registered as a hook; run it right after install)\n\n"

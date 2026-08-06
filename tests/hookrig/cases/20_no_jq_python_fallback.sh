@@ -55,8 +55,8 @@ new_home nojq_events
 install_hooks >/dev/null
 KEYS=$("$RIG_JQ" -r '.hooks | keys | join(",")' "$SETTINGS")
 assert_eq "PreCompact,SessionEnd,SessionStart,Stop,UserPromptSubmit" "$KEYS" "exactly five event keys"
-assert_eq "4" "$("$RIG_JQ" -r '[.hooks[][].hooks[0].command] | unique | length' "$SETTINGS")" "four scripts"
-assert_eq "$HOOKS/flush-session-to-kb.sh" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].command' "$SETTINGS")" "PreCompact -> flush hook"
+assert_eq "5" "$("$RIG_JQ" -r '[.hooks[][].hooks[0].command] | unique | length' "$SETTINGS")" "five dispatcher+event strings"
+assert_eq "$HOOKS/kb-hook-dispatch.sh PreCompact" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].command' "$SETTINGS")" "PreCompact -> dispatcher"
 assert_eq "startup|clear" "$("$RIG_JQ" -r '.hooks.SessionStart[0].matcher' "$SETTINGS")" "SessionStart matcher kept"
 
 # --------------------------------------------------------------- a flush lands

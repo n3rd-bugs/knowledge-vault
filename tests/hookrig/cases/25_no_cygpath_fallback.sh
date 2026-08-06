@@ -35,7 +35,7 @@ step "install still registers an exe+args command Windows can spawn"
 CMD=$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].command' "$SETTINGS")
 ARG0=$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].args[0]' "$SETTINGS")
 assert_eq "bash.exe" "$CMD" "falls back to a bare bash.exe (resolved through the Windows PATH)"
-assert_eq "$HOOKS/flush-session-to-kb.sh" "$ARG0" "the script travels as args[0]"
+assert_eq "$HOOKS/kb-hook-dispatch.sh" "$ARG0" "the dispatcher travels as args[0]"
 case "$CMD" in *.sh) fail "registered a bare .sh -- unspawnable on Windows" ;; *) pass "not a bare .sh" ;; esac
 for ev in SessionEnd SessionStart UserPromptSubmit; do
   assert_eq "bash.exe" "$("$RIG_JQ" -r --arg e "$ev" '.hooks[$e][0].hooks[0].command' "$SETTINGS")" "$ev too"

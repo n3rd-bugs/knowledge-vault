@@ -44,6 +44,7 @@ BRIEF = CONTRIB / "kb-session-brief.sh"
 INSTALL = CONTRIB / "install.sh"
 NOTIFY = CONTRIB / "notify-complete.sh"
 BACKFILL = CONTRIB / "kb-flush-backfill.sh"
+DISPATCH = CONTRIB / "kb-hook-dispatch.sh"
 
 # Fake, shaped like the real thing so the scrubber and every "is this a token?"
 # assertion has something realistic to bite on. Never a live credential.
@@ -310,6 +311,7 @@ def test_install_names_the_credential_it_fetches_with():
         "install.sh",
         "notify-complete.sh",
         "kb-flush-backfill.sh",
+        "kb-hook-dispatch.sh",
     ],
 )
 def test_contrib_and_shipped_copies_stay_identical(name: str):
@@ -595,7 +597,16 @@ def _transcript(path: Path, lines: int = 20) -> Path:
     return path
 
 
-def _run_hook(script: Path, event: dict, home: Path, extra_env: dict | None = None):
+def _run_hook(
+    script: Path,
+    event: dict | str,
+    home: Path,
+    extra_env: dict | None = None,
+    args: tuple[str, ...] = (),
+):
+    """``event`` is normally the hook event object; a raw STRING is written to
+    stdin verbatim, which is how the empty-stdin case is exercised. ``args`` are
+    the script's own argv (the dispatcher takes the event name there)."""
     env = {
         "HOME": str(home),
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -603,8 +614,8 @@ def _run_hook(script: Path, event: dict, home: Path, extra_env: dict | None = No
     }
     env.update(extra_env or {})
     return subprocess.run(
-        ["bash", str(script)],
-        input=json.dumps(event),
+        ["bash", str(script), *args],
+        input=event if isinstance(event, str) else json.dumps(event),
         text=True,
         capture_output=True,
         env=env,
@@ -2153,6 +2164,320 @@ def test_every_line_the_breaker_paths_can_emit_is_ascii_by_construction():
         idx = text.index(needle)
         line = text[text.rindex("\n", 0, idx) + 1 : text.index("\n", idx)]
         assert line.isascii(), f"the {needle!r} line is not ASCII in the source: {line!r}"
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: ONE hook per event — the stdin fan-out dispatcher
+# ---------------------------------------------------------------------------
+#
+# THE BUG THIS EXISTS FOR (verified on the real Windows box, KB item 14508).
+# Claude Code on Windows has an OPEN upstream bug (GH #77078 + siblings): when
+# MORE THAN ONE hook is registered on ONE event, only one of the spawned
+# processes receives the event JSON on stdin — the others read an empty stream.
+# There is no env-var fallback carrying the fields, and no fixed version.
+#
+# Our install used to put TWO hooks on UserPromptSubmit (turn-start + the recall)
+# and one or more on Stop, so on Windows the recall regularly ran with no prompt
+# and no cwd: it printed nothing, which is byte-for-byte what a healthy empty KB
+# prints. The workaround the docs recommend is ONE hook per event that reads
+# stdin once and fans out itself, which is kb-hook-dispatch.sh.
+#
+# These tests are the tripwire for that fan-out: same bytes to every child, in
+# the right order, stdout passing through, and never a non-zero exit.
+
+# A stand-in child. Records the stdin it was really handed and appends its own
+# name to a shared order file, so "both children got the same bytes, in this
+# order" is an assertion about observed behaviour rather than about the source.
+# OUT_<TAG> / RC_<TAG> in the environment drive what it prints and returns.
+_CHILD_RECORDER = """#!/usr/bin/env bash
+D="$KB_DISPATCH_REC"
+mkdir -p "$D"
+TAG="__TAG__"
+cat >"$D/stdin.$TAG"
+printf '%s\\n' "$TAG" >>"$D/order"
+_o="OUT_$TAG"
+_r="RC_$TAG"
+[ -n "${!_o:-}" ] && printf '%s' "${!_o}"
+exit "${!_r:-0}"
+"""
+
+# The event map, as a test fixture rather than a re-reading of the script.
+_DISPATCH_TAGS = {
+    "flush-session-to-kb.sh": "FLUSH",
+    "kb-session-brief.sh": "BRIEF",
+    "turn-start.sh": "TURN",
+    "notify-complete.sh": "NOTIFY",
+}
+_DISPATCH_MAP = {
+    "PreCompact": ["FLUSH"],
+    "SessionEnd": ["FLUSH"],
+    "SessionStart": ["BRIEF"],
+    "UserPromptSubmit": ["TURN", "BRIEF"],
+    "Stop": ["NOTIFY"],
+}
+
+
+def _dispatch_dir(tmp_path: Path, omit: set[str] = frozenset()) -> Path:
+    """A hooks directory holding the REAL dispatcher beside recorder children —
+    the dispatcher resolves them relative to itself, so this is the whole of the
+    resolution path under test."""
+    hookdir = tmp_path / "hookdir"
+    hookdir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(DISPATCH, hookdir / DISPATCH.name)
+    for name, tag in _DISPATCH_TAGS.items():
+        if name in omit:
+            continue
+        child = hookdir / name
+        child.write_text(_CHILD_RECORDER.replace("__TAG__", tag))
+        child.chmod(0o755)
+    return hookdir
+
+
+def _fired(rec_dir: Path) -> list[str]:
+    order = rec_dir / "order"
+    return order.read_text().split() if order.exists() else []
+
+
+def _run_dispatch(tmp_path: Path, event: str, payload, home: Path, omit=frozenset(), **env):
+    hookdir = _dispatch_dir(tmp_path, omit)
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir(exist_ok=True)
+    res = _run_hook(
+        hookdir / "kb-hook-dispatch.sh",
+        payload,
+        home,
+        {"KB_DISPATCH_REC": str(rec_dir), **env},
+        args=(event,),
+    )
+    return res, rec_dir
+
+
+def test_the_dispatcher_gives_BOTH_prompt_children_byte_identical_stdin(tmp_path):
+    """THE TRIPWIRE for 14508. UserPromptSubmit is the event that carried two
+    hooks, so it is the one the Windows bug ate. Both children must see the same
+    bytes — the cheap turn stamp FIRST, the 35 s recall second — and the recall's
+    stdout must reach Claude Code unchanged, because that stdout IS the injected
+    context."""
+    home = _hook_home(tmp_path)
+    event = {
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "why does the drain refill stall",
+        "cwd": str(tmp_path / "proj"),
+        "session_id": "s-dispatch",
+    }
+    res, rec = _run_dispatch(
+        tmp_path, "UserPromptSubmit", event, home, OUT_BRIEF="[KB recall] one hit\n"
+    )
+    assert res.returncode == 0, res.stderr
+
+    assert _fired(rec) == ["TURN", "BRIEF"], (
+        f"fan-out order is {_fired(rec)!r} — the 5 s stamp must not queue behind the 35 s recall"
+    )
+    turn = (rec / "stdin.TURN").read_bytes()
+    brief = (rec / "stdin.BRIEF").read_bytes()
+    assert turn == brief, "the two children received DIFFERENT bytes — the bug, reimplemented"
+    assert turn == json.dumps(event).encode(), (
+        f"the event was altered on the way to the children: {turn!r}"
+    )
+    assert res.stdout == "[KB recall] one hit\n", (
+        f"the brief's stdout did not pass through untouched: {res.stdout!r}"
+    )
+
+
+@pytest.mark.parametrize("event", sorted(_DISPATCH_MAP))
+def test_each_event_reaches_exactly_the_children_it_maps_to(tmp_path, event: str):
+    """Stop must not fire a flush, PreCompact must not fire recall: a mis-routed
+    event would be a session captured on every keystroke, or notifications on
+    compaction."""
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(tmp_path, event, {"hook_event_name": event}, home)
+    assert res.returncode == 0, res.stderr
+    assert _fired(rec) == _DISPATCH_MAP[event], (
+        f"{event} fired {_fired(rec)!r}, expected {_DISPATCH_MAP[event]!r}"
+    )
+
+
+def test_an_unknown_event_runs_nothing_at_all(tmp_path):
+    """Claude Code gains events; an unrecognised one must be a no-op, not a
+    guess. It still exits 0 and prints nothing into whatever context it fired
+    from."""
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(tmp_path, "PostToolUse", {"hook_event_name": "PostToolUse"}, home)
+    assert res.returncode == 0, res.stderr
+    assert _fired(rec) == [], f"an unknown event ran {_fired(rec)!r}"
+    assert res.stdout == "", res.stdout
+
+
+def test_an_EMPTY_event_still_runs_the_children_and_is_logged_exactly_once(tmp_path):
+    """The residual case: Claude Code hands the ONE registered hook an empty
+    stream anyway. The children still run — each degrades gracefully, and a
+    stdin-less notify still pushes a basic ping — but the hit is made COUNTABLE
+    with one line in the log the pre-brief already reads."""
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(tmp_path, "UserPromptSubmit", "", home)
+    assert res.returncode == 0, res.stderr
+    assert _fired(rec) == ["TURN", "BRIEF"], (
+        f"an empty event skipped the children entirely: {_fired(rec)!r}"
+    )
+    assert (rec / "stdin.TURN").read_bytes() == b""
+    assert (rec / "stdin.BRIEF").read_bytes() == b""
+
+    lines = [ln for ln in _hooklog(home).splitlines() if "arrived EMPTY" in ln]
+    assert len(lines) == 1, f"expected exactly one EMPTY line, got {lines!r}"
+    line = lines[0]
+    assert "hook event arrived EMPTY: event=UserPromptSubmit" in line, line
+    _assert_ascii(line, "the empty-event log line")
+
+    # The two-sided pin, exactly as for a dead recall: this log is also the
+    # pre-brief's flush-failure scanner input, and an empty event is not a lost
+    # transcript. Phrasing it with one of those tokens would make every residual
+    # Windows hit claim the session was never captured.
+    for token in ("FAILED", "BUG:", "NOT CONFIGURED", "NOT CAPTURED", "NEEDS TOKEN"):
+        assert token not in line, (
+            f"the empty-event line contains {token!r}, which the pre-brief's "
+            "flush-failure scanner treats as a session that was never captured"
+        )
+
+
+def test_a_failing_child_stops_neither_the_next_child_nor_the_exit_code(tmp_path):
+    """Sequential fan-out means one bad child could take the rest of the event
+    with it. It must not: turn-start crashing has to leave recall intact, and a
+    hook that exits non-zero can block a Claude Code prompt outright."""
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(
+        tmp_path,
+        "UserPromptSubmit",
+        {"hook_event_name": "UserPromptSubmit"},
+        home,
+        RC_TURN="7",
+        RC_BRIEF="3",
+        OUT_BRIEF="[KB recall] still injected\n",
+    )
+    assert res.returncode == 0, f"the dispatcher propagated a child failure: {res!r}"
+    assert _fired(rec) == ["TURN", "BRIEF"], (
+        f"a failing first child swallowed the rest of the event: {_fired(rec)!r}"
+    )
+    assert res.stdout == "[KB recall] still injected\n", res.stdout
+
+
+def test_a_child_that_is_not_installed_is_simply_skipped(tmp_path):
+    """notify-complete.sh and turn-start.sh are OPTIONAL installs (`[ -f ]` in
+    install.sh), and every event is registered regardless. A missing child must
+    be a no-op, not a shell error on every prompt."""
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(
+        tmp_path,
+        "UserPromptSubmit",
+        {"hook_event_name": "UserPromptSubmit"},
+        home,
+        omit={"turn-start.sh"},
+        OUT_BRIEF="[KB recall] hit\n",
+    )
+    assert res.returncode == 0, res.stderr
+    assert _fired(rec) == ["BRIEF"], _fired(rec)
+    assert res.stdout == "[KB recall] hit\n", res.stdout
+    assert res.stderr == "", f"a missing child leaked an error: {res.stderr!r}"
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: install.sh MIGRATES a box off the old per-script registration
+# ---------------------------------------------------------------------------
+#
+# The migration is the dangerous half. If a re-install leaves the OLD
+# kb-session-brief.sh entry beside the new dispatcher entry, UserPromptSubmit
+# holds two hooks again — which both re-arms the Windows stdin bug AND fires
+# recall TWICE per prompt (two searches, two injected blocks, two budgets).
+
+_LEGACY_EVENTS = {
+    "PreCompact": [("flush-session-to-kb.sh", "", 15)],
+    "SessionEnd": [("flush-session-to-kb.sh", "", 15)],
+    "SessionStart": [("kb-session-brief.sh", "startup|clear", 35)],
+    # THE SHAPE THAT MATTERS: two entries on one event.
+    "UserPromptSubmit": [("kb-session-brief.sh", "", 35), ("turn-start.sh", "", 5)],
+    "Stop": [("notify-complete.sh", "", 15)],
+}
+
+
+def _legacy_settings(home: Path) -> Path:
+    """A settings.json in the shape install.sh wrote before 2026-08-06, plus a
+    foreign hook that must survive the migration untouched."""
+    hooks_dir = home / ".claude" / "hooks"
+    settings = home / ".claude" / "settings.json"
+    data = {
+        "model": "opus",
+        "hooks": {
+            ev: [
+                {
+                    "matcher": matcher,
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": str(hooks_dir / script),
+                            "timeout": timeout,
+                        }
+                    ],
+                }
+                for script, matcher, timeout in entries
+            ]
+            for ev, entries in _LEGACY_EVENTS.items()
+        },
+    }
+    data["hooks"]["PreCompact"].insert(
+        0,
+        {"matcher": "", "hooks": [{"type": "command", "command": "/usr/local/bin/user-pre.sh"}]},
+    )
+    settings.write_text(json.dumps(data, indent=2) + "\n")
+    return settings
+
+
+def _entry_commands(settings: Path, event: str) -> list[str]:
+    """The command each entry on ``event`` would really run — the args[0] form on
+    Windows, the command string everywhere else."""
+    data = json.loads(settings.read_text())
+    out = []
+    for item in data["hooks"].get(event, []):
+        inner = item["hooks"][0]
+        out.append(inner["args"][0] if inner.get("args") else inner["command"])
+    return out
+
+
+def test_install_migrates_the_old_two_entry_shape_to_ONE_dispatcher(tmp_path):
+    """Exactly one dispatcher entry per event, zero legacy entries, foreign hooks
+    kept — and byte-identical on the second run, because the installer is meant
+    to be re-run on every asset refresh."""
+    home = _hook_home(tmp_path)
+    settings = _legacy_settings(home)
+    dispatch = str(home / ".claude" / "hooks" / "kb-hook-dispatch.sh")
+
+    res = _run_hook(INSTALL, {}, home)
+    assert res.returncode == 0, res.stderr
+
+    legacy_paths = {str(home / ".claude" / "hooks" / s) for s in _DISPATCH_TAGS}
+    for event in _LEGACY_EVENTS:
+        cmds = _entry_commands(settings, event)
+        ours = [c for c in cmds if c == dispatch or c.startswith(dispatch + " ")]
+        assert len(ours) == 1, f"{event} holds {len(ours)} dispatcher entries: {cmds!r}"
+        left = [c for c in cmds if c in legacy_paths]
+        assert left == [], (
+            f"{event} still holds legacy per-script entries {left!r} — a leftover "
+            "brief entry double-fires recall on every prompt"
+        )
+
+    assert _entry_commands(settings, "PreCompact")[0] == "/usr/local/bin/user-pre.sh", (
+        "the user's own hook was dropped by the migration"
+    )
+    data = json.loads(settings.read_text())
+    assert data["model"] == "opus", "unrelated settings were lost"
+    ups = data["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+    assert ups["timeout"] == 40, (
+        f"UserPromptSubmit timeout is {ups['timeout']} — one process now runs the "
+        "5 s stamp and the 35 s recall"
+    )
+
+    first = settings.read_bytes()
+    res2 = _run_hook(INSTALL, {}, home)
+    assert res2.returncode == 0, res2.stderr
+    assert settings.read_bytes() == first, "a second install rewrote settings.json"
 
 
 # ---------------------------------------------------------------------------

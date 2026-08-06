@@ -27,8 +27,7 @@ EOF
 
 step "first install"
 install_hooks >/dev/null
-FLUSH="$HOOKS/flush-session-to-kb.sh"
-BRIEF="$HOOKS/kb-session-brief.sh"
+DISPATCH="$HOOKS/kb-hook-dispatch.sh"
 assert_eq "2" "$(jq -r '.hooks.PreCompact | length' "$SETTINGS")" "PreCompact: user entry + ours"
 
 step "second install (idempotency)"
@@ -36,13 +35,10 @@ install_hooks >/dev/null
 step "third install (paranoia -- duplication is usually visible only at N>2)"
 install_hooks >/dev/null
 
-for ev in PreCompact SessionEnd; do
-  N=$(jq -r --arg e "$ev" --arg c "$FLUSH" '[.hooks[$e][] | select(.hooks[0].command==$c)] | length' "$SETTINGS")
-  assert_eq "1" "$N" "$ev holds exactly one KB flush entry after 3 installs"
-done
-for ev in SessionStart UserPromptSubmit; do
-  N=$(jq -r --arg e "$ev" --arg c "$BRIEF" '[.hooks[$e][] | select(.hooks[0].command==$c)] | length' "$SETTINGS")
-  assert_eq "1" "$N" "$ev holds exactly one KB brief entry after 3 installs"
+for ev in PreCompact SessionEnd SessionStart Stop UserPromptSubmit; do
+  N=$(jq -r --arg e "$ev" --arg c "$DISPATCH $ev" \
+    '[.hooks[$e][] | select(.hooks[0].command==$c)] | length' "$SETTINGS")
+  assert_eq "1" "$N" "$ev holds exactly one KB dispatcher entry after 3 installs"
 done
 
 step "pre-existing NON-KB hooks survive"

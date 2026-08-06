@@ -9,7 +9,7 @@
 #      scripts. This case fakes uname; nothing else selects the Windows path.
 #   2. Claude Code on Windows spawns a hook as exe+args, NOT through a shell, so
 #      a bare .sh command never runs. install.sh must register bash.exe as the
-#      command with the script as args[0] -- for ALL FOUR events (item 1152).
+#      command with the dispatcher as args[0] and the event as args[1] -- for ALL FIVE events (KB 14508).
 #   3. Native event paths (C:\Users\First Last\...) must be converted before
 #      basename/-f: a backslash path yields the whole drive path otherwise. Here
 #      cygpath does it (case 25 pins the no-cygpath fallback).
@@ -50,8 +50,10 @@ for ev in PreCompact SessionEnd SessionStart UserPromptSubmit; do
   case "$CMD" in *.sh) fail "$ev command is a bare .sh -- Windows cannot spawn it" ;; *) pass "$ev command is not a .sh" ;; esac
   case "$ARG0" in *.sh) pass "$ev args[0] is the hook script" ;; *) fail "$ev args[0] is [$ARG0]" ;; esac
 done
-assert_eq "$HOOKS/flush-session-to-kb.sh" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].args[0]' "$SETTINGS")" "PreCompact -> flush hook"
-assert_eq "$HOOKS/kb-session-brief.sh" "$("$RIG_JQ" -r '.hooks.SessionStart[0].hooks[0].args[0]' "$SETTINGS")" "SessionStart -> brief hook"
+assert_eq "$HOOKS/kb-hook-dispatch.sh" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].args[0]' "$SETTINGS")" "PreCompact -> dispatcher"
+assert_eq "PreCompact" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].args[1]' "$SETTINGS")" "…with the event name as args[1]"
+assert_eq "$HOOKS/kb-hook-dispatch.sh" "$("$RIG_JQ" -r '.hooks.SessionStart[0].hooks[0].args[0]' "$SETTINGS")" "SessionStart -> dispatcher"
+assert_eq "SessionStart" "$("$RIG_JQ" -r '.hooks.SessionStart[0].hooks[0].args[1]' "$SETTINGS")" "…with the event name as args[1]"
 assert_eq "startup|clear" "$("$RIG_JQ" -r '.hooks.SessionStart[0].matcher' "$SETTINGS")" "matcher still startup|clear"
 assert_eq "15" "$("$RIG_JQ" -r '.hooks.PreCompact[0].hooks[0].timeout' "$SETTINGS")" "timeout still declared"
 

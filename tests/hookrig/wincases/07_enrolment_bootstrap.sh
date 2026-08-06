@@ -26,7 +26,8 @@ note "enrolment code: ${CODE:0:8}… (single use)"
 
 step "the four scripts download through Git Bash's curl.exe"
 cd "$HOME/.claude/kb-setup" || exit 1
-for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh \
+  kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do
   if "$RIG_CURL" -fsS -H "Authorization: Bearer $CODE" "$STUB/api/setup/$f" -o "$f"; then
     pass "fetched $f ($(wc -c <"$f") bytes)"
   else
@@ -37,7 +38,8 @@ done
 step "the downloads are byte-identical and LF-clean"
 # A CRLF-mangled install.sh is not a subtly wrong script, it is an unrunnable
 # one: Git Bash reports $'\r': command not found and nothing installs.
-for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh \
+  kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do
   cmp -s "$f" "$SKILL/$f" && pass "$f matches the shipped copy" || fail "$f differs"
   if grep -qU $'\r' "$f" 2>/dev/null; then
     fail "$f arrived with CRLF endings — Git Bash cannot run it"
@@ -84,7 +86,7 @@ new_home winboot2
 mkdir -p "$HOME/.claude/kb-setup"
 cp "$SKILL"/*.sh "$HOME/.claude/kb-setup/"
 OUT2=$(cd "$HOME/.claude/kb-setup" && KB_ENROL_CODE="$CODE" KB_REST_URL="$STUB" bash install.sh 2>&1)
-assert_contains "$OUT2" "REFUSED" "the refusal is reported"
+assert_contains "$OUT2" "refused this code" "the refusal is reported with the server reason"
 if grep -q "KB_TOKEN=$RIG_TOKEN" "$CFG" 2>/dev/null; then
   fail "a spent code still configured the machine"
 else

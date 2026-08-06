@@ -35,6 +35,19 @@ This skill installs three hook behaviors (two scripts):
 
 All hooks fail silently — recall/brief never break a prompt or session.
 
+**One hook per event.** `install.sh` registers exactly ONE command with Claude
+Code for each of the five events — `kb-hook-dispatch.sh <event>` — and that
+script reads the event JSON once and pipes the same bytes to the scripts the
+event needs (`UserPromptSubmit` → `turn-start.sh`, then `kb-session-brief.sh`).
+Claude Code on Windows has an open upstream bug (GH #77078 and siblings): with
+more than one hook on a single event, only one of the spawned processes receives
+stdin and the others read empty — so recall ran with no prompt and captures died
+in silence. Registering one dispatcher is the documented workaround. The
+dispatcher always exits 0, runs its children sequentially, passes their stdout
+through untouched (the brief's stdout IS the injected context), and logs one
+`hook event arrived EMPTY: event=…` line to `flush-session.log` if it is ever
+handed an empty event anyway, so residual hits stay countable.
+
 Four modes, auto-detected by `install.sh` (in priority order):
 - **LOCAL** (the KB host): the hook runs `kb ingest-session <transcript> --queue`
   (checkpointed, GPU-free enqueue). Config: `KB_DIR` in `~/.claude/kb-flush.env`.

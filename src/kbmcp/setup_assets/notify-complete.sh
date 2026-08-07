@@ -158,31 +158,58 @@ kb_progress() { # -> "kb <flushed>/<size>" | "kb <size> synced" | nothing at all
     return 0
   fi
 
-  # BRANCH 2 — no checkpoint file. Two very different situations produce that,
-  # and only one of them is knowable:
-  #   * the flush hook DELETED it after a terminal SessionEnd drain (fully
-  #     captured), or
-  #   * this box flushes in LOCAL mode, which enqueues through the CLI and never
-  #     writes an offset at all (unknowable from here).
-  # The backfill ledger is the one durable record that survives the deletion: it
-  # holds "<session key><TAB><bytes accounted for>" for every session a sweep
-  # finished. A hit means the session is fully in; a miss means we cannot tell.
+  # BRANCH 2 — no checkpoint file. The flush hook DELETED it after a terminal
+  # SessionEnd drain (fully captured), or nothing has ever flushed. The backfill
+  # ledger is the durable record that survives the deletion: it holds
+  # "<session key><TAB><bytes accounted for>" for every session a sweep
+  # finished.
   _led="$_state/.backfill-done"
-  [ -f "$_led" ] || return 0
-  # Split on TAB *or* US (0x1F): the ledger is written TAB-separated, and the US
-  # is accepted so a record written with the sweep's other field separator still
-  # parses. Built with printf so no awk has to interpret an escape sequence.
-  _fs=$(printf '[\t\037]')
-  _acct=$(awk -F"$_fs" -v k="$_okey" '$1 == k { v = $2 } END { print v }' "$_led" 2>/dev/null)
-  case "$_acct" in '' | *[!0-9]*) return 0 ;; esac
-  if [ "$_acct" -ge "$_size" ]; then
-    _h=$(kb_human "$_size") || return 0
-    [ -n "$_h" ] || return 0
-    printf 'kb %s synced' "$_h"
-  else
-    # Accounted for less than the file now holds (it grew after the sweep) — say
-    # so in the same progress shape rather than calling it synced.
-    _h=$(kb_human "$_acct" "$_size") || return 0
+  if [ -f "$_led" ]; then
+    # Split on TAB *or* US (0x1F): the ledger is written TAB-separated, and the
+    # US is accepted so a record written with the sweep's other field separator
+    # still parses. Built with printf so no awk has to interpret an escape.
+    _fs=$(printf '[\t\037]')
+    _acct=$(awk -F"$_fs" -v k="$_okey" '$1 == k { v = $2 } END { print v }' "$_led" 2>/dev/null)
+    case "$_acct" in
+    '' | *[!0-9]*) ;;
+    *)
+      if [ "$_acct" -ge "$_size" ]; then
+        _h=$(kb_human "$_size") || return 0
+        [ -n "$_h" ] || return 0
+        printf 'kb %s synced' "$_h"
+      else
+        # Accounted for less than the file now holds (it grew after the sweep)
+        # — say so in the same progress shape rather than calling it synced.
+        _h=$(kb_human "$_acct" "$_size") || return 0
+        [ -n "$_h" ] || return 0
+        printf 'kb %s' "$_h"
+      fi
+      return 0
+      ;;
+    esac
+  fi
+
+  # BRANCH 3 — NO record at all. Whether that is "zero" or "unknowable" depends
+  # on the box's flush TRANSPORT (owner report 2026-08-07: young sessions on the
+  # Windows box pushed pings with no kb segment at all, which reads as broken):
+  #   * NETWORK mode (KB_REST_URL / KB_MCP_URL / connector): every accepted
+  #     chunk advances an offset and every finished sweep writes the ledger, so
+  #     no record genuinely means NOTHING of this transcript is captured yet —
+  #     say so: "kb 0.0/5.2MB" is the honest zero, not a guess (the flush fires
+  #     at PreCompact/SessionEnd, so a young session is EXPECTED to read 0).
+  #   * LOCAL mode (KB_DIR) enqueues through the CLI and writes neither record —
+  #     truly unknowable from here, so keep the original omission.
+  # A corrupt offset (branch 1) still omits: there the truth is "cannot tell",
+  # not zero. Mode is read from the flush hook's own config in a SUBSHELL so
+  # none of its variables (tokens included) can leak into this environment.
+  _mode=$( [ -r "$HOME/.claude/kb-flush.env" ] && (
+    . "$HOME/.claude/kb-flush.env" 2>/dev/null
+    if [ -n "${KB_REST_URL:-}" ] || [ -n "${KB_MCP_URL:-}" ] || [ "${KB_CONNECTOR:-0}" = "1" ]; then
+      printf net
+    fi
+  ) 2>/dev/null ) || _mode=""
+  if [ "$_mode" = "net" ]; then
+    _h=$(kb_human 0 "$_size") || return 0
     [ -n "$_h" ] || return 0
     printf 'kb %s' "$_h"
   fi

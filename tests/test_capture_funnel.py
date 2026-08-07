@@ -1311,6 +1311,86 @@ def test_the_published_body_is_pure_ascii_in_its_fullest_shape(tmp_path):
     )
 
 
+def test_a_network_box_with_no_capture_record_reports_the_honest_zero(tmp_path):
+    """Owner report 2026-08-07: young sessions on the Windows box (flush fires at
+    PreCompact/SessionEnd, so nothing has flushed yet) pushed pings with NO kb
+    segment — indistinguishable from the feature being broken. On a NETWORK-mode
+    box, no offset and no ledger genuinely means zero bytes captured, so the
+    segment now says so instead of hiding."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    (home / ".claude" / "kb-flush.env").write_text(
+        "KB_REST_URL=http://kb.invalid\nKB_TOKEN=kbg_" + "0" * 40 + "\n"
+    )
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-young",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert msg.endswith("(kb 0.0/5.2MB)"), f"expected the honest zero, got {msg!r}"
+    # The flush config was sourced in a subshell to learn the transport; its
+    # credential must not leak into the push body or any argv.
+    assert "kbg_" not in msg
+    recorded = "".join(p.read_text() for p in rec_dir.glob("argv.*"))
+    assert "kbg_" not in recorded, "the flush credential leaked into curl argv"
+
+
+def test_a_LOCAL_box_with_no_capture_record_still_omits_the_segment(tmp_path):
+    """LOCAL mode writes neither offsets nor ledger — absence is genuinely
+    unknowable there, so the original omission stands."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    (home / ".claude" / "kb-flush.env").write_text("KB_DIR=/somewhere\nUV=/usr/bin/uv\n")
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-local",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert msg == "Claude finished - proj @ testbox", f"LOCAL mode must keep omitting: {msg!r}"
+
+
+def test_no_flush_config_at_all_still_omits_the_segment(tmp_path):
+    """A box with notifications but no flush install: nothing is knowable."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-noflush",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert msg == "Claude finished - proj @ testbox", f"no config must keep omitting: {msg!r}"
+
+
 def _shell_fn(script: Path, name: str) -> str:
     """The function <name> AS WRITTEN in <script>, extracted for execution.
 

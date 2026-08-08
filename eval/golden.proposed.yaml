@@ -6,8 +6,10 @@
 # candidates in exactly this shape from real search→kb_get usage.
 #
 # 2026-08-04: the UART rank case and the TPS55288/Benin forbid guard were
-# resolved (984 / 987) and PROMOTED into golden.yaml. Only the owner-gated
-# graph-expansion A/B fixtures remain below.
+# resolved (984 / 987) and PROMOTED into golden.yaml.
+# 2026-08-08: two owner-gated blocks are staged below — the graph-expansion A/B
+# fixtures (ids still unresolved) and the extra-language multilingual cases
+# (verified green, but each one makes a LANGUAGE a nightly guarantee).
 
 # =============================================================================
 # GRAPH-EXPANSION A/B FIXTURES — rank-sensitive, relation-reachable cases.
@@ -60,3 +62,42 @@
 #   # 'supersedes'/'derived_from' edge (the correction that cites it).
 #   expect_item_id: 0
 #   expect_rank_le: 5
+
+# =============================================================================
+# EXTRA-LANGUAGE MULTILINGUAL CASES — owner decision (2026-08-08).
+#
+# Unlike the block above, these need NO id resolution: both are plain
+# expect_substr cases and both VERIFY GREEN today (ranks observed via kb_search
+# on 2026-08-08, k=5, expand unset → hops 0, i.e. what `make eval` replays).
+# They are staged rather than shipped because adding one is a PROMISE: the
+# nightly sentinel would hold the corpus to serving that language forever, and
+# the embedder can only be swapped (DATA-3/V7) against the guarantees this file
+# encodes. golden.yaml already carries Urdu twice — the Benin teaching item and
+# the cross-lingual Urdu→English journalctl runbook — so the question here is
+# how MANY languages this KB promises, which is the owner's call, not the
+# eval's. Promote by moving a case into eval/golden.yaml verbatim.
+#
+# Note the asymmetry the owner is really deciding on: the German case is a
+# different LANGUAGE (safe: rank 1, and the query still carries the English
+# identifiers WiNet-S/Modbus/TCP that the keyword leg can match). The Roman-Urdu
+# case is a different WRITING SYSTEM for a language already covered — the way
+# this owner actually types — and it is the shakier of the two: the target sits
+# at rank 3 of 5, because the only lexemes the keyword leg can match are the
+# English nouns it is code-switched with ("systemd", "restart", "logs"), which
+# pull generic systemd/journald items in ahead of the runbook that answers the
+# question. Promoting the second one is a real bet on the embedder.
+
+- q: "Warum setzt der WiNet-S Dongle die Modbus TCP Verbindung zurück"
+  # German → English-only sungrow content. The German function words carry no
+  # lexical signal at all: only the vector leg can connect "setzt ... zurück"
+  # to "resets". 2026-08-08: rank 1 = 1070, rank 2 = 10253, rank 4 = 10258 —
+  # all WiNet-S. Bound = observed + 2.
+  expect_substr: ["WiNet-S"]
+  expect_rank_le: 3
+- q: "systemd service baar baar restart ho rahi hai logs kaise dekhein"
+  # Roman Urdu (transliterated, code-switched with English technical nouns).
+  # 2026-08-08: rank 3 = 983 (the journalctl runbook); ranks 1-2 are the kvm
+  # journald-persistence config (15423) and rm3 529. Bound 5 = observed + 2,
+  # and it is the tightest bound this case can safely carry today.
+  expect_substr: ["journalctl"]
+  expect_rank_le: 5

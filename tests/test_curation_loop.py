@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from kbcore import consolidation, db, evidence, llm, review_auto, review_triage
+from kbcore import consolidation, db, evidence, llm, review_auto, review_expire, review_triage
 from kbcore.config import settings
 from kbcore.ingest import ingest
 from kbcore.review import queue_review
@@ -116,7 +116,7 @@ def test_reject_suggested_row_survives_quiet_expiry(kb):
     review_triage.store_triage(qid, {"action": "reject_noise", "dup_of": None, "rationale": "r"})
     _age_row(qid, 400)  # far past ANY expiry age, and never recalled
 
-    assert review_auto.expire_quiet_rows(30) == 0
+    assert review_expire.expire_quiet_rows(30)["expired"] == 0
     assert _resolved(qid) is False, "an unapplied reject_* verdict was quietly closed"
     with db.connect() as conn:
         status = conn.execute("SELECT status FROM items WHERE id = %s", (item_id,)).fetchone()[0]
@@ -132,30 +132,36 @@ def test_reject_duplicate_is_exempt_too(kb):
     )
     _age_row(qid, 400)
 
-    assert review_auto.expire_quiet_rows(30) == 0
+    assert review_expire.expire_quiet_rows(30)["expired"] == 0
     assert _resolved(qid) is False
 
 
-def test_keep_suggested_and_untriaged_rows_still_expire(kb):
-    """Applying a 'keep' lands on the SAME end state as expiry, so it may expire."""
+def test_keep_suggested_expires_but_an_untriaged_row_is_held(kb):
+    """Applying a 'keep' lands on the SAME end state as expiry, so it may expire.
+
+    The untriaged row no longer does (owner amendment 2026-08-08, amending KB
+    957's "an untriaged row expires as before"): closing it would file an
+    unexamined item away for good, so it stays open as visible queue depth.
+    """
     _i1, keep_qid = _unverified("curation", "keepme")
     review_triage.store_triage(keep_qid, {"action": "keep", "dup_of": None, "rationale": "r"})
     _i2, plain_qid = _unverified("curation", "plain")
     for qid in (keep_qid, plain_qid):
         _age_row(qid, 400)
 
-    assert review_auto.expire_quiet_rows(30) == 2
+    assert review_expire.expire_quiet_rows(30)["expired"] == 1
     assert _resolved(keep_qid) is True
-    assert _resolved(plain_qid) is True
+    assert _resolved(plain_qid) is False
 
 
 def test_quiet_expiry_kill_switch_and_age_floor_still_hold(kb):
     """The exemption must not change the two bounds the sweep already had."""
     _item, qid = _unverified("curation", "young")
-    assert review_auto.expire_quiet_rows(0) == 0, "0 is still the kill switch"
-    assert review_auto.expire_quiet_rows(30) == 0, "a fresh row is still too young"
+    review_triage.store_triage(qid, {"action": "keep", "dup_of": None, "rationale": "r"})
+    assert review_expire.expire_quiet_rows(0)["expired"] == 0, "0 is still the kill switch"
+    assert review_expire.expire_quiet_rows(30)["expired"] == 0, "a fresh row is still too young"
     _age_row(qid, 400)
-    assert review_auto.expire_quiet_rows(30) == 1
+    assert review_expire.expire_quiet_rows(30)["expired"] == 1
 
 
 # --- DEFECT 2: the report must carry the curation counts ---------------------
@@ -183,13 +189,14 @@ def test_curation_counts_report_the_backlog(kb):
     assert counts["triage_awaiting_apply"] == 2
     assert counts["reject_suggestions_pending"] == 1
     assert counts["contradiction_suggestions_pending"] == 1
-    # q_raw is the oldest quiet-expiry-eligible row (10 days old) → 20 days out;
-    # the older reject-suggested row is exempt and must not set the date.
+    assert counts["never_triaged_open"] == 1, "q_raw is the whole examined-nothing backlog"
+    # q_keep is the oldest row that can ACTUALLY expire: the reject-suggested row
+    # is exempt, and q_raw — older — is held open by the untriaged gate.
     with db.connect() as conn:
         expected = conn.execute(
             "SELECT (created_at + make_interval(days => 30))::date::text "
             "FROM review_queue WHERE id = %s",
-            (q_raw,),
+            (q_keep,),
         ).fetchone()[0]
     assert counts["first_expiry_date"] == expected
 

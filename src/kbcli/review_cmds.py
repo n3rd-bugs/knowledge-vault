@@ -11,12 +11,20 @@ from datetime import datetime
 
 import typer
 
+from kbcli import expire_cmds
 from kbcore import render, review_apply, review_auto, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import KBError
 
 review_app = typer.Typer(help="Review queue: promote/reject/supersede unverified items")
+
+# The quiet-expiry pair lives in kbcli.expire_cmds (this file is at the 300-line
+# ratchet) but is part of THIS sub-app: `kb review expire` / `kb review
+# undo-expiry`. Registering the functions here is exactly what the decorator
+# does, so the two commands behave like any other in the group.
+review_app.command("expire")(expire_cmds.review_expire_cmd)
+review_app.command("undo-expiry")(expire_cmds.review_undo_expiry)
 
 
 def _fail(err: Exception) -> None:

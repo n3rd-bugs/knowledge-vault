@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from typer.testing import CliRunner
 
-from kbcore import consolidation, db, review_auto
+from kbcore import consolidation, db, review_auto, review_expire, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import InvalidOperation, NotFound
@@ -78,9 +78,14 @@ def test_moot_sweep_closes_rows_for_retired_items(kb):
 
 
 def test_quiet_expiry_closes_only_old_unrecalled_rows(kb):
+    # The sweep moved to kbcore.review_expire (2026-08-08) and now requires a
+    # stored triage verdict — the untriaged gate. Its rails live in
+    # tests/test_quiet_expiry.py; this stays the WP-1 end-to-end pin.
     quiet, q_quiet = _unverified("p", "quiet")
     used, q_used = _unverified("p", "used")
     _young, q_young = _unverified("p", "young")
+    for qid in (q_quiet, q_used, q_young):
+        review_triage.store_triage(qid, {"action": "keep", "dup_of": None, "rationale": "r"})
     with db.transaction() as conn:  # backdate the review rows (kb_test-owned)
         conn.execute(
             "UPDATE review_queue SET created_at = now() - interval '60 days' WHERE id = ANY(%s)",
@@ -88,10 +93,10 @@ def test_quiet_expiry_closes_only_old_unrecalled_rows(kb):
         )
     log_access(used, "kb_get")  # this item WAS recalled — its row must survive
 
-    assert review_auto.expire_quiet_rows(0) == 0  # kill switch: DB untouched
+    assert review_expire.expire_quiet_rows(0)["expired"] == 0  # kill switch: DB untouched
     assert _row(q_quiet)[0] is False
 
-    assert review_auto.expire_quiet_rows(30) == 1
+    assert review_expire.expire_quiet_rows(30)["expired"] == 1
     resolved, detail = _row(q_quiet)
     assert resolved is True
     assert detail["auto_resolution"]["kind"] == "quiet_expiry"
@@ -203,4 +208,4 @@ def test_worker_steps_run_clean_on_empty_queue(kb):
     # advisory lock and would write a report); the functions must no-op cleanly.
     assert worker.review_auto is review_auto
     assert review_auto.close_moot_rows() == 0
-    assert review_auto.expire_quiet_rows(settings.kb_review_expire_days) == 0
+    assert review_expire.expire_quiet_rows(settings.kb_review_expire_days)["expired"] == 0

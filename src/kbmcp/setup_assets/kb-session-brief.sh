@@ -542,7 +542,8 @@ else
         printf 'Re-run the installer to pick up the current scripts:\n'
         printf '  cd ~/.claude/kb-setup 2>/dev/null || mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup\n'
         printf '  for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \\\n'
-        printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do\n'
+        printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh \\\n'
+        printf '           kb-hook-dispatch.sh kb-flush-backfill.sh; do\n'
         printf '    curl -fsS -H "Authorization: Bearer $KB_TOKEN" "%s/api/setup/$f" -o "$f"\n' "${KB_REST_URL%/}"
         printf '  done && bash install.sh\n'
         printf 'This is FYI — nothing is broken, but newer scripts may capture more.\n\n'

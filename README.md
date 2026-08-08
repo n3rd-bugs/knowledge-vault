@@ -158,13 +158,16 @@ enrolment code**; the machine then fetches the scripts and credentials itself (s
 ```bash
 export KB_ENROL_CODE=kbe_…   KB_REST_URL=https://api.<host>
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
-for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
+         kb-mcp-call.sh notify-complete.sh turn-start.sh \
+         kb-hook-dispatch.sh kb-flush-backfill.sh; do
   curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh
 ```
 
-`install.sh` registers **four** events and auto-detects the transport, first match winning:
+`install.sh` registers **five** events (one dispatcher hook each) and auto-detects the transport,
+first match winning:
 **LOCAL** (a KB repo + `uv`) → **MCP** (a bearer-registered KB server in `~/.claude.json`) →
 **CONNECTOR** (any `claude` binary) → **REMOTE** (the fallback). Note CONNECTOR outranks REMOTE on
 essentially every machine, so to get bearer REMOTE mode write `~/.claude/kb-flush.env` *before*

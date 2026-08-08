@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install the KB session-flush hook on THIS machine: writes the hook script,
 # creates ~/.claude/kb-flush.env (LOCAL if a KB repo is here, else a REMOTE stub),
-# and registers PreCompact + SessionEnd in ~/.claude/settings.json. Idempotent.
+# and registers ONE dispatcher hook per event (PreCompact, SessionEnd,
+# SessionStart, UserPromptSubmit, Stop) in ~/.claude/settings.json. Idempotent.
 #
 # NO SUDO REQUIRED. jq is preferred but optional: the installer and the hooks
 # fall back to python3, and jq can be a static binary you drop in ~/.local/bin,

@@ -83,7 +83,8 @@ ingest as `unverified` + a review row.
 excluded, everything undoable); contradiction pairs are judged with a
 per-pair memory (never re-pay a verdict); stable suggestions auto-resolve at
 streak 2; summaries, evidence, dedupe, doc-refresh supersede, 30-day quiet
-expiry (reject-suggested rows exempt), re-embed, then the eval sentinel and a
+expiry (capped at 500/night, oldest first; untriaged and reject-suggested rows
+never expire, and the batch is undoable), re-embed, then the eval sentinel and a
 one-line **ntfy digest** to the owner.
 
 **Guards**: hard noon deadline on weekdays (weekends run unbounded), battery

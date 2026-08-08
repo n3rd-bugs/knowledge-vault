@@ -647,6 +647,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             "contradiction_pairs_judged": 0,
             "triage_awaiting_apply": 0,
             "reject_suggestions_pending": 0,
+            "never_triaged_open": 0,
             "contradiction_suggestions_pending": 0,
             "first_expiry_date": None,
         }
@@ -717,11 +718,8 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         _run_step(counts, "reembedded", reembed_mod.reembed)
         # WP-1 quiet-expiry: close never-recalled unverified rows past the age
         # knob (kb_review_expire_days; 0 = kill switch). Item stays searchable.
-        _run_step(
-            counts,
-            "review_expired",
-            lambda: review_auto.expire_quiet_rows(settings.kb_review_expire_days),
-        )
+        # Capped + STOP-GATED inside the step since 2026-08-08 (kbcore.review_expire).
+        _run_step(counts, "review_expired", lambda: tail_steps.quiet_expire_step(counts, stop))
 
         # AFTER quiet-expiry, so the four curation counts describe the queue the
         # owner will actually wake up to (kbcore.review_auto.curation_counts).

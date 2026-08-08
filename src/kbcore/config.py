@@ -283,6 +283,15 @@ class Settings(SettingsViews, BaseSettings):
     # recalled (zero access_log rows). Only the review ROW closes — the item
     # stays active/unverified/searchable. Kill switch: 0 disables quiet-expiry.
     kb_review_expire_days: int = 30
+    # BLAST RADIUS of one quiet-expiry run (owner amendment 2026-08-08). The
+    # sweep was a single uncapped UPDATE that had never actually fired in anger;
+    # its first real firing (2026-08-19) faced a ~6,600-row 30-day pool and would
+    # have closed all of it in one statement, with no undo written yet and no way
+    # to eyeball what went. Capped and ordered by rq.created_at (oldest first),
+    # the cliff becomes a ramp: each night closes the rows nearest their deadline
+    # and the report says how many were left. 0 = UNCAPPED, explicitly — the kill
+    # switch is kb_review_expire_days=0 above, never this knob.
+    kb_review_expire_cap: int = 500
     # WP-2 LLM triage (owner decision 2026-07-18): the nightly consolidation asks
     # the 14B for a keep / reject_noise / reject_duplicate SUGGESTION per open
     # unverified_extraction row (stored in review_queue.detail.triage); a human

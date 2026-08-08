@@ -60,6 +60,35 @@ def auto_apply_step(counts: dict[str, Any], stop: StopCheck | None = None) -> in
     return applied
 
 
+def quiet_expire_step(counts: dict[str, Any], stop: StopCheck | None = None) -> int:
+    """Tail step ``review_expired``: close aged, never-recalled, TRIAGED rows.
+
+    STOP-GATED like every other tail step (owner amendment 2026-08-08). It was
+    the one automation that ran unconditionally — including in a zero-work
+    boot-catch-up run that stood down before triage — so rows could be closed on
+    a night when nothing was allowed to EXAMINE them. Standing down costs
+    nothing: the rows stay open and the next run takes them, oldest first.
+
+    Returns the rows closed; the run's full counts (eligible / remaining) ride
+    into the report under ``quiet_expiry_counts``, minus the sample, which is a
+    CLI affordance rather than something to persist night over night.
+    """
+    if stop is not None and (reason := stop()):
+        _note_stop("review_expired", reason, 0)
+        return 0
+    try:
+        from kbcore import review_expire
+    except ImportError:
+        logger.warning("kbcore.review_expire is not installed — quiet expiry skipped this run")
+        return 0
+    result = review_expire.expire_quiet_rows(settings.kb_review_expire_days)
+    counts["quiet_expiry_counts"] = {k: v for k, v in result.items() if k != "sample"}
+    expired = int(result.get("expired", 0))
+    if expired or result.get("eligible_remaining"):
+        logger.info("quiet expiry: %d row(s) closed (%s)", expired, counts["quiet_expiry_counts"])
+    return expired
+
+
 def _topup_cutoff(now: datetime | None = None) -> datetime | None:
     """Today's top-up cutoff as a LOCAL datetime, or ``None`` when disabled.
 
@@ -196,14 +225,23 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     # be noise in the one message the owner reads without going looking.
     if topup := counts.get("review_triaged_topup"):
         lines.append(f"topup triaged: {topup}")
+    # The two quiet-expiry facts, POSITIVE-ONLY (owner amendment 2026-08-08):
+    # what the capped sweep actually closed tonight, and the backlog the
+    # untriaged gate now holds open — the number that only falls when work is
+    # done. Pure ASCII: this line goes out over ntfy to a phone.
+    if expired := counts.get("review_expired"):
+        lines.append(f"expired: {expired}")
+    if never_triaged := counts.get("never_triaged_open"):
+        lines.append(f"never-triaged open: {never_triaged}")
     expiry = counts.get("first_expiry_date")
     if expiry and _expiring_soon(expiry):
         lines.append(f"review rows start expiring {expiry}")
-    # The urgent cut of the above (Package O): rows that will age out UNEXAMINED
-    # within a week — each becomes permanently-unverified knowledge if not triaged.
+    # The urgent cut of the above (Package O): untriaged rows reaching the age at
+    # which a TRIAGED row would close. Since the untriaged gate they are held
+    # open rather than closed, so this is a pile-up warning, not a loss warning.
     expiring_7d = counts.get("untriaged_expiring_7d")
     if expiring_7d:
-        lines.append(f"EXPIRY: {expiring_7d} untriaged rows expire within 7d")
+        lines.append(f"EXPIRY: {expiring_7d} untriaged rows reach expiry age within 7d")
     stale = _stale_hook_projects(counts.get("fleet_degenerate_by_project"))
     if stale:
         # NAMED, not counted: the action is "go update that machine's hooks", and

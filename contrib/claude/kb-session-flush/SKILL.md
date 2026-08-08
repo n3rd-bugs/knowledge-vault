@@ -5,7 +5,8 @@ description: Install Claude Code hooks that connect sessions to the Knowledge Va
 
 # Install the KB session hooks (flush + pre-brief)
 
-This skill installs three hook behaviors (two scripts):
+This skill installs three hook behaviors, plus optional completion notifications
+on `Stop` (inert until `~/.claude/notify.env` names a channel):
 
 1. **Flush** (`PreCompact` + `SessionEnd`): the session's new transcript delta is
    flushed into the Knowledge Vault before every compaction. Never blocks

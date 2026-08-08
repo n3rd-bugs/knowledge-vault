@@ -141,3 +141,155 @@
   # fail loudly. forbid-only criteria never inflate hit@5.
   forbid_item_id: 987
   kwargs: {expand: true}
+
+# --- IDENTIFIER-LEG COVERAGE (added 2026-08-08) ------------------------------
+# WHY. kbcore.search_legs arms the identifier leg only for identifier-DOMINANT
+# queries — `_id_dominant`: at least HALF the query's words must be identifier
+# tokens (digit or underscore anywhere, an all-caps acronym, or an internal
+# capital). Before this block only 6 of 37 cases cleared that bar, and those 6
+# were repeats of just TWO seed artefacts — motor-ctl's drv_spi_write and the
+# TPS55288 decision (docx-tools' "PageNumber CURRENT field node docx footer"
+# reads like a symbol query but is NOT dominant: 2 identifiers in 6 words, so
+# the leg stays off there too). The leg — and its word-PREFIX fallback,
+# and the exact-identifier bonus that rides on the same token list — was
+# therefore unmeasured against the REAL corpus: a regression in it could only
+# be seen through hardware seeds that never change.
+#
+# Each case below is identifier-dominant (its token list is quoted in the
+# comment, reproducible with `_identifier_tokens` / `_id_dominant`) and targets
+# a project the leg had never fired for. Ranks are LIVE ranks observed via
+# kb_search on 2026-08-08 with k=5 and expand unset (hops 0) — exactly what
+# `make eval` replays — so every case is green on day one. Each bound is the
+# observed rank + 2: real slippage is visible, one night's consolidation churn
+# is not. Substrings are the SYMBOL itself, so a near-miss that returns the
+# right topic without the right artefact cannot pass.
+
+- q: "SungrowModbusTcpClient GET_KEY handshake"
+  # sungrow (1098 items, zero golden coverage). tokens
+  # [SungrowModbusTcpClient, GET_KEY] of 3 words → leg armed.
+  # 2026-08-08: rank 1 = 1076 (Sungrow Client Handshake Issue); 10258, 10250,
+  # 10257, 10678 fill out the top-5 and all name the class, so this tracks a
+  # near-twin FAMILY, not one id that a re-capture could move (cf. 858/488).
+  expect_substr: ["SungrowModbusTcpClient"]
+  expect_rank_le: 3
+- q: "RF_PROFILE COMPAT FCC_STRICT rollout"
+  # repeater (2659 items). tokens [RF_PROFILE, COMPAT, FCC_STRICT] of 4 → armed.
+  # 2026-08-08: rank 1 = 2644 (decision, FCC_STRICT in the title); 15886, 16003,
+  # 2634, 304 follow — the whole top-5 is the RF_PROFILE decision family.
+  expect_substr: ["FCC_STRICT"]
+  expect_rank_le: 3
+- q: "lr11xx_radio_set_tx_params SF9 BW500"
+  # punchrescue. tokens [lr11xx_radio_set_tx_params, SF9, BW500] of 3 → armed.
+  # 2026-08-08: rank 2 = 3633 (the firmware change naming the symbol). Rank 1
+  # (repeater 14728) describes the SAME change in prose — "the LR11XX radio
+  # configuration" — so the underscored substring deliberately skips it: this
+  # case measures symbol-exact retrieval, not topic retrieval.
+  expect_substr: ["lr11xx_radio_set_tx_params"]
+  expect_rank_le: 4
+- q: "dwc2 TX FIFO flush timeout"
+  # kvm (778 items). tokens [dwc2, TX, FIFO] of 5 words → armed (3*2 >= 5).
+  # 2026-08-08: rank 1 = 15466 (dwc2 TX-FIFO wedge requires full module
+  # reload); 6670, 15468, 13966, 6669 follow.
+  expect_substr: ["dwc2"]
+  expect_rank_le: 3
+- q: "TC358743 HDMI CSI bridge"
+  # kvm, bare PART NUMBER + acronyms (the TPS55288 shape, on a corpus that
+  # actually turns over). tokens [TC358743, HDMI, CSI] of 4 → armed.
+  # 2026-08-08: rank 1 = 13931, rank 2 = 13922, rank 3 = 13926 — all name the part.
+  expect_substr: ["TC358743"]
+  expect_rank_le: 3
+- q: "statement_rows account_id txn_date index"
+  # expenses (285 items, zero coverage). DB schema identifiers — a query class
+  # the set had none of. tokens [statement_rows, account_id, txn_date] of 4 → armed.
+  # 2026-08-08: rank 1 = 11084 (schema migration), rank 2 = 13058 (lang:sql
+  # summary), rank 3 = 11207.
+  expect_substr: ["statement_rows"]
+  expect_rank_le: 3
+- q: "authenticate_ws JWT websocket"
+  # bridgesecuritysolution (515 items). tokens [authenticate_ws, JWT] of 3 → armed.
+  # 2026-08-08: rank 1 = 10653 (protocol:websocket summary), rank 2 = 10445,
+  # rank 3 = 10654, rank 4 = 371 (the verified cross-project bss lesson).
+  expect_substr: ["authenticate_ws"]
+  expect_rank_le: 3
+- q: "qpm_dnp_index_for_reg quantum_dnp_pointmap.c"
+  # aquamonix (3645 items). The set's DNP3 cases are all PROSE, so none of them
+  # arms the leg; this is the same project reached by its firmware symbol.
+  # tokens [qpm_dnp_index_for_reg, quantum_dnp_pointmap] of 3 words → armed.
+  # 2026-08-08: rank 1 = 10878, rank 2 = 13239, rank 3 = 11860.
+  expect_substr: ["qpm_dnp_index_for_reg"]
+  expect_rank_le: 3
+- q: "trap_store_address_misaligned Spike"
+  # i-redis (1251 items). tokens [trap_store_address_misaligned] of 2 → armed.
+  # POSITIVE CONTROL over the very corpus that dilutes the KNOWN-RED canary
+  # above: when the query carries a real symbol, the i-redis stack-pointer
+  # corpus is the CORRECT answer, so a fix for the canary must not be a blanket
+  # demotion of this project. Nothing here repoints or weakens that canary.
+  # 2026-08-08: rank 1 = 4206, rank 2 = 5943, rank 3 = 4197.
+  expect_substr: ["trap_store_address_misaligned"]
+  expect_rank_le: 3
+- q: "OLLAMA_MAX_LOADED_MODELS keep_alive model slot"
+  # gateway/data-server. ENV-VAR (config key) lookup, and the identifier-
+  # dominant twin of the prose case "ollama gpu memory keep alive unload"
+  # above: the pair pins leg-armed and leg-off retrieval of the SAME knowledge
+  # (Invariant 8's finite keep-alive), so a leg regression separates from a
+  # corpus regression. tokens [OLLAMA_MAX_LOADED_MODELS, keep_alive] of 4 → armed.
+  # 2026-08-08: rank 1 = 8614, rank 2 = 4105, rank 3 = 8622, rank 5 = 7659.
+  expect_substr: ["OLLAMA_MAX_LOADED_MODELS"]
+  expect_rank_le: 3
+
+# --- QUERY CLASSES WITH ZERO COVERAGE (added 2026-08-08) ---------------------
+# Five classes the set never exercised. NONE of these is identifier-dominant —
+# they measure the vector/keyword path, not the leg above — and the bound is
+# again observed rank + 2. Same provenance rule: ranks observed live
+# 2026-08-08 via kb_search, k=5, expand unset (hops 0).
+
+- q: "service dies at boot but starts fine manually afterwards"
+  # GOTCHA-BY-SYMPTOM: the query carries none of the answer's identifiers
+  # (isc-dhcp-server, NetworkManager, network-online.target) — the user has the
+  # symptom, not the vocabulary. Every existing gotcha case hands retrieval at
+  # least one of the answer's own words.
+  # 2026-08-08: rank 1 = 23 (verified gateway boot-ordering gotcha), rank 2 =
+  # 8751 (Persistent=true fires before DNS), ranks 3-5 the sungrow
+  # service-ordering patterns.
+  expect_substr: ["network-online.target"]
+  expect_rank_le: 3
+- q: "which TCP port does the WiNet-S dongle use for Modbus and which one is encrypted"
+  # CONFIG-VALUE lookup: the answer is a number, not a document. The substring
+  # is the RARE half of the pair (:516) — ":502" is everywhere in this corpus —
+  # so returning generic Modbus troubleshooting cannot pass.
+  # 2026-08-08: rank 1 = 10255 ("...:502 for standard Modbus TCP, while :516 is
+  # reserved for an encrypted protocol that isn't currently supported").
+  expect_substr: [":516"]
+  expect_rank_le: 3
+- q: "have we hit a websocket authentication bypass anywhere"
+  # CROSS-PROJECT "have we solved X anywhere" with a NON-DILUTED target — the
+  # control for the known-red canary above. Same vague shape, but the target is
+  # UNAMBIGUOUS: "PLATFORM-520" occurs in exactly one item — 371, project bss,
+  # verified, the general LESSON — so no amount of near-twin mass can satisfy
+  # this case by accident, and reaching it means crossing from the project that
+  # owns the topic (bridgesecuritysolution) into another one. Green today: if it
+  # goes red, vague cross-project recall has degraded generally, not just for
+  # the canary's "sp" collision.
+  # 2026-08-08: rank 3 = 371. Ranks 1-2 (10447, 10411) are the
+  # bridgesecuritysolution repro/bug twins and do NOT carry the ticket id
+  # (checked with kb_get), so the criterion really is measuring rank 3.
+  expect_substr: ["PLATFORM-520"]
+  expect_rank_le: 5
+- q: "سسٹم ڈی سروس بار بار ری سٹارٹ ہو رہی ہے لاگ کیسے دیکھیں"
+  # MULTILINGUAL #2. The existing Urdu case retrieves URDU content (Benin); this
+  # one is CROSS-lingual — an all-Urdu query, zero Latin characters, against an
+  # English-only runbook. The 'simple' keyword leg cannot help (no shared
+  # lexeme exists), so this is the embedder's cross-lingual guarantee alone,
+  # which is what a user typing Urdu about their own code actually needs.
+  # 2026-08-08: rank 1 = 983 (verified infra runbook, body carries journalctl),
+  # rank 2 = 529, rank 3 = 13768.
+  expect_substr: ["journalctl"]
+  expect_rank_le: 3
+- q: "why did we choose a tombstone table instead of deleting imported statement transactions"
+  # RECENT-DECISION recall in the "why did we choose X" phrasing. The set's
+  # decision cases all point at 2026-07 seeds; this one lands on 2026-08 work
+  # in expenses, a project with no golden coverage at all.
+  # 2026-08-08: rank 1 = 11207 (pattern: tombstone table, `ignored_statement_rows`),
+  # rank 2 = 11084, rank 3 = 11327.
+  expect_substr: ["ignored_statement_rows"]
+  expect_rank_le: 3

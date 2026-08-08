@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # CASE: the SHARED portable block is one block, and its two JSON backends agree
 # PINS: platform detection, native-path conversion, the timeout guard, the detach
-#       choice and the JSON backend chain are defined ONCE and used by all four
-#       scripts. Shell has no import, so they are duplicated verbatim -- which is
+#       choice and the JSON backend chain are defined ONCE and used by EVERY
+#       script that carries the block. The list below must name EVERY carrier;
+#       tests/test_capture_funnel.py holds it to the files themselves and to the
+#       block's own header sentence, because the hand-written list here had
+#       already gone stale -- it omitted kb-flush-backfill.sh, so that copy could
+#       drift with nothing diffing it.
+#       Shell has no import, so they are duplicated verbatim -- which is
 #       only safe if a test proves the copies are byte-identical. Before this,
 #       Windows knowledge was scattered (install.sh had a `uname -s` case,
 #       flush-session-to-kb.sh had two cygpath cases, kb-session-brief.sh had its
@@ -14,7 +19,7 @@
 . /rig/lib.sh
 
 new_home blockid
-SCRIPTS="install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh"
+SCRIPTS="install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh kb-flush-backfill.sh"
 
 step "every script carries exactly one copy of the block"
 for f in $SCRIPTS; do
@@ -23,7 +28,7 @@ for f in $SCRIPTS; do
   assert_eq "1|1" "$B|$E" "$f has exactly one begin+end marker"
 done
 
-step "and the four copies are byte-identical"
+step "and every copy is byte-identical"
 REF=""
 for f in $SCRIPTS; do
   extract_block "$SKILL/$f" "$HOME/block.$f"
@@ -39,7 +44,7 @@ for f in $SCRIPTS; do
     fail "$f block DRIFTED: $(head -c 300 "$HOME/d.txt")"
   fi
 done
-assert_eq "1" "$(for f in $SCRIPTS; do sha256sum <"$HOME/block.$f" | cut -d' ' -f1; done | sort -u | wc -l | tr -d ' ')" "one sha256 across all four"
+assert_eq "1" "$(for f in $SCRIPTS; do sha256sum <"$HOME/block.$f" | cut -d' ' -f1; done | sort -u | wc -l | tr -d ' ')" "one sha256 across every copy"
 
 step "the block is self-contained (sourceable on its own)"
 # shellcheck disable=SC1090

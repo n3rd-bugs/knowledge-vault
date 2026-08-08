@@ -311,9 +311,11 @@ def test_net_daily_flow_of_the_eligible_pool(kb):
 
 
 def test_digest_emits_the_expiry_line_when_the_7d_count_is_nonzero():
+    # Wording tracks the 2026-08-08 untriaged gate: these rows REACH the age at
+    # which a triaged row closes, and are then held open rather than expired.
     lines = tail_steps.digest_lines({"queued_drained": 1, "untriaged_expiring_7d": 4})
     assert "drained: 1" in lines
-    assert "EXPIRY: 4 untriaged rows expire within 7d" in lines
+    assert "EXPIRY: 4 untriaged rows reach expiry age within 7d" in lines
 
 
 def test_digest_is_silent_when_the_7d_count_is_zero_or_absent():

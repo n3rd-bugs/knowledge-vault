@@ -303,20 +303,15 @@ def test_install_names_the_credential_it_fetches_with():
     )
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "flush-session-to-kb.sh",
-        "kb-session-brief.sh",
-        "install.sh",
-        "notify-complete.sh",
-        "kb-flush-backfill.sh",
-        "kb-hook-dispatch.sh",
-    ],
-)
+@pytest.mark.parametrize("name", sorted(p.name for p in SHIPPED.iterdir() if p.is_file()))
 def test_contrib_and_shipped_copies_stay_identical(name: str):
     """contrib/ is canonical, setup_assets/ is what the container serves. A box
-    that fetches from /api/setup/ must get the script that was tested."""
+    that fetches from /api/setup/ must get the script that was tested.
+
+    DERIVED from the shipped directory, never a hand-written list: the list this
+    replaced had gone stale in the quiet direction (kb-mcp-call.sh, turn-start.sh
+    and SKILL.md were shipped but named nowhere here), so those three could drift
+    from their twins with nothing to report it."""
     assert (CONTRIB / name).read_bytes() == (SHIPPED / name).read_bytes(), (
         f"{name} drifted from its setup_assets twin — run `make sync-assets`"
     )
@@ -343,6 +338,19 @@ _FETCH_LOOPS = {
     "kb_setup bootstrap block": REPO / "src/kbmcp/tools_setup.py",
     "rig case 00 (skill completeness)": REPO / "tests/hookrig/cases/00_hermetic_isolation.sh",
     "rig case 17 (enrolment bootstrap)": REPO / "tests/hookrig/cases/17_enrolment_bootstrap.sh",
+    "win rig case 07 (enrolment bootstrap)": (
+        REPO / "tests/hookrig/wincases/07_enrolment_bootstrap.sh"
+    ),
+    # The SELF-UPDATE list. The pre-brief's staleness banner is the only fetch
+    # list a box ever sees AFTER it is installed — it is what an out-of-date
+    # machine copies to catch up — and it was not checked here, so it went stale
+    # exactly as the gap class predicts (2026-08-08: it named 7 of the 8 assets,
+    # omitting kb-hook-dispatch.sh, which install.sh installs UNCONDITIONALLY;
+    # the paste therefore died at `install -m 0755 … kb-hook-dispatch.sh`).
+    "session-brief staleness banner": BRIEF,
+    # The README's enrolment bootstrap block is the same paste for a human
+    # reader, and had gone stale the same way (4 of 8).
+    "README enrolment bootstrap block": REPO / "README.md",
 }
 
 
@@ -384,6 +392,67 @@ def test_every_served_asset_appears_in_every_fetch_and_allowlist(asset: str):
         f"{asset} is served from setup_assets/ but is not named in: {', '.join(missing)} "
         "— a remote box will never receive it, and nothing will report that"
     )
+
+
+def _banner_fetch_list(text: str) -> set[str]:
+    """The filenames the pre-brief's staleness banner tells a box to fetch,
+    lifted out of the `for f in …; do` line it PRINTS (printf quoting and all)."""
+    start = text.index("Your hook scripts are OUT OF DATE")
+    end = text.index("This is FYI", start)
+    loop = re.search(r"for f in (.*?);\s*do", text[start:end], re.S)
+    assert loop, "the staleness banner no longer prints a `for f in …; do` fetch list"
+    return set(re.findall(r"[A-Za-z0-9_.-]+\.sh", loop.group(1)))
+
+
+def test_the_staleness_banner_names_exactly_the_asset_set():
+    """SET EQUALITY, not membership — the banner is the self-update path, and it
+    is the one list a box reads after install, so it must be neither short nor
+    long. Short is how this broke: it named 7 of 8 assets and install.sh, which
+    stats kb-hook-dispatch.sh unconditionally, aborted on the missing 8th — the
+    deliberate loud failure, but reached from a banner that promised a working
+    paste. Long is just as bad: a name that is no longer served 404s the curl
+    (-fsS, so a hard failure) and the same paste dies before the installer.
+
+    The parametrised case above now covers the banner too; this asserts the other
+    direction, which membership tests structurally cannot."""
+    printed = _banner_fetch_list(BRIEF.read_text())
+    assert printed == {p.name for p in SHIPPED.glob("*.sh")}, (
+        "the staleness banner's fetch list has drifted from the served asset set: "
+        f"extra={sorted(printed - {p.name for p in SHIPPED.glob('*.sh')})} "
+        f"missing={sorted({p.name for p in SHIPPED.glob('*.sh')} - printed)}"
+    )
+
+
+def test_the_portable_block_carriers_are_named_the_same_everywhere():
+    """The same gap class, one layer down. The shared block is duplicated verbatim
+    into several scripts, and that is only safe because a rig case diffs the
+    copies — so the LIST of carriers is load-bearing. It is written in two places
+    (the block's own header sentence, and rig case 26's SCRIPTS) and neither was
+    derived from the files: case 26 still named four when kb-flush-backfill.sh had
+    become the fifth carrier, so that copy could drift with nothing diffing it."""
+    carriers = {p.name for p in SHIPPED.glob("*.sh") if "# >>> KB PORTABLE BLOCK" in p.read_text()}
+
+    header = re.search(r"BYTE-IDENTICAL in (.*?)\. ", INSTALL.read_text(), re.S)
+    assert header, "the portable block no longer says which scripts carry it"
+    assert set(re.findall(r"[A-Za-z0-9_.-]+\.sh", header.group(1))) == carriers, (
+        "the block header's carrier sentence disagrees with the scripts that carry it"
+    )
+
+    case26 = REPO / "tests/hookrig/cases/26_portable_block_identity.sh"
+    rig = re.search(r'^SCRIPTS="([^"]*)"', case26.read_text(), re.M)
+    assert rig, "rig case 26 no longer declares a SCRIPTS list"
+    assert set(rig.group(1).split()) == carriers, (
+        "rig case 26 does not diff every copy of the portable block: "
+        f"unchecked={sorted(carriers - set(rig.group(1).split()))}"
+    )
+
+
+def test_the_staleness_banner_runs_the_installer_on_what_it_fetched():
+    """Fetching the scripts is only half the update: they are inert in
+    ~/.claude/kb-setup until install.sh copies them into ~/.claude/hooks."""
+    text = BRIEF.read_text()
+    banner = text[text.index("Your hook scripts are OUT OF DATE") : text.index("This is FYI")]
+    assert "bash install.sh" in banner, "the banner fetches new scripts but never installs them"
 
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1594,12 @@ def test_a_stale_DEFAULT_ENROLLED_box_is_told_its_hooks_are_out_of_date(tmp_path
         "a stale default-enrolled box was NOT warned; stdout=" + repr(res.stdout)
     )
     assert "oldversion0" in res.stdout and "beef1234cafe" in res.stdout
+    # The RENDERED list, not just the source: a warning whose paste cannot finish
+    # is a warning that strands the box it warned. (It named 7 of 8 assets until
+    # 2026-08-08, and install.sh stats kb-hook-dispatch.sh unconditionally.)
+    assert _banner_fetch_list(res.stdout) == {p.name for p in SHIPPED.glob("*.sh")}, (
+        "the banner a user actually sees does not fetch the whole asset set: " + repr(res.stdout)
+    )
 
     # And it got there with a real bearer, on stdin, not on argv.
     stdins = _recorded(rec_dir, "stdin")

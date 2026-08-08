@@ -9,6 +9,11 @@ existing ``detail`` JSONB (no new schema, no migration). No row is ever
 deleted, no item body is edited, and no trust level changes automatically; the
 only trust/status changes ride the existing human-invoked primitives
 promote/reject, which :func:`bulk_resolve` merely batches for an owner.
+
+QUIET EXPIRY LIVES IN :mod:`kbcore.review_expire` (split out 2026-08-08 when it
+grew its cap/dry-run/undo rails). This module still owns the predicate's other
+consumer — :func:`curation_counts` — and imports the shared SQL from there so
+the sweep and the report can never drift apart.
 """
 
 from __future__ import annotations
@@ -16,40 +21,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from kbcore import llm, review
+from kbcore import review
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
+from kbcore.review_expire import EXPIRY_GATE, QUIET_ELIGIBLE, REJECT_TRIAGE_ACTIONS
 
 BULK_ACTIONS = ("promote", "reject", "dismiss")
-
-# Triage suggestions that ask for the ITEM to be retired. Derived from
-# llm.TRIAGE_ACTIONS rather than hand-listed so a future reject_* action is
-# exempt from quiet expiry the day it ships, not the day someone remembers.
-REJECT_TRIAGE_ACTIONS = tuple(a for a in llm.TRIAGE_ACTIONS if a.startswith("reject"))
-
-# The quiet-expiry predicate, shared by the sweep and the "when does the first
-# row expire" report count so the two can never drift. Constant SQL text with
-# named placeholders — no value is ever formatted in (Invariant 2). ``i`` is the
-# joined items row; ``%(reject)s`` is the REJECT_TRIAGE_ACTIONS array.
-_QUIET_ELIGIBLE = """
-              rq.resolved = false
-              AND rq.reason = 'unverified_extraction'
-              AND i.status = 'active'
-              -- HARD DEADLINE FIX: a row carrying a reject_* triage suggestion is
-              -- a KNOWN-BAD item waiting on a human to apply it. Expiring it
-              -- closes the evidence and leaves the item live, unverified and
-              -- searchable forever — the exact opposite of what the suggestion
-              -- asked for. Those rows therefore never expire; they stay open
-              -- until an owner applies or dismisses them.
-              -- A 'keep'-suggested row DOES still expire: applying a keep closes
-              -- the row and leaves the item active + unverified, which is
-              -- byte-for-byte the end state quiet expiry produces, so holding it
-              -- open buys nothing. An untriaged row expires as before.
-              AND NOT (COALESCE(rq.detail->'triage'->>'action', '') = ANY(%(reject)s))
-              AND NOT EXISTS (
-                  SELECT 1 FROM access_log al WHERE al.item_id = rq.item_id
-              )
-"""
 
 
 def close_moot_rows() -> int:
@@ -86,45 +63,6 @@ def close_moot_rows() -> int:
     return len(rows)
 
 
-def expire_quiet_rows(older_than_days: int) -> int:
-    """Close old ``unverified_extraction`` rows for items that were NEVER recalled.
-
-    Quiet expiry (owner decision 2026-07-18): a row older than
-    ``older_than_days`` whose item is still active but has ZERO access_log rows
-    was never going to be reviewed — nobody ever pulled the item. Only the
-    review ROW closes; the item stays active, unverified, and searchable ("it
-    remains available"). Stamps ``auto_resolution = {kind: 'quiet_expiry',
-    age_days, at}`` via jsonb merge. ``older_than_days <= 0`` is the kill
-    switch: return 0 without touching the DB. Returns the rows closed.
-
-    EXEMPT: rows whose ``detail.triage`` carries a reject_* suggestion — see
-    :data:`_QUIET_ELIGIBLE` for why those must never quietly close, and why a
-    'keep'-suggested row may.
-    """
-    if older_than_days <= 0:
-        return 0
-    at = datetime.now(UTC).isoformat()
-    with transaction() as conn:
-        rows = conn.execute(
-            f"""
-            UPDATE review_queue rq
-            SET resolved = true,
-                detail = COALESCE(rq.detail, '{{}}'::jsonb) || jsonb_build_object(
-                    'auto_resolution', jsonb_build_object(
-                        'kind', 'quiet_expiry',
-                        'age_days', %(days)s::int,
-                        'at', %(at)s::text))
-            FROM items i
-            WHERE i.id = rq.item_id
-              AND {_QUIET_ELIGIBLE}
-              AND rq.created_at < now() - make_interval(days => %(days)s)
-            RETURNING rq.id
-            """,  # noqa: S608 — _QUIET_ELIGIBLE is constant SQL text, values are bound
-            {"days": older_than_days, "at": at, "reject": list(REJECT_TRIAGE_ACTIONS)},
-        ).fetchall()
-    return len(rows)
-
-
 def curation_counts(expire_days: int) -> dict[str, Any]:
     """The four numbers that say whether the CURATION LOOP is actually moving.
 
@@ -138,20 +76,27 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
       from being resolved (``kb review apply-triage``).
     * ``reject_suggestions_pending`` — the subset asking for the item to be
       RETIRED. These are known-bad items still live in retrieval.
-    * ``first_expiry_date`` — the date the oldest quiet-expiry-eligible row
-      reaches ``expire_days`` (ISO date, possibly in the past = "next run").
-      None when expiry is off (``expire_days <= 0``) or nothing is eligible.
+    * ``never_triaged_open`` — open unverified_extraction rows carrying NO triage
+      verdict at all. Since the 2026-08-08 untriaged gate these can never
+      quiet-expire, so this is the TRUE backlog gauge: work that will sit in the
+      queue until triage (or a human) reaches it, however old it gets.
+    * ``first_expiry_date`` — the date the oldest row that can ACTUALLY expire
+      (eligible AND past :data:`kbcore.review_expire.EXPIRY_GATE`) reaches
+      ``expire_days`` (ISO date, possibly in the past = "next run"). None when
+      expiry is off (``expire_days <= 0``) or nothing can expire.
     * ``contradiction_suggestions_pending`` — open contradiction rows carrying a
       decisive ``suggested_resolution`` that has not been executed yet.
 
     EXAMINED-BEFORE-EXPIRY (Package O). The 08-19..09-01 expiry cliff had to be
-    reconstructed by hand, so the pool quiet-expiry silently drains is now
-    first-class (read-only; nothing here changes any expiry behavior):
+    reconstructed by hand, so the pool quiet-expiry drains is first-class
+    (read-only; nothing here changes any expiry behavior):
 
-    * ``untriaged_expiring_7d`` / ``untriaged_expiring_30d`` — quiet-expiry-eligible
-      rows NOT yet triaged whose item reaches ``expire_days`` within 7 / 30 days:
-      the ones at risk of aging out UNEXAMINED into a live, unverified, searchable
-      item nobody looked at. Both 0 when expiry is off (``expire_days <= 0``).
+    * ``untriaged_expiring_7d`` / ``untriaged_expiring_30d`` — otherwise-eligible
+      rows NOT yet triaged that reach ``expire_days`` within 7 / 30 days. Under
+      the untriaged gate these no longer age out unexamined — they are HELD OPEN
+      instead, so the pair now measures how fast unexamined rows pile up against
+      the deadline rather than how many are about to vanish. Both 0 when expiry
+      is off (``expire_days <= 0``).
     * ``eligible_entered_1d`` / ``eligible_left_1d`` / ``eligible_flow_net_1d`` —
       the net daily flow of that pool: rows minted in the last day, versus rows
       that LEFT it by being triaged or having their item recalled. ``net`` > 0
@@ -159,10 +104,11 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
     """
     reject = list(REJECT_TRIAGE_ACTIONS)
     with connect() as conn:
-        triaged, rejecting = conn.execute(
+        triaged, rejecting, never_triaged = conn.execute(
             """
             SELECT count(*) FILTER (WHERE COALESCE(rq.detail, '{}'::jsonb) ? 'triage'),
-                   count(*) FILTER (WHERE rq.detail->'triage'->>'action' = ANY(%(reject)s))
+                   count(*) FILTER (WHERE rq.detail->'triage'->>'action' = ANY(%(reject)s)),
+                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage'))
             FROM review_queue rq
             WHERE rq.resolved = false AND rq.reason = 'unverified_extraction'
             """,
@@ -171,21 +117,23 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
         first_expiry = None
         expiring_7d = expiring_30d = 0
         if expire_days > 0:
-            # first_expiry counts EVERY eligible row (a keep-triaged row still
-            # expires); the two horizon counts narrow to UNTRIAGED-and-eligible
-            # rows — the ones at risk of aging out never having been examined.
+            # first_expiry narrows to rows that can ACTUALLY close (EXPIRY_GATE:
+            # triaged, not undo-vetoed); the two horizon counts narrow the other
+            # way, to UNTRIAGED rows the gate now holds open. One scan, three
+            # FILTERs, so the report and the sweep read the same predicate.
             untriaged = "NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage')"
             expiry = "rq.created_at + make_interval(days => %(days)s)"
             row = conn.execute(
                 f"""
                 SELECT
-                    min(rq.created_at) + make_interval(days => %(days)s),
+                    min(rq.created_at) FILTER (WHERE {EXPIRY_GATE})
+                        + make_interval(days => %(days)s),
                     count(*) FILTER (
                         WHERE {untriaged} AND {expiry} <= now() + make_interval(days => 7)),
                     count(*) FILTER (
                         WHERE {untriaged} AND {expiry} <= now() + make_interval(days => 30))
                 FROM review_queue rq JOIN items i ON i.id = rq.item_id
-                WHERE {_QUIET_ELIGIBLE}
+                WHERE {QUIET_ELIGIBLE}
                 """,  # noqa: S608 — every interpolated fragment is constant SQL text, values bound
                 {"days": expire_days, "reject": reject},
             ).fetchone()
@@ -222,6 +170,9 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
     return {
         "triage_awaiting_apply": int(triaged),
         "reject_suggestions_pending": int(rejecting),
+        # The gauge the untriaged gate makes meaningful: rows that will NEVER
+        # close by themselves, so the number only falls when work gets done.
+        "never_triaged_open": int(never_triaged),
         "first_expiry_date": first_expiry,
         "contradiction_suggestions_pending": int(contra),
         # Examined-before-expiry (Package O): the pool quiet-expiry drains.

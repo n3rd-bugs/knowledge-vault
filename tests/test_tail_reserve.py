@@ -148,7 +148,15 @@ def test_deferred_work_is_counted_in_GROUPS_not_windows():
 def _clean_stop_state(monkeypatch):
     """No battery DB, no stale stop log, and the wall-clock guard disarmed —
     these tests arm the RESERVE, and a suite run after noon would otherwise stop
-    every one of them on the deadline instead."""
+    every one of them on the deadline instead.
+
+    The weekend triage top-up is pinned OFF here for the same
+    when-did-you-run-this reason: on a day with no drain deadline it appends a
+    SECOND run_triage call after the tail, so the step-order assertion below
+    would pass Monday and fail Saturday. The top-up has its own suite
+    (tests/test_triage_topup.py) with the day pinned explicitly.
+    """
+    monkeypatch.setattr(settings, "kb_triage_topup_until", "")
     monkeypatch.setattr(settings, "kb_power_db", "")
     monkeypatch.setattr(consolidate, "should_stop", lambda: None)
     consolidate.reset_stop_cache()

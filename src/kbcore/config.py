@@ -10,10 +10,11 @@ from __future__ import annotations
 import logging
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote, urlsplit, urlunsplit
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from kbcore.config_views import SettingsViews
 
 logger = logging.getLogger("kbcore.config")
 
@@ -21,8 +22,12 @@ logger = logging.getLogger("kbcore.config")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class Settings(BaseSettings):
-    """Typed view over `.env` (see `.env.example` for the documented template)."""
+class Settings(SettingsViews, BaseSettings):
+    """Typed view over `.env` (see `.env.example` for the documented template).
+
+    The DERIVED properties (db_url, raw, embed_url, …) live in
+    ``kbcore.config_views``; this class declares the fields and nothing else.
+    """
 
     model_config = SettingsConfigDict(
         env_file=_REPO_ROOT / ".env",
@@ -297,6 +302,23 @@ class Settings(BaseSettings):
     # and lets the backlog drain instead of grow. Cost is ~500 LLM calls, which is
     # minutes now that model-major cohorting landed. Kill switch: 0.
     kb_review_triage_batch: int = 500
+    # WEEKEND TRIAGE TOP-UP (owner request 2026-08-08): "at weekend triage as
+    # many items as we can". On a day with NO drain deadline (kbcore.drainsched)
+    # the nightly can finish at 19:45 and leave the GPU idle until the next 01:00
+    # firing, so the tail keeps triaging in SLICES until this local HH:MM cutoff,
+    # the queue empties, or the run's stand-down guard fires. EMPTY (or a
+    # malformed value) disables the feature entirely; the batch knob above is
+    # unchanged, so a normal weekday night behaves exactly as before. Applies to
+    # UNATTENDED runs only (the guarded `nightly()` path) — an owner-invoked
+    # `kb consolidate-now` is never turned into a nine-hour triage grind.
+    kb_triage_topup_until: str = "23:00"
+    # Rows per top-up slice, and the reason this is a slice loop rather than one
+    # big batch: the run holds pg_advisory_lock(42) for its whole duration, so a
+    # slice still running at 01:00 makes the NEXT nightly skip outright. At the
+    # measured 10.4 s/row, 200 rows is ~35 min — a slice admitted at 22:59 ends
+    # ~23:35, leaving the archive/re-embed leftovers, the report and the post-run
+    # backup room before 01:00. Kill switch: <= 0.
+    kb_triage_topup_slice: int = 200
     # AUTOMATED reject-apply (owner decision 2026-08-02, kbcore.review_apply),
     # revising "a human applies in bulk": that loop sat dead 15 days while 853
     # reject-suggested items stayed live and expiry-exempt. Cooling days = the
@@ -382,64 +404,6 @@ class Settings(BaseSettings):
                 self.kb_embed_model,
             )
         return self
-
-    @property
-    def db_url(self) -> str:
-        """DB URL with ``KB_DB_PASSWORD`` injected.
-
-        The `.env` template keeps the URL password-free (``postgresql://kb@...``)
-        precisely so neither python-dotenv nor docker-compose ever interpolates
-        the secret into it (unquoted specials would corrupt the URL). Cases
-        handled here: a password-less URL gets ``kb_db_password`` injected,
-        URL-quoted; a literal ``${KB_DB_PASSWORD}`` placeholder (env var set
-        directly, PLAN.md §3 form) is replaced, quoted; a URL that already
-        carries an inline password is respected as-is.
-        """
-        url = self.kb_db_url.replace("${KB_DB_PASSWORD}", quote(self.kb_db_password, safe=""))
-        parts = urlsplit(url)
-        if parts.username and not parts.password and self.kb_db_password:
-            host = parts.hostname or ""
-            port = f":{parts.port}" if parts.port else ""
-            netloc = f"{parts.username}:{quote(self.kb_db_password, safe='')}@{host}{port}"
-            url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
-        return url
-
-    @property
-    def deep_model(self) -> str:
-        """Model for deep search; falls back to the extractor model."""
-        return self.kb_deep_model or self.kb_extract_model
-
-    @property
-    def inbox(self) -> Path:
-        return self.kb_inbox.expanduser()
-
-    @property
-    def raw(self) -> Path:
-        return self.kb_raw.expanduser()
-
-    @property
-    def backups(self) -> Path:
-        return self.kb_backups.expanduser()
-
-    @property
-    def git_repos(self) -> list[Path]:
-        """`KB_GIT_REPOS` parsed as a colon-separated list of repo paths."""
-        return [Path(p.strip()).expanduser() for p in self.kb_git_repos.split(":") if p.strip()]
-
-    @property
-    def web_allowed_emails(self) -> list[str]:
-        """`KB_WEB_ALLOWED_EMAILS` parsed as a lowercased comma-separated list."""
-        return [e.strip().lower() for e in self.kb_web_allowed_emails.split(",") if e.strip()]
-
-    @property
-    def embed_url(self) -> str:
-        """The embedder endpoint — its own host when set, else the main one."""
-        return (self.kb_embed_url or self.ollama_url).rstrip("/")
-
-    @property
-    def extract_ensemble(self) -> list[str]:
-        """`KB_EXTRACT_ENSEMBLE` parsed as a comma-separated list of extra models."""
-        return [m.strip() for m in self.kb_extract_ensemble.split(",") if m.strip()]
 
 
 @lru_cache

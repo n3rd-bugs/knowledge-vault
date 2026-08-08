@@ -59,6 +59,26 @@ def test_no_deadline_configured_stays_no_deadline(monkeypatch):
     assert drainsched.effective_deadline(MON) == ""
 
 
+def test_is_unbounded_day_is_the_deadline_read_the_other_way_round():
+    """The nightly's weekend triage top-up asks THIS, so that "the box is free
+    tonight" has exactly one definition and cannot drift from the deadline."""
+    assert drainsched.is_unbounded_day(SAT) is True
+    assert drainsched.is_unbounded_day(SUN) is True
+    assert drainsched.is_unbounded_day(MON) is False
+
+
+def test_is_unbounded_day_follows_the_deadline_being_switched_off(monkeypatch):
+    monkeypatch.setattr(settings, "kb_drain_deadline", "")
+    assert drainsched.is_unbounded_day(MON) is True
+
+
+def test_is_unbounded_day_fails_toward_gpu_protection_on_a_typo(monkeypatch):
+    """A malformed day list applies the deadline every day, so no day is
+    'unbounded' — the top-up must not be what a typo silently switches on."""
+    monkeypatch.setattr(settings, "kb_drain_deadline_days", "mon,tues,banana")
+    assert drainsched.is_unbounded_day(SAT) is False
+
+
 def test_the_consolidate_guard_routes_through_the_schedule(monkeypatch):
     """_past_deadline must consult the day-aware value, or the weekend feature
     exists only in this test file."""

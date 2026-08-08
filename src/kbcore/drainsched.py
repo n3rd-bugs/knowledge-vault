@@ -49,3 +49,19 @@ def effective_deadline(now: datetime | None = None) -> str:
         return raw
     today = (now or datetime.now()).weekday()
     return raw if today in {_DAYS[d] for d in days} else ""
+
+
+def is_unbounded_day(now: datetime | None = None) -> bool:
+    """True when NO wall-clock deadline applies today, so the window is open-ended.
+
+    The single definition of "the box is free tonight" — deliberately derived
+    from :func:`effective_deadline` rather than from a second weekend notion, so
+    a change to the day list (or turning the deadline off entirely) moves every
+    dependent feature at once. Today's dependant is the nightly's weekend triage
+    top-up (``kbworker.tail_steps.review_triaged_topup``), which spends the idle
+    evening on the review backlog it could never reach on a workday.
+
+    It says nothing about POWER: the battery guard is not routed through here
+    (see the module docstring), so an unbounded day still stands down on a sag.
+    """
+    return not effective_deadline(now)

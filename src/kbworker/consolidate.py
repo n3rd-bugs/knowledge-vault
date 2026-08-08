@@ -629,6 +629,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             "duplicates_marked": 0,
             "review_moot_closed": 0,
             "review_triaged": 0,
+            "review_triaged_topup": 0,
             "auto_applied": 0,
             "summaries_written": 0,
             "contradictions_queued": 0,
@@ -729,6 +730,19 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             return counts["triage_awaiting_apply"]
 
         _run_step(counts, "triage_awaiting_apply", _curation)
+
+        # WEEKEND TOP-UP (owner request 2026-08-08), LAST of the working steps
+        # and before the report/digest so the count reaches the owner. On a day
+        # with no deadline the tail can finish at 19:45 and leave the card idle
+        # until 01:00; this keeps triaging in slices until the cutoff knob, an
+        # empty queue, or the stand-down guard. Slices, because this run holds
+        # the advisory lock: a batch still running at 01:00 makes the NEXT run
+        # skip. No-op on a deadline day and whenever the knobs are off.
+        _run_step(
+            counts,
+            "review_triaged_topup",
+            lambda: tail_steps.review_triaged_topup(counts, stop),
+        )
 
         # Search-quality regression sentinel (§8): replay the golden eval, record
         # hit@5/MRR, flag a drop vs the previous run. Advisory — never aborts the

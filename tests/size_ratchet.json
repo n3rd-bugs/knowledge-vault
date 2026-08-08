@@ -1,6 +1,6 @@
 {
   "src/kbcli/main.py": 431,
-  "src/kbcore/config.py": 426,
+  "src/kbcore/config.py": 412,
   "src/kbcore/consolidation.py": 472,
   "src/kbcore/documents.py": 371,
   "src/kbcore/enrolment.py": 358,

@@ -162,6 +162,7 @@ def _edge_golden(ids: dict[str, int]) -> list[dict]:
 
 
 def test_ab_reports_both_sides_and_a_positive_delta_when_edges_help(kb, monkeypatch):
+    monkeypatch.setattr(eval_sentinel, "GRAPH_AB_ENABLED", True)  # arm the parked A/B
     ids = _seed_edge_reachable_corpus()
     golden = _edge_golden(ids)
 
@@ -192,6 +193,7 @@ def test_ab_reports_both_sides_and_a_positive_delta_when_edges_help(kb, monkeypa
 def test_ab_delta_is_zero_when_expansion_adds_nothing(kb, monkeypatch):
     """No edges in the corpus → both sides identical. The instrument must report
     "expansion does not help HERE" rather than manufacture a difference."""
+    monkeypatch.setattr(eval_sentinel, "GRAPH_AB_ENABLED", True)  # arm the parked A/B
     ingest(
         "docx-tools",
         "gotcha",
@@ -212,6 +214,7 @@ def test_ab_delta_is_zero_when_expansion_adds_nothing(kb, monkeypatch):
 def test_ab_forces_expand_uniformly_over_a_cases_own_kwargs(kb, monkeypatch):
     """A case pinning kwargs.expand must be overridden on BOTH sides (golden.yaml
     has such a case) — otherwise the two sides measure different configurations."""
+    monkeypatch.setattr(eval_sentinel, "GRAPH_AB_ENABLED", True)  # arm the parked A/B
     ids = _seed_edge_reachable_corpus()
     golden = [
         {
@@ -234,6 +237,7 @@ def test_ab_forces_expand_uniformly_over_a_cases_own_kwargs(kb, monkeypatch):
 def test_primary_metrics_survive_an_ab_failure(kb, monkeypatch):
     """The A/B is report-only: it cannot touch the regression-gating metrics, and
     an instrument that explodes costs nothing but its own status field."""
+    monkeypatch.setattr(eval_sentinel, "GRAPH_AB_ENABLED", True)  # arm the parked A/B
     ids = _seed_edge_reachable_corpus()
     golden = _edge_golden(ids)
 
@@ -261,6 +265,22 @@ def test_ab_can_be_switched_off(kb, monkeypatch):
 
     def _boom(*a, **k):
         raise AssertionError("the A/B must not run when disabled")
+
+    monkeypatch.setattr(eval_sentinel, "_ab_side", _boom)
+    counts = _run_sentinel(monkeypatch, [{"q": "anything", "expect_substr": ["x"]}])
+
+    assert counts["eval_ab_status"] == "disabled"
+    assert "eval_ab_off_hit_at_5" not in counts
+
+
+def test_ab_is_parked_off_by_default(kb, monkeypatch):
+    """Wave-3: the A/B ships PARKED (no live relation-only fixture resolves on the
+    corpus). The module default must be OFF, and a default run must replay neither
+    A/B side — that is what reclaims the two nightly replays."""
+    assert eval_sentinel.GRAPH_AB_ENABLED is False
+
+    def _boom(*a, **k):
+        raise AssertionError("the parked A/B must not replay a side")
 
     monkeypatch.setattr(eval_sentinel, "_ab_side", _boom)
     counts = _run_sentinel(monkeypatch, [{"q": "anything", "expect_substr": ["x"]}])
@@ -345,6 +365,42 @@ def test_trust_share_is_pooled_over_queries_not_averaged(kb, monkeypatch):
     assert counts["eval_top5_results"] == 5
     assert counts["eval_top5_unverified"] == 3
     assert counts["eval_top5_unverified_share"] == 0.6
+
+
+def test_summary_share_counts_summary_typed_top5_hits(kb, monkeypatch):
+    """eval_top5_summary_share: the POOLED share of top-5 hits whose type is
+    'summary', reported alongside the unverified share over the same read-only
+    pass — the signal for whether consolidation summaries earn their slots."""
+    s = ingest(
+        "kb-system",
+        "summary",
+        "Widget calibration rollup",
+        "The widget calibration rollup summarizes the bench soak observations.",
+        kind="chat",
+        uri="sm:s",
+        trust="unverified",
+    )
+    n = ingest(
+        "kb-system",
+        "note",
+        "Widget calibration observation",
+        "A widget calibration bench observation recorded during the long soak.",
+        kind="chat",
+        uri="sm:n",
+        trust="unverified",
+    )
+    for item_id in (s, n):
+        _blind(item_id)  # keyword-only, so the result set is exactly these two
+    golden = [{"q": "widget calibration", "expect_substr": ["calibration"]}]
+
+    counts = _run_sentinel(monkeypatch, golden)
+
+    assert counts["eval_trust_status"] == "ok"
+    assert counts["eval_top5_results"] == 2
+    assert counts["eval_top5_summary"] == 1
+    assert counts["eval_top5_summary_share"] == 0.5
+    # both hits are unverified, so the new signal is orthogonal to the trust share
+    assert counts["eval_top5_unverified_share"] == 1.0
 
 
 def test_trust_metric_is_report_only(kb, monkeypatch):

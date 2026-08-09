@@ -10,6 +10,10 @@
 # 2026-08-08: two owner-gated blocks are staged below — the graph-expansion A/B
 # fixtures (ids still unresolved) and the extra-language multilingual cases
 # (verified green, but each one makes a LANGUAGE a nightly guarantee).
+# 2026-08-09 (Wave-3): the recipe below was run against the live corpus for all
+# three fixtures and NONE resolved (details in the A/B block); the A/B instrument
+# is consequently PARKED (kbworker.eval_sentinel.GRAPH_AB_ENABLED = False). These
+# stay staged as the re-arm target — resolve one and flip the constant back on.
 
 # =============================================================================
 # GRAPH-EXPANSION A/B FIXTURES — rank-sensitive, relation-reachable cases.
@@ -42,6 +46,22 @@
 # expansion, so with the shipped hops=0 default it fails nightly and drags the
 # headline hit@5 down toward the KB_EVAL_MIN_HIT5 floor. Two or three is enough
 # signal; a dozen would turn the regression sentinel into a false alarm.
+#
+# 2026-08-09 RESOLUTION ATTEMPT (Wave-3) — all three FAILED, so the A/B is PARKED:
+#   * "how did we fix the UART byte loss": seed 985/984; the only typed neighbours
+#     are 984<->985 (both already direct top-5 hits) and summary 989 (a
+#     nightly-regenerated summary — unstable id); expand=true surfaced no
+#     relation-only neighbour into the top-5.
+#   * "DNP3 outstation poll interval register map": seeds 4050/4053; their only
+#     typed edges are `supersedes` -> 609/462, both SUPERSEDED, which expansion
+#     re-checks against status='active' and drops. No active relation-only target.
+#   * "ollama gpu memory keep alive unload": seed 986 has NO typed edges (mentions
+#     only); the alternate seed 6227's typed edges are a superseded predecessor
+#     plus regenerated summaries. expand=true top-5 was byte-identical to hops=0.
+# Root cause is corpus shape, not the recipe: these topics have enough direct
+# lexical/vector hits that a hop-decayed (x0.5) neighbour never reaches the top-5.
+# A good fixture needs a strong seed whose ANSWER lives one typed edge away with
+# few competing direct hits — re-run the recipe when such a pair exists.
 # =============================================================================
 
 # - q: "how did we fix the UART byte loss"

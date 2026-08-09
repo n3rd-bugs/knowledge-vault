@@ -258,6 +258,25 @@ class Settings(SettingsViews, BaseSettings):
     # WP2 graph expansion: default n-hop neighbor pull-in in search (0=off). A
     # per-call hops>0 overrides this; search caps the effective value to 3 hops.
     kb_graph_expand_hops: int = 0
+    # ---- Wave-3 search dials (design review #2, KB 16601). Each ships at its
+    # NO-OP default so today's ranking is byte-identical (kbcore.search /
+    # kbcore.search_rank), proven by the golden eval. ----
+    # (2) Trust dial — the real form of V4's "unverified ranked slightly lower":
+    # a VERIFIED candidate's fused score is multiplied by this in _apply_bonuses.
+    # 1.0 = inert; size it BELOW one rank-1 RRF increment (like BOOST_FACTOR) so it
+    # only breaks near-ties toward verified, never lifts a weak verified over a
+    # strong unverified answer.
+    kb_trust_factor: float = 1.0
+    # (3) Rare-token identifier leg — for a NON-id-dominant query, ALSO run the id
+    # leg for identifier tokens whose corpus df (tsv GIN index) is <=
+    # kb_id_leg_rare_max_df, fused at a rank offset below any real lexical hit.
+    # False = today's candidate set exactly.
+    kb_id_leg_rare_tokens: bool = False
+    kb_id_leg_rare_max_df: int = 2
+    # (4) Rank-time twin collapse — two candidates in the SAME result set joined by
+    # a cross-project 'alternative_to' edge collapse to the higher-scored one
+    # (loser's score folded in, loser dropped; no status flip). False = inert.
+    kb_collapse_alternatives: bool = False
     # Optional cross-encoder rerank sidecar (llama-server --reranking with the
     # verified Qwen3-Reranker-0.6B GGUF). Empty = off (no HTTP call ever made).
     # Fail-open: a down/slow sidecar leaves the fused order untouched. Measured
@@ -395,6 +414,17 @@ class Settings(SettingsViews, BaseSettings):
     kb_git_repos: str = ""
     kb_archive_after_days: int = 180
     kb_dup_threshold: float = 0.97
+    # --- Owner-fired CROSS-PROJECT twin detector (kbcore.twin_crossproject; KB 13061).
+    # The nightly dedupe is per-project by settled design, so the SAME gotcha captured
+    # in two projects (124/858, 383/488) leaves both copies active and dilutes rank.
+    # This owner-invoked pass links such pairs with 'alternative_to' (NO status flip,
+    # Inv 5 — nothing leaves any project's surface; the rank-time collapse folds them
+    # only when both land in one result set). A candidate is a cross-project lead-chunk
+    # cosine SIMILARITY strictly above this, then confirmed same-fact by the 14B judge.
+    kb_xtwin_threshold: float = 0.93
+    # Max candidate pairs enumerated (and thus 14B-judged) per run — the call budget of
+    # an owner-invoked pass. 0 is the KILL SWITCH (nothing enumerated, judged, or linked).
+    kb_xtwin_cap: int = 200
     # Contradiction pairs the 14B may judge per NIGHT, across all projects — the
     # sibling of kbworker.consolidate.EVIDENCE_PAIR_CAP for the step BEFORE it.
     # The step had no bound at all and grew 4,972s -> 8,194s in two days. It is a

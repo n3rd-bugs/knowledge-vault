@@ -13,12 +13,12 @@ own guard so a broken instrument can never cost us the metric that gates
 regressions: the graph-expansion A/B (:func:`_graph_expansion_ab`) and the
 top-5 trust composition (:func:`_trust_composition`).
 
-Cost: the nightly eval now replays the golden set FOUR times (primary + two A/B
-sides + the trust pass) — ~120 searches for a 30-case set, each one embed + SQL.
-GPU courtesy (Invariant 8) is unchanged: real searches → bge-m3 embeds only;
-kbcore.search has no extractor path, so the 14B is never invoked. Kill switches:
-``kb_eval_in_consolidation`` (whole eval), :data:`GRAPH_AB_ENABLED`,
-:data:`TRUST_METRIC_ENABLED`.
+Cost: with the A/B PARKED (:data:`GRAPH_AB_ENABLED` False) the nightly eval
+replays the golden set TWICE (primary + the trust/composition pass); re-arming
+the A/B restores its two extra replays. GPU courtesy (Invariant 8) is unchanged:
+real searches → embeds only; kbcore.search has no extractor path, so the 14B is
+never invoked. Kill switches: ``kb_eval_in_consolidation`` (whole eval),
+:data:`GRAPH_AB_ENABLED`, :data:`TRUST_METRIC_ENABLED`.
 """
 
 from __future__ import annotations
@@ -40,7 +40,12 @@ REVIEW_REASON = "search_regression"
 # only decide whether a measurement is TAKEN — no production retrieval path
 # reads them, and a .env-tunable measurement is one more thing that can silently
 # be off when the owner goes looking for the number.
-GRAPH_AB_ENABLED = True
+# GRAPH_AB PARKED 2026-08-09 (Wave-3): the A/B measured ~0 delta — the live corpus
+# has no relation-ONLY golden case and the three staged fixtures do not resolve
+# (every typed neighbour of a strong seed is already a direct top-5 hit, is
+# superseded, or is a nightly-regenerated summary with an unstable id). Off
+# reclaims the two nightly A/B replays; re-enable with real proposed fixtures.
+GRAPH_AB_ENABLED = False
 TRUST_METRIC_ENABLED = True
 TRUST_K = 5  # top-K window the trust composition is measured over
 
@@ -201,24 +206,15 @@ def _ab_side(golden: list[dict], expand: bool) -> tuple[float, float]:
 def _graph_expansion_ab(golden: list[dict]) -> dict[str, Any]:
     """Answer "does graph expansion help on THIS corpus?" from data, per night.
 
-    The KB holds >20k curated relation edges that influence ZERO production
-    queries: ``KB_GRAPH_EXPAND_HOPS`` defaults to 0 and no caller passes
-    ``expand``. Turning that on is a ranking change nobody should make on a
-    hunch, so the sentinel runs the golden set both ways every night and reports
-    each side's hit@5/MRR plus the delta (ON − OFF). REPORT-ONLY — it flips no
-    default, feeds no regression check, and the primary metrics above are still
-    the ones the sentinel gates on.
+    Runs the golden set with expansion OFF (hops=0) and ON
+    (``hops_from_expand(True)`` = ``max(KB_GRAPH_EXPAND_HOPS, 1)``, the MCP
+    ``expand=true`` rule) and reports each side's hit@5/MRR plus the delta
+    (ON − OFF). REPORT-ONLY — flips no default, feeds no regression check.
 
-    The ON side uses ``hops_from_expand(True)`` = ``max(KB_GRAPH_EXPAND_HOPS, 1)``
-    — one hop with the shipped default, and never NARROWER than the configured
-    default (same rule the MCP ``expand=true`` follows).
-
-    Reading it: a delta at or near zero means the edges are inert for these
-    queries; a positive delta is the evidence for raising the hop default; a
-    negative one means expansion is displacing direct hits (add a
-    ``forbid_item_id`` case to catch WHICH neighbour). Because plain hit@5 only
-    sees found/not-found, rank-sensitive cases (``expect_rank_le``) are what make
-    the delta informative — see eval/golden.proposed.yaml for how to add them.
+    PARKED (:data:`GRAPH_AB_ENABLED` False, 2026-08-09): the delta is only as
+    informative as the relation-ONLY cases behind it, and the corpus has none
+    that resolve (see eval/golden.proposed.yaml). Kept wired so a future fixture
+    set re-arms it by flipping one constant; the mechanism stays test-covered.
     """
     hops_on = search_expand.hops_from_expand(True)
     off_hit, off_mrr = _ab_side(golden, expand=False)
@@ -250,29 +246,28 @@ def _graph_expansion_ab(golden: list[dict]) -> dict[str, Any]:
 
 
 def _trust_composition(golden: list[dict]) -> dict[str, Any]:
-    """Share of the golden queries' top-5 results that carry trust='unverified'.
+    """Trust AND type composition of the golden queries' top-5 (report-only).
 
-    ~91% of the corpus is unverified (automatic quote-grounded extractions,
-    Invariant 4) and NOTHING measured whether the verified minority actually
-    SURFACES. hit@5/MRR cannot see it: a golden case passes identically whether
-    the answer came from a hand-verified decision or an unreviewed extraction.
-    This number makes the composition visible night over night, so a drift
-    toward an all-unverified top-5 is noticed rather than discovered.
+    Two shares, POOLED (micro) over every top-5 hit of every query so a query
+    returning one hit does not weigh like one returning five:
 
-    REPORT-ONLY, and structurally so: it replays the golden QUERIES read-only
-    with ``tool=None`` (no access_log write — eval reads are not usage), touches
-    no ranking input, and returns numbers. Retrieval order is unchanged; the
-    verified >= unverified tie-break in ``search`` remains the only place trust
-    affects ranking.
+    * ``eval_top5_unverified_share`` — hits with trust != 'verified'. ~91% of the
+      corpus is unverified (quote-grounded auto-extractions, Invariant 4) and
+      NOTHING else sees whether the verified minority SURFACES: a golden case
+      passes identically whether its answer was hand-verified or unreviewed.
+    * ``eval_top5_summary_share`` — hits whose ``type == 'summary'``.
+      Consolidation-minted summaries are ~9% of items, all unverified, and exempt
+      from every hygiene pass; a month of this share says whether they earn their
+      top-5 slots or crowd out the primaries they summarize.
 
-    Measured on the PRODUCTION DEFAULT configuration — plain query, default
-    hops, no per-case ``boost_project``/``as_of``/``expand`` — because the
-    question is what an ordinary agent query surfaces, not what the eval's tuned
-    knobs surface. POOLED (micro) over all hits rather than a mean of per-query
-    shares, so a query that returns one hit does not weigh as much as one that
-    returns five.
+    Structurally report-only: replays the QUERIES read-only with ``tool=None`` (no
+    access_log write — eval reads are not usage), touches no ranking input, and
+    returns numbers. Retrieval order is unchanged. Measured on the PRODUCTION
+    DEFAULT config — plain query, default hops, no per-case knobs — because the
+    question is what an ordinary agent query surfaces.
     """
     unverified = 0
+    summary = 0
     total = 0
     for case in golden:
         query = case.get("q")
@@ -281,17 +276,24 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
         for hit in search(query, k=TRUST_K, tool=None):
             total += 1
             unverified += int(hit.trust != "verified")
-    share = round(unverified / total, 4) if total else 0.0
+            summary += int(hit.type == "summary")
+    unverified_share = round(unverified / total, 4) if total else 0.0
+    summary_share = round(summary / total, 4) if total else 0.0
     logger.info(
-        "trust composition of top-%d over %d queries: %d/%d unverified (%.1f%%)",
+        "top-%d composition over %d queries: %d/%d unverified (%.1f%%), %d/%d summary (%.1f%%)",
         TRUST_K,
         len(golden),
         unverified,
         total,
-        100 * share,
+        100 * unverified_share,
+        summary,
+        total,
+        100 * summary_share,
     )
     return {
-        "eval_top5_unverified_share": share,
+        "eval_top5_unverified_share": unverified_share,
         "eval_top5_unverified": unverified,
+        "eval_top5_summary_share": summary_share,
+        "eval_top5_summary": summary,
         "eval_top5_results": total,
     }

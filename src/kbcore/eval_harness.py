@@ -11,9 +11,11 @@ Golden case schema (all criteria optional, at least one required; additive):
   expect_rank_le: R — the positive match's rank must be <= R (catches "still
                   found, but demoted" ranking regressions that hit@K cannot see)
   forbid_item_id: N — FAIL if that id appears in the top-K
-  kwargs:         {boost_project, expand, as_of} forwarded to search() so those
-                  ranking knobs are exercised by the eval (expand is the public
-                  tri-state bool mapped to hops exactly like the MCP surface)
+  kwargs:         {boost_project, expand, as_of, type, domain, tags} forwarded to
+                  search() so those ranking/filter knobs are exercised by the eval
+                  (expand is the public tri-state bool mapped to hops exactly like
+                  the MCP surface; type/domain/tags map straight through to the
+                  same-named filters, letting a case pin a single artefact class)
 
 Metrics: hit@5 counts CASES PASSED (all present criteria ok) / all cases. MRR
 averages 1/rank over cases carrying a positive criterion (expect_substr or
@@ -44,7 +46,9 @@ K = 5
 
 # The only search() knobs a golden case may forward. A misspelled key raises
 # instead of silently testing nothing (the harness must stay trustworthy).
-ALLOWED_CASE_KWARGS = frozenset({"boost_project", "expand", "as_of"})
+# type/domain/tags let a case exercise search()'s filters so precision cases can
+# pin a query to a single artefact class (e.g. type='decision', tags=['hw:x']).
+ALLOWED_CASE_KWARGS = frozenset({"boost_project", "expand", "as_of", "type", "domain", "tags"})
 _CRITERIA_KEYS = ("expect_substr", "expect_item_id", "forbid_item_id")
 
 
@@ -109,6 +113,11 @@ def _search_kwargs(case: dict) -> dict:
         kwargs["hops"] = search_expand.hops_from_expand(raw["expand"])
     if "as_of" in raw:
         kwargs["as_of"] = _parse_as_of(raw["as_of"])
+    # type/domain/tags map straight through to the identically-named search()
+    # filters (no translation, unlike expand→hops / as_of→datetime).
+    for key in ("type", "domain", "tags"):
+        if key in raw:
+            kwargs[key] = raw[key]
     return kwargs
 
 

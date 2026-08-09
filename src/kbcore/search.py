@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from kbcore import rerank as rerank_mod
-from kbcore import scope, search_expand
+from kbcore import scope, search_expand, search_rank
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.ingest import _as_utc
@@ -95,6 +95,7 @@ def search(
     boost_project: str | None = None,
     include_superseded: bool = False,
     include_archived: bool = False,
+    include_duplicate: bool = False,
     include_pending: bool = False,
     as_of: datetime | None = None,
     hops: int | None = None,
@@ -130,6 +131,9 @@ def search(
         statuses.append("superseded")
     if include_archived:
         statuses.append("archived")
+    if include_duplicate:
+        # Inv 5: marked-duplicate items stay retrievable WITH a flag. Default off.
+        statuses.append("duplicate")
     if include_pending and scope.current().is_owner:
         statuses.append("pending")
 
@@ -144,18 +148,25 @@ def search(
         params = [*params, *vis_params]
 
     id_tokens = _identifier_tokens(query)[:MAX_ID_TOKENS]
+    dominant = _id_dominant(query, id_tokens)
     with connect() as conn:
         vec_rows = _vector_leg(conn, query, where, params)
         kw_rows = _keyword_leg(conn, query, where, params)
         # The identifier leg only fires for identifier-DOMINANT queries (bare
         # symbols, part numbers) — for prose that merely mentions an acronym it
         # would inject recency-ranked mentions as noise (search_legs).
-        id_rows = (
-            _identifier_leg(conn, id_tokens, where, params)
-            if _id_dominant(query, id_tokens)
-            else []
-        )
+        id_rows = _identifier_leg(conn, id_tokens, where, params) if dominant else []
         fused = _rrf_fuse(vec_rows, kw_rows, id_rows)  # RAW RRF, no bonuses yet
+        # (3) Rare-token id leg (KB 16601): for a NON-dominant query, admit the id
+        # leg for tokens too rare to be noise, fused below any real hit (search_rank).
+        if settings.kb_id_leg_rare_tokens and id_tokens and not dominant:
+            rare = search_rank.rare_identifier_tokens(
+                conn, id_tokens, settings.kb_id_leg_rare_max_df
+            )
+            if rare:
+                fused = search_rank.fuse_rare_id_rows(
+                    fused, _identifier_leg(conn, rare, where, params)
+                )
         expansion_origin: dict[int, int] = {}
         if hops > 0 and fused:
             # expand_fused walls every neighbor against the SAME where per BFS
@@ -180,6 +191,9 @@ def search(
                 settings.kb_rerank_top_n,
                 evidence=_rerank_evidence(fused),
             )
+        # (4) Rank-time twin collapse: fold a cross-project 'alternative_to' twin
+        if settings.kb_collapse_alternatives and fused:
+            fused, _ = search_rank.collapse_alternatives(conn, fused)
     # Materialize ALL fused candidates before truncating: the verified >=
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
@@ -240,8 +254,19 @@ def _apply_bonuses(
         return fused
     scores = {item_id: score for item_id, score, _snip in fused}
     ids = list(scores)
-    if not boost_project and not id_tokens:
+    trust_factor = settings.kb_trust_factor
+    if not boost_project and not id_tokens and trust_factor == 1.0:
         return fused
+    # (2) Trust dial (KB 16601): VERIFIED candidates nudged up multiplicatively,
+    # sized below one rank-1 RRF increment so it only breaks near-ties. NULL trust =
+    # verified (parity with _to_hits); 1.0 default skips the query.
+    if trust_factor != 1.0:
+        for (item_id,) in conn.execute(
+            "SELECT i.id FROM items i LEFT JOIN sources s ON s.id = i.source_id "
+            "WHERE i.id = ANY(%s) AND (s.trust IS NULL OR s.trust = 'verified')",
+            (ids,),
+        ).fetchall():
+            scores[item_id] *= trust_factor
     if boost_project:
         for (item_id,) in conn.execute(
             "SELECT id FROM items WHERE id = ANY(%s) AND project = %s",

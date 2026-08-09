@@ -3,18 +3,54 @@
 # Coverage per §8: >=2 code/identifier queries, >=2 cross-project gotcha
 # phrasings, >=1 Urdu (multilingual guarantee).
 
+# --- PRECISION HARDENING (2026-08-09, Wave-3): the P0 saturation finding —
+# finish the shift from PRESENCE to PRECISION. ~10 stable expect_substr cases are
+# converted in place to expect_item_id + expect_rank_le (exact artefact + a
+# demotion guard hit@5 cannot see), 4 forbid_item_id dilutor guards are added
+# (precision was near-unmeasured with only ~1 before), and three cases exercise
+# search()'s type/tags filters. Ranks are LIVE ranks observed via kb_search on
+# 2026-08-09 (k=5, expand unset → hops 0, exactly what `make eval` replays);
+# bound = observed rank + 2 so real slippage shows but one night's consolidation
+# churn does not. Every case is green today. The KNOWN-RED canary further down
+# ("have we hit SPI problems anywhere") is deliberately NOT touched.
 - q: "why was TPS55288 chosen for the buck-boost stage"
-  expect_substr: ["TPS55288"]
+  # 980 = the verified motor-ctl buck-boost DECISION; rank 1 (2026-08-09).
+  # forbid 987 = the Urdu Kingdom-of-Benin teaching note (domain:history): a
+  # cross-lingual/domain leak sentinel that must never surface for a hardware
+  # decision query (e.g. via a future graph-expansion hop).
+  expect_item_id: 980
+  expect_rank_le: 3
+  forbid_item_id: 987
 - q: "SPI mode polarity problem motor driver"          # cross-project gotcha recall
-  expect_substr: ["DRV8706"]
+  # 981 = the verified DRV8706 SPI-mode gotcha; rank 1 (2026-08-09).
+  # forbid 987: same cross-lingual/domain leak sentinel as above.
+  expect_item_id: 981
+  expect_rank_le: 3
+  forbid_item_id: 987
 - q: "docx page number footer nodejs"                  # snippet retrieval by identifiers
-  expect_substr: ["Footer"]
+  # 982 = the verified docx-tools footer/page-number snippet; rank 1 (2026-08-09).
+  # forbid 980: reverse cross-domain leak — the TPS55288 firmware decision must
+  # never surface for a Node.js docx-tooling query.
+  expect_item_id: 982
+  expect_rank_le: 3
+  forbid_item_id: 980
 - q: "بینن کی سلطنت کے بارے میں مواد"                    # multilingual path stays proven
   expect_substr: ["Benin"]
 - q: "TPS55288 I2C output voltage"                     # identifier query 1
-  expect_substr: ["TPS55288"]
-- q: "drv_spi_write gotcha"                            # identifier query 2 (symbol lookup)
-  expect_substr: ["DRV8706"]
+  # 980 pinned + type-filter exercise: with type='decision' the summary twin 989
+  # drops out and 980 is rank 1 (2026-08-09). Exercises search()'s type filter.
+  expect_item_id: 980
+  expect_rank_le: 3
+  kwargs: {type: "decision"}
+- q: "drv_spi_write gotcha"                            # tags-filter precision (symbol lookup)
+  # 981 pinned + tags-filter exercise: UNFILTERED this query is diluted (981 sits
+  # at rank 3 behind two gateway eval-QA notes, 6884/6858); tags=['hw:drv8706']
+  # excludes those and leaves 981 at rank 1 (2026-08-09) — the tag filter rescues
+  # precision. The unfiltered symbol path is still measured by the bare
+  # 'drv_spi_write' cases and the KNOWN-RED canary below.
+  expect_item_id: 981
+  expect_rank_le: 3
+  kwargs: {tags: ["hw:drv8706"]}
 - q: "have we hit SPI problems anywhere"               # cross-project gotcha phrasing 2
   # KNOWN RED (2026-08-04): code-symbol dilution — the i-redis stack-pointer
   # ("sp") corpus outranks the DRV8706 gotcha for this vague phrasing (the
@@ -23,15 +59,27 @@
   # happens to rank — fixing it means fixing retrieval, not the case.
   expect_substr: ["DRV8706"]
 - q: "systemd service keeps restarting how to debug"
-  expect_substr: ["journalctl"]
+  # 983 pinned + type-filter exercise: with type='runbook' the rm3 fleet-ops spec
+  # (4068) drops and 983 is rank 1 (2026-08-09; unfiltered it is rank 2).
+  expect_item_id: 983
+  expect_rank_le: 3
+  kwargs: {type: "runbook"}
 - q: "UART dropping bytes at high baud rate"
   expect_substr: ["UART RX"]
 - q: "how did we fix the UART byte loss"
-  expect_substr: ["ring buffer"]
+  # 985 = the verified motor-ctl ring-buffer FIX; rank 2 (2026-08-09).
+  # forbid 2998 = repeater's "UART RX overflow regression": a cross-project UART
+  # near-twin that must not displace the motor-ctl fix for this query.
+  expect_item_id: 985
+  expect_rank_le: 4
+  forbid_item_id: 2998
 - q: "ollama gpu memory keep alive unload"
   expect_substr: ["keep_alive"]
 - q: "add page numbers to a Word document footer"      # semantic paraphrase, no identifiers
-  expect_substr: ["Footer", "docx"]
+  # 982 = the same verified docx footer snippet, reached by pure paraphrase (no
+  # identifiers); rank 1 (2026-08-09). Pins the semantic path to the exact item.
+  expect_item_id: 982
+  expect_rank_le: 3
 
 # --- Phase 3.5 corpus-bootstrap queries (answerable only from the real client repos) ---
 - q: "DNP3 outstation poll interval register map"       # aquamonix irrigation SCADA
@@ -55,9 +103,14 @@
 - q: "add a footer with the page number in a Word document programmatically"  # paraphrase
   expect_substr: ["Footer", "docx"]
 - q: "UART RX ring buffer ISR overrun fix"               # bug→fix recall, identifiers
-  expect_substr: ["ring buffer"]
+  # 985 = the verified motor-ctl ring-buffer fix; rank 1 (2026-08-09).
+  expect_item_id: 985
+  expect_rank_le: 3
 - q: "restart a crashed systemd user unit and read its logs"
-  expect_substr: ["journalctl"]
+  # 983 = the verified systemd-debug runbook, reached by paraphrase; rank 2
+  # (2026-08-09).
+  expect_item_id: 983
+  expect_rank_le: 4
 - q: "aquamonix DNP3 outstation register poll"           # cross-project, identifier
   expect_substr: ["DNP3"]
 - q: "blacksigma cb212 OBD-II telematics server endpoints"  # identifier + project
@@ -110,23 +163,25 @@
   expect_item_id: 68
 
 # --- GRAPH-EXPANSION A/B (kbworker.eval_sentinel._graph_expansion_ab) ---------
-# Every night the sentinel now replays THIS set twice more — once with expansion
-# forced OFF (hops=0) and once ON (expand=true → max(KB_GRAPH_EXPAND_HOPS, 1)) —
-# and reports eval_ab_off_* / eval_ab_on_* / eval_ab_delta_* in the consolidation
-# report. That is the evidence for (or against) raising KB_GRAPH_EXPAND_HOPS, and
-# it OVERRIDES each case's own kwargs.expand on both sides so the two numbers stay
+# PARKED 2026-08-09 (GRAPH_AB_ENABLED = False). When armed, the sentinel replays
+# THIS set twice more — expansion forced OFF (hops=0) and ON (expand=true →
+# max(KB_GRAPH_EXPAND_HOPS, 1)) — and reports eval_ab_off_* / eval_ab_on_* /
+# eval_ab_delta_* as the evidence for (or against) raising KB_GRAPH_EXPAND_HOPS,
+# overriding each case's own kwargs.expand on both sides so the two stay
 # comparable.
 #
-# The delta is only as informative as the cases behind it. A case whose expected
-# item is found by the lexical/vector legs anyway scores the same on both sides
-# and tells you nothing; what moves the delta is a case whose expected item is
-# reachable ONLY over a relation edge from a strong lexical match, plus
-# expect_rank_le so a demotion is visible. This file's format supports exactly
-# that (expect_item_id + expect_rank_le) but NOT fixtures — it pins LIVE item ids,
-# which cannot be resolved from the repo — so such cases are staged, with the
-# recipe for resolving them, in eval/golden.proposed.yaml. Move them here once the
-# ids are filled in. tests/test_eval_plumbing.py exercises the same shape against
-# a seeded kb_test corpus.
+# The delta is only as informative as its relation-ONLY cases: an item the
+# lexical/vector legs already find scores the same on both sides and tells you
+# nothing; only a case whose expected item is reachable ONLY over a relation edge
+# from a strong lexical match (plus expect_rank_le so a demotion shows) moves it.
+# The three staged fixtures in eval/golden.proposed.yaml could NOT be resolved on
+# today's corpus — for each candidate query the strong seed's typed neighbours are
+# already direct top-5 hits, superseded (expansion re-checks status), or
+# nightly-regenerated summaries with unstable ids; expand=true lifts none of them
+# into the top-5. With no informative case the A/B measured ~0 delta every night,
+# so it is parked (reclaiming its two replays) rather than run empty. The
+# mechanism stays covered by tests/test_eval_plumbing.py against a seeded kb_test
+# corpus; re-arm by resolving real fixtures and flipping the one constant.
 
 # --- promoted from golden.proposed.yaml 2026-08-04 (ids resolved live) -------
 - q: "UART dropping bytes at high baud rate"

@@ -193,6 +193,49 @@ def test_unknown_case_kwarg_is_rejected():
         )
 
 
+def test_filter_kwargs_reach_search(monkeypatch):
+    """The precision-hardening extension: type/domain/tags forward straight
+    through to the same-named search() filters (no translation)."""
+    ingest(project="alpha", type="decision", title="widget pick", body="ZWIDGET99 chosen")
+    captured: dict = {}
+    real_search = eval_harness.search
+
+    def spy(query, **kwargs):
+        captured.update(kwargs)
+        return real_search(query, **kwargs)
+
+    monkeypatch.setattr(eval_harness, "search", spy)
+    case = {
+        "q": "ZWIDGET99",
+        "expect_substr": ["ZWIDGET99"],
+        "kwargs": {"type": "decision", "domain": "embedded", "tags": ["hw:x"]},
+    }
+    eval_harness.evaluate(golden=[case])
+
+    assert captured["type"] == "decision"
+    assert captured["domain"] == "embedded"
+    assert captured["tags"] == ["hw:x"]
+    assert captured["tool"] is None, "eval reads never hit access_log"
+
+
+def test_type_filter_narrows_the_result_end_to_end():
+    """type= actually filters: a decision and a note share a token; type='decision'
+    returns only the decision, so an expect_item_id case passes ONLY with it."""
+    decision = ingest(
+        project="alpha", type="decision", title="widget choice", body="ZWIDGET99 pick"
+    )
+    note = ingest(project="alpha", type="note", title="widget aside", body="ZWIDGET99 note")
+
+    d_case = {"q": "ZWIDGET99", "expect_item_id": decision, "kwargs": {"type": "decision"}}
+    d_res, d_hit, _ = eval_harness.evaluate(golden=[d_case])
+    assert d_res[0].passed and d_hit == 1.0
+
+    # the note is filtered OUT of a decision-only search
+    n_case = {"q": "ZWIDGET99", "expect_item_id": note, "kwargs": {"type": "decision"}}
+    n_res, n_hit, _ = eval_harness.evaluate(golden=[n_case])
+    assert not n_res[0].passed and n_hit == 0.0
+
+
 # --- legacy compatibility ----------------------------------------------------
 
 

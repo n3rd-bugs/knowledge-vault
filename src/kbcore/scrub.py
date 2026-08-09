@@ -48,6 +48,17 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # one quoted from ANOTHER project's console is caught too, not just this
     # deployment's (which the config layer below already covers).
     ("google_secret", re.compile(r"GOCSPX-[A-Za-z0-9_\-]{10,}")),
+    # The age PRIVATE identity (AGE-SECRET-KEY-1…): the single key that decrypts
+    # EVERY offsite backup. offsite_config.generate_age_keypair returns it to be
+    # shown ONCE and deliberately persists it NOWHERE — so if it lands in a
+    # transcript (a keygen run, a paste) the flush hooks would otherwise carry the
+    # whole backup set's decryption key into the KB and off-site. Bounded {50,}.
+    ("age_identity", re.compile(r"AGE-SECRET-KEY-1[0-9A-Z]{50,}")),
+    # A Google OAuth REFRESH token (1//0…): the crown-jewel backup secret
+    # offsite_config.store_drive_token writes write-only into rclone.conf. It is
+    # long-lived, so a copy quoted in a transcript is a durable credential heading
+    # for durable storage — exactly the shape the session hooks flush.
+    ("google_refresh_token", re.compile(r"1//0[A-Za-z0-9_\-]{20,}")),
     # …and the third shape the same credential travels in: inline URL userinfo
     # (`postgresql://kb:pw@host`, `https://admin:pw@ntfy…`). The config layer
     # below catches THIS deployment's db password wherever it appears, but a URL
@@ -86,6 +97,24 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
         re.compile(r"(?i)(?:password|passwd|secret|token)\s*[=:]\s*(?!\[REDACTED:)\S{6,}"),
     ),
 ]
+
+
+# Every kbcore function that MINTS or returns a PLAINTEXT secret, mapped to the
+# SECRET_PATTERNS label that must redact its output by SHAPE (a secret minted for
+# ANOTHER machine has no config-value entry on this box, so only its shape can
+# save it). CLAUDE.md rule 12: every secret this system issues needs a scrub
+# pattern so it cannot survive ingest. The tripwire in
+# tests/test_scrub_credentials.py asserts each label here is a real
+# SECRET_PATTERNS entry AND each function still exists — so the NEXT minter added
+# without a matching pattern fails the build instead of shipping an unredactable
+# credential (kbg_, kbe_ and tk_ were each missed in turn before this was a check).
+MINTED_SECRETS: dict[str, str] = {
+    "kbcore.principals.create_principal": "kb_token",  # kbg_ grantee bearer
+    "kbcore.project_tokens.issue": "kb_token",  # kbg_ per-project token
+    "kbcore.enrolment.mint_code": "kb_enrol_code",  # kbe_ enrolment code
+    "kbcore.offsite_config.generate_age_keypair": "age_identity",  # AGE-SECRET-KEY-1…
+    "kbcore.offsite_config.store_drive_token": "google_refresh_token",  # 1//0…
+}
 
 
 # --- this deployment's OWN secrets, by exact value ----------------------------

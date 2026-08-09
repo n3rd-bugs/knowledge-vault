@@ -219,3 +219,68 @@ def test_it_is_gated_like_the_other_setup_assets(client, monkeypatch):
         client.get("/api/setup/notify.env").status_code
         == client.get("/api/setup/install.sh").status_code
     )
+
+
+# --- the kbe_ laundering path (Wave-2 review #2) -------------------------------
+# ANY grantee can mint an enrolment code (kb_setup has no owner gate), and that
+# code AUTHENTICATES as an enrolling machine. Before the sentinel split it then
+# resolved to the SAME identity the notify gate admits, so a read grant on one
+# project could pull the owner's ntfy publish token. It now resolves to a DISTINCT
+# sentinel (ENROLLING_GRANTEE_NAME) that the gate refuses.
+
+
+def test_a_grantee_issued_enrolment_code_cannot_launder_the_channel(served, monkeypatch):
+    """End-to-end through the real bearer layer: a code minted UNDER A GRANTEE is
+    refused notify.env with the byte-identical unknown-path 404, while an
+    owner-issued code (the true bootstrap identity) still passes."""
+    with scope.use_principal(scope.OWNER):
+        _pid, gtoken = principals.create_principal("launderer", kind="token")
+        principals.grant("launderer", "alpha", rw=False)
+        owner_code = enrolment.create_code(project="newbox")
+    grantee = principals.resolve_token(gtoken)
+    with scope.use_principal(grantee):
+        grantee_code = enrolment.create_code(project="alpha")
+
+    refused = served.get("/api/setup/notify.env", headers=_bearer(grantee_code.code))
+    assert refused.status_code == 404
+
+    ok = served.get("/api/setup/notify.env", headers=_bearer(owner_code.code))
+    assert ok.status_code == 200 and "NTFY_TOKEN=tk_write_only" in ok.text
+
+    # The grantee refusal is byte-identical to what an unconfigured deployment
+    # returns the owner — no oracle that a channel (or the grantee code) exists.
+    monkeypatch.setattr(settings, "kb_notify_url", "")
+    monkeypatch.setattr(settings, "kb_notify_topic", "")
+    unconfigured = served.get("/api/setup/notify.env", headers=_bearer(OWNER_TOKEN))
+    assert unconfigured.status_code == refused.status_code
+    assert unconfigured.content == refused.content, "the grantee refusal is distinguishable"
+
+
+def test_the_grantee_enrolling_sentinel_is_refused(configured):
+    """The grantee-issued enrolment sentinel is NOT the bootstrap identity — it
+    carries only a grantee's authority and must not reach the owner's channel."""
+    grantee_enrolling = scope.Principal(name=principal_ctx.ENROLLING_GRANTEE_NAME, is_owner=False)
+    with scope.use_principal(grantee_enrolling):
+        assert configured.get("/api/setup/notify.env").status_code == 404
+
+
+def test_resolve_bearer_splits_the_enrolling_sentinel_by_issuer(kb):
+    """resolve_bearer maps the enrolling identity by WHO ISSUED the code: an
+    owner-issued code -> ENROLLING_NAME (passes notify.env); a grantee-issued one
+    -> ENROLLING_GRANTEE_NAME (refused). Both stay zero-authority and both are
+    recognised as enrolling, so each still reaches /api/enrol + /api/setup."""
+    with scope.use_principal(scope.OWNER):
+        _pid, gtoken = principals.create_principal("sentinel-grantee", kind="token")
+        principals.grant("sentinel-grantee", "alpha", rw=False)
+        owner_code = enrolment.create_code(project="newbox")
+    grantee = principals.resolve_token(gtoken)
+    with scope.use_principal(grantee):
+        grantee_code = enrolment.create_code(project="alpha")
+
+    po = principal_ctx.resolve_bearer("Bearer " + owner_code.code)
+    pg = principal_ctx.resolve_bearer("Bearer " + grantee_code.code)
+    assert po is not None and po.name == principal_ctx.ENROLLING_NAME
+    assert pg is not None and pg.name == principal_ctx.ENROLLING_GRANTEE_NAME
+    for p in (po, pg):
+        assert not p.read_projects and not p.write_projects and not p.caps
+        assert p.name in principal_ctx.ENROLLING_NAMES

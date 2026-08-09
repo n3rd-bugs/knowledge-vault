@@ -76,6 +76,7 @@ def _auto_apply_defaults(monkeypatch):
     monkeypatch.setattr(settings, "kb_auto_apply_enabled", True)
     monkeypatch.setattr(settings, "kb_auto_apply_cooling_days", 3)
     monkeypatch.setattr(settings, "kb_auto_apply_cap", 300)
+    monkeypatch.setattr(settings, "kb_triage_invalidate_cap", 200)
 
 
 # --- rail 1: cooling-off -----------------------------------------------------
@@ -151,6 +152,8 @@ def test_duplicate_applies_against_a_live_canonical(kb):
         "skipped_accessed": 0,
         "skipped_cooling": 0,
         "skipped_target_gone": 0,
+        "skipped_cluster_winner": 0,
+        "triage_invalidated": 0,
         "eligible_remaining": 0,
     }
     assert _status(dup) == "duplicate"  # NOT archived — the manual path's flip
@@ -208,11 +211,114 @@ def test_reciprocal_pair_never_retires_both_ends(kb):
 
     counts = review_apply.auto_apply_rejects()
     assert counts["applied_duplicate"] == 1
-    assert counts["skipped_target_gone"] == 1
+    # SPLIT (design review #2, KB 16601): the winner A is its own fact now, no
+    # longer conflated with genuinely-dead targets in skipped_target_gone.
+    assert counts["skipped_cluster_winner"] == 1
+    assert counts["skipped_target_gone"] == 0
     assert _status(a) == "active"  # the cluster canonical survives
     assert _status(b) == "duplicate"
-    assert _row(qa)[0] is False  # the survivor's own row stays open for a human
+    # BEHAVIOR REVERSAL (design review #2, KB 16601 — flagged for owner sign-off):
+    # the survivor's OWN row previously stayed open forever; it now CLOSES as
+    # triage_keep/cluster_winner, the disposition the MANUAL apply path has used
+    # since 2026-07-18 (review_triage.py:242-245). No item touched, no trust change.
+    resolved_a, detail_a = _row(qa)
+    assert resolved_a is True
+    assert detail_a["auto_resolution"]["kind"] == "triage_keep"
+    assert detail_a["auto_resolution"]["note"] == "cluster_winner"
     assert _row(qb)[1]["auto_resolution"]["dup_of"] == a
+
+
+# --- triage-invalidation for provably-dead dup targets (design review #2) -----
+# A reject_duplicate whose dup_of is provably dead can never apply, yet reject_*
+# rows are quiet-expiry-exempt — so auto-apply re-counted them skipped_target_gone
+# every night forever (324 -> 433, monotone; KB 16601). They are now re-queued for
+# a fresh triage verdict instead: a status flip on the ROW only (Inv 5), no item
+# touched, no trust change (Inv 4/10).
+
+
+def test_dead_dup_target_row_is_invalidated_and_requeued(kb):
+    dead = ingest("p", "note", "dead-canon", "retired canonical", uri="dead-canon")
+    with db.transaction() as conn:
+        conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (dead,))
+    plain, q_plain = _unverified("plain")  # an ordinary untriaged row, to prove ordering
+    victim, q_victim = _unverified("victim")
+    _triage(q_victim, "reject_duplicate", dup_of=dead)
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["applied_duplicate"] == 0  # nothing retired
+    assert counts["skipped_target_gone"] == 1  # still counted a dead target ...
+    assert counts["triage_invalidated"] == 1  # ... and re-queued
+    assert _status(victim) == "active"  # item untouched — the flip is on the row only
+
+    resolved, detail = _row(q_victim)
+    assert resolved is False  # NOT a resolution — the row reopens for re-triage
+    assert "triage" not in detail  # the stale suggestion is dropped ...
+    assert detail["triage_prior"]["action"] == "reject_duplicate"  # ... but preserved
+    assert detail["auto_resolution"]["kind"] == "triage_invalidated"
+    assert detail["auto_resolution"]["reason"] == "dup_target_dead"
+    assert detail["priority"]["reason"] == "dup_target_dead"  # front-of-queue OBJECT
+
+    # It re-enters pending_triage AT THE FRONT (priority DESC), ahead of q_plain.
+    pending = [r["queue_id"] for r in review_triage.pending_triage(10)]
+    assert pending[0] == q_victim and q_plain in pending
+
+
+def test_invalidation_hits_dead_targets_only_not_live_ones(kb):
+    live_canon = ingest("p", "note", "live-canon", "surviving body", uri="live-canon")
+    dead_canon = ingest("p", "note", "dead-canon", "retired body", uri="dead-canon")
+    with db.transaction() as conn:
+        conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (dead_canon,))
+    live_dup, q_live = _unverified("live-dup")
+    dead_dup, q_dead = _unverified("dead-dup")
+    _triage(q_live, "reject_duplicate", dup_of=live_canon)
+    _triage(q_dead, "reject_duplicate", dup_of=dead_canon)
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["applied_duplicate"] == 1  # the LIVE-target row retired
+    assert counts["triage_invalidated"] == 1  # the DEAD-target row re-queued
+    assert counts["skipped_target_gone"] == 1
+
+    # LIVE-target row: applied + resolved, never touched by invalidation.
+    resolved, detail = _row(q_live)
+    assert resolved is True and _status(live_dup) == "duplicate"
+    assert detail["auto_resolution"]["kind"] == "auto_applied_reject"
+    assert "triage_prior" not in detail and "priority" not in detail
+
+    # DEAD-target row: invalidated, still open, item untouched.
+    resolved, detail = _row(q_dead)
+    assert resolved is False and _status(dead_dup) == "active"
+    assert detail["auto_resolution"]["kind"] == "triage_invalidated"
+    assert "triage" not in detail and detail["triage_prior"]["action"] == "reject_duplicate"
+
+
+def test_triage_invalidate_cap_and_kill_switch(kb, monkeypatch):
+    dead = ingest("p", "note", "dead-canon", "retired", uri="dead-canon")
+    with db.transaction() as conn:
+        conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (dead,))
+    qids = []
+    for n in range(3):
+        _item, qid = _unverified(f"d{n}")
+        _triage(qid, "reject_duplicate", dup_of=dead)
+        qids.append(qid)
+
+    # kill switch: 0 invalidates nothing — the rows stay dead targets, untouched.
+    monkeypatch.setattr(settings, "kb_triage_invalidate_cap", 0)
+    counts = review_apply.auto_apply_rejects()
+    assert counts["skipped_target_gone"] == 3 and counts["triage_invalidated"] == 0
+    for qid in qids:
+        _resolved, detail = _row(qid)
+        assert "triage" in detail and "triage_prior" not in detail
+
+    # cap 2: two re-queued this run; all three still COUNTED as dead targets.
+    monkeypatch.setattr(settings, "kb_triage_invalidate_cap", 2)
+    counts = review_apply.auto_apply_rejects()
+    assert counts["skipped_target_gone"] == 3 and counts["triage_invalidated"] == 2
+    assert sum("triage_prior" in _row(q)[1] for q in qids) == 2
+
+    # next run mops up the last one (the re-queued two dropped out of candidates).
+    counts = review_apply.auto_apply_rejects()
+    assert counts["triage_invalidated"] == 1
+    assert all("triage_prior" in _row(q)[1] for q in qids)
 
 
 # --- rail 4: state guard (raced by a human) ----------------------------------
@@ -227,17 +333,17 @@ def test_rows_raced_by_a_human_are_skipped_silently(kb, monkeypatch):
     for qid in (q_keep, q_promoted, q_archived, q_survivor):
         _triage(qid, "reject_noise")
 
-    real = review_apply.eligible_rows
+    real = review_apply.plan_run
 
     def race(cooling_days, counts):
-        rows = real(cooling_days, counts)
+        plan = real(cooling_days, counts)
         review_mod.dismiss(q_keep)  # human closed the row
         review_mod.promote(q_promoted)  # human raised trust (row closes too)
         with db.transaction() as conn:  # human archived the item another way
             conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (archived,))
-        return rows
+        return plan
 
-    monkeypatch.setattr(review_apply, "eligible_rows", race)
+    monkeypatch.setattr(review_apply, "plan_run", race)
     counts = review_apply.auto_apply_rejects()
     assert counts["applied_noise"] == 1  # only the survivor
     assert counts["skipped_cooling"] == 0
@@ -305,6 +411,8 @@ def test_cap_defaults_to_config_and_zero_applies_nothing(kb, monkeypatch):
         "skipped_accessed": 0,
         "skipped_cooling": 0,
         "skipped_target_gone": 0,
+        "skipped_cluster_winner": 0,
+        "triage_invalidated": 0,
         "eligible_remaining": 1,
     }
     assert _status(item) == "active"
@@ -316,7 +424,7 @@ def test_kill_switch_returns_zeros_without_touching_the_db(kb, monkeypatch):
     item, qid = _unverified("a")
     _triage(qid, "reject_noise")
     monkeypatch.setattr(settings, "kb_auto_apply_enabled", False)
-    monkeypatch.setattr(review_apply, "eligible_rows", _no_db)
+    monkeypatch.setattr(review_apply, "plan_run", _no_db)
     assert review_apply.auto_apply_rejects() == dict.fromkeys(review_apply_rails.COUNT_KEYS, 0)
     assert _status(item) == "active" and _row(qid)[0] is False
 

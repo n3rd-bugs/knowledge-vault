@@ -113,6 +113,22 @@ CREDENTIAL_KINDS: tuple[CredentialKind, ...] = (
         sample="postgresql://kb:" + "h" * 20 + "@db.internal:5433/kb",
         label="url_credentials",
     ),
+    # No setting: generate_age_keypair RETURNS the identity and persists it
+    # NOWHERE (it is shown once), so only its SHAPE can save it if it lands in a
+    # transcript — and it decrypts every offsite backup.
+    CredentialKind(
+        kind="age PRIVATE identity minted by kbcore.offsite_config.generate_age_keypair",
+        sample="AGE-SECRET-KEY-1" + "Q" * 55,
+        label="age_identity",
+    ),
+    # No setting: store_drive_token writes the refresh token WRITE-ONLY into
+    # rclone.conf (never a Settings field, never read back), so shape is again the
+    # only defence for a copy quoted in a session.
+    CredentialKind(
+        kind="Google OAuth refresh token stored by kbcore.offsite_config.store_drive_token",
+        sample="1//0" + "g" * 30,
+        label="google_refresh_token",
+    ),
 )
 
 SETTINGS_BACKED = {k.setting: k for k in CREDENTIAL_KINDS if k.setting}
@@ -148,6 +164,41 @@ def test_the_field_walk_matches_the_settings_model():
     assert set(credential_setting_fields()) == expected
     # …and an int TTL that merely has 'token' in its name is not a credential.
     assert "kb_oauth_token_ttl" not in credential_setting_fields()
+
+
+# --- the CLASS tripwire: every MINTER must have a scrub pattern ----------------
+
+
+def test_every_minter_has_a_scrub_pattern():
+    """CLAUDE.md rule 12's class guard for the MINTING side: a kbcore function that
+    returns a plaintext secret must have a SECRET_PATTERNS entry that redacts its
+    output by shape. Adding a new minter without a pattern fails HERE — not after
+    the secret has already shipped to an off-site backup unredacted.
+
+    This is the check that would have caught the age private key and the Google
+    refresh token being unredactable (Wave-2 review #2): the age key decrypts
+    EVERY backup and is shown-once to the web; the refresh token is minted through
+    store_drive_token — yet neither had a shape rule until now."""
+    labels = {label for label, _ in scrub_mod.SECRET_PATTERNS}
+    missing = {
+        minter: label for minter, label in scrub_mod.MINTED_SECRETS.items() if label not in labels
+    }
+    assert not missing, (
+        "these minters return a plaintext secret with no SECRET_PATTERNS rule to "
+        f"redact it — CLAUDE.md rule 12 requires one: {missing}"
+    )
+
+
+def test_the_minter_registry_names_real_functions():
+    """The registry must reference LIVE kbcore functions — so renaming or removing
+    a minter turns the entry stale and fails here, instead of the tripwire quietly
+    guarding a function that no longer mints anything."""
+    import importlib
+
+    for dotted in scrub_mod.MINTED_SECRETS:
+        module_name, _, func = dotted.rpartition(".")
+        module = importlib.import_module(module_name)
+        assert callable(getattr(module, func, None)), f"{dotted} is not a callable minter"
 
 
 # --- every kind, planted in text ----------------------------------------------

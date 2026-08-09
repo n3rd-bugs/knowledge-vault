@@ -225,6 +225,11 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     # be noise in the one message the owner reads without going looking.
     if topup := counts.get("review_triaged_topup"):
         lines.append(f"topup triaged: {topup}")
+    # Dead-dup-target re-queues (design review #2, KB 16601), POSITIVE-ONLY: the
+    # deadlock-breaker only fires when a provably-dead target is there to re-queue.
+    # Nested under the auto-apply breakdown the tail step stashed in the report.
+    if invalidated := (counts.get("auto_apply_counts") or {}).get("triage_invalidated"):
+        lines.append(f"triage re-queued: {invalidated}")
     # The two quiet-expiry facts, POSITIVE-ONLY (owner amendment 2026-08-08):
     # what the capped sweep actually closed tonight, and the backlog the
     # untriaged gate now holds open — the number that only falls when work is

@@ -219,9 +219,11 @@ def _register_write(app: FastAPI) -> None:
         already-redeemed codes are refused identically.
         """
         current = scope.current()
-        if current.name != principal_ctx.ENROLLING_NAME:
+        if current.name not in principal_ctx.ENROLLING_NAMES:
             # A real bearer does not need to enrol — and must not be able to use
-            # this route to mint a second credential for itself.
+            # this route to mint a second credential for itself. BOTH enrolling
+            # sentinels (owner-issued and grantee-issued codes) may redeem here;
+            # only the owner-only notify.env narrows to the owner-issued one.
             raise HTTPException(status_code=404, detail="not found")
         raw = request.headers.get("authorization", "")
         code = raw[7:].strip() if raw[:7].lower() == "bearer " else raw.strip()
@@ -252,9 +254,14 @@ def _register_write(app: FastAPI) -> None:
         404 when unconfigured, so a deployment that does not want notifications
         simply never sets these and installers carry on without them.
 
-        WHO MAY FETCH IT (2026-08-01): the OWNER, or an unredeemed enrolment code
-        — the bootstrap case this exists for, a machine mid-install that has
-        nothing else yet. It used to answer ANY live credential, which handed the
+        WHO MAY FETCH IT (2026-08-01): the OWNER, or an OWNER-ISSUED unredeemed
+        enrolment code — the bootstrap case this exists for, a machine mid-install
+        that has nothing else yet. A GRANTEE-issued code (any grantee can mint one
+        — kb_setup has no owner gate) authenticates as a DISTINCT enrolling
+        sentinel (principal_ctx.ENROLLING_GRANTEE_NAME) and is refused here, so it
+        cannot launder the owner's publish token even though it can still redeem
+        (/api/enrol) and fetch its hooks (/api/setup/{script}).
+        It used to answer ANY live credential, which handed the
         publish token to every narrow per-project grantee: a read grant on one
         project is not a reason to hold a credential for the owner's private
         notification channel, and it is exactly the kind of quiet distribution

@@ -141,6 +141,51 @@ def test_deferred_work_is_counted_in_GROUPS_not_windows():
     assert allocator.deferred_groups([]) == 0
 
 
+# ------------------------------------------------ WAVE-2: the triage inner share
+
+
+def test_the_triage_share_stops_triage_and_leaves_the_reserve_for_later_steps(monkeypatch):
+    """The headline of the re-derive. The reserve window is 09:00-12:00 (deadline
+    12:00, reserve 180m); a 0.5 triage share stops triage at 10:30 and leaves
+    10:30-12:00 — the OTHER half of the reserve — for the steps that run behind it
+    (contradictions, evidence), which is exactly what a saturated weekday lost."""
+    monkeypatch.setattr(settings, "kb_tail_reserve_minutes", 180)
+    monkeypatch.setattr(settings, "kb_drain_deadline", "12:00")
+    monkeypatch.setattr(settings, "kb_drain_deadline_days", "")  # day-independent, per the suite
+    res = allocator.TailReserve.for_run(now=_at("01:00"))
+    clock = {"now": _at("09:30")}
+    res._now = lambda: clock["now"]
+
+    assert res.reserve_start == _at("09:00")
+    assert res.share_cutoff(0.5) == _at("10:30"), "triage's half of the 180m reserve ends 10:30"
+    assert res.share_cutoff(1.0) == _at("12:00"), "the reserve AS A WHOLE is still the tail's"
+    assert res.share_budget_minutes(0.5) == 90.0
+
+    run_guard = {"r": None}
+    guard = res.share_guard(0.5, lambda: run_guard["r"])
+    assert guard() is None, "09:30 is inside triage's 10:30 slice"
+    clock["now"] = _at("10:45")  # past the 10:30 cutoff
+    assert guard() == allocator.TRIAGE_SHARE_REASON, "triage yields the rest of the reserve"
+
+
+def test_a_triage_share_of_zero_reproduces_the_pooled_reserve_exactly(monkeypatch):
+    """The per-step kill switch and the regression pin: share=0 keeps the reserve
+    wholly pooled — no inner cutoff, admit anything, and the run's own guard handed
+    back UNTOUCHED — even at 11:59, deep in the reserve, where any positive share
+    would have stopped triage cold."""
+    monkeypatch.setattr(settings, "kb_tail_reserve_minutes", 180)
+    monkeypatch.setattr(settings, "kb_drain_deadline", "12:00")
+    monkeypatch.setattr(settings, "kb_drain_deadline_days", "")  # day-independent, per the suite
+    res = allocator.TailReserve.for_run(now=_at("01:00"))
+    res._now = lambda: _at("11:59")
+
+    assert res.share_cutoff(0.0) is None
+    assert res.share_budget_minutes(0.0) == 0.0
+    assert res.admit_step(0.0, est_cost_seconds=9 * 3600) is True
+    base = lambda: None  # noqa: E731 — identity is the assertion
+    assert res.share_guard(0.0, base) is base, "share=0 must hand back the run guard itself"
+
+
 # ------------------------------------------------------- the drain integration
 
 
@@ -303,6 +348,63 @@ def test_the_tail_RUNS_after_the_drain_stands_down_for_the_reserve(kb, monkeypat
     assert result["digest_pushed"] is True
     assert len(pushed) == 1, "the digest must be pushed exactly once per run"
     assert ingest_queue.queue_depth() == 2, "the deferred rows are still waiting, unharmed"
+
+
+def test_the_triage_share_budget_minutes_land_in_the_run_report(kb, monkeypatch):
+    """Fold the per-step budget into the report so the allocator docstring's
+    hand-arithmetic becomes a MEASURED number: on a deadline night with a 0.5
+    share of the 180m reserve the report carries 90.0 minutes, and triage is
+    handed the composed share guard rather than the bare run guard."""
+    monkeypatch.setattr(settings, "kb_tail_reserve_minutes", 180)
+    monkeypatch.setattr(settings, "kb_tail_triage_share", 0.5)
+    monkeypatch.setattr(settings, "kb_drain_deadline", "12:00")
+    monkeypatch.setattr(settings, "kb_drain_deadline_days", "")  # day-independent, per the suite
+    monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)
+    seen: dict = {}
+    monkeypatch.setattr(
+        consolidate.review_triage,
+        "run_triage",
+        lambda batch, should_stop=None: seen.update(guard=should_stop) or 0,
+    )
+
+    result = consolidate.main(stop=lambda: None)
+
+    assert result["tail_triage_budget_min"] == 90.0
+    assert seen["guard"] is not None, "triage got a composed share guard on a deadline night"
+
+
+def test_a_weekend_night_leaves_triage_uncapped_and_runs_the_topup(kb, monkeypatch):
+    """No deadline (weekend) => the reserve does not bind, so the share is inert
+    even when opted in: the normal triage step keeps the run guard UNCHANGED, and
+    the idle night is spent by the weekend top-up instead. Day-independent:
+    kb_drain_deadline='' is drainsched's always-unbounded pin, not the day list."""
+    monkeypatch.setattr(settings, "kb_tail_triage_share", 0.5)  # opted in, yet inert here
+    monkeypatch.setattr(settings, "kb_drain_deadline", "")  # -> unbounded EVERY day
+    monkeypatch.setattr(settings, "kb_triage_topup_slice", 200)
+    monkeypatch.setattr(settings, "kb_review_triage_batch", 1000)
+    monkeypatch.setattr(
+        tail_steps, "_topup_cutoff", lambda now=None: datetime.now() + timedelta(hours=1)
+    )
+    monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)
+
+    def run_guard() -> str | None:
+        return None
+
+    calls: list[tuple[int, object]] = []
+
+    def fake_triage(batch, should_stop=None):
+        calls.append((batch, should_stop))
+        return 0  # empty queue: the normal step and each top-up slice triage nothing
+
+    monkeypatch.setattr(consolidate.review_triage, "run_triage", fake_triage)
+
+    result = consolidate.main(stop=run_guard)
+
+    assert result["tail_triage_budget_min"] == 0.0, "no deadline => the triage share is inert"
+    normal = [g for b, g in calls if b == 1000]
+    assert normal and normal[0] is run_guard, "weekend triage keeps the run guard, uncapped"
+    assert any(b == 200 for b, _ in calls), "the weekend top-up ran a slice"
+    assert result["triage_topup_slices"] == 1
 
 
 # ------------------------------------------------------------- the P0-2 hooks

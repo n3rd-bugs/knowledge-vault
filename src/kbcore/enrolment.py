@@ -342,6 +342,29 @@ def is_live_code(code: str | None) -> bool:
     return row is not None
 
 
+def code_is_owner_issued(code: str | None) -> bool | None:
+    """For a LIVE (unredeemed, unexpired) code: ``True`` when it was issued under
+    an OWNER principal, ``False`` when issued under a GRANTEE. ``None`` when the
+    code is not a live credential at all.
+
+    Reads the ``grants_owner`` column the row already stores. The bearer layer
+    needs the distinction: any grantee can mint a code (kb_setup has no owner
+    gate), so a grantee-issued one must resolve to a DIFFERENT sentinel than an
+    owner-issued one, or it would launder itself into the owner-only notify channel.
+    One query, no cache — a code is single-use and short-lived (as is_live_code)."""
+    if not _looks_like_code(code):
+        return None
+    with transaction() as conn:
+        row = conn.execute(
+            """
+            SELECT grants_owner FROM enrolment_codes
+             WHERE code_hash = %s AND redeemed_at IS NULL AND expires_at > now()
+            """,
+            (_hash(str(code)),),
+        ).fetchone()
+    return bool(row[0]) if row is not None else None
+
+
 def sweep_expired(older_than_days: int = 30) -> int:
     """Drop long-dead codes. Returns how many rows went.
 

@@ -83,6 +83,10 @@ class Settings(SettingsViews, BaseSettings):
     # REMOTE session-hook config so a new machine needs only a token. Empty ->
     # kb_setup emits a generic placeholder.
     kb_public_rest_url: str = ""
+    # Extra hosts kb_setup may honor in a caller-supplied rest_url (comma-separated);
+    # that URL is curl|bash'd at install, so a foreign host is ignored unless listed
+    # here — the configured host is always honored. See kbcore.setup_url.
+    kb_setup_allowed_rest_hosts: str = ""
     # Completion-notification channel handed to enrolled machines. Empty disables
     # the feature entirely — no endpoint output, nothing written on install.
     # KB_NOTIFY_TOKEN must be a WRITE-ONLY ntfy token scoped to the one topic, not
@@ -177,6 +181,11 @@ class Settings(SettingsViews, BaseSettings):
     # kbworker.allocator for why the DRAIN is the right residual claimant. Never
     # extends past kb_drain_deadline — deadline/battery still preempt the tail.
     kb_tail_reserve_minutes: int = 180
+    # FRACTION OF THE TAIL RESERVE HANDED TO TRIAGE so the FIRST tail step cannot eat
+    # the window contradictions/evidence run in (stops triage at reserve_start +
+    # share*reserve). 0 = OLD pooled reserve (inert) and is the default => opt-in,
+    # reproduces today's run exactly; weekends have no deadline so inert there too.
+    kb_tail_triage_share: float = 0.0
     # PAUSE THE DRAIN WHEN THE HOUSE IS ON BATTERY. The GPU is the largest load on
     # this box and the UPS could not ride out a grid fluctuation (2026-07-30), so
     # hours of inference during an outage is exactly the wrong thing to be doing.
@@ -335,6 +344,10 @@ class Settings(SettingsViews, BaseSettings):
     # acts (veto = resolve the row); cap bounds one run; enabled is the switch.
     kb_auto_apply_cooling_days: int = 3
     kb_auto_apply_cap: int = 300
+    # Per-run cap on dead-dup-target triage invalidation (design review #2, KB
+    # 16601): re-queue a reject_duplicate whose dup_of is provably dead for a fresh
+    # triage verdict instead of re-counting it skipped_target_gone forever. 0 = off.
+    kb_triage_invalidate_cap: int = 200
     kb_auto_apply_enabled: bool = True
     # Search-quality regression sentinel (§8): the nightly consolidation replays
     # the golden retrieval eval and flags a hit@5/MRR drop vs the prior run. Set

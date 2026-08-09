@@ -675,10 +675,21 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # a human applies them (kb review apply-triage / kb_review_bulk). Runs
         # after the moot sweep so freshly-mooted rows never burn GPU budget.
         # Sanctioned Invariant-8 call site; kill switch: batch knob = 0.
+        # WAVE-2: hand triage an INNER SHARE of the tail reserve so this first tail
+        # step cannot spend the whole reserve and starve contradictions/evidence
+        # behind it (kb_tail_triage_share; 0 / no-deadline / explicit-run = inert =
+        # old pooled behaviour). The share's measured budget minutes ride the report.
+        reserve = allocator.TailReserve.for_run()
+        share = float(settings.kb_tail_triage_share)
+        bound = stop is not None  # the share binds only on an unattended, guarded run
+        triage_stop = reserve.share_guard(share, stop) if bound else stop
+        counts["tail_triage_budget_min"] = reserve.share_budget_minutes(share) if bound else 0.0
         _run_step(
             counts,
             "review_triaged",
-            lambda: review_triage.run_triage(settings.kb_review_triage_batch, should_stop=stop),
+            lambda: review_triage.run_triage(
+                settings.kb_review_triage_batch, should_stop=triage_stop
+            ),
         )
         # P0-2: apply the triage verdicts that have COOLED (kbcore.review_apply),
         # right after the step that writes them — status flips only, never a

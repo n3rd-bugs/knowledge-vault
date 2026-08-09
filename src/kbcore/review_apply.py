@@ -40,11 +40,11 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from kbcore import consolidation, review
+from kbcore import consolidation, review, review_triage
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
-from kbcore.review_apply_rails import APPLIED_STATUS, COUNT_KEYS, STAMP_KIND, Row, eligible_rows
+from kbcore.review_apply_rails import APPLIED_STATUS, COUNT_KEYS, STAMP_KIND, Row, plan_run
 
 logger = logging.getLogger("kbcore.review_apply")
 
@@ -148,50 +148,97 @@ def _apply_one(row: Row, cooling_days: int, batch: str) -> bool:
     return False
 
 
+def _close_cluster_winner(qid: int) -> None:
+    """Close a cluster-winner duplicate row via the MANUAL path's primitive.
+
+    The winner is never retired (its own item is the cluster canonical). The
+    disposition is exactly ``review_triage._close_row(qid, 'triage_keep',
+    note='cluster_winner')`` (review_triage.py:242) — a status flip (Inv 5), no
+    item touched, no trust change (Inv 4/10), guarded by ``resolved = false`` and
+    stamped for audit, byte-identical to a manual close (design review #2, KB 16601).
+    """
+    review_triage._close_row(qid, "triage_keep", note="cluster_winner")
+
+
+def _invalidate_dead_dup(qid: int) -> bool:
+    """Re-queue a reject_duplicate row whose dup_of is PROVABLY dead for fresh triage.
+
+    Not a retirement or resolution: the row stays OPEN. Its stale triage moves to
+    ``detail.triage_prior`` (audit preserved, Inv 5, reversible), an
+    ``auto_resolution`` stamp records ``triage_invalidated``/``dup_target_dead``,
+    and a ``detail.priority`` OBJECT (existence-ordered, never an int) floats it to
+    the FRONT of ``pending_triage``. Dropping ``triage`` breaks the deadlock:
+    ``candidates`` stops re-selecting it, ``pending_triage`` starts. One atomic
+    guarded UPDATE; a raced / already-invalidated row matches nothing (False).
+    """
+    at = datetime.now(UTC).isoformat()
+    stamp = {
+        "auto_resolution": {"kind": "triage_invalidated", "reason": "dup_target_dead", "at": at},
+        "priority": {"reason": "dup_target_dead", "source": "auto_apply", "at": at},
+    }
+    with transaction() as conn:
+        row = conn.execute(
+            """
+            UPDATE review_queue
+            SET detail = ((COALESCE(detail, '{}'::jsonb) - 'triage')
+                          || jsonb_build_object('triage_prior', detail->'triage'))
+                          || %(stamp)s
+            WHERE id = %(qid)s AND resolved = false
+              AND COALESCE(detail, '{}'::jsonb) ? 'triage'
+            RETURNING id
+            """,
+            {"stamp": Jsonb(stamp), "qid": qid},
+        ).fetchone()
+    return row is not None
+
+
 def auto_apply_rejects(cap: int | None = None, *, dry_run: bool = False) -> dict[str, int]:
     """Apply stored ``reject_noise`` / ``reject_duplicate`` triage suggestions.
 
-    Returns the run's counts: ``applied_noise``, ``applied_duplicate``,
-    ``skipped_accessed``, ``skipped_cooling``, ``skipped_target_gone``,
-    ``eligible_remaining``. The rails, each a documented+tested predicate:
+    Returns the run's counts (all in ``review_apply_rails.COUNT_KEYS``). The rails
+    (:func:`plan_run` partitions the candidates; first rail that stops a row wins):
 
-    1. COOLING-OFF — the ``detail.triage.at`` stamp must be at least
-       ``kb_auto_apply_cooling_days`` (default 3) old, so the owner sees the
-       queued application in >= 3 nightly digests and can veto it by resolving
-       the row. A missing/unparseable stamp fails CLOSED (skipped_cooling).
-    2. ACCESS EXCLUSION — any access_log hit in the last 30 days hands the row
-       back to the human (skipped_accessed).
-    3. TARGET LIVENESS (reject_duplicate only) — the dup target must exist, be
-       active, not be a summary and not be the item itself; surviving edges are
-       cluster-canonicalized (``review_apply_rails.dup_canonicals``).
-    4. STATE GUARD — re-checked atomically at apply time by :func:`_claim`.
-    5. STAMP — ``detail.auto_resolution`` records kind/action/at/cooling_days/
-       batch (+ the canonical dup_of) so :func:`undo_auto_applied` can reverse it.
+    1. COOLING-OFF — ``detail.triage.at`` >= ``kb_auto_apply_cooling_days`` (3) old
+       (owner saw >= 3 digests, veto=resolve); missing stamp fails CLOSED (skipped_cooling).
+    2. ACCESS EXCLUSION — any access_log hit in 30 days hands it back (skipped_accessed).
+    3. TARGET LIVENESS (reject_duplicate) — surviving edges are cluster-canonicalized
+       (``dup_canonicals``). A cluster-winner row is CLOSED as a keep
+       (skipped_cluster_winner), never retired; a provably-dead ``dup_of`` is
+       RE-QUEUED for a fresh verdict (:func:`_invalidate_dead_dup`; triage_invalidated,
+       ``kb_triage_invalidate_cap`` 0=off) — design review #2, KB 16601.
+    4. STATE GUARD (re-checked atomically by :func:`_claim`) + STAMP
+       (``detail.auto_resolution`` = the undo record for a retirement).
 
-    Rails 1-3 partition the candidates (first rail that stops a row wins); a row
-    raced by a human between selection and apply is skipped SILENTLY, counted
-    nowhere, because it was a human's decision rather than an automation skip.
-
-    ``cap`` (None -> ``kb_auto_apply_cap``, default 300) bounds the applications
-    per run; negative is unbounded, 0 applies nothing. ``eligible_remaining`` is
-    what the cap left for the next run. ``dry_run`` reports the same counts
-    (``applied_*`` = what WOULD be applied) and writes NOTHING.
-    ``kb_auto_apply_enabled=false`` is the kill switch: all zeros, no DB access.
+    A human-raced row is skipped SILENTLY. ``cap`` (None -> ``kb_auto_apply_cap``,
+    300) bounds RETIREMENTS (neg unbounded, 0 none); ``dry_run`` writes NOTHING;
+    ``kb_auto_apply_enabled=false`` = kill switch (all zeros, no DB).
     """
     counts = dict.fromkeys(COUNT_KEYS, 0)
     if not settings.kb_auto_apply_enabled:
         return counts
     cooling = max(0, int(settings.kb_auto_apply_cooling_days))
     limit = settings.kb_auto_apply_cap if cap is None else int(cap)
-    eligible = eligible_rows(cooling, counts)
-    attempted = eligible if limit < 0 else eligible[: max(0, limit)]
-    counts["eligible_remaining"] = len(eligible) - len(attempted)
+    plan = plan_run(cooling, counts)
+    attempted = plan.eligible if limit < 0 else plan.eligible[: max(0, limit)]
+    counts["eligible_remaining"] = len(plan.eligible) - len(attempted)
     batch = datetime.now(UTC).isoformat()
     for r in attempted:
         key = "applied_noise" if r.action == "reject_noise" else "applied_duplicate"
         if dry_run or _apply_one(r, cooling, batch):
             counts[key] += 1
-    if not dry_run and (counts["applied_noise"] or counts["applied_duplicate"]):
+    # Cluster winners: closed (never retired), cheap status flips, no cap.
+    if not dry_run:
+        for r in plan.cluster_winners:
+            _close_cluster_winner(r.qid)
+    # Provably-dead dup targets: re-queued for a fresh verdict under their own cap.
+    inv_cap = int(settings.kb_triage_invalidate_cap)
+    dead = plan.dead_dup_targets if inv_cap < 0 else plan.dead_dup_targets[: max(0, inv_cap)]
+    for r in dead:
+        if dry_run or _invalidate_dead_dup(r.qid):
+            counts["triage_invalidated"] += 1
+    if not dry_run and any(
+        (counts["applied_noise"], counts["applied_duplicate"], counts["triage_invalidated"])
+    ):
         logger.info("auto-apply batch %s: %s", batch, counts)
     return counts
 

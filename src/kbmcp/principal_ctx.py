@@ -40,6 +40,14 @@ def _master_matches(token: str) -> bool:
 
 
 ENROLLING_NAME = "enrolling-machine"
+# A GRANTEE-issued enrolment code resolves to a DISTINCT sentinel. Any grantee can
+# mint a code (kb_setup has no owner gate), but such a code carries only the
+# grantee's own authority — it must never satisfy an OWNER-issued-only gate (the
+# notify.env ntfy publish token). Both sentinels still reach /api/enrol and
+# /api/setup/{script} (a grantee machine must be able to redeem + fetch its hooks);
+# only the notify channel narrows to ENROLLING_NAME.
+ENROLLING_GRANTEE_NAME = "enrolling-machine-grantee"
+ENROLLING_NAMES = frozenset({ENROLLING_NAME, ENROLLING_GRANTEE_NAME})
 
 
 def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
@@ -60,17 +68,23 @@ def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
         return grantee
     # An unredeemed ENROLMENT code authenticates too, as the narrowest identity
     # this system has: no projects, no capabilities. It exists so a brand-new
-    # machine can reach exactly one endpoint (POST /api/enrol) to exchange the
-    # code for its real credential, WITHOUT the bearer check being disabled for
-    # an unauthenticated path (CLAUDE.md rule 6). Every other route sees an
-    # identity that can read nothing and write nothing, which is what it is.
+    # machine can reach the bootstrap endpoints (POST /api/enrol, GET /api/setup/*)
+    # to exchange the code for its real credential, WITHOUT the bearer check being
+    # disabled for an unauthenticated path (CLAUDE.md rule 6). Every other route
+    # sees an identity that can read nothing and write nothing, which is what it is.
     # A PREFIX IS NOT A CREDENTIAL. This used to return a principal on the
     # `kbe_` prefix alone, which satisfied the bearer gate with four known
     # characters — the identity carried no authority, but "authenticates with no
     # secret" is not a state this system may be in (CLAUDE.md rule 6). The code
     # must be a live, unredeemed, unexpired row before it authenticates at all.
-    if enrolment.is_live_code(tok):
+    # OWNER-issued and GRANTEE-issued codes resolve to DIFFERENT sentinels: a
+    # grantee-minted code (any grantee can mint one) must not launder itself into
+    # the owner-only notify channel, so only ENROLLING_NAME clears that gate.
+    owner_issued = enrolment.code_is_owner_issued(tok)
+    if owner_issued is True:
         return scope.Principal(name=ENROLLING_NAME, is_owner=False)
+    if owner_issued is False:
+        return scope.Principal(name=ENROLLING_GRANTEE_NAME, is_owner=False)
     return None
 
 

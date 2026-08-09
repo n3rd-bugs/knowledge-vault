@@ -17,7 +17,7 @@ from pathlib import Path
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 
-from kbcore import enrolment, scope
+from kbcore import enrolment, scope, setup_url
 from kbcore.config import settings
 from kbcore.errors import InvalidOperation, KBError
 from kbmcp import ANNOTATIONS_WRITE, ANNOTATIONS_WRITE_IDEMPOTENT
@@ -85,8 +85,10 @@ def build_setup_guide(
     token for a grantee, and None for OAuth-authed callers (who get an explanation
     + tokenless alternatives instead).
     """
-    configured = (rest_url or settings.kb_public_rest_url or "").strip()
-    url = (configured or _PLACEHOLDER_URL).rstrip("/")
+    # rest_url is a fetch-and-execute target (curl|bash at install time), so it is
+    # validated + host-gated in the kbcore chokepoint, never merely .strip()'d here.
+    configured = setup_url.rest_url_to_render(rest_url)
+    url = configured or _PLACEHOLDER_URL
     # MCP is a DIFFERENT service on a DIFFERENT host from REST — kbrest serves
     # only /api/* and has no /mcp route at all, so deriving the MCP endpoint by
     # appending "/mcp" to the REST base hands out a URL that cannot work. The
@@ -460,3 +462,5 @@ def register(mcp) -> None:
         except OSError as e:  # packaged assets unreadable — surface cleanly
             log.exception("kb_setup asset read failed")
             raise ToolError(f"setup assets unavailable: {e}") from e
+        except KBError as e:  # e.g. an invalid rest_url (a fetch-and-execute target)
+            raise ToolError(str(e)) from e

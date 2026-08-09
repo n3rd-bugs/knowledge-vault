@@ -2,10 +2,10 @@
 
 THE SUBSCRIPTION MATH. The window is 01:00->12:00 (11 h). Median arrival is
 73-89 MB/day at ~12.5 MB/h measured drain throughput, so the median drain costs
-5.9-7.1 h; the LLM tail at current caps costs 5.0-6.0 h (triage 500 x 10.2 s =
-1.4 h, contradictions 200 x ~41 s = 2.3 h, summaries 0.8-1.6 h, evidence 20 x
-94-130 s = 0.7 h). A median night DEMANDS 10.9-13.1 h of an 11 h window — it is
-subscribed at 100-110% of capacity, so SOMEBODY is the residual claimant: the
+5.9-7.1 h; the LLM tail at current caps costs 5.5-6.5 h (triage 1000 x 10.4 s =
+2.9 h, contradictions 500 x 9.2 s = 1.3 h, summaries 0.8-1.6 h, evidence 20 x
+94-130 s = 0.5-0.7 h). A median night DEMANDS 11.4-13.6 h of an 11 h window — it
+is subscribed at 104-124% of capacity, so SOMEBODY is the residual claimant: the
 step that runs last gets what the others left, which on a saturated night is
 nothing. The drain is Step 0 with a refill-until-empty loop, so today that is the
 tail — report 9684 is what it looks like: queued_drained 33,284 s (99.5% of the
@@ -35,6 +35,17 @@ still preempt everything including the tail, and it can never extend a run past
 ``KB_DRAIN_DEADLINE``. The arithmetic is naive-local wall clock, exactly like
 :func:`kbworker.consolidate._past_deadline` — scheduling, not storage, so
 Invariant 7 (TIMESTAMPTZ/UTC for what the KB stores) is untouched.
+
+INTERNAL SHARES WITHIN THE RESERVE (WAVE-2, 2026-08-09). The pooled reserve
+protects the tail FROM the drain, but not the tail's later steps from its earlier
+ones. Triage runs FIRST and, at the doubled caps (batch 500->1000, pairs
+200->500), now costs ~2.9 h and claims almost the whole 180-min reserve — so on a
+weekday contradictions and evidence, behind it, get ~0. ``TailReserve`` can
+therefore hand a step an INNER share of the window: it admits work while
+``now + est_cost < reserve_start + share*reserve``. ``kb_tail_triage_share`` gives
+triage its slice (default 0 = the OLD pooled behaviour, inert: triage is simply
+asked to stop at its share so the steps behind it get theirs). Weekends carry no
+deadline, so the share is inert there — triage keeps going and the top-up runs.
 """
 
 from __future__ import annotations
@@ -42,7 +53,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from kbcore.config import settings
@@ -56,6 +67,14 @@ StopCheck = Callable[[], "str | None"]
 # battery stops — distinct so a report can tell "the window ran out" (deadline)
 # apart from "the window was DEALT" (tail-reserve).
 TAIL_RESERVE_REASON = "tail-reserve"
+
+# The reason a tail step stops because it spent its INTERNAL share of the reserve —
+# distinct from the run's deadline/battery stop and the drain's pooled tail-reserve.
+TRIAGE_SHARE_REASON = "triage-share"
+
+# Measured wall-clock cost of ONE triage row (the 14B judge) — the one-row lookahead
+# a share-bounded triage uses to stop before its slice closes (10.4 s/row measured).
+TRIAGE_SECONDS_PER_ROW = 10.4
 
 # Cost of the FIRST cohort of a run, before it has observed anything. Measured
 # across nightly reports: ~111 s/job wall clock, dominated by model loading
@@ -184,6 +203,66 @@ class TailReserve:
     def enabled(self) -> bool:
         """False when the reserve cannot bind (kill switch or no deadline)."""
         return self.reserve_seconds > 0 and self.deadline is not None
+
+    @property
+    def reserve_start(self) -> datetime | None:
+        """Wall-clock instant the tail's reserved window opens (deadline - reserve).
+
+        None whenever the reserve cannot bind (same condition as :attr:`enabled`).
+        """
+        if not self.enabled:
+            return None
+        return self.deadline - timedelta(seconds=self.reserve_seconds)  # deadline set
+
+    def share_cutoff(self, share: float) -> datetime | None:
+        """The instant a tail step holding ``share`` of the reserve must stop by:
+        ``reserve_start + share*reserve``, the INNER bound that keeps an early tail
+        step (triage) from spending the window the later ones run in. None (no inner
+        bound = OLD pooled behaviour) when the reserve is off or ``share <= 0``.
+        """
+        start = self.reserve_start
+        if start is None or share <= 0:
+            return None
+        return start + timedelta(seconds=share * self.reserve_seconds)
+
+    def admit_step(self, share: float, est_cost_seconds: float = 0.0) -> bool:
+        """May a step holding ``share`` admit ``est_cost_seconds`` more work?
+
+        ``now + est_cost < share_cutoff``; always True when the share is inert, so
+        a non-opted-in run behaves exactly as it did before this knob existed.
+        """
+        cutoff = self.share_cutoff(share)
+        if cutoff is None:
+            return True
+        return self._now() + timedelta(seconds=est_cost_seconds) < cutoff
+
+    def share_budget_minutes(self, share: float) -> float:
+        """Minutes ``share`` reserves for its step — the report's MEASURED number
+        in place of the module docstring's hand-arithmetic; 0.0 when inert."""
+        if self.share_cutoff(share) is None:
+            return 0.0
+        return round(share * self.reserve_seconds / 60.0, 1)
+
+    def share_guard(
+        self, share: float, base: StopCheck, est_cost_seconds: float = TRIAGE_SECONDS_PER_ROW
+    ) -> StopCheck:
+        """Wrap ``base`` so a step also stands down once it has spent its ``share``.
+
+        Returns :data:`TRIAGE_SHARE_REASON` when the share is exhausted, else
+        ``base()`` — the run's deadline/battery verdict, which STILL preempts within
+        the share (an inner bound, never a way to run longer). When the share is
+        inert (kill switch, no deadline, ``share <= 0``) this is ``base`` UNCHANGED,
+        so the pooled behaviour is reproduced byte for byte and the knob is opt-in.
+        """
+        if self.share_cutoff(share) is None:
+            return base
+
+        def guard() -> str | None:
+            if not self.admit_step(share, est_cost_seconds):
+                return TRIAGE_SHARE_REASON
+            return base()
+
+        return guard
 
     def record(self, jobs: int, seconds: float) -> None:
         """Fold a completed cohort into this run's observed cost."""

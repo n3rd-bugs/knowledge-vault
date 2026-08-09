@@ -25,7 +25,7 @@ import pytest
 
 from kbcore import llm, review_triage
 from kbcore.config import settings
-from kbworker import consolidate
+from kbworker import allocator, consolidate
 
 
 @pytest.fixture(autouse=True)
@@ -216,6 +216,26 @@ def test_the_summary_loop_stands_down(monkeypatch):
 
     assert consolidate._summaries(None, lambda: "deadline") == 0
     assert consolidate._STOP_LOG["summaries_written"]["deferred"] == 3
+
+
+def test_the_triage_share_guard_yields_to_the_run_guard_then_to_its_slice():
+    """WAVE-2 reach: triage's INNER share of the tail reserve is a stand-down like
+    every other tail loop's — the run's own deadline/battery STILL preempts inside
+    the share, and the share itself stops triage once spent even while the run
+    guard is quiet. Day-independent: the reserve is built by hand with a fixed
+    deadline, never read from the calendar."""
+    res = allocator.TailReserve(reserve_seconds=180 * 60.0, deadline=datetime(2026, 8, 3, 12, 0))
+    clock = {"now": datetime(2026, 8, 3, 9, 30)}  # inside triage's 09:00-10:30 slice
+    res._now = lambda: clock["now"]
+    run = {"r": None}
+    guard = res.share_guard(0.5, lambda: run["r"])
+
+    assert guard() is None
+    run["r"] = "battery"
+    assert guard() == "battery", "the run's own guard must still preempt within the share"
+    run["r"] = None
+    clock["now"] = datetime(2026, 8, 3, 11, 0)  # past the 10:30 half-reserve cutoff
+    assert guard() == allocator.TRIAGE_SHARE_REASON
 
 
 def test_a_deferral_is_accumulated_across_projects():

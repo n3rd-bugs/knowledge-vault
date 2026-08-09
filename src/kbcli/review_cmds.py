@@ -174,8 +174,10 @@ def review_auto_apply(
 
     The same entry point the nightly worker calls (owner decision 2026-08-02).
     Only reject_* suggestions past the cooling-off window, never recalled in 30
-    days, with a live dup target — 'keep' is never touched and trust is never
-    raised. Every application is stamped and reversible via ``undo-auto``.
+    days, with a live SAME-PROJECT dup target the twin linker has not already
+    ruled on — 'keep' is never touched and trust is never raised. Every effect,
+    retirement and cluster-winner close alike, is stamped and reversible via
+    ``undo-auto``, and both share the one --cap.
     """
     try:
         counts = review_apply.auto_apply_rejects(cap, dry_run=dry_run)
@@ -187,7 +189,15 @@ def review_auto_apply(
     )
     typer.echo(
         f"skipped: {counts['skipped_cooling']} cooling, "
-        f"{counts['skipped_accessed']} accessed, {counts['skipped_target_gone']} target gone"
+        f"{counts['skipped_accessed']} accessed, {counts['skipped_target_gone']} target gone, "
+        f"{counts['skipped_unresolvable_target']} unresolvable, "
+        f"{counts['skipped_cross_project']} cross-project, "
+        f"{counts['skipped_linked_alternative']} linked"
+    )
+    typer.echo(
+        f"cluster winners: {counts['skipped_cluster_winner']} "
+        f"({counts['cluster_winners_closed']} closed, "
+        f"{counts['cluster_winner_remaining']} left for the next run)"
     )
     typer.echo(f"eligible remaining: {counts['eligible_remaining']}")
 

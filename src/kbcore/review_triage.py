@@ -35,9 +35,15 @@ from kbcore.errors import (
 logger = logging.getLogger("kbcore.review_triage")
 
 TRIAGE_SIMILAR_K = 5  # neighbor candidates offered to the judge as dup targets
-# Rows between stand-down checks — the bound is the OVERSHOOT (at most this many
-# more 14B calls after the deadline passes or the grid drops), not the cost: the
-# guard memoizes its answer for a few seconds.
+# NEVER offered as a dup target. Consolidation OUTPUT is not source knowledge: a summary is
+# superseded on every refresh, so it is an unstable canonical BOTH apply paths permanently refuse
+# (cluster_util.validate_dup_edges, review_apply_dups) — offering one produced a verdict nobody
+# could ever apply, and auto-apply's re-queue of unappliable rows turned that into a livelock
+# (review wfulfrf33). Filtered at the CALL SITE, never inside graph.similar: kb_similar's other
+# callers legitimately want summaries back.
+DUP_TARGET_EXCLUDED_TYPES = ("summary", "report")
+# Rows between stand-down checks — the bound is the OVERSHOOT (at most this many more 14B calls
+# after the deadline passes or the grid drops), not the cost: the guard memoizes for a few seconds.
 STOP_CHECK_EVERY = 5
 
 
@@ -159,6 +165,7 @@ def run_triage(batch: int, should_stop: Callable[[], str | None] | None = None) 
             similar = [
                 {"id": h.item_id, "title": h.title, "similarity": h.score, "status": "active"}
                 for h in graph.similar(item["id"], k=TRIAGE_SIMILAR_K)
+                if h.type not in DUP_TARGET_EXCLUDED_TYPES
             ]
             verdict = llm.triage_extraction(item, similar, row["usage_count"])
         except (ExtractorUnavailable, EmbedderUnavailable) as e:
@@ -177,16 +184,20 @@ def run_triage(batch: int, should_stop: Callable[[], str | None] | None = None) 
     return stored
 
 
-def _close_row(queue_id: int, kind: str, **extra: Any) -> None:
-    """Resolve one open row with an ``auto_resolution`` audit stamp (status flip)."""
+def _close_row(queue_id: int, kind: str, **extra: Any) -> bool:
+    """Resolve one open row with an ``auto_resolution`` audit stamp (status flip).
+    Returns whether the guarded UPDATE matched, so an unattended caller can tell
+    "closed" from "a human got there first" (the manual callers ignore it)."""
     stamp = {"auto_resolution": {"kind": kind, **extra, "at": datetime.now(UTC).isoformat()}}
     with transaction() as conn:
-        conn.execute(
+        row = conn.execute(
             "UPDATE review_queue SET resolved = true, "
             "detail = COALESCE(detail, '{}'::jsonb) || %s "
-            "WHERE id = %s AND resolved = false",
+            "WHERE id = %s AND resolved = false "
+            "RETURNING id",
             (Jsonb(stamp), queue_id),
-        )
+        ).fetchone()
+    return row is not None
 
 
 def _apply_one(qid: int, item_id: int, action: str) -> str:

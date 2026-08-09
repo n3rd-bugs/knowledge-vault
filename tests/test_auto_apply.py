@@ -21,7 +21,15 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
-from kbcore import db, notify, review_apply, review_apply_rails, review_triage
+from kbcore import (
+    db,
+    graph,
+    notify,
+    review_apply,
+    review_apply_rails,
+    review_apply_rows,
+    review_triage,
+)
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import InvalidOperation
@@ -68,6 +76,33 @@ def _row(qid: int) -> tuple[bool, dict]:
 def _status(item_id: int) -> str:
     with db.connect() as conn:
         return conn.execute("SELECT status FROM items WHERE id = %s", (item_id,)).fetchone()[0]
+
+
+def _snapshot() -> tuple:
+    """Every byte a run could touch, plus the three table counts.
+
+    A dry run is asserted against THIS rather than against the two or three rows a
+    test happens to know the ids of — the point of the assertion is that nothing
+    ANYWHERE moved, including rows a future write path might reach.
+    """
+    with db.connect() as conn:
+        return (
+            conn.execute("SELECT id, resolved, detail FROM review_queue ORDER BY id").fetchall(),
+            conn.execute("SELECT id, status, updated_at FROM items ORDER BY id").fetchall(),
+            conn.execute("SELECT src_id, rel, dst_id FROM relations ORDER BY id").fetchall(),
+            conn.execute(
+                "SELECT (SELECT count(*) FROM review_queue), (SELECT count(*) FROM items), "
+                "       (SELECT count(*) FROM relations)"
+            ).fetchone(),
+        )
+
+
+def _dead_item(tag: str = "dead-canon") -> int:
+    """An item retired out-of-band (kb_test-owned) — a PROVABLY dead dup target."""
+    item_id = ingest("p", "note", tag, "retired canonical", uri=tag)
+    with db.transaction() as conn:
+        conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (item_id,))
+    return item_id
 
 
 @pytest.fixture(autouse=True)
@@ -146,16 +181,7 @@ def test_duplicate_applies_against_a_live_canonical(kb):
     _triage(qid, "reject_duplicate", dup_of=canonical)
 
     counts = review_apply.auto_apply_rejects()
-    assert counts == {
-        "applied_noise": 0,
-        "applied_duplicate": 1,
-        "skipped_accessed": 0,
-        "skipped_cooling": 0,
-        "skipped_target_gone": 0,
-        "skipped_cluster_winner": 0,
-        "triage_invalidated": 0,
-        "eligible_remaining": 0,
-    }
+    assert counts == {**dict.fromkeys(review_apply_rails.COUNT_KEYS, 0), "applied_duplicate": 1}
     assert _status(dup) == "duplicate"  # NOT archived — the manual path's flip
     assert _status(canonical) == "active"
     resolved, detail = _row(qid)
@@ -173,6 +199,9 @@ def test_duplicate_applies_against_a_live_canonical(kb):
 
 
 def test_dead_or_missing_dup_targets_are_skipped(kb):
+    """PROVABLY dead = the target item is retired or does not exist. A row with NO
+    target at all is a different fact (nothing died — the verdict never named
+    anything), so it is unresolvable rather than gone; see the test below."""
     gone = ingest("p", "note", "gone", "retired canonical", uri="gone")
     with db.transaction() as conn:
         conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (gone,))
@@ -184,13 +213,17 @@ def test_dead_or_missing_dup_targets_are_skipped(kb):
     _triage(qc, "reject_duplicate", dup_of=None)  # no target at all
 
     counts = review_apply.auto_apply_rejects()
-    assert counts["skipped_target_gone"] == 3
+    assert counts["skipped_target_gone"] == 2
+    assert counts["skipped_unresolvable_target"] == 1
     assert counts["applied_duplicate"] == 0
     for item, qid in ((a, qa), (b, qb), (c, qc)):
         assert _status(item) == "active" and _row(qid)[0] is False
 
 
 def test_summary_targets_and_self_reference_are_refused(kb):
+    """A LIVE summary / self-reference is refusable FOREVER, not dead: re-triage
+    would return the same unappliable verdict, which is the livelock. It counts
+    as unresolvable and is never stamped 'dup_target_dead' — the target is alive."""
     summ = ingest("p", "summary", "rollup", "a consolidation summary", uri="summ")
     a, qa = _unverified("a")
     b, qb = _unverified("b")
@@ -198,8 +231,15 @@ def test_summary_targets_and_self_reference_are_refused(kb):
     _triage(qb, "reject_duplicate", dup_of=b)  # duplicate of itself
 
     counts = review_apply.auto_apply_rejects()
-    assert counts["skipped_target_gone"] == 2 and counts["applied_duplicate"] == 0
+    assert counts["skipped_unresolvable_target"] == 2
+    assert counts["skipped_target_gone"] == 0 and counts["applied_duplicate"] == 0
+    assert counts["triage_invalidated"] == 0, "an ALIVE target is never re-queued"
     assert _status(a) == "active" and _status(b) == "active"
+    for qid in (qa, qb):
+        resolved, detail = _row(qid)
+        assert resolved is False, "the row stays open for the owner, like the manual path"
+        assert detail["triage"]["action"] == "reject_duplicate", "the verdict is retained"
+        assert "auto_resolution" not in detail and "triage_prior" not in detail
 
 
 def test_reciprocal_pair_never_retires_both_ends(kb):
@@ -218,12 +258,14 @@ def test_reciprocal_pair_never_retires_both_ends(kb):
     assert _status(a) == "active"  # the cluster canonical survives
     assert _status(b) == "duplicate"
     # BEHAVIOR REVERSAL (design review #2, KB 16601 — flagged for owner sign-off):
-    # the survivor's OWN row previously stayed open forever; it now CLOSES as
-    # triage_keep/cluster_winner, the disposition the MANUAL apply path has used
-    # since 2026-07-18 (review_triage.py:242-245). No item touched, no trust change.
+    # the survivor's OWN row previously stayed open forever; it now CLOSES with the
+    # MANUAL path's disposition (note='cluster_winner', no item touched, no trust
+    # change) under its own stamp kind, which is what makes the close UNDOABLE.
+    assert counts["cluster_winners_closed"] == 1
+    assert counts["cluster_winner_remaining"] == 0
     resolved_a, detail_a = _row(qa)
     assert resolved_a is True
-    assert detail_a["auto_resolution"]["kind"] == "triage_keep"
+    assert detail_a["auto_resolution"]["kind"] == "cluster_winner_closed"
     assert detail_a["auto_resolution"]["note"] == "cluster_winner"
     assert _row(qb)[1]["auto_resolution"]["dup_of"] == a
 
@@ -321,6 +363,163 @@ def test_triage_invalidate_cap_and_kill_switch(kb, monkeypatch):
     assert all("triage_prior" in _row(q)[1] for q in qids)
 
 
+# --- the livelock (review wfulfrf33) -----------------------------------------
+# invalidate -> re-triage -> the same unappliable verdict -> invalidate ... with
+# the row priority-stamped to the FRONT of the triage queue each lap and a cycle
+# period of the 3-day cooling rail. Two independent stops, both pinned here: a
+# LIVE refusable target is never re-queued at all, and a DEAD one is re-queued
+# exactly once before the row is stamped terminal.
+
+
+def test_a_live_refusable_target_cycles_zero_times(kb):
+    """A summary dup_of is ALIVE, so re-triage would return the same verdict
+    forever. It is therefore never invalidated — not once — and the row keeps its
+    verdict for the owner instead of being re-queued behind a lie."""
+    summ = ingest("p", "summary", "rollup", "a consolidation summary", uri="summ")
+    item, qid = _unverified("live-summary-target")
+    _triage(qid, "reject_duplicate", dup_of=summ)
+
+    for _lap in range(3):  # three nights in a row must change nothing at all
+        counts = review_apply.auto_apply_rejects()
+        assert counts["skipped_unresolvable_target"] == 1
+        assert counts["triage_invalidated"] == 0, "an alive target was re-queued"
+        assert counts["triage_unresolvable"] == 0, "an alive target is not a dead one"
+        resolved, detail = _row(qid)
+        assert resolved is False and "triage_prior" not in detail
+        assert detail["triage"]["dup_of"] == summ
+        assert "priority" not in detail, "never front-of-queue: there is nothing to re-ask"
+    assert _status(item) == "active" and _status(summ) == "active"
+    # ... and it never re-enters the triage queue, so the 14B never sees it again.
+    assert qid not in [r["queue_id"] for r in review_triage.pending_triage(50)]
+
+
+def test_a_dead_target_is_re_queued_once_then_stamped_terminal(kb):
+    """LAP 1 re-queues (the deadlock-breaker). LAP 2 — triage came back naming the
+    SAME dead target — is where the old code started the loop; the row is stamped
+    terminal instead, keeps its verdict, and stays open for the owner."""
+    dead = _dead_item()
+    victim, qid = _unverified("victim")
+    _triage(qid, "reject_duplicate", dup_of=dead)
+
+    first = review_apply.auto_apply_rejects()
+    assert first["triage_invalidated"] == 1 and first["triage_unresolvable"] == 0
+    assert _row(qid)[1]["triage_prior"]["dup_of"] == dead
+
+    _triage(qid, "reject_duplicate", dup_of=dead)  # the deterministic re-verdict
+
+    second = review_apply.auto_apply_rejects()
+    assert second["triage_invalidated"] == 0, "a second re-queue IS the livelock"
+    assert second["triage_unresolvable"] == 1
+    assert second["skipped_target_gone"] == 1, "still counted as the dead target it is"
+    resolved, detail = _row(qid)
+    assert resolved is False, "terminal for the machine is still open for the owner"
+    assert detail["triage"]["action"] == "reject_duplicate", "the verdict is retained"
+    assert detail["auto_resolution"]["kind"] == "triage_unresolvable"
+    assert _status(victim) == "active", "no item was touched on either lap"
+
+    stamped_at = detail["auto_resolution"]["at"]
+    third = review_apply.auto_apply_rejects()
+    assert third["triage_invalidated"] == 0 and third["triage_unresolvable"] == 1
+    assert _row(qid)[1]["auto_resolution"]["at"] == stamped_at, "terminal rows are not re-written"
+    assert qid not in [r["queue_id"] for r in review_triage.pending_triage(50)]
+
+
+def test_a_fresh_verdict_naming_a_DIFFERENT_dead_target_re_queues_again(kb):
+    """The memory is per-TARGET, not "this row was invalidated once": a genuinely
+    new verdict (a different target that has since died) is still worth one lap."""
+    first_dead, second_dead = _dead_item("dead-one"), _dead_item("dead-two")
+    _victim, qid = _unverified("moving-target")
+    _triage(qid, "reject_duplicate", dup_of=first_dead)
+    assert review_apply.auto_apply_rejects()["triage_invalidated"] == 1
+
+    _triage(qid, "reject_duplicate", dup_of=second_dead)
+    counts = review_apply.auto_apply_rejects()
+    assert counts["triage_invalidated"] == 1 and counts["triage_unresolvable"] == 0
+
+
+# --- the two jurisdiction walls (FIX 2) --------------------------------------
+# Triage suggestions are cross-project by construction (graph.similar ranks by
+# cosine, not by project), so auto-apply could retire one side of a pair the
+# owner-invoked wave-3 linker had certified as "both stay active".
+
+
+def test_a_cross_project_retirement_is_refused(kb):
+    """Cross-project sameness is the LINKER's jurisdiction (twin_crossproject:5-22)
+    and the same-project dedupe verdict is settled. The machine counts and stands
+    down; the row stays open, where `kb review apply-triage` can still take it."""
+    canonical = ingest("other", "note", "canonical", "the surviving body", uri="x-canon")
+    dup, qid = _unverified("x-dup", project="p")
+    _triage(qid, "reject_duplicate", dup_of=canonical)
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["skipped_cross_project"] == 1
+    assert counts["applied_duplicate"] == 0
+    assert counts["skipped_target_gone"] == 0, "the target is alive and fine — just elsewhere"
+    assert _status(dup) == "active" and _status(canonical) == "active"
+    resolved, detail = _row(qid)
+    assert resolved is False and "auto_resolution" not in detail
+
+
+def test_a_pair_the_twin_linker_already_joined_is_never_retired(kb):
+    """An `alternative_to` edge IS the linker's ruling on exactly this pair, so it
+    refuses the retirement on its own — in either direction, and even inside one
+    project, where no project wall would have caught it."""
+    same_canon = ingest("p", "note", "same-canon", "surviving body", uri="same-canon")
+    same_dup, q_same = _unverified("same-dup", project="p")
+    graph.link(same_dup, "alternative_to", same_canon)
+
+    rev_canon = ingest("p", "note", "rev-canon", "surviving body two", uri="rev-canon")
+    rev_dup, q_rev = _unverified("rev-dup", project="p")
+    graph.link(rev_canon, "alternative_to", rev_dup)  # stored the OTHER way round
+
+    cross_canon = ingest("other", "note", "cross-canon", "surviving body three", uri="x2-canon")
+    cross_dup, q_cross = _unverified("cross-dup", project="p")
+    graph.link(cross_dup, "alternative_to", cross_canon)
+
+    for qid, canon in ((q_same, same_canon), (q_rev, rev_canon), (q_cross, cross_canon)):
+        _triage(qid, "reject_duplicate", dup_of=canon)
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["skipped_linked_alternative"] == 3
+    assert counts["applied_duplicate"] == 0
+    # The linked cross-project pair counts under the MORE SPECIFIC wall, not both.
+    assert counts["skipped_cross_project"] == 0
+    for item in (same_dup, rev_dup, cross_dup, same_canon, rev_canon, cross_canon):
+        assert _status(item) == "active"
+    for qid in (q_same, q_rev, q_cross):
+        assert _row(qid)[0] is False
+
+
+def test_a_linked_item_is_protected_even_when_it_retires_onto_a_THIRD_item(kb):
+    """The wall is about the ITEM, not about which target it happens to retire onto.
+    Cluster-canonicalization can retarget a row at a third item, and a
+    target-only check would walk straight around the linker's ruling: the pair's
+    A side would leave retrieval while the linker's edge said both stay active."""
+    twin = ingest("other", "gotcha", "the same gotcha", "captured twice", uri="x-twin")
+    canonical = ingest("p", "note", "third", "an unrelated same-project canonical", uri="third")
+    dup, qid = _unverified("linked-elsewhere", project="p")
+    graph.link(dup, "alternative_to", twin)  # certified: BOTH stay active
+    _triage(qid, "reject_duplicate", dup_of=canonical)  # retires onto neither of them
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["skipped_linked_alternative"] == 1
+    assert counts["applied_duplicate"] == 0
+    assert _status(dup) == "active" and _status(twin) == "active"
+    assert _row(qid)[0] is False
+
+
+def test_the_walls_do_not_touch_an_ordinary_same_project_duplicate(kb):
+    """The rails' own control: neither wall fires on the case auto-apply exists for."""
+    canonical = ingest("p", "note", "canonical", "the surviving body", uri="ok-canon")
+    dup, qid = _unverified("ok-dup", project="p")
+    _triage(qid, "reject_duplicate", dup_of=canonical)
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["applied_duplicate"] == 1
+    assert counts["skipped_cross_project"] == 0 and counts["skipped_linked_alternative"] == 0
+    assert _status(dup) == "duplicate"
+
+
 # --- rail 4: state guard (raced by a human) ----------------------------------
 
 
@@ -406,13 +605,7 @@ def test_cap_defaults_to_config_and_zero_applies_nothing(kb, monkeypatch):
     item, qid = _unverified("a")
     _triage(qid, "reject_noise")
     assert review_apply.auto_apply_rejects(cap=0) == {
-        "applied_noise": 0,
-        "applied_duplicate": 0,
-        "skipped_accessed": 0,
-        "skipped_cooling": 0,
-        "skipped_target_gone": 0,
-        "skipped_cluster_winner": 0,
-        "triage_invalidated": 0,
+        **dict.fromkeys(review_apply_rails.COUNT_KEYS, 0),
         "eligible_remaining": 1,
     }
     assert _status(item) == "active"
@@ -434,6 +627,84 @@ def _no_db(*_a, **_kw):
 
 
 # --- dry run -----------------------------------------------------------------
+
+
+def test_dry_run_writes_nothing_on_the_three_row_only_paths(kb):
+    """The winner close, the dead-target re-queue and the terminal stamp are all
+    WRITES, and none of them goes through _apply_one's dry-run branch. Asserted by
+    whole-table snapshot + row counts, so a fourth write path added later cannot
+    slip past a test that only re-reads the rows it seeded."""
+    dead = _dead_item()
+    a, qa = _unverified("dry-a")  # a reciprocal pair: one retirement + one winner
+    b, qb = _unverified("dry-b")
+    _triage(qa, "reject_duplicate", dup_of=b)
+    _triage(qb, "reject_duplicate", dup_of=a)
+    _fresh, q_fresh = _unverified("dry-fresh")
+    _triage(q_fresh, "reject_duplicate", dup_of=dead)
+    _repeat, q_repeat = _unverified("dry-repeat")  # already round once -> terminal path
+    _triage(q_repeat, "reject_duplicate", dup_of=dead)
+    assert review_apply_rows.invalidate_dead_dup(q_repeat)
+    _triage(q_repeat, "reject_duplicate", dup_of=dead)
+
+    before = _snapshot()
+    counts = review_apply.auto_apply_rejects(dry_run=True)
+
+    assert counts["applied_duplicate"] == 1, "the retirement was planned"
+    assert counts["cluster_winners_closed"] == 1, "the winner close was planned"
+    assert counts["triage_invalidated"] == 1, "the re-queue was planned"
+    assert counts["triage_unresolvable"] == 1, "the terminal stamp was planned"
+    assert _snapshot() == before, "a dry run wrote to the database"
+    assert _status(a) == "active" and _status(b) == "active"
+    assert _row(qa)[0] is False and _row(qb)[0] is False
+
+
+# --- cluster-winner governance: cap, undo, veto (FIX 3) ----------------------
+# A winner close retires nothing, but it DOES dispose of a row, and every surface
+# (CLI, DATA_FLOW, the KB record) advertises auto-apply as reversible. So it is
+# stamped with its own kind, bounded by the run's blast-radius cap, and undoable.
+
+
+def test_the_cap_covers_cluster_winner_closes_too(kb):
+    a, qa = _unverified("cap-a")  # ingested first -> the item_ranks canonical
+    b, qb = _unverified("cap-b")
+    _triage(qa, "reject_duplicate", dup_of=b)
+    _triage(qb, "reject_duplicate", dup_of=a)
+
+    counts = review_apply.auto_apply_rejects(cap=1)
+    assert counts["applied_duplicate"] == 1, "the retirement spent the whole cap"
+    assert counts["skipped_cluster_winner"] == 1
+    assert counts["cluster_winners_closed"] == 0
+    assert counts["cluster_winner_remaining"] == 1, "and the remainder is reported"
+    assert _row(qa)[0] is False, "the winner's row is still open — the cap held"
+    assert _status(a) == "active" and _status(b) == "duplicate"
+
+
+def test_cluster_winner_closes_are_undoable_and_the_undo_vetoes_them(kb):
+    a, qa = _unverified("undo-win-a")
+    b, qb = _unverified("undo-win-b")
+    _triage(qa, "reject_duplicate", dup_of=b)
+    _triage(qb, "reject_duplicate", dup_of=a)
+    since = datetime.now(UTC) - timedelta(seconds=1)
+
+    counts = review_apply.auto_apply_rejects()
+    assert counts["cluster_winners_closed"] == 1 and counts["applied_duplicate"] == 1
+    assert _row(qa)[1]["auto_resolution"]["kind"] == "cluster_winner_closed"
+
+    assert review_apply.undo_auto_applied(since, dry_run=True) == [qa, qb]
+    assert _row(qa)[0] is True, "the dry run wrote nothing"
+
+    assert review_apply.undo_auto_applied(since) == [qa, qb]
+    resolved, detail = _row(qa)
+    assert resolved is False, "the winner's row reopened"
+    assert _status(a) == "active", "no item state was ever touched by the close, or by its undo"
+    assert detail["auto_resolution"]["kind"] == "cluster_winner_closed"  # history kept
+    assert detail["auto_resolution"]["undone_at"]
+    assert _status(b) == "active", "the retirement in the same batch reversed as before"
+
+    # THE VETO: tonight's run must not silently re-close what the owner reopened.
+    assert review_apply.auto_apply_rejects() == dict.fromkeys(review_apply_rails.COUNT_KEYS, 0)
+    assert _row(qa)[0] is False and _row(qb)[0] is False
+    assert review_apply.undo_auto_applied(since) == []  # idempotent
 
 
 def test_dry_run_reports_but_changes_nothing(kb):
@@ -554,6 +825,10 @@ def test_cli_auto_apply_and_undo_auto(kb):
     assert res.exit_code == 0, res.output
     assert "applied: 1 noise, 0 duplicate" in res.output
     assert "eligible remaining: 0" in res.output
+    # ADD-only surfacing of the new facts (review wfulfrf33): the two jurisdiction
+    # walls and the cluster-winner split are visible to whoever runs this by hand.
+    assert "0 unresolvable, 0 cross-project, 0 linked" in res.output
+    assert "cluster winners: 0 (0 closed, 0 left for the next run)" in res.output
     assert _status(item) == "archived"
 
     undo = runner.invoke(app, ["review", "undo-auto", "--since", since])

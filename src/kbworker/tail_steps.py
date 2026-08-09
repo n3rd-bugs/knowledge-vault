@@ -22,11 +22,11 @@ StopCheck = Callable[[], "str | None"]
 
 DIGEST_EXPIRY_HORIZON_DAYS = 7  # digest horizon for 'rows start expiring'
 
-# Backstop on the top-up slice loop, in the spirit of consolidate.MAX_REFILLS.
-# The real bound is the wall clock (every slice moves the clock toward the
-# cutoff), so this only exists so a hypothetical slice that stores suggestions
-# without ever shrinking the pending set cannot spin all night. At slice 200 and
-# the measured 10.4 s/row this is ~29 h of work — reaching it is a loud anomaly.
+# Backstop on the top-up slice loop, in the spirit of consolidate.MAX_REFILLS. The real bound is
+# the wall clock (every slice moves the clock toward the cutoff), so this only exists so a
+# hypothetical slice that stores suggestions without ever shrinking the pending set cannot spin all
+# night. At slice 200 and the measured 10.4 s/row this is ~29 h of work — reaching it is a loud
+# anomaly.
 TOPUP_MAX_SLICES = 50
 
 
@@ -225,15 +225,25 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     # be noise in the one message the owner reads without going looking.
     if topup := counts.get("review_triaged_topup"):
         lines.append(f"topup triaged: {topup}")
-    # Dead-dup-target re-queues (design review #2, KB 16601), POSITIVE-ONLY: the
-    # deadlock-breaker only fires when a provably-dead target is there to re-queue.
-    # Nested under the auto-apply breakdown the tail step stashed in the report.
-    if invalidated := (counts.get("auto_apply_counts") or {}).get("triage_invalidated"):
+    # The auto-apply breakdown the tail step stashed in the report. All
+    # POSITIVE-ONLY and all pure ASCII (this goes to a phone over ntfy):
+    #   re-queued  — the deadlock-breaker fired on a provably-dead target;
+    #   stuck      — rows the machine has given up on (a re-queue came back with the
+    #                same unappliable verdict). Nothing else will ever move these;
+    #                the owner is the only remaining path, so the owner is told;
+    #   winners    — duplicate rows whose own item won its cluster, and how many of
+    #                those closes the run's cap let through. A close is a row flip
+    #                the owner can reverse, so it is reported, not silent (wfulfrf33).
+    auto = counts.get("auto_apply_counts") or {}
+    if invalidated := auto.get("triage_invalidated"):
         lines.append(f"triage re-queued: {invalidated}")
-    # The two quiet-expiry facts, POSITIVE-ONLY (owner amendment 2026-08-08):
-    # what the capped sweep actually closed tonight, and the backlog the
-    # untriaged gate now holds open — the number that only falls when work is
-    # done. Pure ASCII: this line goes out over ntfy to a phone.
+    if stuck := auto.get("triage_unresolvable"):
+        lines.append(f"triage stuck (needs owner): {stuck}")
+    if winners := auto.get("skipped_cluster_winner"):
+        lines.append(f"cluster winners: {winners} ({auto.get('cluster_winners_closed', 0)} closed)")
+    # The two quiet-expiry facts, POSITIVE-ONLY (owner amendment 2026-08-08): what the capped sweep
+    # actually closed tonight, and the backlog the untriaged gate now holds open — the number that
+    # only falls when work is done. Pure ASCII: this line goes out over ntfy to a phone.
     if expired := counts.get("review_expired"):
         lines.append(f"expired: {expired}")
     if never_triaged := counts.get("never_triaged_open"):

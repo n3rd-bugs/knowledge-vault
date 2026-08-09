@@ -351,15 +351,28 @@ def test_the_tail_RUNS_after_the_drain_stands_down_for_the_reserve(kb, monkeypat
 
 
 def test_the_triage_share_budget_minutes_land_in_the_run_report(kb, monkeypatch):
-    """Fold the per-step budget into the report so the allocator docstring's
-    hand-arithmetic becomes a MEASURED number: on a deadline night with a 0.5
-    share of the 180m reserve the report carries 90.0 minutes, and triage is
-    handed the composed share guard rather than the bare run guard."""
+    """Fold the per-step budget into the report AND prove the guard is really the
+    composed one — driven through consolidate.main against a FAKE reserve whose
+    clock this test owns.
+
+    The old assertion here was ``seen["guard"] is not None``, which cannot fail:
+    the run guard itself is not None either, so a completely disconnected share
+    (``share_guard`` never called, bare run guard passed through) passed it. This
+    version fails on exactly that: the guard triage receives must NOT be the run
+    guard, and pushing the reserve's clock past the share cutoff must make it
+    stand triage down with the share's own reason while the run guard still says
+    "keep going"."""
     monkeypatch.setattr(settings, "kb_tail_reserve_minutes", 180)
     monkeypatch.setattr(settings, "kb_tail_triage_share", 0.5)
-    monkeypatch.setattr(settings, "kb_drain_deadline", "12:00")
-    monkeypatch.setattr(settings, "kb_drain_deadline_days", "")  # day-independent, per the suite
     monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)
+    clock = {"now": _at("09:30")}  # inside the 09:00-10:30 triage slice
+    fake = allocator.TailReserve(reserve_seconds=180 * 60, deadline=_at("12:00"))
+    fake._now = lambda: clock["now"]
+    monkeypatch.setattr(allocator.TailReserve, "for_run", classmethod(lambda cls, now=None: fake))
+
+    def run_guard() -> str | None:
+        return None  # the RUN never wants to stop; only the share may
+
     seen: dict = {}
     monkeypatch.setattr(
         consolidate.review_triage,
@@ -367,10 +380,15 @@ def test_the_triage_share_budget_minutes_land_in_the_run_report(kb, monkeypatch)
         lambda batch, should_stop=None: seen.update(guard=should_stop) or 0,
     )
 
-    result = consolidate.main(stop=lambda: None)
+    result = consolidate.main(stop=run_guard)
 
-    assert result["tail_triage_budget_min"] == 90.0
-    assert seen["guard"] is not None, "triage got a composed share guard on a deadline night"
+    assert result["tail_triage_budget_min"] == 90.0, "the measured budget rides the report"
+    guard = seen["guard"]
+    assert guard is not run_guard, "triage was handed the BARE run guard — the share is inert"
+    assert guard() is None, "inside its slice the share must not stop triage"
+    clock["now"] = _at("10:45")  # past reserve_start + 0.5 * reserve
+    assert guard() == allocator.TRIAGE_SHARE_REASON
+    assert run_guard() is None, "and the run itself never asked anyone to stand down"
 
 
 def test_a_weekend_night_leaves_triage_uncapped_and_runs_the_topup(kb, monkeypatch):

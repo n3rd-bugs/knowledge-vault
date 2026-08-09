@@ -182,6 +182,47 @@ def test_kb_setup_registered_and_callable(monkeypatch):
     assert "install.sh" in text and "https://api.x.test" in text
 
 
+def test_a_rejected_rest_url_burns_no_enrolment_code(kb, monkeypatch):
+    """VALIDATE BEFORE MINT (review wfulfrf33). kb_setup used to issue the one-time
+    enrolment code FIRST and only then let build_setup_guide reject a malformed
+    rest_url — so every fat-fingered URL consumed a live code, and five live codes
+    disable the issuer outright (enrolment.MAX_LIVE_CODES_PER_IDENTITY). The
+    chokepoint is asked first now, and it writes nothing."""
+    from fastmcp import Client, FastMCP
+
+    from kbcore import db, enrolment
+    from kbcore.config import settings
+
+    monkeypatch.setattr(settings, "kb_public_rest_url", "")
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "")
+    mcp = FastMCP(name="kb-test")
+    tools_setup.register(mcp)
+
+    def codes() -> int:
+        with db.connect() as conn:
+            return conn.execute("SELECT count(*) FROM enrolment_codes").fetchone()[0]
+
+    def call(args: dict) -> str:
+        async def run():
+            async with Client(mcp) as client:
+                res = await client.call_tool("kb_setup", args, raise_on_error=False)
+                return res.content[0].text
+
+        return asyncio.run(run())
+
+    before = codes()
+    # More attempts than the issuer's live-code budget: under the old ordering this
+    # alone would have locked enrolment out for the identity.
+    for _ in range(enrolment.MAX_LIVE_CODES_PER_IDENTITY + 2):
+        assert "rest_url must be https://" in call({"rest_url": "https://h.test; curl evil"})
+    assert codes() == before, "a rejected rest_url minted an enrolment code"
+
+    # The issuer is untouched, so a VALID call still gets its code.
+    monkeypatch.setattr(settings, "kb_setup_allowed_rest_hosts", "api.ok.test")
+    assert "install.sh" in call({"rest_url": "https://api.ok.test", "project": "p"})
+    assert codes() == before + 1
+
+
 # --- auth-gated token embedding ------------------------------------------------------
 
 

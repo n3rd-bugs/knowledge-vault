@@ -288,6 +288,28 @@ def test_never_triaged_open_counts_only_open_untriaged_extraction_rows(kb):
     assert review_auto.curation_counts(30)["never_triaged_open"] == 1, "resolving one drains it"
 
 
+def test_never_triaged_open_excludes_rows_a_re_queue_already_examined(kb):
+    """GAUGE HONESTY (review wfulfrf33). auto-apply's dead-target re-queue moves the
+    stored verdict to ``triage_prior`` and drops ``triage``, so a row the 14B HAD
+    examined started counting as never-triaged again — inflating the one backlog
+    number the nightly digest carries, and inflating it a little more every night
+    the re-queue fires. A row waiting for a SECOND look is not an unexamined row."""
+    from kbcore import review_apply_rows
+
+    _i1, requeued = _unverified("gauge-requeued")
+    _i2, _untouched = _unverified("gauge-untouched")
+    assert review_auto.curation_counts(30)["never_triaged_open"] == 2
+
+    _triage(requeued, "reject_duplicate")
+    assert review_auto.curation_counts(30)["never_triaged_open"] == 1
+
+    assert review_apply_rows.invalidate_dead_dup(requeued), "the production re-queue shape"
+    counts = review_auto.curation_counts(30)
+    assert counts["never_triaged_open"] == 1, "a re-queued row WAS examined"
+    assert counts["triage_awaiting_apply"] == 0, "and it carries no verdict to apply either"
+    assert _open(requeued), "the row itself is still open — only the gauge changed"
+
+
 def test_first_expiry_date_tracks_the_rows_that_can_actually_close(kb):
     _i1, untriaged = _unverified("fe-untriaged")
     _age(untriaged, 20)  # oldest row, but the gate holds it open forever

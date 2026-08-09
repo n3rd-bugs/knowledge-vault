@@ -321,3 +321,43 @@ def test_digest_emits_the_expiry_line_when_the_7d_count_is_nonzero():
 def test_digest_is_silent_when_the_7d_count_is_zero_or_absent():
     for counts in ({"queued_drained": 1, "untriaged_expiring_7d": 0}, {"queued_drained": 1}):
         assert not any(line.startswith("EXPIRY:") for line in tail_steps.digest_lines(counts))
+
+
+def test_digest_surfaces_the_auto_apply_row_only_dispositions():
+    """A cluster-winner close disposes of a review row without touching an item, so
+    it is the kind of thing that could run for months unseen. It rides the ONE
+    message the owner reads without going looking, next to the re-queue count and
+    with the capped/closed split visible (review wfulfrf33). ADD-only: the existing
+    lines are untouched."""
+    lines = tail_steps.digest_lines(
+        {
+            "queued_drained": 1,
+            "auto_applied": 12,
+            "auto_apply_counts": {
+                "triage_invalidated": 3,
+                "triage_unresolvable": 2,
+                "skipped_cluster_winner": 7,
+                "cluster_winners_closed": 5,
+            },
+        }
+    )
+    assert "drained: 1" in lines and "auto-applied: 12" in lines
+    assert "triage re-queued: 3" in lines
+    assert "triage stuck (needs owner): 2" in lines, "nothing else will ever move these rows"
+    assert "cluster winners: 7 (5 closed)" in lines
+    assert all(line.isascii() for line in lines), "this goes out over ntfy to a phone"
+
+
+def test_digest_says_nothing_about_winners_when_there_were_none():
+    """POSITIVE-ONLY, like every other auto-apply line: a nightly 'cluster winners:
+    0' would be noise in the message that has to stay worth reading."""
+    for counts in (
+        {
+            "queued_drained": 1,
+            "auto_apply_counts": {"skipped_cluster_winner": 0, "triage_unresolvable": 0},
+        },
+        {"queued_drained": 1, "auto_apply_counts": {}},
+        {"queued_drained": 1},
+    ):
+        quiet = tail_steps.digest_lines(counts)
+        assert not any(line.startswith(("cluster winners:", "triage stuck")) for line in quiet)

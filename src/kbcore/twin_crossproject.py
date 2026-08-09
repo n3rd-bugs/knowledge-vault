@@ -12,8 +12,8 @@ scope-safety — DISPOSITION IS LINK, NOT RETIRE:
   SIMILARITY (``1 - (a <=> b)``) strictly above ``kb_xtwin_threshold``, each
   unordered pair once (``ia.id < ib.id``), both leads on the CURRENT model,
   summaries/reports excluded, closest first, bounded by ``kb_xtwin_cap`` (0 = kill).
-* :func:`plan` confirms same-fact with the shared 14B judge (reused via
-  :func:`llm.chat` + :func:`llm.parse_model_json`, **fail-closed**). Writes NOTHING.
+* :func:`plan` confirms same-fact with the shared 14B judge (:mod:`kbcore.twin_judge`:
+  strict boolean verdict, nonce-fenced bodies, **fail-closed**). Writes NOTHING.
 * :func:`apply_links` is the ONLY writer: :func:`graph.link` ``(a, 'alternative_to',
   b)`` — it flips NO status, so nothing leaves any project's surface (Invariant 5)
   and there is NO cross-project knowledge hole; the rank-time collapse (search
@@ -27,19 +27,15 @@ write guards (Invariant 2). ``alternative_to`` is in ``models.RELATIONS`` and
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
-from kbcore import graph, llm, scope
+from kbcore import graph, scope, twin_judge
 from kbcore.config import settings
-from kbcore.consolidation import item_pair_texts
 from kbcore.db import connect
-from kbcore.errors import ExtractionFailed, ExtractorUnavailable, InvalidOperation
-
-logger = logging.getLogger("kbcore.twin_crossproject")
+from kbcore.errors import InvalidOperation
 
 #: The disposition — a symmetric "these two say the same thing" edge (models.RELATIONS).
 ALTERNATIVE_TO = "alternative_to"
@@ -181,51 +177,13 @@ def enumerate_candidates(
     return [CrossTwinPair(similarity=float(r[0]), a=_side(r, 1), b=_side(r, 6)) for r in rows]
 
 
-_SAME_FACT_SYSTEM = (
-    "You compare two knowledge items captured in DIFFERENT projects and decide "
-    "whether they record the SAME underlying fact — the same decision, gotcha, "
-    "bug/fix, configuration, or rule — even if worded differently or wrapped in "
-    "different surrounding detail. Merely related, adjacent, or same-topic items "
-    "are NOT the same fact. Answer STRICT JSON only, shaped exactly like:\n"
-    '{"same_fact": true, "reason": "<one sentence>"}\n'
-    "If you are unsure, answer false."
-)
-
-
 def _judge_same_fact(pair: CrossTwinPair) -> tuple[bool, bool, str]:
-    """(same_fact, judged, rationale) from the shared 14B judge — FAIL-CLOSED. Reuses
-    the sanctioned LLM chokepoints (:func:`llm.chat` + :func:`llm.parse_model_json`),
-    not a reimplemented client. Unavailable/unparseable/non-boolean ⇒ ``judged=False``."""
-    (a_title, a_body), (b_title, b_body) = item_pair_texts(pair.a.item_id, pair.b.item_id)
-    try:
-        content = llm.chat(
-            [
-                {"role": "system", "content": _SAME_FACT_SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Item A (project {pair.a.project}): {a_title}\n{a_body}\n\n"
-                        f"Item B (project {pair.b.project}): {b_title}\n{b_body}"
-                    ),
-                },
-            ],
-            json_format=True,
-        )
-    except (ExtractorUnavailable, ExtractionFailed) as e:
-        logger.warning("judge unavailable for %s/%s: %s", pair.a.item_id, pair.b.item_id, e)
-        return False, False, f"judge unavailable: {e.__class__.__name__}"
-    try:
-        data = llm.parse_model_json(content)
-    except (ValueError, TypeError):
-        return False, False, "unparseable judge output"
-    if not isinstance(data, dict):
-        return False, False, "judge output was not a JSON object"
-    val = data.get("same_fact")
-    # format=json models sometimes emit a stringified bool; bool("false") is True,
-    # so coerce strings explicitly rather than trusting bool() on them.
-    same = val.strip().lower() in ("true", "yes", "1") if isinstance(val, str) else bool(val)
-    rationale = " ".join(str(data.get("reason") or "").split())
-    return same, True, rationale or ("same fact" if same else "not the same fact")
+    """(same_fact, judged, rationale) — the STRICT, fenced judge in
+    :mod:`kbcore.twin_judge` (prompt, nonce delimiters, and why a non-boolean
+    verdict is no verdict). Unavailable/unparseable/non-boolean ⇒ ``judged=False``."""
+    return twin_judge.judge_same_fact(
+        pair.a.item_id, pair.a.project, pair.b.item_id, pair.b.project
+    )
 
 
 def _already_linked(a_id: int, b_id: int) -> bool:

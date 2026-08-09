@@ -19,6 +19,7 @@ from kbcore.config import settings
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable, InvalidOperation
 from kbcore.ingest import ingest
 from kbcore.items import get_item, log_access
+from kbcore.models import SimilarHit
 from kbcore.review import queue_review
 
 runner = CliRunner()
@@ -371,6 +372,34 @@ def test_worker_wires_the_shared_loop(kb):
     # main() wires review_triage.run_triage between the moot sweep and summaries
     # (do not run main() — it takes the advisory lock and writes a report).
     assert worker.review_triage is review_triage
+
+
+def test_run_triage_never_offers_a_summary_or_report_as_a_dup_candidate(kb, monkeypatch):
+    """graph.similar has no type filter, so the judge was being handed SUMMARIES as
+    duplicate candidates — targets both apply paths permanently refuse (an unstable
+    canonical). The resulting verdicts could never be applied, and auto-apply's
+    re-queue of unappliable rows turned that into a livelock. Filtered at the CALL
+    SITE: kb_similar's other callers still get summaries back."""
+    _item, q = _unverified("p", "cand")
+    hits = [
+        SimilarHit(item_id=101, title="a real note", type="note", project="p", score=0.90),
+        SimilarHit(item_id=102, title="Summary - x", type="summary", project="p", score=0.99),
+        SimilarHit(item_id=103, title="Report - y", type="report", project="p", score=0.98),
+        SimilarHit(item_id=104, title="a gotcha", type="gotcha", project="other", score=0.88),
+    ]
+    monkeypatch.setattr(review_triage.graph, "similar", lambda item_id, k=5: hits)
+    seen: list[list[dict]] = []
+
+    def fake_triage(item, similar, usage_count):
+        seen.append(similar)
+        return {"action": "keep", "dup_of": None, "rationale": "r"}
+
+    monkeypatch.setattr(llm, "triage_extraction", fake_triage)
+    assert review_triage.run_triage(10) == 1
+    assert [h["id"] for h in seen[0]] == [101, 104], "only appliable targets reach the judge"
+    # ... and the filter is what makes the verdict safe, because _validate_triage
+    # accepts a dup_of ONLY if it was one of the ids presented (pinned above).
+    assert llm._validate_triage({"action": "reject_duplicate", "dup_of": 102}, {101, 104}) is None
 
 
 # --- CLI ---------------------------------------------------------------------

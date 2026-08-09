@@ -40,11 +40,22 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from kbcore import consolidation, review, review_triage
+from kbcore import consolidation, review
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.review_apply_rails import APPLIED_STATUS, COUNT_KEYS, STAMP_KIND, Row, plan_run
+from kbcore.review_apply_rows import (
+    WINNER_STAMP_KIND,
+    close_cluster_winner,
+    invalidate_dead_dup,
+    mark_triage_unresolvable,
+)
+
+#: Stamp kinds :func:`undo_auto_applied` can reverse. Both are effects THIS
+#: module produced; a row carrying any other kind (a human's dismissal, a quiet
+#: expiry, a terminal triage_unresolvable stamp) is never touched by the undo.
+UNDOABLE_KINDS = (STAMP_KIND, WINNER_STAMP_KIND)
 
 logger = logging.getLogger("kbcore.review_apply")
 
@@ -148,50 +159,6 @@ def _apply_one(row: Row, cooling_days: int, batch: str) -> bool:
     return False
 
 
-def _close_cluster_winner(qid: int) -> None:
-    """Close a cluster-winner duplicate row via the MANUAL path's primitive.
-
-    The winner is never retired (its own item is the cluster canonical). The
-    disposition is exactly ``review_triage._close_row(qid, 'triage_keep',
-    note='cluster_winner')`` (review_triage.py:242) — a status flip (Inv 5), no
-    item touched, no trust change (Inv 4/10), guarded by ``resolved = false`` and
-    stamped for audit, byte-identical to a manual close (design review #2, KB 16601).
-    """
-    review_triage._close_row(qid, "triage_keep", note="cluster_winner")
-
-
-def _invalidate_dead_dup(qid: int) -> bool:
-    """Re-queue a reject_duplicate row whose dup_of is PROVABLY dead for fresh triage.
-
-    Not a retirement or resolution: the row stays OPEN. Its stale triage moves to
-    ``detail.triage_prior`` (audit preserved, Inv 5, reversible), an
-    ``auto_resolution`` stamp records ``triage_invalidated``/``dup_target_dead``,
-    and a ``detail.priority`` OBJECT (existence-ordered, never an int) floats it to
-    the FRONT of ``pending_triage``. Dropping ``triage`` breaks the deadlock:
-    ``candidates`` stops re-selecting it, ``pending_triage`` starts. One atomic
-    guarded UPDATE; a raced / already-invalidated row matches nothing (False).
-    """
-    at = datetime.now(UTC).isoformat()
-    stamp = {
-        "auto_resolution": {"kind": "triage_invalidated", "reason": "dup_target_dead", "at": at},
-        "priority": {"reason": "dup_target_dead", "source": "auto_apply", "at": at},
-    }
-    with transaction() as conn:
-        row = conn.execute(
-            """
-            UPDATE review_queue
-            SET detail = ((COALESCE(detail, '{}'::jsonb) - 'triage')
-                          || jsonb_build_object('triage_prior', detail->'triage'))
-                          || %(stamp)s
-            WHERE id = %(qid)s AND resolved = false
-              AND COALESCE(detail, '{}'::jsonb) ? 'triage'
-            RETURNING id
-            """,
-            {"stamp": Jsonb(stamp), "qid": qid},
-        ).fetchone()
-    return row is not None
-
-
 def auto_apply_rejects(cap: int | None = None, *, dry_run: bool = False) -> dict[str, int]:
     """Apply stored ``reject_noise`` / ``reject_duplicate`` triage suggestions.
 
@@ -201,16 +168,23 @@ def auto_apply_rejects(cap: int | None = None, *, dry_run: bool = False) -> dict
     1. COOLING-OFF — ``detail.triage.at`` >= ``kb_auto_apply_cooling_days`` (3) old
        (owner saw >= 3 digests, veto=resolve); missing stamp fails CLOSED (skipped_cooling).
     2. ACCESS EXCLUSION — any access_log hit in 30 days hands it back (skipped_accessed).
-    3. TARGET LIVENESS (reject_duplicate) — surviving edges are cluster-canonicalized
-       (``dup_canonicals``). A cluster-winner row is CLOSED as a keep
+    3. TARGET LIVENESS + JURISDICTION (reject_duplicate) — the six-way partition in
+       :mod:`kbcore.review_apply_dups`. A cluster-winner row is CLOSED as a keep
        (skipped_cluster_winner), never retired; a provably-dead ``dup_of`` is
-       RE-QUEUED for a fresh verdict (:func:`_invalidate_dead_dup`; triage_invalidated,
-       ``kb_triage_invalidate_cap`` 0=off) — design review #2, KB 16601.
+       RE-QUEUED once for a fresh verdict (:func:`invalidate_dead_dup`;
+       triage_invalidated, ``kb_triage_invalidate_cap`` 0=off) and stamped
+       TERMINAL if that verdict names the same dead target again
+       (triage_unresolvable); a live-but-refusable target, a cross-project
+       retirement and a pair the twin linker already joined are each counted and
+       left strictly alone.
     4. STATE GUARD (re-checked atomically by :func:`_claim`) + STAMP
        (``detail.auto_resolution`` = the undo record for a retirement).
 
     A human-raced row is skipped SILENTLY. ``cap`` (None -> ``kb_auto_apply_cap``,
-    300) bounds RETIREMENTS (neg unbounded, 0 none); ``dry_run`` writes NOTHING;
+    300) bounds THE RUN's row dispositions — retirements first, then winner closes
+    out of whatever budget is left (neg unbounded, 0 none). Winners are cheap
+    flips, but the cap is the blast-radius rail and the docs describe it as
+    covering auto-apply, so it covers all of it. ``dry_run`` writes NOTHING;
     ``kb_auto_apply_enabled=false`` = kill switch (all zeros, no DB).
     """
     counts = dict.fromkeys(COUNT_KEYS, 0)
@@ -226,16 +200,25 @@ def auto_apply_rejects(cap: int | None = None, *, dry_run: bool = False) -> dict
         key = "applied_noise" if r.action == "reject_noise" else "applied_duplicate"
         if dry_run or _apply_one(r, cooling, batch):
             counts[key] += 1
-    # Cluster winners: closed (never retired), cheap status flips, no cap.
-    if not dry_run:
-        for r in plan.cluster_winners:
-            _close_cluster_winner(r.qid)
+    # Cluster winners: closed (never retired), out of the SAME cap the retirements
+    # spent from — a run that hits its cap stops writing entirely.
+    left = -1 if limit < 0 else max(0, limit - len(attempted))
+    winners = plan.cluster_winners if left < 0 else plan.cluster_winners[:left]
+    counts["cluster_winner_remaining"] = len(plan.cluster_winners) - len(winners)
+    for r in winners:
+        if dry_run or close_cluster_winner(r.qid):
+            counts["cluster_winners_closed"] += 1
     # Provably-dead dup targets: re-queued for a fresh verdict under their own cap.
     inv_cap = int(settings.kb_triage_invalidate_cap)
     dead = plan.dead_dup_targets if inv_cap < 0 else plan.dead_dup_targets[: max(0, inv_cap)]
     for r in dead:
-        if dry_run or _invalidate_dead_dup(r.qid):
+        if dry_run or invalidate_dead_dup(r.qid):
             counts["triage_invalidated"] += 1
+    # Second lap around the loop: stamped terminal instead (counted in plan_run,
+    # so the gauge is the row's STATE and the write only happens once).
+    if not dry_run:
+        for r in plan.repeat_dead_targets:
+            mark_triage_unresolvable(r.qid, "dup_target_dead_after_retriage")
     if not dry_run and any(
         (counts["applied_noise"], counts["applied_duplicate"], counts["triage_invalidated"])
     ):
@@ -244,7 +227,7 @@ def auto_apply_rejects(cap: int | None = None, *, dry_run: bool = False) -> dict
 
 
 def undo_auto_applied(since: datetime, *, dry_run: bool = False) -> list[int]:
-    """Reverse auto-applied rejects stamped at/after ``since``. Owner CLI only.
+    """Reverse auto-applied rejects AND cluster-winner closes stamped at/after ``since``.
 
     NEVER scheduled: this is the escape hatch for an owner who disagrees with a
     batch. Per row (its own transaction) it flips the item back to ``active`` —
@@ -253,6 +236,13 @@ def undo_auto_applied(since: datetime, *, dry_run: bool = False) -> list[int]:
     stamp with ``undone_at``. That annotation is also the VETO:
     ``review_apply_rails.candidates`` permanently excludes an undone row, so
     tonight's run cannot silently re-apply what the owner just reversed.
+
+    A CLUSTER-WINNER CLOSE (:data:`kbcore.review_apply_rows.WINNER_STAMP_KIND`) is
+    reversed by the SAME selector, because everything the CLI, DATA_FLOW and the
+    KB record say about auto-apply being reversible has to be true of every effect
+    it has. That row carries no ``action``, so ``APPLIED_STATUS`` yields nothing
+    and no item is touched — correctly, since closing a winner never touched one.
+    Its ``undone_at`` is the same permanent veto against re-closing it.
 
     Only ``resolved`` rows are reversed (a stamped-but-open row is a crashed
     apply, not an applied one). The ``derived_from`` relation a duplicate marking
@@ -270,12 +260,12 @@ def undo_auto_applied(since: datetime, *, dry_run: bool = False) -> list[int]:
             SELECT rq.id, rq.item_id, rq.detail->'auto_resolution'
             FROM review_queue rq
             WHERE rq.resolved = true
-              AND rq.detail->'auto_resolution'->>'kind' = %(kind)s
+              AND rq.detail->'auto_resolution'->>'kind' = ANY(%(kinds)s)
               AND rq.detail->'auto_resolution'->>'undone_at' IS NULL
               AND (rq.detail->'auto_resolution'->>'at')::timestamptz >= %(since)s
             ORDER BY rq.id
             """,
-            {"kind": STAMP_KIND, "since": since},
+            {"kinds": list(UNDOABLE_KINDS), "since": since},
         ).fetchall()
     if dry_run:
         return [int(r[0]) for r in rows]

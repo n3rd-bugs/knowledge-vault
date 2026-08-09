@@ -80,7 +80,9 @@ ingest as `unverified` + a review row.
 
 **Tail** (reserved 3 h): triage suggests keep/reject per row (500/night);
 **reject suggestions auto-apply** after a 3-day cooling window (accessed items
-excluded, everything undoable); contradiction pairs are judged with a
+excluded; duplicates only within one project and never across a pair the
+cross-project twin linker already joined; cluster-winner closes share the same
+cap; everything undoable); contradiction pairs are judged with a
 per-pair memory (never re-pay a verdict); stable suggestions auto-resolve at
 streak 2; summaries, evidence, dedupe, doc-refresh supersede, 30-day quiet
 expiry (capped at 500/night, oldest first; untriaged and reject-suggested rows

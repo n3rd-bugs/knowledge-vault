@@ -27,6 +27,10 @@ from kbcore.errors import InvalidOperation
 from kbcore.review_expire import EXPIRY_GATE, QUIET_ELIGIBLE, REJECT_TRIAGE_ACTIONS
 
 BULK_ACTIONS = ("promote", "reject", "dismiss")
+#: A row carrying EITHER key has been examined by the judge. ``triage_prior`` holds
+#: the verdict auto-apply's dead-target re-queue moved aside, and a re-queued row
+#: is waiting for a SECOND look, not a first one.
+EXAMINED_DETAIL_KEYS = ("triage", "triage_prior")
 
 
 def close_moot_rows() -> int:
@@ -77,9 +81,14 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
     * ``reject_suggestions_pending`` — the subset asking for the item to be
       RETIRED. These are known-bad items still live in retrieval.
     * ``never_triaged_open`` — open unverified_extraction rows carrying NO triage
-      verdict at all. Since the 2026-08-08 untriaged gate these can never
-      quiet-expire, so this is the TRUE backlog gauge: work that will sit in the
-      queue until triage (or a human) reaches it, however old it gets.
+      verdict at all AND no ``triage_prior``. Since the 2026-08-08 untriaged gate
+      these can never quiet-expire, so this is the TRUE backlog gauge: work that
+      will sit in the queue until triage (or a human) reaches it, however old it
+      gets. The ``triage_prior`` exclusion is what keeps the gauge honest: a row
+      auto-apply INVALIDATED (a dead dup target re-queued for a fresh verdict)
+      has its verdict moved to ``triage_prior``, and counting it as never-triaged
+      would report an examined row as unexamined — inflating the one number the
+      digest uses to say whether the backlog is being worked.
     * ``first_expiry_date`` — the date the oldest row that can ACTUALLY expire
       (eligible AND past :data:`kbcore.review_expire.EXPIRY_GATE`) reaches
       ``expire_days`` (ISO date, possibly in the past = "next run"). None when
@@ -108,11 +117,11 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
             """
             SELECT count(*) FILTER (WHERE COALESCE(rq.detail, '{}'::jsonb) ? 'triage'),
                    count(*) FILTER (WHERE rq.detail->'triage'->>'action' = ANY(%(reject)s)),
-                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage'))
+                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{}'::jsonb) ?| %(examined)s))
             FROM review_queue rq
             WHERE rq.resolved = false AND rq.reason = 'unverified_extraction'
             """,
-            {"reject": reject},
+            {"reject": reject, "examined": list(EXAMINED_DETAIL_KEYS)},
         ).fetchone()
         first_expiry = None
         expiring_7d = expiring_30d = 0

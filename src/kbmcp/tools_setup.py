@@ -89,11 +89,10 @@ def build_setup_guide(
     # validated + host-gated in the kbcore chokepoint, never merely .strip()'d here.
     configured = setup_url.rest_url_to_render(rest_url)
     url = configured or _PLACEHOLDER_URL
-    # MCP is a DIFFERENT service on a DIFFERENT host from REST — kbrest serves
-    # only /api/* and has no /mcp route at all, so deriving the MCP endpoint by
-    # appending "/mcp" to the REST base hands out a URL that cannot work. The
-    # MCP base is kb_public_url (what the server advertises for OAuth metadata).
-    # It is not set on every deployment path, so fall back to a labelled
+    # MCP is a DIFFERENT service on a DIFFERENT host from REST — kbrest serves only /api/* and has
+    # no /mcp route at all, so deriving the MCP endpoint by appending "/mcp" to the REST base hands
+    # out a URL that cannot work. The MCP base is kb_public_url (what the server advertises for
+    # OAuth metadata). It is not set on every deployment path, so fall back to a labelled
     # placeholder rather than inventing one.
     mcp_base = (settings.kb_public_url or "").strip().rstrip("/")
     mcp_url = f"{mcp_base}/mcp" if mcp_base else _PLACEHOLDER_MCP_URL
@@ -129,14 +128,13 @@ def build_setup_guide(
             "`/mcp`.)*"
         )
     )
-    # A one-time enrolment code turns steps 2-4 into a single command. The code
-    # is what travels through the transcript, NOT the credential: it is single
-    # use and expires in minutes, so once the machine has redeemed it the
-    # transcript holds a dead string. That matters here specifically because the
-    # session hooks flush transcripts into the KB, which is then backed up.
-    # A code with no project cannot redeem (an owner enrolment must name the
-    # project it scopes to), so emitting a bootstrap block for one advertises a
-    # command that always fails — exactly what happened in the field (KB 1198).
+    # A one-time enrolment code turns steps 2-4 into a single command. The code is what travels
+    # through the transcript, NOT the credential: it is single use and expires in minutes, so once
+    # the machine has redeemed it the transcript holds a dead string. That matters here
+    # specifically because the session hooks flush transcripts into the KB, which is then backed
+    # up. A code with no project cannot redeem (an owner enrolment must name the project it scopes
+    # to), so emitting a bootstrap block for one advertises a command that always fails — exactly
+    # what happened in the field (KB 1198).
     if enrol is not None and not getattr(enrol, "project", None):
         enrol = None
     if enrol is not None:
@@ -181,11 +179,10 @@ rather than reusing this message.
             "repo you are in — and this section becomes a single copy-paste block.\n"
         )
 
-    # The four scripts are ~23,000 tokens. Embedding them burned that much of the
-    # caller's context on every single kb_setup call — including a passing "how do
-    # I set this up?" — for bytes nobody reads: they are written to disk verbatim
-    # and executed. The machine fetches them instead, and the full embed stays
-    # available for a box that cannot reach the KB over HTTP.
+    # The four scripts are ~23,000 tokens. Embedding them burned that much of the caller's context
+    # on every single kb_setup call — including a passing "how do I set this up?" — for bytes
+    # nobody reads: they are written to disk verbatim and executed. The machine fetches them
+    # instead, and the full embed stays available for a box that cannot reach the KB over HTTP.
     if include_scripts:
         scripts = {name: _read(name) for name in _SCRIPTS}
         files_block = "## The files (verbatim)\n\n" + "\n\n".join(
@@ -441,6 +438,14 @@ def register(mcp) -> None:
         fetches them. Pass include_scripts=true only for a machine that cannot
         reach the KB over HTTP.
         """
+        # VALIDATE BEFORE MINTING. rest_url is a fetch-and-execute target, and build_setup_guide
+        # used to be the first thing to reject a bad one — AFTER a single-use enrolment code had
+        # been issued and burnt. Five burns disable the issuer, so a fat-fingered URL could lock
+        # enrolment out; the kbcore chokepoint is asked first and writes nothing.
+        try:
+            setup_url.rest_url_to_render(rest_url)
+        except KBError as e:
+            raise ToolError(str(e)) from e
         # Issue an enrolment code automatically for any caller that HAS authority
         # to enrol something. It is safe to emit unprompted precisely because it
         # is not a credential: single use, minutes long, and useless once

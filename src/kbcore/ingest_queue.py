@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Iterable
-from datetime import datetime
 from typing import Any, NamedTuple
 
 from psycopg.types.json import Jsonb
@@ -19,6 +18,20 @@ from psycopg.types.json import Jsonb
 from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
+
+# THE ESTABLISHED SEAM. Both modules below were split OUT of this one (the
+# per-window checkpoint 2026-08-10, the owner requeue repairs with it) and are
+# re-imported HERE because this module owns these rows: every caller, CLI and
+# test reaches them as ``ingest_queue.<name>``, and the split must not be visible
+# to any of them. Same pattern as kbworker.consolidate's re-exports.
+from kbcore.queue_checkpoint import (  # noqa: F401
+    CHECKPOINT_KEY,
+    resume_windows,
+    save_window_checkpoint,
+    window_checkpoint,
+    window_fingerprint,
+)
+from kbcore.queue_repair import requeue_extracted, requeue_failed  # noqa: F401
 from kbcore.scrub import scrub
 
 logger = logging.getLogger("kbcore.ingest_queue")
@@ -241,140 +254,6 @@ def mark_extracted(queue_id: int, saved: int, rejected: int) -> None:
             """,
             (saved, rejected, queue_id),
         )
-
-
-def requeue_failed(*, since: datetime | None = None, reason: str = "") -> list[int]:
-    """Return ``failed`` rows to ``pending`` so a fixed pipeline can retry them.
-
-    A row is marked ``failed`` by a policy judgement — "this content cannot be
-    extracted" — but that judgement is only as good as the classifier that made
-    it. When a TRANSIENT fault has been misclassified as content-deterministic,
-    the rows it condemned are not bad content; they are casualties of a bug, and
-    they sit at a terminal status no automatic path will ever revisit.
-
-    Concretely (2026-07-29): an embed ReadTimeout was classified as permanent,
-    so a zombie consolidation retired 12 rows on a fault fixed hours earlier.
-    Invariant 5 is what makes this recoverable — automation flips ``status`` and
-    never deletes, so the content was intact and only the verdict was wrong.
-
-    ``attempts`` is RESET, deliberately: the previous attempts were spent against
-    a broken classifier, and carrying them forward would exhaust
-    :data:`MAX_ATTEMPTS` against a pipeline that can now succeed. ``requeue_count``
-    is left alone — it guards the re-arm budget, a different concern.
-
-    This is an OWNER repair, never automation: nothing calls it on a schedule,
-    and it widens no automatic path (Invariant 5's carve-out is about non-knowledge
-    stores; this only moves knowledge rows BACK into reach).
-    """
-    with transaction() as conn:
-        rows = conn.execute(
-            """
-            UPDATE ingest_queue
-               SET status = 'pending', attempts = 0, processed_at = NULL,
-                   error = CASE
-                             WHEN %(reason)s = '' THEN error
-                             ELSE left(
-                               coalesce(error, '') || ' | requeued: ' || %(reason)s, 2000)
-                           END
-             WHERE status = 'failed'
-               AND (%(since)s::timestamptz IS NULL OR processed_at >= %(since)s)
-            RETURNING id
-            """,
-            {"since": since, "reason": reason},
-        ).fetchall()
-    ids = [r[0] for r in rows]
-    logger.info("requeued %d failed row(s) to pending: %s", len(ids), reason or "(no reason given)")
-    return ids
-
-
-def requeue_extracted(
-    *,
-    ids: list[int] | None = None,
-    project: str | None = None,
-    since: datetime | None = None,
-    reason: str = "",
-) -> list[int]:
-    """Return ZERO-YIELD ``extracted`` rows to ``pending`` for a supervised retry.
-
-    ``status='extracted'`` normally means "this content has been mined and the
-    knowledge is in the KB". It does NOT mean that when the extraction saved
-    nothing: those rows are terminal, no automatic path will ever revisit them,
-    and their content — retained in full, because automation only ever flips
-    ``status`` (Invariant 5) — has produced no knowledge at all.
-
-    That is the state the coalescing bug left behind. 137 rows across six
-    projects were concatenated into cross-project mega-extractions (an empty
-    session id made every submission share one grouping key), and the extractions
-    saved nothing. The rows were then stamped 'extracted' with
-    ``saved_count = 0`` — indistinguishable, to every query in the system, from
-    content that was genuinely mined and yielded nothing.
-
-    SCOPE IS THE SAFETY PROPERTY. Only rows whose GROUP produced ZERO items can be
-    re-opened: a row that produced knowledge would, if re-drained, duplicate it.
-    Because :func:`mark_group_extracted` books a group's total on ONE row and 0 on
-    the rest, "zero" is judged over the whole (project, source_uri) group. And a
-    selector is REQUIRED — ``ids``, a ``project``, or a ``since``
-    cutoff — so this cannot become an accidental whole-table replay of every
-    empty extraction the KB has ever done.
-
-    Like :func:`requeue_failed` this is an OWNER REPAIR: nothing calls it on a
-    schedule, it deletes nothing, it only moves knowledge rows back into reach,
-    and it records ``reason`` on the row so a status flip is never mistaken for a
-    bug. ``attempts`` is reset for the same reason as there — the previous
-    attempts were spent against a broken grouping key, not against bad content.
-    """
-    if ids is None and project is None and since is None:
-        raise InvalidOperation(
-            "requeue_extracted needs a selector (ids, project or since) — refusing "
-            "to re-open every zero-yield extraction in the queue"
-        )
-    with transaction() as conn:
-        rows = conn.execute(
-            """
-            UPDATE ingest_queue
-               SET status = 'pending', attempts = 0, deferrals = 0, processed_at = NULL,
-                   error = CASE
-                             WHEN %(reason)s = '' THEN error
-                             ELSE left(
-                               coalesce(error, '') || ' | requeued (0 items saved): '
-                               || %(reason)s, 2000)
-                           END
-             WHERE status = 'extracted'
-               AND coalesce(saved_count, 0) = 0
-               -- GROUP-AWARE zero-yield: a per-row 0 re-opens only when NO row in
-               -- its (project, source_uri) group produced anything (else re-mining
-               -- a productive session duplicates it); a degenerate uri has none.
-               AND NOT EXISTS (
-                   SELECT 1
-                     FROM ingest_queue sib
-                    WHERE sib.status = 'extracted'
-                      AND coalesce(sib.saved_count, 0) > 0
-                      AND sib.project = ingest_queue.project
-                      AND btrim(coalesce(sib.meta->>'source_uri', '')) <> ''
-                      AND btrim(coalesce(sib.meta->>'source_uri', ''))
-                            !~ '^[^:]*:[/[:space:]]*$'
-                      AND btrim(coalesce(sib.meta->>'source_uri', ''))
-                            = btrim(coalesce(ingest_queue.meta->>'source_uri', ''))
-               )
-               AND (%(ids)s::bigint[] IS NULL OR id = ANY(%(ids)s::bigint[]))
-               AND (%(project)s::text IS NULL OR project = %(project)s)
-               AND (%(since)s::timestamptz IS NULL OR processed_at >= %(since)s)
-            RETURNING id
-            """,
-            {
-                "ids": list(ids) if ids is not None else None,
-                "project": project,
-                "since": since,
-                "reason": reason,
-            },
-        ).fetchall()
-    out = [r[0] for r in rows]
-    logger.info(
-        "requeued %d zero-yield extracted row(s) to pending: %s",
-        len(out),
-        reason or "(no reason given)",
-    )
-    return out
 
 
 def mark_failed(queue_id: int, error: str) -> None:
@@ -638,6 +517,12 @@ def mark_group_extracted(ids: list[int], saved: int, rejected: int) -> None:
     on the rest, so the column sums to the real total; that zero on a productive
     group's other rows is told apart from a genuinely zero-yield row by
     :func:`requeue_extracted`, whose predicate is group-aware for exactly this.
+
+    THE PER-WINDOW CHECKPOINT DIES WITH THE GROUP IT WAS RESUMING (2026-08-10),
+    in this same transaction as the flip: a completed group leaves no residue, so
+    the key can never be read back against a re-opened row (and a stale one could
+    only ever be read against a matching fingerprint anyway). See
+    :mod:`kbcore.queue_checkpoint`.
     """
     if not ids:
         return
@@ -646,6 +531,13 @@ def mark_group_extracted(ids: list[int], saved: int, rejected: int) -> None:
             "UPDATE ingest_queue SET status='extracted', "
             "saved_count = CASE WHEN id = %(first)s THEN %(saved)s ELSE 0 END, "
             "rejected_count = CASE WHEN id = %(first)s THEN %(rejected)s ELSE 0 END, "
+            "meta = coalesce(meta, '{}'::jsonb) - %(cpkey)s::text, "
             "processed_at = now() WHERE id = ANY(%(ids)s)",
-            {"first": ids[0], "saved": saved, "rejected": rejected, "ids": list(ids)},
+            {
+                "first": ids[0],
+                "saved": saved,
+                "rejected": rejected,
+                "ids": list(ids),
+                "cpkey": CHECKPOINT_KEY,
+            },
         )

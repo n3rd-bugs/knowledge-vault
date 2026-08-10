@@ -50,11 +50,7 @@ from kbworker import (
 # likewise part of the patch surface (tests patch attributes ON those modules
 # via `consolidate.sessions` / `consolidate.llm`) even where this file no
 # longer calls them directly.
-from kbworker.cohort import (  # noqa: F401
-    _COHORT_STATS,
-    _cohort_prepare,
-    _drain_job,
-)
+from kbworker.cohort import _COHORT_STATS, _cohort_prepare, _drain_job  # noqa: F401
 from kbworker.prep import (  # noqa: F401
     EXTRACT_BYTES_PER_TOKEN,
     EXTRACT_PROMPT_OVERHEAD_TOKENS,
@@ -346,6 +342,11 @@ def _drain_ingest_queue() -> tuple[int, int]:
             # coming back, and there would otherwise be no way to see it.
             "cohort_refills": 0,
             "cohort_groups_considered": 0,
+            # Per-window checkpoint telemetry (ADDED 2026-08-10, never renamed): windows
+            # a resumed group skipped, groups resumed, failed writes (swallowed in cohort).
+            "cohort_windows_resumed": 0,
+            "cohort_groups_resumed": 0,
+            "cohort_checkpoint_failures": 0,
         }
     )
     live = ensemble.mode() == "live"

@@ -153,6 +153,17 @@ class Settings(SettingsViews, BaseSettings):
     # a 46-job cohort exhaust RAM. Assembly must always take AT LEAST ONE job even if that job
     # alone exceeds this, or an oversized row would wedge the queue permanently.
     kb_drain_cohort_bytes: int = 48_000_000
+    # PER-WINDOW RESUME MEMORY (owner request 2026-08-10). A multi-window group interrupted part
+    # way — a failing window, the tail reserve, the deadline — re-extracted from window 1 the next
+    # night, and the night after. Measured on three giant sessions (aquamonix 269 rows/116 MB at
+    # deferrals=6, ims 59/52 MB, weird-rtos 10/8 MB): ~8 GPU-hours a night re-mining windows whose
+    # items were already stored (they dedupe to nothing on content_hash), then the same failing
+    # window, then the whole group deferred again — 7.9 h drain, 0 drained, 0 saved. The drain now
+    # records which windows SUCCEEDED on the group's first row, keyed to a fingerprint of the
+    # assembled text, and skips them on the next attempt. ROW FLIPS ARE UNCHANGED (still
+    # all-or-nothing, still group-atomic); only the extraction CALLS remember. False = the old
+    # full-re-extract behaviour.
+    kb_drain_window_checkpoint: bool = True
     # Wall-clock time (HH:MM, local) after which the drain starts NO NEW cohort. The box is shared
     # with interactive work and sits on a UPS that cannot ride out a grid fluctuation, so an
     # unbounded overnight run is both a latency and a power risk. Stopping is always SAFE and

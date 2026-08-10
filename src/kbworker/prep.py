@@ -18,6 +18,7 @@ from typing import Any
 from kbcore import ingest_queue
 from kbcore.config import settings
 from kbworker import sessions
+from kbworker.cohort import _COHORT_STATS
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -122,6 +123,35 @@ def _warn_if_oversized(key: str, text: str, budget_tokens: int | None = None) ->
     return True
 
 
+def _resume_windows(row: dict[str, Any], fp: str, n_windows: int) -> tuple[set[int], int, int]:
+    """``(windows already extracted, saved so far, rejected so far)`` for a group.
+
+    Policy here, validation in :mod:`kbcore.queue_checkpoint`: the kill switch and
+    the telemetry are the DRAIN's business, the fingerprint match and the
+    malformed-value handling are the store's. Empty on a single-window group
+    (nothing to resume TO), and empty whenever the fingerprint says the assembled
+    text has moved since the checkpoint was written.
+    """
+    if not settings.kb_drain_window_checkpoint or n_windows < 2:
+        return set(), 0, 0
+    done, saved, rejected = ingest_queue.resume_windows(row.get("meta"), fp, n_windows)
+    if done:
+        # .get(), not []: _assemble_jobs is also called directly (unit tests, an
+        # owner-invoked run) where the stats dict was never primed, and a KeyError
+        # here would fail a group that is extracting perfectly well.
+        for stat, n in (("cohort_groups_resumed", 1), ("cohort_windows_resumed", len(done))):
+            _COHORT_STATS[stat] = _COHORT_STATS.get(stat, 0) + n
+        logger.warning(
+            "resuming group %s: %d of %d window(s) already extracted on an earlier run "
+            "(%d item(s) saved so far) — NOT re-extracting them",
+            row.get("id"),
+            len(done),
+            n_windows,
+            saved,
+        )
+    return done, saved, rejected
+
+
 def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One JOB per CONTEXT-SIZED WINDOW of each coalesced group's assembled text.
 
@@ -153,6 +183,15 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     judge saw is provably the text stored as the item's ``raw`` (it used to be
     assembled twice, in two places). Per-group isolation as everywhere else in
     the drain: a group that will not assemble is marked failed, never fatal.
+
+    CHECKPOINTED (2026-08-10, owner decision). Windows a previous attempt already
+    extracted are SKIPPED — no job is emitted — and their totals are restored into
+    the shared state, so the final ``mark_group_extracted`` books the truth across
+    every night the group took. Safe because a checkpointed window is one whose
+    ``extract_and_ingest`` RETURNED: its items are stored, so re-running it only
+    pays the 14B to produce duplicates that dedupe to nothing (Invariant 3). ROW
+    FLIPS are untouched — still all-or-nothing — and the skip is only ever trusted
+    against a fingerprint of this exact text (:mod:`kbcore.queue_checkpoint`).
     """
     jobs: list[dict[str, Any]] = []
     for group in groups:
@@ -163,17 +202,34 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             meta = row["meta"] or {}
             text = sessions.assemble_text("".join(r["content"] for r in rows), row["kind"])
             windows = _fit_windows(text)
+            # Fingerprint the WINDOWS (content + geometry), never the pre-split
+            # text: the split depends on num_ctx, so a knob change must
+            # invalidate the checkpoint (reviewed-out CRITICAL, wfulfrf33).
+            fp = ingest_queue.window_fingerprint(windows)
+            resumed, saved, rejected = _resume_windows(row, fp, len(windows))
             # ONE state per group, shared by its window jobs: the queue flip and
             # the failure taxonomy are group-wide, the extraction calls are not.
             state: dict[str, Any] = {
                 "ids": ids,
-                "left": len(windows),
-                "saved": 0,
-                "rejected": 0,
+                # A resumed window is COMPLETED work: it decrements `left` and
+                # restores its yield, so the group still flips exactly once, when
+                # the last OUTSTANDING window lands.
+                "left": len(windows) - len(resumed),
+                "saved": saved,
+                "rejected": rejected,
                 "done": False,
+                "fp": fp,
+                "windows_done": sorted(resumed),
+                # A single-window group has nothing to resume to, so checkpointing
+                # it would be an UPDATE per drained note for no benefit.
+                "checkpoint": bool(settings.kb_drain_window_checkpoint and len(windows) > 1),
             }
             uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
             for i, window in enumerate(windows):
+                if i in resumed:
+                    continue  # extracted on an earlier run; its items are stored
+                # Keyed off len(windows), never the emitted count, so a resumed
+                # window keeps the same cohort key and detail it had last night.
                 key = f"{group['uri']}#w{i}" if len(windows) > 1 else group["uri"]
                 _warn_if_oversized(key, window)
                 jobs.append(
@@ -181,6 +237,7 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "key": key,  # cohort key: unique per SUBMISSION
                         "group": state,  # shared: the queue rows flip once, together
                         "ids": ids,
+                        "window": i,  # this window's index in the GROUP (checkpoint)
                         "project": row["project"],
                         "uri": uri,
                         "branch": meta.get("branch"),

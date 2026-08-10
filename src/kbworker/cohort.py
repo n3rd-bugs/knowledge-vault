@@ -105,6 +105,37 @@ def _cohort_prepare(
     return pre_by_key, plan_by_key
 
 
+def _record_window(state: dict[str, Any], job: dict[str, Any]) -> None:
+    """Persist "this window is extracted" on the group's first queue row.
+
+    ONE cheap UPDATE against a multi-minute extraction call, written after EACH
+    window rather than once at the end, because what it protects against is the
+    run ENDING part-way through a group — batching it would checkpoint only the
+    groups that never needed one.
+
+    Swallow-and-count, like every other optimisation in this module: bookkeeping
+    must never be able to retire the work it reports on (the same rule
+    ``jobs.touch_drain_heartbeat`` follows). A lost checkpoint costs a
+    re-extraction; a raised one would mark good content 'failed'.
+    """
+    if not state.get("checkpoint"):
+        return
+    state["windows_done"].append(int(job["window"]))
+    try:
+        ingest_queue.save_window_checkpoint(
+            state["ids"][0],
+            fp=state["fp"],
+            done=state["windows_done"],
+            saved=state["saved"],
+            rejected=state["rejected"],
+        )
+    except Exception:  # noqa: BLE001 — never let bookkeeping fail the group
+        _COHORT_STATS["cohort_checkpoint_failures"] = (
+            _COHORT_STATS.get("cohort_checkpoint_failures", 0) + 1
+        )
+        logger.warning("window checkpoint for group %s failed", state["ids"], exc_info=True)
+
+
 def _drain_job(
     job: dict[str, Any], *, pre_extracted: dict | None, planned: EnsemblePlan | None
 ) -> tuple[int, int]:
@@ -119,6 +150,19 @@ def _drain_job(
     windows, so the next run re-extracts the whole group rather than stitching a
     session together out of two different nights (ingest is idempotent,
     Invariant 3, so the re-extraction cannot double-write).
+
+    AMENDED 2026-08-10 (owner decision), the last sentence above: the next run no
+    longer re-extracts the WHOLE group, only the windows that have not landed yet.
+    The all-or-nothing property that sentence exists to protect is unchanged — the
+    ROW FLIPS are still group-atomic, a session still never half-lands in the
+    queue's status accounting, and a group is still resolved as a unit. What
+    gained a memory is the EXTRACTION CALLS: a window whose extract_and_ingest
+    returned has its items durably stored, so re-running it is pure waste, and
+    :func:`_record_window` writes down which windows those were. The motivation
+    was measurable — three giant sessions burned ~8 GPU-hours a night re-mining
+    already-stored windows (they deduped to nothing on content_hash) before
+    hitting the same failing window and deferring the whole group again: 7.9 h of
+    drain, 0 rows drained, 0 items saved. See :mod:`kbcore.queue_checkpoint`.
     """
     state = job["group"]
     ids = state["ids"]
@@ -148,6 +192,7 @@ def _drain_job(
         state["left"] -= 1
         if state["left"] > 0:
             state["done"] = False
+            _record_window(state, job)  # resume memory: this window is banked
             jobs.touch_drain_heartbeat(ids)  # the rows won't flip for a while yet
             return 0, saved  # more windows to come — the rows stay 'pending'
         # All-or-nothing: a group extracted once must never leave rows

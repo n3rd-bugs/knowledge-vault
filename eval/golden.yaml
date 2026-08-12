@@ -155,10 +155,11 @@
   # (redis-riscv-qemu gotcha: upload text/html, NOT text/markdown), rank 1.
   expect_item_id: 488
 - q: "stream push status sensor settings on-change realtime"
-  # was 81 -> 470 (doc-refresh supersede), now 470 -> ... -> 6431: the chain
-  # moved twice more. A golden case must track the ACTIVE revision — the head
-  # of the supersession chain, not any link inside it.
-  expect_item_id: 6431
+  # was 81 -> 470 -> 6431 -> now 16791: the doc-refresh chain moves every time
+  # the source doc is re-scanned, and a golden case must track the chain HEAD.
+  # Third repoint of this case — if it moves again, consider expect_substr on
+  # the doc's stable title instead of pinning the revision id.
+  expect_item_id: 16791
 - q: "mTLS fleet agent deferred config-sync"
   expect_item_id: 68
 

@@ -46,8 +46,13 @@ def requeue_failed(*, since: datetime | None = None, reason: str = "") -> list[i
     ``attempts`` is RESET, deliberately: the previous attempts were spent against
     a broken classifier, and carrying them forward would exhaust
     :data:`kbcore.ingest_queue.MAX_ATTEMPTS` against a pipeline that can now
-    succeed. ``requeue_count`` is left alone — it guards the re-arm budget, a
-    different concern.
+    succeed. ``deferrals`` is reset WITH it (2026-08-14): the owner's requeue is
+    a fresh grant of BOTH budgets. Without this, the documented repair for a
+    deferral-cap escalation was a NO-OP — the row came back 'pending' still
+    carrying deferrals at :data:`kbcore.ingest_queue.DEFERRAL_CAP`, so its first
+    re-defer escalated it straight back to 'failed' (review #3 P2, KB 19663).
+    ``requeue_count`` is left alone — it guards the re-arm budget, a different
+    concern.
 
     ANY PER-WINDOW CHECKPOINT IS KEPT (2026-08-10). These rows never completed,
     so resuming at the first not-done window is exactly the point of the feature:
@@ -63,7 +68,9 @@ def requeue_failed(*, since: datetime | None = None, reason: str = "") -> list[i
         rows = conn.execute(
             """
             UPDATE ingest_queue
-               SET status = 'pending', attempts = 0, processed_at = NULL,
+               -- deferrals = 0 alongside attempts: the owner's requeue is a fresh
+               -- grant of BOTH budgets (see docstring; review #3 P2).
+               SET status = 'pending', attempts = 0, deferrals = 0, processed_at = NULL,
                    error = CASE
                              WHEN %(reason)s = '' THEN error
                              ELSE left(

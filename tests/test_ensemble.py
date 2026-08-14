@@ -1092,6 +1092,50 @@ def test_a_cohort_prefetch_that_lost_the_primary_defers_instead_of_degrading(mon
     assert plan.partial["candidates"] == {"prime": 1}
 
 
+def test_a_primary_alive_elsewhere_in_the_prefetch_is_a_CONTENT_failure(monkeypatch):
+    """Review #3 P1 (KB 19663). A per-text primary failure inside an otherwise
+    healthy prefetch is content-deterministic — kbcore.llm already classifies a
+    per-row ReadTimeout as ExtractionFailed — but the prefetch swallowed it into
+    absence and the absence re-raised as ExtractorUnavailable, so _drain_job took
+    the CONNECTIVITY branch: the whole group deferred nightly with no attempts
+    burned, checkpoint pinned, ~1 GPU-h/night of zero yield, deferrals ticking
+    toward a SILENT terminal escalation. Provably-alive-elsewhere must take the
+    attempts-bounded content path instead."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    _install_extractors(monkeypatch, {"prime": [P_ONLY], "ex-a": [A_ONLY]})
+    _install_judge(monkeypatch)
+
+    with pytest.raises(ExtractionFailed):
+        ensemble.plan_ensemble(
+            TEXT,
+            "proj",
+            "test://wpb2/poisonwindow",
+            pre_extracted={"ex-a": []},
+            primary_alive_elsewhere=True,
+        )
+
+
+def test_a_primary_dead_cohort_wide_still_defers_as_a_true_outage(monkeypatch):
+    """The other half of the classification: nothing in the prefetch proves the
+    primary alive, so a missing primary is CONNECTIVITY — defer, never burn
+    attempts. The DEFAULT (no flag) must stay the outage path too: run_ensemble
+    is a cohort of one, where absent-here IS absent-cohort-wide."""
+    monkeypatch.setattr(settings, "kb_extract_ensemble", "ex-a")
+    _install_extractors(monkeypatch, {"prime": [P_ONLY], "ex-a": [A_ONLY]})
+    _install_judge(monkeypatch)
+
+    with pytest.raises(ExtractorUnavailable):
+        ensemble.plan_ensemble(
+            TEXT,
+            "proj",
+            "test://wpb2/deadwide",
+            pre_extracted={"ex-a": []},
+            primary_alive_elsewhere=False,
+        )
+    with pytest.raises(ExtractorUnavailable):
+        ensemble.plan_ensemble(TEXT, "proj", "test://wpb2/deadwide2", pre_extracted={"ex-a": []})
+
+
 def test_judge_cohort_tolerates_an_empty_cohort(monkeypatch):
     assert ensemble.judge_cohort([]) == []
 
@@ -1169,3 +1213,52 @@ def test_a_broken_cohort_judge_pass_falls_back_per_job_instead_of_ingesting_unju
     items = _session_items()
     assert items["a0"].meta["extraction_pipeline"]["verified_by"] == "primary-judge"
     assert all(c["judge_model"] in ("second", "prime") for c in judge_calls)
+
+
+def test_a_poison_text_in_a_live_cohort_burns_an_attempt_instead_of_deferring(monkeypatch):
+    """End to end through the drain (review #3 P1, KB 19663): the primary
+    succeeds on one text of the cohort and fails on the other, so the failing
+    group must take the CONTENT path — mark_failed, one attempt burned, zero
+    deferrals — while the healthy group extracts. The old classification sent the
+    group down the CONNECTIVITY branch instead: pending forever, one deferral per
+    night, no attempts burned, ~1 GPU-h/night of zero yield."""
+    from kbcore import ingest_queue
+
+    _cohort_env(monkeypatch)
+    monkeypatch.setattr(settings, "kb_ensemble_shadow", False)
+    monkeypatch.setattr(settings, "kb_drain_cohort", 8)
+    jobs = _cohort_jobs(2)
+    _install_cohort_extractors(monkeypatch, jobs)
+    healthy_fake = llm.extract_items  # the fake just installed
+
+    def poison(text, *, model=None, keep_alive=None):
+        if model == "prime" and "Job 1 marker" in text:
+            raise ExtractionFailed("read timeout: this window is too heavy (test)")
+        return healthy_fake(text, model=model, keep_alive=keep_alive)
+
+    monkeypatch.setattr(llm, "extract_items", poison)
+    _install_judge(monkeypatch, supported=_all_supported(jobs))
+    qids = {}
+    for job in jobs:
+        qids[job["i"]] = ingest_queue.enqueue(
+            "cohort-poison", job["text"], kind="memory", source_uri=job["uri"]
+        ).id
+
+    drained, saved = consolidate._drain_ingest_queue()
+
+    assert (drained, saved) == (1, 2), "the healthy group must drain: p0 + a0 ingested"
+    with db.connect() as conn:
+        rows = {
+            qid: conn.execute(
+                "SELECT status, attempts, deferrals FROM ingest_queue WHERE id = %s", (qid,)
+            ).fetchone()
+            for qid in qids.values()
+        }
+    assert rows[qids[0]][0] == "extracted"
+    assert rows[qids[1]] == ("failed", 1, 0), (
+        "the poison group must burn ONE attempt (content path), not defer with "
+        f"attempts unburned (connectivity path): {rows[qids[1]]}"
+    )
+    assert consolidate._COHORT_STATS["cohort_plan_failures"] == 1, (
+        "the plan phase classified the poison text and fell back per job"
+    )

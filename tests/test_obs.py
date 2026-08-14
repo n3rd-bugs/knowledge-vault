@@ -1,6 +1,6 @@
 """Package O — observability.
 
-Two independent signals, tested here:
+Three independent signals, tested here:
 
 1. 401-BURST ALERTING (:mod:`kbrest.auth_alert`). The public surface is silent on
    failed auth by design (no-oracle 401), so a stale-hooks box / broken installer
@@ -13,6 +13,11 @@ Two independent signals, tested here:
    :func:`kbworker.tail_steps.digest_lines`). The quiet-expiry cliff used to be
    reconstructed by hand; the untriaged-eligible pool it drains is now first-class
    in the nightly report, with a digest line when rows expire within 7 days.
+
+3. DEFERRAL-CAP VISIBILITY (:func:`kbcore.ingest_queue.near_deferral_cap_groups`
+   + the two ``drain:`` digest lines — review #3 P1 rider, KB 19663). A group's
+   escalation to terminal 'failed' was silent; now the near-cap count warns ~2
+   nights ahead and the escalation count reports the event itself.
 
 DB tests run against kb_test (conftest ``kb``); the counter/middleware/digest
 tests are pure and touch neither DB nor network.
@@ -361,3 +366,59 @@ def test_digest_says_nothing_about_winners_when_there_were_none():
     ):
         quiet = tail_steps.digest_lines(counts)
         assert not any(line.startswith(("cluster winners:", "triage stuck")) for line in quiet)
+
+
+# ================================================== 3. deferral-cap visibility
+# Review #3 P1 rider (KB 19663): an escalation to terminal 'failed' was silent —
+# no digest line, and journald's <36h retention destroyed the evidence. The
+# near-cap count warns ~2 nights ahead; the escalation count reports the event.
+
+
+def _q(project: str, body: str, source_uri: str | None = None) -> int:
+    from kbcore import ingest_queue
+
+    res = ingest_queue.enqueue(project, body, kind="session", source_uri=source_uri)
+    assert res.id is not None
+    return res.id
+
+
+def _set_def(ids: list[int], n: int) -> None:
+    with db.transaction() as conn:
+        conn.execute("UPDATE ingest_queue SET deferrals = %s WHERE id = ANY(%s)", (n, list(ids)))
+
+
+def test_near_deferral_cap_counts_GROUPS_at_the_margin(kb):
+    from kbcore import ingest_queue
+
+    # One group of TWO rows at the margin counts ONCE (a giant session is one
+    # group, not a row count)...
+    a1 = _q("obs-defer", "chunk 1\n", source_uri="session:near")
+    a2 = _q("obs-defer", "chunk 2\n", source_uri="session:near")
+    _set_def([a1, a2], ingest_queue.DEFERRAL_CAP - 2)
+    # ...a row below the margin does not count...
+    b = _q("obs-defer", "User: fine\nAssistant: ok")
+    _set_def([b], ingest_queue.DEFERRAL_CAP - 3)
+    # ...a row at CAP-1 counts...
+    c = _q("obs-defer-c", "User: worse\nAssistant: worse")
+    _set_def([c], ingest_queue.DEFERRAL_CAP - 1)
+    # ...and an ESCALATED row is 'failed', past warning — it is reported as an
+    # escalation by the drain, never double-counted as near-cap.
+    d = _q("obs-defer-d", "User: gone\nAssistant: gone")
+    _set_def([d], ingest_queue.DEFERRAL_CAP - 1)
+    assert ingest_queue.mark_deferred(d, "outage that never healed") is True
+
+    assert ingest_queue.near_deferral_cap_groups() == 2, "the two-row group + row c"
+
+
+def test_digest_carries_the_deferral_lines_positive_only():
+    lines = tail_steps.digest_lines(
+        {"queued_drained": 1, "groups_near_deferral_cap": 2, "deferral_escalations": 3}
+    )
+    assert "drain: 2 group(s) near deferral cap" in lines
+    assert "drain: 3 row(s) escalated to failed at the deferral cap" in lines
+    assert all(line.isascii() for line in lines), "this goes out over ntfy to a phone"
+    for counts in (
+        {"queued_drained": 1, "groups_near_deferral_cap": 0, "deferral_escalations": 0},
+        {"queued_drained": 1},
+    ):
+        assert not any("deferral" in ln for ln in tail_steps.digest_lines(counts))

@@ -23,6 +23,7 @@ The tests are therefore of three kinds:
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -2682,6 +2683,244 @@ def test_install_fetches_setup_assets_BEFORE_the_code_is_spent(tmp_path):
         assert min(setup_idx) < min(enrol_idx), (
             "setup assets were fetched AFTER redemption had spent the code"
         )
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: install.sh verifies what it INSTALLED before stamping the version
+# ---------------------------------------------------------------------------
+#
+# THE TRUST GAP (review #3 P1, KB 19663). install.sh stamped .setup-version from
+# the fetched manifest without ever hashing the files it had just written — so a
+# partial or corrupted install (truncated copy, Git Bash autocrlf rewriting every
+# LF) recorded itself as current, and the stamp SILENCED the staleness banner,
+# the one channel that reports a broken box every session. The server already
+# publishes a sha256 per served file; the stamp must now be EARNED by a full
+# per-file match, and any mismatch must leave the box unversioned (stripping a
+# stale stamp too), which the banner reports honestly.
+
+_MANIFEST_CURL = r"""#!/usr/bin/env bash
+# curl stand-in for the installer-verification tests: answers the manifest URL
+# with the JSON in $CURL_MANIFEST (empty -> hard failure, like an unreachable or
+# older server), refuses notify.env, ignores everything else. Never a network.
+D="$CURL_REC"
+mkdir -p "$D"
+N=$(( $(cat "$D/.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$N" >"$D/.n"
+printf '%s\n' "$*" >"$D/argv.$N"
+: >"$D/stdin.$N"
+for a in "$@"; do
+  if [ "$a" = "-K" ]; then cat >"$D/stdin.$N"; break; fi
+done
+URL=""
+for a in "$@"; do case "$a" in http://*|https://*) URL="$a" ;; esac; done
+case "$URL" in
+  *"/api/setup/manifest.json")
+    [ -n "${CURL_MANIFEST:-}" ] || exit 22
+    printf '%s' "$CURL_MANIFEST" ;;
+  *"/api/setup/notify.env") exit 22 ;;
+  *) : ;;
+esac
+exit 0
+"""
+
+
+def _shipped_manifest(drop: tuple[str, ...] = ()) -> tuple[str, str]:
+    """The manifest EXACTLY as src/kbrest/server.py derives it, computed from the
+    canonical contrib/ scripts — the same derivation, never a restatement of what
+    this test believes the hashes are."""
+    files = {
+        p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(CONTRIB.glob("*.sh"))
+    }
+    for name in drop:
+        files.pop(name)
+    version = hashlib.sha256(
+        "".join(f"{k}:{v}" for k, v in sorted(files.items())).encode()
+    ).hexdigest()[:12]
+    return version, json.dumps({"version": version, "files": files, "count": len(files)})
+
+
+def _verify_home(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A configured REMOTE box with the manifest-serving curl first on PATH."""
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = home / "bin"
+    binp.mkdir(parents=True, exist_ok=True)
+    curl = binp / "curl"
+    curl.write_text(_MANIFEST_CURL)
+    curl.chmod(0o755)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    (home / ".claude" / "kb-flush.env").write_text(
+        f"KB_REST_URL=http://127.0.0.1:9\nKB_TOKEN={FAKE_PROJECT_TOKEN}\n"
+    )
+    return home, binp, rec_dir
+
+
+def _run_install_verified(home: Path, binp: Path, rec_dir: Path, manifest: str):
+    return _run_hook(
+        INSTALL,
+        {},
+        home,
+        {
+            "PATH": f"{binp}:{os.environ.get('PATH', '')}",
+            "CURL_REC": str(rec_dir),
+            "CURL_MANIFEST": manifest,
+            "KB_REST_URL": "http://127.0.0.1:9",
+            "KB_TOKEN": FAKE_PROJECT_TOKEN,
+        },
+    )
+
+
+def _corrupting_install(binp: Path, victim: str) -> None:
+    """An `install` that corrupts ONE destination file after the real copy —
+    the exact 'survives to the stamp' shape: source intact, installed bytes
+    mangled (a partial write, or autocrlf appending its damage)."""
+    real = shutil.which("install")
+    assert real, "install(1) missing from the test environment"
+    (binp / "install").write_text(
+        "#!/usr/bin/env bash\n"
+        f'"{real}" "$@"\n'
+        "rc=$?\n"
+        'last=""\n'
+        'for a in "$@"; do last="$a"; done\n'
+        f'case "$last" in */{victim}) printf \'\\r\\n\' >>"$last" ;; esac\n'
+        "exit $rc\n"
+    )
+    (binp / "install").chmod(0o755)
+
+
+def test_install_stamps_only_after_verifying_the_installed_bytes(tmp_path):
+    """The clean path: every installed hook hashes to what the manifest says, so
+    the stamp is written — and says it was verified, not merely fetched."""
+    home, binp, rec_dir = _verify_home(tmp_path)
+    version, manifest = _shipped_manifest()
+    res = _run_install_verified(home, binp, rec_dir, manifest)
+    assert res.returncode == 0, res.stderr
+    stamp = home / ".claude" / "hooks" / ".setup-version"
+    assert stamp.read_text() == version + "\n", "the verified version was not stamped"
+    assert "verified" in res.stdout
+    assert "MISMATCH" not in res.stdout + res.stderr
+
+
+def test_a_corrupted_install_stays_UNVERSIONED_with_a_loud_per_file_line(tmp_path):
+    """One corrupted byte in one installed file: no stamp, a stale stamp from an
+    earlier run STRIPPED (a stamp over corrupted files is the silence this whole
+    check exists to end), and a loud line naming the file with expected-vs-got
+    hash prefixes — 12 hex chars, never the full digests or path noise."""
+    home, binp, rec_dir = _verify_home(tmp_path)
+    version, manifest = _shipped_manifest()
+    _corrupting_install(binp, "kb-session-brief.sh")
+    stamp = home / ".claude" / "hooks" / ".setup-version"
+    stamp.write_text("stalestamp00\n")  # from an earlier, clean install
+
+    res = _run_install_verified(home, binp, rec_dir, manifest)
+    assert res.returncode == 0, res.stderr
+    out = res.stdout + res.stderr
+    assert not stamp.exists(), "a stale stamp survived a failed verification"
+    assert "MISMATCH kb-session-brief.sh" in out, f"no loud per-file line: {out!r}"
+    expected = json.loads(manifest)["files"]["kb-session-brief.sh"]
+    got = hashlib.sha256(
+        (home / ".claude" / "hooks" / "kb-session-brief.sh").read_bytes()
+    ).hexdigest()
+    assert expected[:12] in out and got[:12] in out, f"expected-vs-got prefixes absent: {out!r}"
+    assert expected not in out and got not in out, "full 64-char digests are noise"
+    assert "CRLF" in out, "the mismatch hint no longer names the Git Bash CRLF trap"
+    assert "UNVERSIONED" in out
+    mline = next(ln for ln in out.splitlines() if "MISMATCH kb-session-brief.sh" in ln)
+    assert str(home / ".claude" / "hooks") not in mline, "the per-file line carries path noise"
+
+
+def test_a_hash_absent_from_the_manifest_is_a_MISMATCH_not_a_pass(tmp_path):
+    """A file the manifest does not vouch for cannot be verified, and unverified
+    must never stamp — treating absence as success would let a truncated
+    manifest wave through exactly the files it lost."""
+    home, binp, rec_dir = _verify_home(tmp_path)
+    _version, manifest = _shipped_manifest(drop=("turn-start.sh",))
+    res = _run_install_verified(home, binp, rec_dir, manifest)
+    assert res.returncode == 0, res.stderr
+    out = res.stdout + res.stderr
+    assert not (home / ".claude" / "hooks" / ".setup-version").exists()
+    assert "MISMATCH turn-start.sh" in out
+    assert "no hash" in out
+
+
+def test_no_manifest_skips_verification_with_a_note_and_no_stamp(tmp_path):
+    """An enrolment-less LOCAL install (or an older/unreachable server) has
+    nothing to verify against: the install still succeeds, stamps nothing —
+    exactly the pre-verification behavior — and now SAYS so in one line."""
+    home, binp, rec_dir = _verify_home(tmp_path)
+    res = _run_install_verified(home, binp, rec_dir, "")
+    assert res.returncode == 0, res.stderr
+    assert not (home / ".claude" / "hooks" / ".setup-version").exists()
+    assert "no manifest available" in res.stdout
+
+
+def test_the_verification_loop_names_every_hook_asset():
+    """SET EQUALITY with the shipped assets, minus install.sh (served in the
+    manifest but never copied into ~/.claude/hooks — the fetch verifies it). A
+    new hook asset that lands in setup_assets/ but not in this loop would
+    install unverified under a stamp that vouches for it."""
+    m = re.search(r"for _hf in (.*?);\s*do", INSTALL.read_text(), re.S)
+    assert m, "install.sh no longer verifies its installed hooks in a loop"
+    named = set(re.findall(r"[A-Za-z0-9_.-]+\.sh", m.group(1)))
+    shipped = {p.name for p in SHIPPED.glob("*.sh")} - {"install.sh"}
+    assert named == shipped, (
+        f"the verify loop drifted from the shipped asset set: "
+        f"extra={sorted(named - shipped)} missing={sorted(shipped - named)}"
+    )
+
+
+def test_kb_sha256_matches_hashlib_byte_for_byte(tmp_path):
+    """Source-extracted and really executed. CRLF is the payload here: the
+    digest is over the exact bytes, so the one mangle Git Bash actually performs
+    (LF -> CRLF) can never hash equal — that is the point of hashing at all."""
+    fn = _shell_fn(INSTALL, "kb_sha256")
+    lf = tmp_path / "lf.bin"
+    lf.write_bytes(b"line one\nline two\n\x00\xff")
+    crlf = tmp_path / "crlf.bin"
+    crlf.write_bytes(b"line one\r\nline two\r\n\x00\xff")
+
+    def digest(path: Path) -> str:
+        return subprocess.run(
+            ["bash", "-c", f'KB_PY_BIN=""\n{fn}\nkb_sha256 "$1"', "-", str(path)],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    assert digest(lf) == hashlib.sha256(lf.read_bytes()).hexdigest()
+    assert digest(crlf) == hashlib.sha256(crlf.read_bytes()).hexdigest()
+    assert digest(lf) != digest(crlf), "CRLF mangling did not change the digest"
+
+
+def test_kb_sha256_python_fallback_agrees_with_sha256sum(tmp_path):
+    """A box with no sha256sum (macOS, odd minimal images) hashes through the
+    same python3 the JSON fallback already relies on — hashlib is stdlib, so no
+    new dependency — and the two backends must agree exactly."""
+    fn = _shell_fn(INSTALL, "kb_sha256")
+    target = tmp_path / "t.bin"
+    target.write_bytes(b"payload\r\nwith bytes\x01")
+    bindir = tmp_path / "restricted-bin"
+    bindir.mkdir()
+    for tool in ("bash", "python3"):
+        real = shutil.which(tool)
+        assert real, f"{tool} missing from the test environment"
+        (bindir / tool).symlink_to(real)
+    res = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'command -v sha256sum >/dev/null 2>&1 && exit 97\nKB_PY_BIN=""\n{fn}\nkb_sha256 "$1"',
+            "-",
+            str(target),
+        ],
+        env={"PATH": str(bindir), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode != 97, "sha256sum leaked into the restricted PATH"
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == hashlib.sha256(target.read_bytes()).hexdigest()
 
 
 def _age(uri: str) -> None:

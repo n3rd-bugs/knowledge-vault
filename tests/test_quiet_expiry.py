@@ -346,6 +346,42 @@ def test_the_expiry_step_stands_down_with_the_rest_of_the_run(kb):
     assert counts["quiet_expiry_counts"] == {"expired": 1, "eligible": 1, "eligible_remaining": 0}
 
 
+def test_quiet_expiry_runs_BEFORE_the_llm_tail(kb, monkeypatch):
+    """Review #3 P2 (KB 19663): scheduled after the LLM tail, this CHEAP SQL step
+    stood down on 4 of the last 6 deadline-clipped nights — the deadline was
+    always spent before it. It now runs right after auto-apply and before the
+    LLM-heavy summaries/contradictions/evidence, still stop-gated (the stand-down
+    test above is unchanged: a boot-catch-up run still skips it)."""
+    from kbworker import consolidate
+
+    order: list[str] = []
+    monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)
+    monkeypatch.setattr(review_triage, "run_triage", lambda batch, should_stop=None: 0)
+    monkeypatch.setattr(
+        tail_steps, "auto_apply_step", lambda counts, stop=None: (order.append("auto"), 0)[1]
+    )
+    monkeypatch.setattr(
+        tail_steps, "quiet_expire_step", lambda counts, stop=None: (order.append("expire"), 0)[1]
+    )
+    monkeypatch.setattr(
+        consolidate, "_summaries", lambda since, s=None: (order.append("summaries"), 0)[1]
+    )
+    monkeypatch.setattr(
+        consolidate, "_contradictions_all", lambda p, s=None: (order.append("contra"), 0)[1]
+    )
+    monkeypatch.setattr(
+        consolidate, "_evidence", lambda s=None: (order.append("evidence"), (0, 0))[1]
+    )
+
+    result = consolidate.main(stop=lambda: None)  # guarded, and never stopped
+
+    assert result["skipped"] is False
+    assert order[:2] == ["auto", "expire"], f"expiry must follow auto-apply: {order}"
+    assert order == ["auto", "expire", "summaries", "contra", "evidence"], (
+        f"review_expired must run before every LLM-tail step: {order}"
+    )
+
+
 def test_the_digest_shows_expiry_and_backlog_only_when_positive():
     lines = tail_steps.digest_lines(
         {"queued_drained": 1, "review_expired": 7, "never_triaged_open": 4200}

@@ -50,7 +50,13 @@ from kbworker import (
 # likewise part of the patch surface (tests patch attributes ON those modules
 # via `consolidate.sessions` / `consolidate.llm`) even where this file no
 # longer calls them directly.
-from kbworker.cohort import _COHORT_STATS, _cohort_prepare, _drain_job  # noqa: F401
+from kbworker.cohort import (  # noqa: F401
+    _COHORT_STATS,
+    _cohort_prepare,
+    _drain_job,
+    record_deferral_pressure,
+    reset_cohort_stats,
+)
 from kbworker.prep import (  # noqa: F401
     EXTRACT_BYTES_PER_TOKEN,
     EXTRACT_PROMPT_OVERHEAD_TOKENS,
@@ -323,32 +329,9 @@ def _drain_ingest_queue() -> tuple[int, int]:
     Returns ``(rows_drained, items_saved)``.
     """
     cohort = max(1, int(settings.kb_drain_cohort))
-    _COHORT_STATS.clear()
-    _COHORT_STATS.update(
-        {
-            "cohort_size": cohort,
-            "cohort_batches": 0,
-            "cohort_jobs": 0,
-            "cohort_failures": 0,
-            "cohort_plans": 0,
-            "cohort_plan_failures": 0,
-            "cohort_judge_batches": 0,
-            "cohort_judge_failures": 0,
-            "cohort_eligible": 0,
-            "cohort_mode": ensemble.mode(),
-            # Refill telemetry (added, never renamed): how many times the drain
-            # went back for more, and how many groups it took up in total. A run
-            # that did one refill on a deep queue is the old rows-vs-jobs bug
-            # coming back, and there would otherwise be no way to see it.
-            "cohort_refills": 0,
-            "cohort_groups_considered": 0,
-            # Per-window checkpoint telemetry (ADDED 2026-08-10, never renamed): windows
-            # a resumed group skipped, groups resumed, failed writes (swallowed in cohort).
-            "cohort_windows_resumed": 0,
-            "cohort_groups_resumed": 0,
-            "cohort_checkpoint_failures": 0,
-        }
-    )
+    # Seeded where the dict lives (kbworker.cohort — mechanical move 2026-08-14);
+    # every key is ADDED, never renamed, because the report is read night-over-night.
+    reset_cohort_stats(cohort)
     live = ensemble.mode() == "live"
 
     drained = 0
@@ -414,6 +397,9 @@ def _drain_ingest_queue() -> tuple[int, int]:
             "being filled at least as fast as it drains",
             MAX_REFILLS,
         )
+    # AFTER the loop, so tonight's deferral bumps are counted: an impending
+    # deferral-cap escalation must reach the digest (review #3 P1 rider).
+    record_deferral_pressure()
     return drained, saved_total
 
 
@@ -696,6 +682,14 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # right after the step that writes them — status flips only, never a
         # delete (Invariant 5). Stop-gated inside; see kbworker.allocator.
         _run_step(counts, "auto_applied", lambda: tail_steps.auto_apply_step(counts, stop))
+        # WP-1 quiet-expiry: close never-recalled unverified rows past the age
+        # knob (kb_review_expire_days; 0 = kill switch). Item stays searchable.
+        # Capped + STOP-GATED inside the step (kbcore.review_expire). MOVED ahead
+        # of the LLM tail (review #3 P2, 2026-08-14): scheduled after it, this
+        # cheap SQL stood down on 4 of the last 6 deadline-clipped nights. The
+        # stop-gate stands — a boot-catch-up run still skips it — and the report
+        # key order is unchanged (counts are pre-seeded above).
+        _run_step(counts, "review_expired", lambda: tail_steps.quiet_expire_step(counts, stop))
         # Housekeeping for the two non-knowledge stores this system creates.
         # Both sweeps existed with NO call site, so their TTLs were fiction:
         # abandoned upload parts accumulated in the raw volume (which is tarred
@@ -728,13 +722,10 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             ),
         )
         _run_step(counts, "reembedded", reembed_mod.reembed)
-        # WP-1 quiet-expiry: close never-recalled unverified rows past the age
-        # knob (kb_review_expire_days; 0 = kill switch). Item stays searchable.
-        # Capped + STOP-GATED inside the step since 2026-08-08 (kbcore.review_expire).
-        _run_step(counts, "review_expired", lambda: tail_steps.quiet_expire_step(counts, stop))
 
-        # AFTER quiet-expiry, so the four curation counts describe the queue the
-        # owner will actually wake up to (kbcore.review_auto.curation_counts).
+        # AFTER quiet-expiry (which now runs early, before the LLM tail), so the
+        # four curation counts describe the queue the owner will actually wake up
+        # to (kbcore.review_auto.curation_counts).
         def _curation() -> int:
             counts.update(review_auto.curation_counts(settings.kb_review_expire_days))
             return counts["triage_awaiting_apply"]

@@ -296,6 +296,29 @@ def mark_deferred(queue_id: int, error: str) -> bool:
     return False
 
 
+def near_deferral_cap_groups() -> int:
+    """Still-'pending' GROUPS whose rows sit within 2 deferrals of :data:`DEFERRAL_CAP`.
+
+    Drain telemetry (review #3 P1 rider): a terminal escalation used to be silent —
+    no digest line, and journald retention (<36h) beat the owner to the evidence.
+    This count precedes one by ~2 nights of deferrals. Grouped the way
+    :func:`pending_groups` groups, so a giant session counts once, not per row.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT count(DISTINCT (project,
+                     CASE WHEN {_DEGENERATE_URI_SQL}
+                          THEN 'queue:' || kind || ':' || id::text
+                          ELSE btrim(meta->>'source_uri') END))
+              FROM ingest_queue
+             WHERE status = 'pending' AND deferrals >= %(near)s
+            """,  # noqa: S608 — _DEGENERATE_URI_SQL is a constant fragment
+            {"near": DEFERRAL_CAP - 2},
+        ).fetchone()
+    return int(row[0])
+
+
 def queue_depth() -> int:
     """Count of pending submissions. Resilient to migration 002 not yet applied."""
     with connect() as conn:

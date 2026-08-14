@@ -53,6 +53,36 @@ def test_requeue_never_touches_extracted_or_pending_rows(kb, as_owner):
     assert done not in ids and live not in ids
 
 
+def test_requeue_rearms_the_deferral_budget_alongside_attempts(kb, as_owner):
+    """Round trip for a deferral-cap escalation (review #3 P2, KB 19663). The
+    owner's requeue is a fresh grant of BOTH budgets: without deferrals=0 the
+    documented repair was a no-op — the row came back 'pending' still at the cap,
+    so its very first re-defer escalated it straight back to 'failed'."""
+    from kbcore.db import connect
+
+    qid = _mk("proj", "a poison window escalated this group")
+    escalated = False
+    for _ in range(ingest_queue.DEFERRAL_CAP):
+        escalated = ingest_queue.mark_deferred(qid, "ExtractorUnavailable: never heals")
+    assert escalated is True, "the cap must escalate the row to terminal 'failed'"
+
+    ids = ingest_queue.requeue_failed(reason="misclassification fixed")
+    assert qid in ids
+
+    with connect() as c:
+        status, attempts, deferrals = c.execute(
+            "SELECT status, attempts, deferrals FROM ingest_queue WHERE id=%s", (qid,)
+        ).fetchone()
+    assert (status, attempts, deferrals) == ("pending", 0, 0), (
+        "requeue must re-arm BOTH budgets or the row re-escalates immediately"
+    )
+
+    # ...and the row can now defer the FULL cap's worth again before escalating.
+    for n in range(ingest_queue.DEFERRAL_CAP - 1):
+        assert ingest_queue.mark_deferred(qid, "outage") is False, f"escalated early at {n + 1}"
+    assert ingest_queue.mark_deferred(qid, "outage") is True, "the cap still bounds the re-grant"
+
+
 def test_the_reason_is_recorded_on_the_row(kb, as_owner):
     """A status flip with no audit trail is indistinguishable from a bug."""
     qid = _mk("proj", "row with a reason")

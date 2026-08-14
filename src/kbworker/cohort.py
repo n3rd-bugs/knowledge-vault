@@ -16,20 +16,25 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from kbcore import ingest_queue, jobs
+from kbcore.config import settings
 from kbcore.errors import EmbedderUnavailable, ExtractionFailed, ExtractorUnavailable
 from kbworker import ensemble, sessions
+
+# THE ESTABLISHED SEAM (mechanical split, 2026-08-14): the shared stats dict and
+# its seeding moved to kbworker.drainstats when the deferral-cap telemetry
+# reached this file's 300-line ratchet. `consolidate` and `prep` keep importing
+# every name from HERE; the dict stays one object, mutated in place, never
+# rebound.
+from kbworker.drainstats import (  # noqa: F401
+    _COHORT_STATS,
+    record_deferral_pressure,
+    reset_cohort_stats,
+)
 
 if TYPE_CHECKING:
     from kbworker.judging import EnsemblePlan
 
 logger = logging.getLogger("kbworker.consolidate")
-
-# Cohort telemetry for the run report. The FIRST attempt at cohorting shipped
-# with only a logger.info, and when throughput did not improve there was no way
-# to answer "did it even run?" without grepping journald — the same blind spot
-# that let 40% of embeddings run on CPU unnoticed. An optimisation you cannot
-# observe is an optimisation you cannot trust.
-_COHORT_STATS: dict[str, int] = {}
 
 
 def _cohort_prepare(
@@ -67,6 +72,17 @@ def _cohort_prepare(
         logger.warning("cohort prefetch failed; falling back per job", exc_info=True)
         return pre_by_key, plan_by_key
 
+    # Review #3 P1 (KB 19663): did THIS prefetch prove the primary alive on any
+    # text? plan_ensemble splits a missing-primary on it — content-deterministic
+    # (ExtractionFailed, attempts-bounded) when alive elsewhere, true outage
+    # (ExtractorUnavailable, defer) when absent cohort-wide. Stamped onto the JOB
+    # dicts because the per-job fallback (_drain_job → extract_and_ingest) replans
+    # from the SAME prefetch and must classify identically, or the plan-phase
+    # verdict is laundered right back into a connectivity defer.
+    primary_alive = any(settings.kb_extract_model in pre for pre in pre_by_key.values())
+    for job in batch:
+        job["primary_alive"] = primary_alive
+
     for job in batch:
         pre = pre_by_key.get(job["key"])
         if pre is None:
@@ -80,6 +96,7 @@ def _cohort_prepare(
                 branch=job["branch"],
                 extra_detail=job["detail"],
                 pre_extracted=pre,
+                primary_alive_elsewhere=primary_alive,
             )
         except Exception as e:  # noqa: BLE001 — one unplannable job falls back, alone
             _COHORT_STATS["cohort_plan_failures"] += 1
@@ -186,6 +203,10 @@ def _drain_job(
             branch=job["branch"],
             extra_detail=job["detail"],
             extra_meta=job["extra_meta"],
+            # Cohort-wide primary liveness (stamped by _cohort_prepare), so the
+            # fallback replan classifies a missing primary the same way the plan
+            # phase did (content vs outage — review #3 P1, KB 19663).
+            primary_alive_elsewhere=bool(job.get("primary_alive")),
         )
         state["saved"] += saved
         state["rejected"] += rejected
@@ -216,6 +237,12 @@ def _drain_job(
             rid for rid in ids if ingest_queue.mark_deferred(rid, f"{type(e).__name__}: {e}")
         ]
         if escalated:
+            # Into the run report (and the digest, when positive): a terminal
+            # escalation was journald-only, and retention (<36h) destroyed the
+            # evidence before the owner ever looked (review #3 P1 rider).
+            _COHORT_STATS["deferral_escalations"] = _COHORT_STATS.get(
+                "deferral_escalations", 0
+            ) + len(escalated)
             logger.error(
                 "rows %s escalated to failed after %d deferrals (transient never healed): %s",
                 escalated,

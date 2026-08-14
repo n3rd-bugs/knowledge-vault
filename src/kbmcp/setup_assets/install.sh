@@ -368,9 +368,11 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
     # live. A GET does not spend it (rig case 17 pins that); only POST /api/enrol
     # redeems. Stashed now, written at the end with the other optional artefacts.
     # Best-effort (|| true): an optional convenience must never fail an install.
-    PRE_MANIFEST_V=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
-      | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
-      | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
+    # The WHOLE manifest is kept, not just its version: the stamp at the end is
+    # written only after the per-file sha256 digests in it have been checked
+    # against what actually landed in ~/.claude/hooks.
+    PRE_MANIFEST=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+      | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null || true)
     PRE_NOTIFY=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
       | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/notify.env" 2>/dev/null || true)
     # The code travels as a BEARER on STDIN (curl -K -), never in argv: an
@@ -667,6 +669,16 @@ fi
 # start whether the server has moved on. Without a stamp the brief reports
 # "unversioned", which is correct and still actionable for hooks that predate
 # this. Best-effort: a machine that cannot reach the manifest is still installed.
+#
+# VERIFIED BEFORE STAMPED (2026-08-14, review #3 P1). The stamp used to record
+# the manifest's version without ever looking at what this run had actually put
+# in $HOOKS — so a partial or corrupted install (a truncated copy, a Git Bash
+# checkout with autocrlf rewriting every LF) stamped itself current, and that
+# stamp SILENCED the staleness banner, the one channel that would have reported
+# the breakage. The manifest already carries a sha256 per served file: each
+# installed hook is re-hashed and compared, the stamp is written only on a full
+# match, and any mismatch strips an existing stamp too — an old stamp sitting
+# over corrupted files is the same silence.
 
 # The bearer these last two fetches use, in priority order, and stated ONCE so
 # both calls cannot drift: the credential this run just redeemed (the enrolment
@@ -680,17 +692,81 @@ setup_auth_config() { # -> curl config on stdout; empty when we have nothing
   printf 'header = "Authorization: Bearer %s"\n' "$_sab"
 }
 
+# sha256 of one file, for the verification below. sha256sum where it exists
+# (coreutils, incl. Git Bash), else the same python3 the JSON fallback already
+# relies on — hashlib is stdlib, so this adds NO new dependency to any box.
+kb_sha256() { # <file> -> lowercase hex digest (empty when no backend exists)
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  else
+    _kbsp="$KB_PY_BIN"
+    if [ -z "$_kbsp" ]; then
+      for _kbsq in python3 python; do
+        if command -v "$_kbsq" >/dev/null 2>&1; then
+          _kbsp="$_kbsq"
+          break
+        fi
+      done
+    fi
+    [ -n "$_kbsp" ] || return 0
+    "$_kbsp" -c 'import hashlib,sys
+print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null
+  fi
+}
+
 if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_SETUP_BEARER:-}${KB_TOKEN:-}${KB_ENROL_CODE:-}" ]; then
   # `|| true` is load-bearing: with `set -e`, a 404 from an older server (curl
   # exit 22) would abort the WHOLE install over an optional stamp. Versioning is
   # a convenience; it must never be able to break the thing it describes.
-  _v="${PRE_MANIFEST_V:-}"
-  [ -n "$_v" ] || _v=$(setup_auth_config | curl -fsS -K - --max-time 8 \
-    "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
-    | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
-  if [ -n "$_v" ]; then
-    printf '%s\n' "$_v" > "$HOOKS/.setup-version" 2>/dev/null || true
-    echo "version:  $_v (recorded in $HOOKS/.setup-version)"
+  _manifest="${PRE_MANIFEST:-}"
+  [ -n "$_manifest" ] || _manifest=$(setup_auth_config | curl -fsS -K - --max-time 8 \
+    "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null || true)
+  _v=$(printf '%s' "$_manifest" | kb_json_get version || true)
+  if [ -z "$_v" ]; then
+    # An enrolment-less LOCAL install, or an older/unreachable server: there is
+    # no manifest to verify against. Same outcome as before this check existed
+    # — no stamp — but SAID, in one line, instead of silently skipped.
+    echo "version:  no manifest available -- installed hooks not verified, no version stamped"
+  elif [ -z "$(kb_sha256 "$HOOK" || true)" ]; then
+    # No sha256 backend at all (neither sha256sum nor python3 — a box this
+    # minimal still passed the JSON probe via jq). Verification is impossible,
+    # not failed: stamp exactly as before rather than punish the box.
+    printf '%s\n' "$_v" >"$HOOKS/.setup-version" 2>/dev/null || true
+    echo "version:  $_v (recorded UNVERIFIED -- no sha256 backend on this box)"
+  else
+    _vfiles=$(printf '%s' "$_manifest" | kb_json_get files || true)
+    _vbad=0
+    # Every hook asset this installer manages. install.sh itself is served in
+    # the manifest but never copied into $HOOKS, so it is not checked here.
+    for _hf in flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh \
+      kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do
+      _want=$(printf '%s' "$_vfiles" | kb_json_get "$_hf" || true)
+      if [ -f "$HOOKS/$_hf" ]; then
+        _got=$(kb_sha256 "$HOOKS/$_hf" || true)
+        if [ -z "$_want" ]; then
+          _vbad=1
+          echo "verify:   MISMATCH $_hf -- the manifest carries no hash for it (installed $(printf '%.12s' "$_got"))" >&2
+        elif [ "$_got" != "$_want" ]; then
+          _vbad=1
+          echo "verify:   MISMATCH $_hf -- expected $(printf '%.12s' "$_want"), got $(printf '%.12s' "$_got")" >&2
+        fi
+      elif [ -n "$_want" ]; then
+        _vbad=1
+        echo "verify:   MISMATCH $_hf -- the manifest ships it but it never landed in ~/.claude/hooks" >&2
+      fi
+    done
+    if [ "$_vbad" = 0 ]; then
+      printf '%s\n' "$_v" >"$HOOKS/.setup-version" 2>/dev/null || true
+      echo "version:  $_v (every installed hook verified against the manifest sha256; recorded in $HOOKS/.setup-version)"
+    else
+      # UNVERSIONED, deliberately — and strip any stamp an earlier run left:
+      # a stale stamp over corrupted files silences the staleness banner, which
+      # is the exact trust gap this check closes. The banner reports an
+      # unversioned box honestly, so the failure stays visible every session.
+      rm -f "$HOOKS/.setup-version" 2>/dev/null || true
+      echo "verify:   INSTALLED HOOKS DO NOT MATCH THE SERVER -- .setup-version NOT stamped; this box stays UNVERSIONED until a clean re-install" >&2
+      echo "verify:   (an every-file mismatch is usually CRLF mangling -- Git Bash autocrlf rewrites LF; re-fetch the scripts with curl and re-run)" >&2
+    fi
   fi
 fi
 

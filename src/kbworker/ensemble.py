@@ -190,14 +190,17 @@ def prefetch_extractions(texts: list[str]) -> list[dict[str, list[dict[str, Any]
     whole cohort, where the per-row path reloads all three for every row. On a
     card that holds one model at a time that is the dominant cost.
 
-    A model that fails is recorded as absent for EVERY text in the cohort — the
-    same "skip the extra, never abort the run" rule the per-row path uses. The
-    primary is NOT special-cased here; :func:`plan_ensemble` raises
-    ExtractorUnavailable per text when the primary is missing from a prefetch, so
-    one bad cohort cannot mask it (that claim used to be made here and was FALSE:
-    a dead primary produced a silently primary-less report with no extractor
-    errors, turning every extra item into a fail-closed singleton judged by the
-    dead primary).
+    A model call that fails is recorded as absent for THAT text only — recording
+    is PER TEXT, never cohort-wide (this docstring long claimed cohort-wide
+    recording it never did) — the same "skip the extra, never abort the run" rule
+    the per-row path uses per model. The primary is NOT special-cased here;
+    :func:`plan_ensemble` classifies a missing primary per text instead: content
+    (ExtractionFailed) when the same prefetch shows the primary alive on another
+    text, outage (ExtractorUnavailable) when it is absent cohort-wide — so one
+    bad cohort cannot mask a dead primary (that claim used to be made here and
+    was FALSE: a dead primary produced a silently primary-less report with no
+    extractor errors, turning every extra item into a fail-closed singleton
+    judged by the dead primary).
     """
     primary = settings.kb_extract_model
     extras = list(dict.fromkeys(m for m in settings.extract_ensemble if m != primary))
@@ -221,6 +224,7 @@ def plan_ensemble(
     branch: str | None = None,
     extra_detail: dict[str, Any] | None = None,
     pre_extracted: dict[str, list[dict[str, Any]]] | None = None,
+    primary_alive_elsewhere: bool = False,
 ) -> EnsemblePlan:
     """Everything before the judge: extract → quote-gate → cluster → PASS ONE.
 
@@ -231,10 +235,11 @@ def plan_ensemble(
 
     Raises exactly what the fused version raised: the primary's
     ExtractorUnavailable / ExtractionFailed, and EmbedderUnavailable from
-    clustering. PLUS one new, deliberate case: a prefetch that is MISSING the
-    primary raises ExtractorUnavailable instead of quietly producing a
-    primary-less report (see :func:`prefetch_extractions`) — the group defers and
-    re-drains intact rather than ingesting a degraded extraction.
+    clustering. PLUS one deliberate case: a prefetch that is MISSING the primary
+    raises instead of quietly producing a primary-less report (see
+    :func:`prefetch_extractions`) — and WHICH error it raises is the drain's
+    whole defer-vs-fail taxonomy, split by ``primary_alive_elsewhere`` (the
+    caller's cohort-wide knowledge this per-text function cannot derive itself).
     """
     primary = settings.kb_extract_model
     extras = list(dict.fromkeys(m for m in settings.extract_ensemble if m != primary))
@@ -245,11 +250,25 @@ def plan_ensemble(
     # card every switch is a full load, so that is the difference between ~3
     # extractor loads per row and ~3 per cohort.
     if pre_extracted is not None and primary not in pre_extracted:
-        # A cohort prefetch whose PRIMARY died: without this the job would run on
-        # extras only, reporting no extractor errors, no primary items and no
-        # corroboration — every extra item becoming a fail-closed singleton sent
-        # to a judge that is the same dead primary. Fail like a per-job primary
-        # failure so the drain defers the group instead (audit 2026-07-29).
+        if primary_alive_elsewhere:
+            # The SAME prefetch produced primary output for another text, so the
+            # extractor is provably alive and THIS text is what it cannot process
+            # (a per-window ReadTimeout / poison window — exactly what kbcore.llm
+            # already calls ExtractionFailed per row). Raising Unavailable here
+            # laundered that into the drain's CONNECTIVITY branch: the WHOLE
+            # group deferred nightly with no attempts burned — checkpoint pinned,
+            # ~1 GPU-h/night of zero yield — while deferrals ticked toward a
+            # silent terminal escalation (review #3 P1, KB 19663).
+            raise ExtractionFailed(
+                f"cohort prefetch has no output from the primary extractor "
+                f"{primary!r} for this text although it extracted other texts in "
+                f"the same cohort — content-deterministic, attempts-bounded"
+            )
+        # Absent COHORT-WIDE — the primary truly died: without this the job would
+        # run on extras only, reporting no extractor errors, no primary items and
+        # no corroboration — every extra item becoming a fail-closed singleton
+        # sent to a judge that is the same dead primary. Fail like a per-job
+        # primary failure so the drain defers the group instead (audit 2026-07-29).
         raise ExtractorUnavailable(
             f"cohort prefetch produced no output for the primary extractor {primary!r}"
         )
@@ -410,6 +429,7 @@ def run_ensemble(
     branch: str | None = None,
     extra_detail: dict[str, Any] | None = None,
     pre_extracted: dict[str, list[dict[str, Any]]] | None = None,
+    primary_alive_elsewhere: bool = False,
 ) -> dict[str, Any]:
     """Extract with every configured model, converge, verify — REPORT only.
 
@@ -438,6 +458,7 @@ def run_ensemble(
         branch=branch,
         extra_detail=extra_detail,
         pre_extracted=pre_extracted,
+        primary_alive_elsewhere=primary_alive_elsewhere,
     )
     judge_cohort([planned])
     return finish_ensemble(planned)

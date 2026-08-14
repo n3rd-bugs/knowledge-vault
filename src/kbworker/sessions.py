@@ -415,6 +415,7 @@ def extract_and_ingest(
     extra_meta: dict[str, Any] | None = None,
     pre_extracted: dict | None = None,
     planned: EnsemblePlan | None = None,
+    primary_alive_elsewhere: bool = False,
 ) -> tuple[int, int]:
     """Extract → quote-validate/repair → ingest, the core shared by file + queue paths.
 
@@ -454,6 +455,12 @@ def extract_and_ingest(
     A plan that does not match this call's project/uri is IGNORED (never trusted)
     — ingesting job A's survivors under job B's uri, with B's transcript stored
     as their raw, is the one cross-job corruption this split could cause.
+
+    ``primary_alive_elsewhere`` rides shotgun with ``pre_extracted`` (review #3
+    P1, KB 19663): the drain's per-job fallback re-plans from the SAME prefetch,
+    so it must carry the same cohort-wide liveness knowledge or a content-
+    deterministic per-text primary failure re-launders into the connectivity
+    defer path here. See :func:`kbworker.ensemble.plan_ensemble`.
     """
     ensemble_on = bool(settings.extract_ensemble)
     if ensemble_on and not settings.kb_ensemble_shadow:
@@ -479,6 +486,7 @@ def extract_and_ingest(
                 branch=branch,
                 extra_detail=extra_detail,
                 pre_extracted=pre_extracted,
+                primary_alive_elsewhere=primary_alive_elsewhere,
             )
         return ingest_ensemble_report(report, text, extra_meta=extra_meta)
 

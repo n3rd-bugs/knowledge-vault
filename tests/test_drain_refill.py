@@ -381,6 +381,54 @@ def test_max_groups_bounds_a_call_to_one_cohorts_worth(kb):
 # --------------------------------------------------------------- termination
 
 
+def _set_deferrals(ids: list[int], n: int) -> None:
+    """Backdate a row's deferral history (kb_test-owned data) instead of running
+    n nightly drains to accumulate it."""
+    with transaction() as conn:
+        conn.execute("UPDATE ingest_queue SET deferrals = %s WHERE id = ANY(%s)", (n, list(ids)))
+
+
+# ------------------------------------------ deferral-cap visibility (review #3)
+
+
+def test_a_deferral_escalation_is_counted_into_the_run_report(kb, monkeypatch):
+    """An escalation to terminal 'failed' was SILENT: no report key, no digest
+    line, and journald's <36h retention destroyed the log line before anyone
+    looked. mark_deferred's escalated return now rides _COHORT_STATS."""
+    monkeypatch.setattr(settings, "kb_drain_cohort", 1)
+    qid = _enqueue("defer-cap", "User: poison\nAssistant: window")
+    _set_deferrals([qid], ingest_queue.DEFERRAL_CAP - 1)
+    _recorder(monkeypatch, fail_on={f"queue:session:{qid}": ExtractorUnavailable("never heals")})
+
+    consolidate._drain_ingest_queue()
+
+    assert _row(qid)[0] == "failed", "the deferral cap did not escalate the row"
+    assert consolidate._COHORT_STATS["deferral_escalations"] == 1
+    assert consolidate._COHORT_STATS["groups_near_deferral_cap"] == 0, (
+        "an escalated group is 'failed' — no longer pending near the cap"
+    )
+
+
+def test_groups_near_the_deferral_cap_are_counted_AFTER_the_drain(kb, monkeypatch):
+    """Counted at END of drain so tonight's deferral is included: a group
+    arriving at DEFERRAL_CAP-2 tonight is ~2 nights from a silent terminal
+    escalation, and this count is what earns it a digest line."""
+    monkeypatch.setattr(settings, "kb_drain_cohort", 1)
+    near = _enqueue("defer-near", "User: outage\nAssistant: x")
+    _set_deferrals([near], ingest_queue.DEFERRAL_CAP - 3)  # tonight's defer -> CAP-2
+    fine = _enqueue("defer-near", "User: healthy\nAssistant: y")
+    _age_rows([near], 100)
+    _age_rows([fine], 50)
+    _recorder(monkeypatch, fail_on={f"queue:session:{near}": ExtractorUnavailable("down")})
+
+    consolidate._drain_ingest_queue()
+
+    assert _row(near) == ("pending", 0, ingest_queue.DEFERRAL_CAP - 2)
+    assert consolidate._COHORT_STATS["groups_near_deferral_cap"] == 1
+    assert consolidate._COHORT_STATS["deferral_escalations"] == 0
+    assert _row(fine)[0] == "extracted", "the healthy neighbour still drained"
+
+
 def test_the_refill_loop_has_a_backstop(kb, monkeypatch, caplog):
     """Clients can enqueue while the drain runs and a one-row submission is
     eligible immediately, so 'refill until empty' needs a floor under it for a

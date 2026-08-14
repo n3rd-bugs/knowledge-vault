@@ -155,11 +155,12 @@
   # (redis-riscv-qemu gotcha: upload text/html, NOT text/markdown), rank 1.
   expect_item_id: 488
 - q: "stream push status sensor settings on-change realtime"
-  # was 81 -> 470 -> 6431 -> now 16791: the doc-refresh chain moves every time
-  # the source doc is re-scanned, and a golden case must track the chain HEAD.
-  # Third repoint of this case — if it moves again, consider expect_substr on
-  # the doc's stable title instead of pinning the revision id.
-  expect_item_id: 16791
+  # was 81 -> 470 -> 6431 -> 16791: the rm3 doc is under ACTIVE development, so
+  # its doc-refresh chain moves nightly and any pinned revision id goes stale in
+  # days (four repoints in two weeks). The case's intent is "the CURRENT revision
+  # of this doc is retrievable" — so match the doc's stable identity, which every
+  # revision carries in its title, and let the chain churn freely underneath.
+  expect_substr: ["RM3_SCADA_JSON_API"]
 - q: "mTLS fleet agent deferred config-sync"
   expect_item_id: 68
 

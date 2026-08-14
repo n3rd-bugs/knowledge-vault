@@ -231,11 +231,18 @@ def test_id_dominant_classification():
     assert not search_legs._id_dominant("plain prose query", [])
 
 
-def test_prose_query_does_not_pull_identifier_only_matches():
+def test_prose_query_does_not_pull_identifier_only_matches(monkeypatch):
     """A prose query mentioning an acronym must not surface an item reachable
     only through the identifier leg (the leg is gated to id-dominant queries).
     The lurker's acronym hides inside a path token, so only the id leg's regex
-    could ever reach it — if the gate were dropped, this test would catch it."""
+    could ever reach it — if the gate were dropped, this test would catch it.
+
+    PINS the rare-token dial OFF: this test asserts the id-DOMINANT gate, and
+    with KB_ID_LEG_RARE_TOKENS=true in the box's .env (validation week
+    2026-08-14) the rare-token path may legitimately admit the lurker — the
+    environment-leak test-flake class the repo has recorded before. The
+    dial-ON behaviour has its own pins in tests/test_search_wave3.py."""
+    monkeypatch.setattr(settings, "kb_id_leg_rare_tokens", False)
     lurker = ingest("p", "note", "acronym lurker", "Wiring notes live at /src/SPI/ctrl.c only.")
     ingest("p", "gotcha", "real answer", "motor driver polarity problem notes with SPI details")
     _blind(lurker)  # invisible to the vector leg; the path lexeme hides it from tsquery

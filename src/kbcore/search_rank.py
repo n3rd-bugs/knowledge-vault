@@ -83,8 +83,8 @@ def collapse_alternatives(
     """Collapse cross-project ``alternative_to`` twins WITHIN one result set.
 
     When two candidates in ``fused`` are joined by an ``alternative_to`` edge and
-    live in DIFFERENT projects, keep the higher-scored candidate, FOLD the loser's
-    score into it, and DROP the loser from the rendered set. No status flip — the
+    live in DIFFERENT projects, keep the higher-scored candidate at the MAX of
+    the pair's scores (dedupe, never boost) and DROP the loser. No status flip — the
     loser row is untouched in the DB (Invariant 5 stays intact); this is a
     rank-time render decision only. Returns ``(pruned_fused, {winner_id:
     [collapsed_loser_ids]})``; the map lets the caller record the collapse.
@@ -123,7 +123,13 @@ def collapse_alternatives(
         if a in collapsed or b in collapsed:
             continue
         winner, loser = (a, b) if (scores[a], a) >= (scores[b], b) else (b, a)
-        scores[winner] += scores[loser]  # fold the loser's weight into the survivor
+        # MAX, not SUM (validation-day-one finding, 2026-08-14): summing let two
+        # tangential twins at ranks ~6-7 COMBINE their way into the top-5 and
+        # push out the query's actual answer (the WireGuard golden case caught
+        # it within the hour). A twin pair is one piece of knowledge captured
+        # twice, not two independent votes: deduplication removes the redundant
+        # slot, it must never manufacture rank the pair never earned alone.
+        scores[winner] = max(scores[winner], scores[loser])
         collapsed[loser] = winner
         folded.setdefault(winner, []).append(loser)
     if not collapsed:

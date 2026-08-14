@@ -108,7 +108,10 @@ def test_trust_factor_cannot_lift_weak_verified_over_strong_unverified(monkeypat
 def test_rare_token_id_leg_surfaces_a_symbol_that_misses_today(monkeypatch):
     """A rare identifier hiding in a path token (tsv-invisible) on a vector-blinded
     item is unreachable by a NON-id-dominant query today; the rare-token leg reaches
-    it once enabled, without changing the id-dominant path."""
+    it once enabled, without changing the id-dominant path.
+
+    Off phase PINNED: .env carries KB_ID_LEG_RARE_TOKENS=true (validation week)."""
+    monkeypatch.setattr(settings, "kb_id_leg_rare_tokens", False)
     # Body shares NO lexeme with the query, and the symbol sits inside a path token
     # (lexed as one whole-path lexeme), so tsquery for zprq_write cannot reach it.
     target = ingest("p", "note", "fixup", "Fixed at /src/drv/zprq_write.c around offset 9.")
@@ -150,6 +153,9 @@ def test_cross_project_alternative_twins_collapse_under_the_flag(monkeypatch):
     graph.link(a, "alternative_to", b)  # cross-project edge
     q = "widgetsync approach"
 
+    # PIN the off phase: the box's .env carries KB_COLLAPSE_ALTERNATIVES=true
+    # since validation week (2026-08-14) — the A/B must not inherit it.
+    monkeypatch.setattr(settings, "kb_collapse_alternatives", False)
     off_hits = search(q, k=10)
     off_ids = [h.item_id for h in off_hits]
     assert a in off_ids and b in off_ids, "without the flag both twins appear"

@@ -56,6 +56,23 @@ def fake_vector(text: str) -> list[float]:
 
 
 @pytest.fixture(autouse=True)
+def _ranking_dials_at_code_defaults(monkeypatch):
+    """Tests must not inherit the box's .env ranking dials (same hermeticity
+    gotcha as _no_real_notifications). Validation week 2026-08-14 flipped
+    KB_ID_LEG_RARE_TOKENS / KB_TRUST_FACTOR / KB_COLLAPSE_ALTERNATIVES /
+    KB_TAIL_TRIAGE_SHARE live on this box, and three dial tests' "off" phases
+    promptly failed by inheriting them. Every test sees the CODE defaults; a
+    test that wants a dial on sets it deliberately (as the wave-3 suite does).
+    """
+    from kbcore.config import settings as _s
+
+    monkeypatch.setattr(_s, "kb_id_leg_rare_tokens", False)
+    monkeypatch.setattr(_s, "kb_trust_factor", 1.0)
+    monkeypatch.setattr(_s, "kb_collapse_alternatives", False)
+    monkeypatch.setattr(_s, "kb_tail_triage_share", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_notifications(monkeypatch):
     """Tests must NEVER reach the owner's real ntfy channel.
 

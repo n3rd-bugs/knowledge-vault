@@ -82,6 +82,11 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
         lines.append(f"expired: {expired}")
     if never_triaged := counts.get("never_triaged_open"):
         lines.append(f"never-triaged open: {never_triaged}")
+    # THE PROMOTE PROGRAM (review #3 strategic P1, KB 19663): recall-proven
+    # unverified items waiting on an owner promote — the owner sees the queue
+    # exists without asking. POSITIVE-ONLY and pure ASCII, like its neighbours.
+    if promotable := counts.get("promote_candidates"):
+        lines.append(f"promote-worthy: {promotable}")
     expiry = counts.get("first_expiry_date")
     if expiry and _expiring_soon(expiry):
         lines.append(f"review rows start expiring {expiry}")

@@ -15,7 +15,7 @@
   "src/kbcore/review.py": 514,
   "src/kbcore/review_triage.py": 322,
   "src/kbcore/scope.py": 378,
-  "src/kbcore/search.py": 361,
+  "src/kbcore/search.py": 368,
   "src/kbcore/search_legs.py": 381,
   "src/kbmcp/server.py": 585,
   "src/kbmcp/tools_setup.py": 448,

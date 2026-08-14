@@ -361,6 +361,21 @@ kb_take_lock() { # <lockpath> -- 0 = we own it, 1 = someone else is draining
 }
 export -f kb_take_lock
 
+# Feed the bearer to curl on STDIN (curl -K -), never on the command line: argv
+# is world-visible through /proc/<pid>/cmdline and `ps`, and a credential has
+# already leaked that way once on this system (2026-07-31). Same name and shape
+# as kb-session-brief.sh's copy. EXPORTED, because the REST submission runs in
+# the detached child -- the transcript-capture path carries the highest-value
+# bearer on the box (the owner's master token where no project token exists),
+# and this curl was the last one still holding it in argv. An empty bearer
+# yields an empty config, i.e. an unauthenticated request the server refuses
+# loudly -- never a silent skip.
+kb_curl_auth_config() { # -> curl config on stdout
+  [ -n "${KB_TOKEN:-}" ] || return 0
+  printf 'header = "Authorization: Bearer %s"\n' "$KB_TOKEN"
+}
+export -f kb_curl_auth_config
+
 # Opportunistic housekeeping — bound our OWN state/log growth so a daily-driver
 # machine doesn't accumulate thousands of dead .offset files and an unrotated
 # multi-MB log. Cheap (runs before the detach) and scoped strictly to the hooks'
@@ -608,9 +623,9 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
           rm -f "$BODYF" "$TMPC"; break
         fi
-        CODE=$(curl -sS -o "$TMPC.resp" -w "%{http_code}" --max-time 30 \
+        CODE=$(kb_curl_auth_config | curl -sS -K - -o "$TMPC.resp" -w "%{http_code}" --max-time 30 \
              -X POST "$KB_REST_URL/api/ingest-session" \
-             -H "Authorization: Bearer $KB_TOKEN" -H "Content-Type: application/json" \
+             -H "Content-Type: application/json" \
              --data @"$BODYF")
         # A flaked response read (000) whose body still carries a queue id was
         # ACCEPTED by the server (KB item 497) — count it as success.

@@ -146,9 +146,11 @@ def test_deferred_work_is_counted_in_GROUPS_not_windows():
 
 def test_the_triage_share_stops_triage_and_leaves_the_reserve_for_later_steps(monkeypatch):
     """The headline of the re-derive. The reserve window is 09:00-12:00 (deadline
-    12:00, reserve 180m); a 0.5 triage share stops triage at 10:30 and leaves
-    10:30-12:00 — the OTHER half of the reserve — for the steps that run behind it
-    (contradictions, evidence), which is exactly what a saturated weekday lost."""
+    12:00, reserve 180m). The 0.5 share is anchored to when the tail ACTUALLY
+    entered its first step (review #3 / KB 19663 (4)): entering triage at 09:30
+    gives it 09:30-11:00 and leaves 11:00-on — the other half of the reserve —
+    for the steps that run behind it (contradictions, evidence). Before the tail
+    is marked started, the SCHEDULED reserve_start stands in as the anchor."""
     monkeypatch.setattr(settings, "kb_tail_reserve_minutes", 180)
     monkeypatch.setattr(settings, "kb_drain_deadline", "12:00")
     monkeypatch.setattr(settings, "kb_drain_deadline_days", "")  # day-independent, per the suite
@@ -157,15 +159,47 @@ def test_the_triage_share_stops_triage_and_leaves_the_reserve_for_later_steps(mo
     res._now = lambda: clock["now"]
 
     assert res.reserve_start == _at("09:00")
-    assert res.share_cutoff(0.5) == _at("10:30"), "triage's half of the 180m reserve ends 10:30"
+    assert res.share_cutoff(0.5) == _at("10:30"), "unmarked: the SCHEDULED anchor stands in"
     assert res.share_cutoff(1.0) == _at("12:00"), "the reserve AS A WHOLE is still the tail's"
     assert res.share_budget_minutes(0.5) == 90.0
 
     run_guard = {"r": None}
-    guard = res.share_guard(0.5, lambda: run_guard["r"])
-    assert guard() is None, "09:30 is inside triage's 10:30 slice"
-    clock["now"] = _at("10:45")  # past the 10:30 cutoff
+    guard = res.share_guard(0.5, lambda: run_guard["r"])  # the first tail-step entry: 09:30
+    assert res.tail_start == _at("09:30"), "building a BINDING guard marks the tail started"
+    assert res.share_cutoff(0.5) == _at("11:00"), "the share is anchored where the tail began"
+    assert guard() is None, "09:30 is inside triage's slice"
+    clock["now"] = _at("10:45")  # past the OLD schedule-anchored cutoff, inside the real one
+    assert guard() is None, "a late-starting tail still gets its whole share (KB 19663)"
+    clock["now"] = _at("11:05")  # past tail_start + 0.5 * reserve
     assert guard() == allocator.TRIAGE_SHARE_REASON, "triage yields the rest of the reserve"
+
+
+def test_the_share_survives_a_drain_overrun_into_the_reserve():
+    """Review #3 / KB 19663 (4): the share window used to be DEALT from
+    reserve_start at drain handoff, so a drain overrunning into the reserve
+    silently spent triage's slice before triage ever ran (a tail entering at
+    10:40 had 0 of its 90 minutes left). Anchored to the ACTUAL first tail-step
+    entry, the late tail still gets its whole share — and the run's own
+    deadline/battery guard still preempts INSIDE it, so the anchor can never
+    extend a run. Day-independent: the reserve is built by hand."""
+    res = allocator.TailReserve(reserve_seconds=180 * 60.0, deadline=_at("12:00"))
+    clock = {"now": _at("10:40")}  # the drain overran 100 min into the 09:00 reserve
+    res._now = lambda: clock["now"]
+    run = {"r": None}
+
+    guard = res.share_guard(0.5, lambda: run["r"])
+    clock["now"] = _at("11:55")  # the schedule-anchored math stood triage down at 10:30
+    assert guard() is None, "the late-starting tail keeps its full 90-minute share"
+    run["r"] = "deadline"
+    assert guard() == "deadline", "the run guard still preempts inside the share"
+    run["r"] = None
+    clock["now"] = _at("12:15")  # past 10:40 + 90 min
+    assert guard() == allocator.TRIAGE_SHARE_REASON
+
+    res.mark_tail_start()  # idempotent: the FIRST entry set the anchor and it holds
+    assert res.tail_start == _at("10:40")
+    base = lambda: None  # noqa: E731 — identity is the assertion
+    assert res.share_guard(0.0, base) is base, "share=0 stays byte-identically inert"
 
 
 def test_a_triage_share_of_zero_reproduces_the_pooled_reserve_exactly(monkeypatch):
@@ -386,7 +420,9 @@ def test_the_triage_share_budget_minutes_land_in_the_run_report(kb, monkeypatch)
     guard = seen["guard"]
     assert guard is not run_guard, "triage was handed the BARE run guard — the share is inert"
     assert guard() is None, "inside its slice the share must not stop triage"
-    clock["now"] = _at("10:45")  # past reserve_start + 0.5 * reserve
+    clock["now"] = _at("10:45")  # inside the ANCHORED slice: the tail entered at 09:30
+    assert guard() is None, "the share is anchored to the tail's ACTUAL start (KB 19663)"
+    clock["now"] = _at("11:05")  # past tail_start + 0.5 * reserve
     assert guard() == allocator.TRIAGE_SHARE_REASON
     assert run_guard() is None, "and the run itself never asked anyone to stand down"
 

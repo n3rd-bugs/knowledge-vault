@@ -269,9 +269,11 @@ def generate_age_keypair() -> tuple[str, str]:
     """Run age-keygen and return (public recipient, PRIVATE identity).
 
     Shells out via a LIST argv (never shell=True) to the settings.kb_age_bin seam.
-    This function STORES NOTHING and LOGS NOTHING: the caller persists only the
-    public recipient (via write_config) and shows the private identity exactly
-    once. A missing binary or unparseable output raises a clean InvalidOperation."""
+    This function STORES NOTHING and LOGS NOTHING — it returns the plaintext
+    secret exactly once (the marker sentence: :data:`kbcore.scrub.MINTED_SECRETS`
+    must list this function): the caller persists only the public recipient (via
+    write_config) and shows the private identity once.
+    A missing binary or unparseable output raises a clean InvalidOperation."""
     try:
         proc = subprocess.run(
             [settings.kb_age_bin],

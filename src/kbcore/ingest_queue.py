@@ -161,6 +161,8 @@ def enqueue(
     ):
         if value:
             meta[key] = scrub(value)[0]
+    # Box identity (KB 19663): AUTHENTICATED submitter via kbcore.scope (rule 12).
+    meta["submitted_by"] = scope.current().name
     if redactions:
         meta["redactions"] = redactions
 

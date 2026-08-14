@@ -245,15 +245,17 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         # FIX 6 (audit 2026-07-26): a queued session/memory window
                         # anchors no FILE — repo/commit ride the item meta as
                         # provenance instead of a phantom {"path": "."} code_ref.
+                        # Box identity (KB 19663) rides the same way.
                         "detail": {
                             "ingest_queue_id": row["id"],
                             "source": row["kind"],
                             **({"coalesced_rows": len(ids)} if len(ids) > 1 else {}),
                             **({"window": i, "windows": len(windows)} if len(windows) > 1 else {}),
                         },
-                        "extra_meta": sessions._session_provenance(
-                            meta.get("repo"), meta.get("commit")
-                        ),
+                        "extra_meta": {
+                            **sessions._session_provenance(meta.get("repo"), meta.get("commit")),
+                            **({"submitted_by": s} if (s := meta.get("submitted_by")) else {}),
+                        },
                     }
                 )
         except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain

@@ -1,51 +1,47 @@
 """kbworker.allocator — who gets the nightly window: the drain, or the LLM tail.
 
-THE SUBSCRIPTION MATH. The window is 01:00->12:00 (11 h). Median arrival is
-73-89 MB/day at ~12.5 MB/h measured drain throughput, so the median drain costs
-5.9-7.1 h; the LLM tail at current caps costs 5.5-6.5 h (triage 1000 x 10.4 s =
-2.9 h, contradictions 500 x 9.2 s = 1.3 h, summaries 0.8-1.6 h, evidence 20 x
-94-130 s = 0.5-0.7 h). A median night DEMANDS 11.4-13.6 h of an 11 h window — it
-is subscribed at 104-124% of capacity, so SOMEBODY is the residual claimant: the
-step that runs last gets what the others left, which on a saturated night is
-nothing. The drain is Step 0 with a refill-until-empty loop, so today that is the
-tail — report 9684 is what it looks like: queued_drained 33,284 s (99.5% of the
-window), triage 0 rows, contradictions/summaries/evidence all stood down, and the
-judged-pair memory (migration 017) still frozen at 0 rows because the
-contradictions step has not run since it landed.
+THE SUBSCRIPTION MATH. The window is 01:00->12:00 (11 h). Median arrival costs
+the drain 5.9-7.1 h (73-89 MB/day at ~12.5 MB/h measured); the LLM tail at
+current caps costs 5.5-6.5 h (triage 2.9 h, contradictions 1.3 h, summaries
+0.8-1.6 h, evidence 0.5-0.7 h). A median night DEMANDS 11.4-13.6 h of an 11 h
+window — subscribed at 104-124%, so SOMEBODY is the residual claimant: the step
+that runs last gets what the others left, on a saturated night nothing. The
+drain is Step 0 with a refill-until-empty loop, so today that is the tail —
+report 9684: queued_drained 33,284 s (99.5% of the window), triage 0 rows,
+contradictions/summaries/evidence stood down, judged-pair memory (migration 017)
+frozen at 0 rows because the contradictions step has not run since it landed.
 
 WHY THE DRAIN MUST BE THE RESIDUAL CLAIMANT INSTEAD (owner-approved: keep the
 drain first, cap its appetite).
 
 * **Drain debt is durable and self-announcing.** An unreached group stays
-  'pending', is counted by ``ingest_queue.queue_depth()``, rides into every run
+  'pending', is counted by ``ingest_queue.queue_depth()``, rides every run
   report, and ingest is idempotent (Invariant 3) — falling behind is VISIBLE and
   RECOVERABLE: a deeper queue tomorrow, drained by a lighter night.
-* **Tail debt compounds invisibly.** Nothing records "triage did not run".
-  Verdicts sit unapplied so the queue grows; contradictions are never judged, so
-  the per-pair memory that would make the NEXT night cheaper is never written and
-  the step pays full price forever; and evidence auto-resolution needs
-  ``AUTO_RESOLVE_STREAK`` CONSECUTIVE nightly visits — a skipped night does not
-  postpone a resolution, it RESETS one. The cost is not the work deferred, it is
-  the work that never converges.
+* **Tail debt compounds invisibly.** Nothing records "triage did not run":
+  verdicts sit unapplied so the queue grows; unjudged contradictions never write
+  the per-pair memory that makes the NEXT night cheaper; evidence auto-resolution
+  needs ``AUTO_RESOLVE_STREAK`` CONSECUTIVE nightly visits, so a skipped night
+  RESETS a resolution. The cost is the work that never converges.
 
-So the drain stops admitting NEW refill cohorts once the estimated cost of the
-next cohort would eat into ``kb_tail_reserve_minutes`` (180; 0 restores the old
+So the drain stops admitting NEW refill cohorts once the next cohort's estimated
+cost would eat into ``kb_tail_reserve_minutes`` (180; 0 restores the old
 behaviour). The reserve is an INNER bound only: the deadline and battery guards
 still preempt everything including the tail, and it can never extend a run past
-``KB_DRAIN_DEADLINE``. The arithmetic is naive-local wall clock, exactly like
+``KB_DRAIN_DEADLINE``. The arithmetic is naive-local wall clock, like
 :func:`kbworker.consolidate._past_deadline` — scheduling, not storage, so
-Invariant 7 (TIMESTAMPTZ/UTC for what the KB stores) is untouched.
+Invariant 7 (TIMESTAMPTZ/UTC for stored data) is untouched.
 
-INTERNAL SHARES WITHIN THE RESERVE (WAVE-2, 2026-08-09). The pooled reserve
-protects the tail FROM the drain, but not the tail's later steps from its earlier
-ones. Triage runs FIRST and, at the doubled caps (batch 500->1000, pairs
-200->500), now costs ~2.9 h and claims almost the whole 180-min reserve — so on a
-weekday contradictions and evidence, behind it, get ~0. ``TailReserve`` can
-therefore hand a step an INNER share of the window: it admits work while
-``now + est_cost < reserve_start + share*reserve``. ``kb_tail_triage_share`` gives
-triage its slice (default 0 = the OLD pooled behaviour, inert: triage is simply
-asked to stop at its share so the steps behind it get theirs). Weekends carry no
-deadline, so the share is inert there — triage keeps going and the top-up runs.
+INTERNAL SHARES WITHIN THE RESERVE (WAVE-2, 2026-08-09; anchor KB 19663). The
+pooled reserve protects the tail FROM the drain, not the tail's later steps from
+its earlier ones: triage runs FIRST and can claim the whole reserve, leaving
+contradictions/evidence ~0. ``TailReserve`` therefore hands a step an INNER
+share: admit work while ``now + est_cost < tail_start + share*reserve``, anchored
+to when the tail ACTUALLY entered its first step (review #3: on reserve_start, an
+overrunning drain silently spent triage's slice; reserve_start stands in until
+the tail is marked started). ``kb_tail_triage_share`` gives triage its slice
+(default 0 = OLD pooled behaviour, byte-identical inert); weekends carry no
+deadline, so the share is inert there and the top-up runs.
 """
 
 from __future__ import annotations
@@ -188,6 +184,7 @@ class TailReserve:
     reserve_seconds: float = 0.0
     deadline: datetime | None = None
     tracker: CostTracker = field(default_factory=CostTracker)
+    tail_start: datetime | None = None  # when the TAIL actually started (share anchor)
     _now: Callable[[], datetime] = datetime.now
 
     @classmethod
@@ -214,15 +211,18 @@ class TailReserve:
             return None
         return self.deadline - timedelta(seconds=self.reserve_seconds)  # deadline set
 
+    def mark_tail_start(self) -> None:
+        """Stamp the share anchor at the FIRST tail-step entry (idempotent, KB 19663)."""
+        self.tail_start = self.tail_start or self._now()
+
     def share_cutoff(self, share: float) -> datetime | None:
-        """The instant a tail step holding ``share`` of the reserve must stop by:
-        ``reserve_start + share*reserve``, the INNER bound that keeps an early tail
-        step (triage) from spending the window the later ones run in. None (no inner
-        bound = OLD pooled behaviour) when the reserve is off or ``share <= 0``.
-        """
-        start = self.reserve_start
-        if start is None or share <= 0:
+        """The instant a step holding ``share`` must stop by: ``anchor +
+        share*reserve``, the INNER bound keeping an early tail step (triage) from
+        spending the later ones' window. Anchor = the tail's ACTUAL start when
+        marked, else ``reserve_start``. None (= OLD pooled) when off/``share<=0``."""
+        if not self.enabled or share <= 0:
             return None
+        start = self.tail_start or self.reserve_start
         return start + timedelta(seconds=share * self.reserve_seconds)
 
     def admit_step(self, share: float, est_cost_seconds: float = 0.0) -> bool:
@@ -253,9 +253,11 @@ class TailReserve:
         the share (an inner bound, never a way to run longer). When the share is
         inert (kill switch, no deadline, ``share <= 0``) this is ``base`` UNCHANGED,
         so the pooled behaviour is reproduced byte for byte and the knob is opt-in.
-        """
+        Building a BINDING guard marks the tail started (the share anchor, KB 19663:
+        this call site IS the first tail-step entry)."""
         if self.share_cutoff(share) is None:
             return base
+        self.mark_tail_start()
 
         def guard() -> str | None:
             if not self.admit_step(share, est_cost_seconds):

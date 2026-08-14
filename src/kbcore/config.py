@@ -310,6 +310,13 @@ class Settings(SettingsViews, BaseSettings):
     # report says how many were left. 0 = UNCAPPED, explicitly — the kill switch is
     # kb_review_expire_days=0 above, never this knob.
     kb_review_expire_cap: int = 500
+    # THE PROMOTE PROGRAM (review #3 strategic P1, KB 19663). Trust has been one-way in practice:
+    # promote throughput ~0 while the top-5 unverified share rose 53.5% -> 64%. The candidate
+    # surface (kbcore.review_promote) ranks the items most WORTH a human's promote: active,
+    # unverified, and RECALL-PROVEN — at least this many access_log rows. V4 stands: nothing
+    # promotes automatically; this knob only decides what the owner is SHOWN first (and what the
+    # digest's 'promote-worthy' count means). Floor, not cap: 0 lists every unverified item.
+    kb_promote_candidate_min_recalls: int = 3
     # WP-2 LLM triage (owner decision 2026-07-18): the nightly consolidation asks the 14B for a
     # keep / reject_noise / reject_duplicate SUGGESTION per open unverified_extraction row (stored
     # in review_queue.detail.triage); a human applies suggestions in bulk (kb review apply-triage /
@@ -406,6 +413,13 @@ class Settings(SettingsViews, BaseSettings):
     # Max candidate pairs enumerated (and thus 14B-judged) per run — the call budget of
     # an owner-invoked pass. 0 is the KILL SWITCH (nothing enumerated, judged, or linked).
     kb_xtwin_cap: int = 200
+    # Review #3 P2 (KB 19663): enumeration is a bounded INDEX-ASSISTED scan, never the old
+    # O(N^2) self-join (unrunnable at 19.6k items). Each probed item — newest first, at most
+    # probe_limit of them (0 = probe every eligible item) — takes one pgvector KNN probe of its
+    # knn nearest OTHER-project leads; the run reports probed-of-eligible coverage so a bounded
+    # pass never masquerades as exhaustive (kbcore.twin_probe).
+    kb_xtwin_probe_limit: int = 0
+    kb_xtwin_knn: int = 8
     # Contradiction pairs the 14B may judge per NIGHT, across all projects — the sibling of
     # kbworker.consolidate.EVIDENCE_PAIR_CAP for the step BEFORE it. The step had no bound at all
     # and grew 4,972s -> 8,194s in two days. It is a per-night budget rather than a per-project one

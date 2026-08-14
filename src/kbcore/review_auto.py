@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from kbcore import review
+from kbcore import review, review_promote
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.review_expire import EXPIRY_GATE, QUIET_ELIGIBLE, REJECT_TRIAGE_ACTIONS
@@ -110,6 +110,10 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
       the net daily flow of that pool: rows minted in the last day, versus rows
       that LEFT it by being triaged or having their item recalled. ``net`` > 0
       means the backlog grows faster than it is examined.
+    * ``promote_candidates`` — recall-proven unverified items waiting on an
+      owner promote, at the default threshold (the PROMOTE PROGRAM, review #3
+      P1: the owner sees the queue exists without asking). ADDED key; nothing
+      renamed.
     """
     reject = list(REJECT_TRIAGE_ACTIONS)
     with connect() as conn:
@@ -190,6 +194,9 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
         "eligible_entered_1d": int(entered),
         "eligible_left_1d": int(left),
         "eligible_flow_net_1d": int(entered) - int(left),
+        # The PROMOTE PROGRAM's queue depth (kbcore.review_promote): same
+        # predicate as `kb review promote-candidates`, so digest and table agree.
+        "promote_candidates": review_promote.count_promote_candidates(),
     }
 
 

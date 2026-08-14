@@ -46,6 +46,8 @@ INSTALL = CONTRIB / "install.sh"
 NOTIFY = CONTRIB / "notify-complete.sh"
 BACKFILL = CONTRIB / "kb-flush-backfill.sh"
 DISPATCH = CONTRIB / "kb-hook-dispatch.sh"
+MCPCALL = CONTRIB / "kb-mcp-call.sh"
+NOTIFY_FAIL = REPO / "systemd" / "kb-notify-fail.sh"
 
 # Fake, shaped like the real thing so the scrubber and every "is this a token?"
 # assertion has something realistic to bite on. Never a live credential.
@@ -242,12 +244,14 @@ def _executed_curl_lines(script: str) -> list[str]:
     return out
 
 
-@pytest.mark.parametrize("path", [NOTIFY, BRIEF, INSTALL], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [NOTIFY, BRIEF, INSTALL, FLUSH, MCPCALL], ids=lambda p: p.name)
 def test_no_credential_is_passed_on_a_curl_command_line(path: Path):
     """argv is world-readable (/proc/<pid>/cmdline, `ps`). An ntfy admin password
     already leaked into a transcript this way — and a transcript is precisely
     what these hooks flush into the KB. Credentials travel on stdin via
-    `curl -K -`, never as arguments."""
+    `curl -K -`, never as arguments. FLUSH and MCPCALL joined the family last
+    (review #3 wave D): the transcript-capture path was still holding the
+    bearer — on a single-token box, the OWNER master token — in argv."""
     offenders = [
         ln
         for ln in _executed_curl_lines(path.read_text())
@@ -256,7 +260,7 @@ def test_no_credential_is_passed_on_a_curl_command_line(path: Path):
     assert not offenders, f"{path.name} puts a credential in argv: {offenders}"
 
 
-@pytest.mark.parametrize("path", [NOTIFY, BRIEF, INSTALL], ids=lambda p: p.name)
+@pytest.mark.parametrize("path", [NOTIFY, BRIEF, INSTALL, FLUSH, MCPCALL], ids=lambda p: p.name)
 def test_credentialed_requests_read_their_auth_from_stdin(path: Path):
     """The other half: having removed the argv form, the scripts must still
     authenticate. Every one of them builds a curl config and pipes it in."""
@@ -2351,6 +2355,8 @@ mkdir -p "$D"
 TAG="__TAG__"
 cat >"$D/stdin.$TAG"
 printf '%s\\n' "$TAG" >>"$D/order"
+: >"$D/args.$TAG"
+for a in "$@"; do printf '%s\\n' "$a" >>"$D/args.$TAG"; done
 _o="OUT_$TAG"
 _r="RC_$TAG"
 [ -n "${!_o:-}" ] && printf '%s' "${!_o}"
@@ -3136,3 +3142,425 @@ def test_requeue_extracted_never_touches_failed_or_pending_rows(kb):
             0
         ]
     assert status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: the LAST bearers still travelling in argv (review #3 wave D)
+# ---------------------------------------------------------------------------
+#
+# The structural tests above prove the SOURCE builds a curl config; these prove
+# the processes really invoked put the credential on stdin and nothing else.
+# The two scripts here are the transcript-capture path itself — the one family
+# member whose bearer, on a single-token box, is the OWNER master token.
+
+
+def _wait_for(pred, timeout: float = 30.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_the_flush_rest_submission_carries_its_bearer_on_stdin_never_argv(tmp_path):
+    """The REST submission runs in the DETACHED child, where nothing else ever
+    looked: `-H "Authorization: Bearer $KB_TOKEN"` sat there long after every
+    sibling had moved to the stdin config. Assert against the recorded process,
+    not the source."""
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recording_curl(home, rec_dir)
+    work = tmp_path / "argvproj"
+    transcript = _transcript(work / "t.jsonl")
+    (home / ".claude" / "kb-flush.env").write_text(
+        f"KB_REST_URL=http://127.0.0.1:9\nKB_TOKEN={FAKE_PROJECT_TOKEN}\n"
+    )
+    res = _run_hook(
+        FLUSH,
+        {
+            "transcript_path": str(transcript),
+            "cwd": str(work),
+            "session_id": "s-argv",
+            "hook_event_name": "SessionEnd",
+        },
+        home,
+        {"PATH": f"{binp}:{os.environ.get('PATH', '')}", "CURL_REC": str(rec_dir)},
+    )
+    assert res.returncode == 0, res.stderr
+
+    def _submitted() -> bool:
+        try:
+            return any("/api/ingest-session" in u for u in _recorded(rec_dir, "url"))
+        except FileNotFoundError:
+            return False
+
+    assert _wait_for(_submitted), (
+        "the flush child never invoked curl for the submission; flush log: "
+        + (home / ".claude/hooks/flush-session.log").read_text(errors="replace")
+    )
+    urls = _recorded(rec_dir, "url")
+    argvs = _recorded(rec_dir, "argv")
+    stdins = _recorded(rec_dir, "stdin")
+    idx = [n for n, u in enumerate(urls) if "/api/ingest-session" in u]
+    assert idx
+    for n in idx:
+        assert FAKE_PROJECT_TOKEN not in argvs[n], (
+            f"the bearer is on the curl command line: {argvs[n]!r}"
+        )
+        assert "Authorization" not in argvs[n], f"an auth header is built in argv: {argvs[n]!r}"
+        assert FAKE_PROJECT_TOKEN in stdins[n], (
+            "the bearer is not on argv, but it is not on stdin either — the "
+            "submission is now unauthenticated"
+        )
+
+
+_MCP_CURL = r"""#!/usr/bin/env bash
+# curl stand-in for the MCP client: records argv + the stdin config, then plays
+# the server's part by CALL NUMBER -- 1: the initialize response (the session id
+# travels in a header, which `curl -D -` dumps to stdout); 2: the initialized
+# notification (no body); 3: the tools/call result; 4: the session DELETE.
+# Never a network.
+D="$CURL_REC"
+mkdir -p "$D"
+N=$(( $(cat "$D/.n" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$N" >"$D/.n"
+printf '%s\n' "$*" >"$D/argv.$N"
+: >"$D/stdin.$N"
+for a in "$@"; do
+  if [ "$a" = "-K" ]; then cat >"$D/stdin.$N"; break; fi
+done
+case "$N" in
+  1) printf 'HTTP/1.1 200 OK\r\nMcp-Session-Id: sess-argv-test\r\n\r\n' ;;
+  3) printf '%s' '{"jsonrpc":"2.0","id":2,"result":{"isError":false,' \
+       '"content":[{"type":"text","text":"queued 42"}]}}' ;;
+esac
+exit 0
+"""
+
+
+def test_the_mcp_helper_carries_its_bearer_on_stdin_on_all_four_requests(tmp_path):
+    """kb-mcp-call.sh makes FOUR credentialed requests per chunk (initialize,
+    initialized, tools/call, session DELETE), and every one used to interpolate
+    the bearer into `-H "$AUTH"` — one chunked flush paraded the token through
+    /proc/<pid>/cmdline ~117 times. All four must now read it from stdin."""
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = home / "bin"
+    binp.mkdir(parents=True, exist_ok=True)
+    curl = binp / "curl"
+    curl.write_text(_MCP_CURL)
+    curl.chmod(0o755)
+    rec_dir.mkdir(exist_ok=True)
+    res = _run_hook(
+        MCPCALL,
+        "",
+        home,
+        {
+            "PATH": f"{binp}:{os.environ.get('PATH', '')}",
+            "CURL_REC": str(rec_dir),
+            "KB_MCP_URL": "http://127.0.0.1:9/mcp",
+            "KB_TOKEN": FAKE_PROJECT_TOKEN,
+        },
+        args=("kb_stats", "{}"),
+    )
+    assert res.returncode == 0, res.stderr + res.stdout
+    assert res.stdout.strip() == "queued 42", (
+        f"the tool result did not survive the transport change: {res.stdout!r}"
+    )
+    argvs = _recorded(rec_dir, "argv")
+    stdins = _recorded(rec_dir, "stdin")
+    assert len(argvs) == 4, f"expected the full 4-request MCP conversation, got {len(argvs)}"
+    for n, (argv, stdin) in enumerate(zip(argvs, stdins, strict=True), start=1):
+        assert FAKE_PROJECT_TOKEN not in argv, (
+            f"request {n} put the bearer on the curl command line: {argv!r}"
+        )
+        assert "Authorization" not in argv, f"request {n} builds an auth header in argv: {argv!r}"
+        assert FAKE_PROJECT_TOKEN in stdin, (
+            f"request {n} sent no bearer at all — it is unauthenticated"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Behavioural + structural: the dispatcher's per-child timeout and event argv
+# ---------------------------------------------------------------------------
+#
+# Review #3 wave D. (a) The children run SEQUENTIALLY, so before the per-child
+# bound one wedged child owned the whole hook slot: a hung turn-start spent the
+# entire UserPromptSubmit budget and the recall behind it never ran. (b) The
+# children used to re-derive the event name from the stdin JSON — and the one
+# case the dispatcher exists for (an EMPTY stdin) is exactly the case where
+# stdin says nothing, while the dispatcher's own argv always carries it.
+
+
+@pytest.mark.parametrize("event", sorted(_DISPATCH_MAP))
+def test_every_child_receives_the_event_name_as_its_first_argument(tmp_path, event: str):
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(tmp_path, event, {"hook_event_name": event}, home)
+    assert res.returncode == 0, res.stderr
+    for tag in _DISPATCH_MAP[event]:
+        args = (rec / f"args.{tag}").read_text().splitlines()
+        assert args and args[0] == event, (
+            f"{tag} received argv {args!r} for {event} — the event name must arrive as $1"
+        )
+
+
+def test_the_event_name_reaches_the_children_even_when_stdin_is_empty(tmp_path):
+    """The payoff case: the residual Windows bug hands the hook an empty stream,
+    and a child that needed stdin for the event name got NOTHING. Our argv still
+    knows the event, and it must arrive."""
+    home = _hook_home(tmp_path)
+    res, rec = _run_dispatch(tmp_path, "UserPromptSubmit", "", home)
+    assert res.returncode == 0, res.stderr
+    for tag in ("TURN", "BRIEF"):
+        args = (rec / f"args.{tag}").read_text().splitlines()
+        assert args and args[0] == "UserPromptSubmit", (
+            f"{tag} lost the event name exactly when stdin was empty: {args!r}"
+        )
+
+
+_HUNG_CHILD = """#!/usr/bin/env bash
+# A child that wedges: records that it ran, then blocks far past its budget.
+# Its stdio is pointed at /dev/null BEFORE the block so the orphaned sleep
+# cannot hold the dispatcher's stdout pipe open after the child is killed.
+D="$KB_DISPATCH_REC"
+mkdir -p "$D"
+printf 'HUNG\\n' >>"$D/order"
+exec >/dev/null 2>&1 </dev/null
+sleep 300
+"""
+
+
+def test_a_hung_child_is_killed_at_its_budget_and_later_children_still_run(tmp_path):
+    """turn-start's budget is 5 s; a child that sleeps 300 must cost ~5 s, not
+    the whole slot, and the recall behind it must still run and still have its
+    stdout injected."""
+    home = _hook_home(tmp_path)
+    hookdir = _dispatch_dir(tmp_path)
+    hung = hookdir / "turn-start.sh"
+    hung.write_text(_HUNG_CHILD)
+    hung.chmod(0o755)
+    rec_dir = tmp_path / "rec"
+    rec_dir.mkdir(exist_ok=True)
+    t0 = time.monotonic()
+    res = _run_hook(
+        hookdir / "kb-hook-dispatch.sh",
+        {"hook_event_name": "UserPromptSubmit"},
+        home,
+        {"KB_DISPATCH_REC": str(rec_dir), "OUT_BRIEF": "[KB recall] survived\n"},
+        args=("UserPromptSubmit",),
+    )
+    elapsed = time.monotonic() - t0
+    assert res.returncode == 0, res.stderr
+    assert _fired(rec_dir) == ["HUNG", "BRIEF"], (
+        f"a hung first child swallowed the rest of the event: {_fired(rec_dir)!r}"
+    )
+    assert res.stdout == "[KB recall] survived\n", res.stdout
+    assert elapsed < 60, (
+        f"the hung child was not killed at its budget (the dispatch took {elapsed:.0f}s)"
+    )
+
+
+def _dispatcher_budgets() -> dict[str, dict[str, int]]:
+    """{event: {child: seconds}} parsed from the dispatcher's own map, so the
+    arithmetic below is over what ships, not over what this test remembers."""
+    out: dict[str, dict[str, int]] = {}
+    for m in re.finditer(r'^\s*([A-Za-z| ]+)\)\s*CHILDREN="([^"]+)"', DISPATCH.read_text(), re.M):
+        entries: dict[str, int] = {}
+        for tok in m.group(2).split():
+            name, sep, budget = tok.partition(":")
+            assert sep, f"dispatcher child {tok!r} carries no timeout budget"
+            entries[name] = int(budget)
+        for ev in m.group(1).split("|"):
+            out[ev.strip()] = entries
+    return out
+
+
+def _registered_timeouts() -> dict[str, int]:
+    """The per-event hook timeouts install.sh registers, read from the jq branch
+    (the python branch is pinned byte-identical to it by rig case 20)."""
+    found = dict(re.findall(r'kb_entry (\w+) "[^"]*" (\d+)', INSTALL.read_text()))
+    assert set(found) == {"PreCompact", "SessionEnd", "SessionStart", "UserPromptSubmit", "Stop"}
+    return {k: int(v) for k, v in found.items()}
+
+
+def test_the_per_child_budgets_fit_inside_the_registered_hook_slots():
+    """The budgets only help if the dispatcher finishes INSIDE its slot instead
+    of being killed by it — so per event, the child budgets must SUM below the
+    timeout install.sh registers. The flush events are the documented exception:
+    that hook detaches its real work in under a second, and its oversized budget
+    is a runaway net that must not cut off the 45 s token auto-mint."""
+    budgets = _dispatcher_budgets()
+    slots = _registered_timeouts()
+    assert set(budgets) == set(slots), (
+        f"dispatcher events {sorted(budgets)} != registered events {sorted(slots)}"
+    )
+    for ev, slot in slots.items():
+        if ev in ("PreCompact", "SessionEnd"):
+            assert budgets[ev] == {"flush-session-to-kb.sh": 300}, (
+                f"{ev}: the flush exception changed shape: {budgets[ev]!r}"
+            )
+            continue
+        total = sum(budgets[ev].values())
+        assert total < slot, (
+            f"{ev}: child budgets sum to {total}s, which does not fit under the "
+            f"registered {slot}s slot — a hung child would eat the hook slot again"
+        )
+    text = DISPATCH.read_text()
+    assert 'kb_timeout "$_kbb" "${BASH:-bash}" "$_kbs" "$EV"' in text, (
+        "the fan-out no longer bounds each child AND forwards the event as $1"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: credential files are 0600 from their FIRST byte (install umask)
+# ---------------------------------------------------------------------------
+
+
+def test_enrolment_writes_the_token_file_0600_at_creation_not_via_chmod(tmp_path):
+    """The LOW-3 fix, recreated for kb-tokens.env (review #3 wave D). The token
+    line travelled through a DEFAULT-UMASK temp (`grep > .t`, then mv): 0644
+    with the credential inside until a later chmod, and permanently 0644 if the
+    installer died in between. mv PRESERVES the temp's mode, so the fix must be
+    at CREATION — proven here by running the installer under umask 022 with
+    chmod turned into a no-op: the mode must hold by construction."""
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recording_curl(home, rec_dir)
+    (binp / "chmod").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (binp / "chmod").chmod(0o755)
+    wrapper = tmp_path / "umask022-install.sh"
+    wrapper.write_text(f'#!/usr/bin/env bash\numask 022\nexec bash "{INSTALL}"\n')
+    reply = json.dumps(
+        {"token": FAKE_REDEEMED, "project": "argvproj", "principal": "proj-argvproj--box"}
+    )
+    res = _run_hook(
+        wrapper,
+        {},
+        home,
+        {
+            "PATH": f"{binp}:{os.environ.get('PATH', '')}",
+            "CURL_REC": str(rec_dir),
+            "KB_REST_URL": "http://127.0.0.1:9",
+            "KB_ENROL_CODE": FAKE_ENROL_CODE,
+            "CURL_ENROL_REPLY": reply,
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    tokens = home / ".claude" / "kb-tokens.env"
+    assert tokens.exists(), res.stdout + res.stderr
+    assert f"KB_TOKEN_ARGVPROJ={FAKE_REDEEMED}\n" in tokens.read_text()
+    assert (tokens.stat().st_mode & 0o777) == 0o600, (
+        f"kb-tokens.env is {oct(tokens.stat().st_mode & 0o777)} without chmod's help — "
+        "the credential was world-readable at some point of its life"
+    )
+    cfg = home / ".claude" / "kb-flush.env"
+    assert (cfg.stat().st_mode & 0o777) == 0o600, (
+        f"kb-flush.env is {oct(cfg.stat().st_mode & 0o777)} without chmod's help"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Behavioural: the failure notifier redacts the journal excerpt it ships
+# ---------------------------------------------------------------------------
+
+
+def test_the_failure_notifier_redacts_credentials_from_the_journal_excerpt(tmp_path):
+    """kb-notify-fail.sh ships two raw journald lines to an external ntfy server,
+    and journald keeps credentials in the clear — log lines are where an ntfy
+    admin password already leaked once. A planted kbg_ token (bare AND as a
+    Bearer header) must leave the box as ***; the notifier's own credential must
+    still travel on stdin, never argv."""
+    home = _hook_home(tmp_path)
+    rec_dir = tmp_path / "rec"
+    binp = _recording_curl(home, rec_dir)
+    (binp / "journalctl").write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'auth retry with Authorization: Bearer {FAKE_PROJECT_TOKEN}\\n'\n"
+        f"printf 'flush refused for token {FAKE_PROJECT_TOKEN}\\n'\n"
+    )
+    (binp / "journalctl").chmod(0o755)
+    (binp / "systemctl").write_text("#!/usr/bin/env bash\necho exit-code\n")
+    (binp / "systemctl").chmod(0o755)
+    (home / ".claude" / "notify.env").write_text(
+        "NTFY_URL=http://127.0.0.1:9\nNTFY_TOPIC=some-topic\nNTFY_MACHINE=testbox\n"
+        f"NTFY_TOKEN={FAKE_NTFY_TOKEN}\n"
+    )
+    res = _run_hook(
+        NOTIFY_FAIL,
+        "",
+        home,
+        {"PATH": f"{binp}:{os.environ.get('PATH', '')}", "CURL_REC": str(rec_dir)},
+        args=("kb-consolidate.service",),
+    )
+    assert res.returncode == 0, res.stderr
+    argvs = _recorded(rec_dir, "argv")
+    assert argvs, "the notifier never invoked curl"
+    push = argvs[0]
+    assert FAKE_PROJECT_TOKEN not in push, (
+        f"the planted credential left the box in the push body: {push!r}"
+    )
+    assert "***" in push, f"nothing was redacted: {push!r}"
+    assert "Bearer ***" in push, f"the Bearer value survived: {push!r}"
+    assert FAKE_NTFY_TOKEN not in push, "the notifier's own credential reached argv"
+    assert any(FAKE_NTFY_TOKEN in s for s in _recorded(rec_dir, "stdin")), (
+        "the push is now unauthenticated"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structural: every function that mints a plaintext secret is REGISTERED for
+# scrubbing
+# ---------------------------------------------------------------------------
+#
+# CLAUDE.md rule 12: every secret this system issues must be matched by a scrub
+# pattern so it cannot survive ingest — and kbg_, kbe_ and tk_ were each missed
+# IN TURN because kbcore.scrub.MINTED_SECRETS was tied to nothing but its
+# author's memory. The convention now (review #3 wave D): a minter's docstring
+# carries the marker sentence, this test greps kbcore for it, and a new minter
+# that writes the marker but skips the registry fails the build.
+
+_MINT_MARKER = "returns the plaintext secret exactly once"
+
+
+def _marked_minters() -> set[str]:
+    """Every kbcore function whose DOCSTRING carries the marker, by qualified
+    name — resolved with ast so a mention in a comment or a nearby string can
+    never count. Whitespace-normalised before matching, so the sentence may
+    wrap across docstring lines."""
+    import ast
+
+    src_root = REPO / "src"
+    marked: set[str] = set()
+    for path in sorted((src_root / "kbcore").rglob("*.py")):
+        module = ".".join(path.relative_to(src_root).with_suffix("").parts)
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = " ".join((ast.get_docstring(node) or "").split())
+                if _MINT_MARKER in doc.lower():
+                    marked.add(f"{module}.{node.name}")
+    return marked
+
+
+def test_every_marked_minter_is_registered_in_MINTED_SECRETS():
+    from kbcore.scrub import MINTED_SECRETS
+
+    marked = _marked_minters()
+    # The floor keeps the tripwire from going vacuous: these four really do
+    # return a plaintext credential today, so a lost marker is a red test too.
+    # (store_drive_token RECEIVES its secret and returns nothing, so it is
+    # registered without the marker — see the note beside MINTED_SECRETS.)
+    floor = {
+        "kbcore.principals.create_principal",
+        "kbcore.project_tokens.issue",
+        "kbcore.enrolment.mint_code",
+        "kbcore.offsite_config.generate_age_keypair",
+    }
+    assert floor <= marked, f"minters lost their docstring marker: {sorted(floor - marked)}"
+    unregistered = sorted(marked - set(MINTED_SECRETS))
+    assert not unregistered, (
+        f"functions marked as minting a plaintext secret are MISSING from "
+        f"kbcore.scrub.MINTED_SECRETS: {unregistered} — their credential shape "
+        "would survive ingest unredacted"
+    )

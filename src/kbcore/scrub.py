@@ -108,6 +108,17 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # SECRET_PATTERNS entry AND each function still exists — so the NEXT minter added
 # without a matching pattern fails the build instead of shipping an unredactable
 # credential (kbg_, kbe_ and tk_ were each missed in turn before this was a check).
+#
+# MARKER CONVENTION (review #3 wave D, 2026-08-14) — the OTHER direction, tied
+# to source rather than to this dict's author remembering it exists: every
+# minter's docstring carries the sentence "returns the plaintext secret exactly
+# once", and tests/test_capture_funnel.py greps kbcore for that marker and fails
+# if any marked function is absent from this registry. A NEW minter therefore
+# writes the marker (the review convention for any function handing back a
+# plaintext credential) and the tripwire catches the registry omission
+# mechanically. store_drive_token is the one registry entry WITHOUT the marker:
+# it RECEIVES the secret as an argument and returns nothing, so the sentence
+# would be false in its docstring — it stays hand-registered here.
 MINTED_SECRETS: dict[str, str] = {
     "kbcore.principals.create_principal": "kb_token",  # kbg_ grantee bearer
     "kbcore.project_tokens.issue": "kb_token",  # kbg_ per-project token

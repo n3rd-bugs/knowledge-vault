@@ -71,6 +71,11 @@ def repair_cross_twins(
     cap: int | None = typer.Option(
         None, "--cap", help="max candidate pairs enumerated + judged (0 = kill switch)"
     ),
+    probe_limit: int | None = typer.Option(
+        None,
+        "--probe-limit",
+        help="max items KNN-probed, newest first (default: kb_xtwin_probe_limit; 0 = all)",
+    ),
     apply: bool = typer.Option(
         False, "--apply", help="create the links (default: dry run, writes nothing)"
     ),
@@ -80,9 +85,11 @@ def repair_cross_twins(
     retires and flips no status: nothing leaves any project's search surface (Inv 5)."""
 
     def _dry() -> list:
-        pairs = twin_crossproject.enumerate_candidates(
-            project_a, project_b, threshold=threshold, cap=cap
+        pairs, coverage = twin_crossproject.probe_candidates(
+            project_a, project_b, threshold=threshold, cap=cap, probe_limit=probe_limit
         )
+        # No silent caps (review #3, KB 19663): a bounded scan must SAY it was bounded.
+        typer.echo(coverage.render())
         return twin_crossproject.plan(pairs)
 
     _flow(

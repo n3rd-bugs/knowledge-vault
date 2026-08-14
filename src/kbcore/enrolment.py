@@ -59,7 +59,9 @@ def _hash(code: str) -> str:
 
 
 def mint_code() -> str:
-    """A fresh ``kbe_`` enrolment code (plaintext, shown once)."""
+    """A fresh ``kbe_`` enrolment code — returns the plaintext secret exactly
+    once (the marker sentence: see the registry note on
+    :data:`kbcore.scrub.MINTED_SECRETS`, which must list this function)."""
     return CODE_PREFIX + secrets.token_urlsafe(_CODE_NBYTES)
 
 

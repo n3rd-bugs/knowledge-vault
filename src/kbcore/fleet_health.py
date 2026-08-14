@@ -87,6 +87,39 @@ def degenerate_by_project(hours: int = FLEET_WINDOW_HOURS) -> dict[str, dict[str
     return out
 
 
+def fleet_by_box(hours: int = FLEET_WINDOW_HOURS) -> dict[str, dict[str, int]]:
+    """Per SUBMITTING BOX: the degenerate/total split, keyed by the authenticated
+    principal the enqueue path stamps into ``meta->>'submitted_by'`` (KB 19663).
+
+    Review #3 P2 (box identity): the server always AUTHENTICATED a per-machine
+    principal at ingest and then discarded it, so the project view could say
+    "someone on pre-fix hooks submitted into project X" but never WHICH BOX to go
+    fix. This is the same read-only aggregate keyed by the submitter instead —
+    deliberately the SAME shape as :func:`degenerate_by_project`, so the digest's
+    tolerant reader (:func:`stale_hook_projects`) reads either view unchanged.
+
+    Rows enqueued before the stamp existed group under ``(unknown)``, which is
+    itself signal: an unknown box is a box on old code — exactly the population
+    this module exists to find. Rides the nightly report as the ADDED key
+    ``fleet_by_box`` beside the project view; nothing is renamed.
+    """
+    window = max(1, int(hours))
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT coalesce(nullif(btrim(meta->>'submitted_by'), ''), '(unknown)') AS box,
+                   count(*) FILTER (WHERE {_DEGENERATE_URI_SQL}) AS degenerate,
+                   count(*) AS total
+              FROM ingest_queue
+             WHERE created_at > now() - make_interval(hours => %s)
+             GROUP BY box
+             ORDER BY box
+            """,  # noqa: S608 — _DEGENERATE_URI_SQL is a constant fragment
+            (window,),
+        ).fetchall()
+    return {str(b): {"degenerate": int(d), "total": int(t)} for b, d, t in rows}
+
+
 def stale_hook_projects(report: Any) -> list[str]:
     """The projects in a :func:`degenerate_by_project` report with a live problem.
 

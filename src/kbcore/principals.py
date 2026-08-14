@@ -70,8 +70,10 @@ def create_principal(
 ) -> tuple[int, str | None]:
     """Create a grantee. Returns ``(principal_id, plaintext_token | None)``.
 
-    ``kind='token'`` mints a ``kbg_`` bearer and stores only its hash — the
-    plaintext is returned ONCE and never recoverable. ``kind='google'`` binds a
+    ``kind='token'`` mints a ``kbg_`` bearer, stores only its hash, and returns
+    the plaintext secret exactly once — never recoverable afterwards (the marker
+    sentence: :data:`kbcore.scrub.MINTED_SECRETS` must list this function).
+    ``kind='google'`` binds a
     verified email (for the claude.ai connector / web UI) and returns no token.
     ``role`` is the capability bundle (plan §2), validated against
     :data:`kbcore.scope.ROLE_CAPS` — 'owner' is not creatable (never a row).

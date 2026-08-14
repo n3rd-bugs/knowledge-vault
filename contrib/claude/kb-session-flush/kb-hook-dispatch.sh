@@ -19,9 +19,11 @@
 # CONTRACT
 #   * usage: kb-hook-dispatch.sh <event>
 #   * children are resolved beside THIS script, run SEQUENTIALLY, in map order;
-#   * every child gets byte-identical stdin, and its stdout/stderr pass through
-#     UNTOUCHED (the brief's stdout IS the injected context);
-#   * a child that fails, or is missing, never stops a later one;
+#   * every child gets byte-identical stdin AND the event name as $1 (stdin can
+#     arrive empty -- see below -- but our argv always carries the event);
+#   * every child runs under a PER-CHILD timeout, so one hung child cannot eat
+#     the hook slot for the children behind it;
+#   * a child that fails, times out, or is missing, never stops a later one;
 #   * an unknown event runs nothing;
 #   * ALWAYS exits 0 -- a dispatcher that failed a session would be worse than
 #     the bug it works around;
@@ -50,17 +52,84 @@ kb_winpath() {
   printf '%s' "$_kbp"
 }
 
+# A TRUSTWORTHY timeout, trimmed from the portable block for the same reason as
+# kb_winpath above (this script deliberately does not carry the whole block).
+# A binary merely NAMED `timeout` is not enough: on Git Bash `command -v
+# timeout` resolves to C:\Windows\System32\timeout.exe -- a WAIT utility that
+# cannot run a command and errors on redirected stdin -- so trusting the name
+# would make every per-child bound below a silent no-op. Trust a candidate only
+# if it behaves like GNU/BSD timeout: a coreutils --version, or a self-test that
+# really bounds a command with stdin redirected. Else gtimeout, else a perl
+# watchdog (Git Bash ships perl), else run unbounded rather than mis-invoke.
+_kb_timeout_ok() {
+  [ -n "${1:-}" ] || return 1
+  "$1" --version 2>/dev/null | grep -qi coreutils && return 0
+  "$1" 1 true </dev/null >/dev/null 2>&1
+}
+KB_TIMEOUT_BIN=""
+KB_TIMEOUT_PROBED=0
+kb_timeout() { # <seconds> cmd...
+  if [ "$KB_TIMEOUT_PROBED" = 0 ]; then
+    KB_TIMEOUT_PROBED=1
+    for _kbt in "$(command -v timeout 2>/dev/null || true)" "$(command -v gtimeout 2>/dev/null || true)"; do
+      [ -n "$_kbt" ] || continue
+      if _kb_timeout_ok "$_kbt"; then
+        KB_TIMEOUT_BIN="$_kbt"
+        break
+      fi
+    done
+  fi
+  _kbd="$1"
+  shift
+  if [ -n "$KB_TIMEOUT_BIN" ]; then
+    "$KB_TIMEOUT_BIN" "$_kbd" "$@"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -e '
+      my $t = shift @ARGV;
+      my $pid = fork();
+      if (!defined $pid) { exit 127; }   # fork failed: bail, do NOT exec unbounded
+      if ($pid == 0)     { exec @ARGV or exit 127; }
+      my $to = 0;
+      local $SIG{ALRM} = sub { $to = 1; kill "TERM", $pid; };
+      alarm $t;
+      waitpid($pid, 0);
+      my $rc = $?;
+      alarm 0;
+      exit 124 if $to;
+      exit(($rc & 127) ? 128 + ($rc & 127) : ($rc >> 8));
+    ' "$_kbd" "$@"
+  else
+    "$@"
+  fi
+}
+
 HOOKDIR="$(cd "$(dirname "$(kb_winpath "$0")")" 2>/dev/null && pwd)"
 [ -n "$HOOKDIR" ] || HOOKDIR="$HOME/.claude/hooks"
 
-# The map. ORDER MATTERS on UserPromptSubmit: turn-start.sh is a ~5 ms stamp and
-# must not sit behind the recall's 35 s budget, and the recall's stdout is the
+# The map, with a PER-CHILD TIMEOUT in seconds after each name. The children run
+# SEQUENTIALLY, so before this bound one wedged child owned the WHOLE hook slot:
+# a hung turn-start.sh spent the entire UserPromptSubmit budget and the recall
+# behind it never ran at all. Each child is killed (TERM, rc 124) at its budget
+# and the NEXT child still runs.
+#
+# The budgets are set against install.sh's registered per-event timeouts
+# (PreCompact 15 / SessionEnd 15 / SessionStart 35 / UserPromptSubmit 40 /
+# Stop 15) so the dispatcher finishes INSIDE its slot instead of being killed by
+# it: turn-start 5 + brief 34 = 39 < 40; brief 34 < 35; notify 12 < 15. The
+# flush is the deliberate exception: its hook detaches its real work in well
+# under a second, so 300 is a runaway net for a pathological pre-detach hang (a
+# dead mount, a wedged uv) -- it exceeds the 15 s slot on purpose, because the
+# one slow LEGITIMATE path (first-time token auto-mint, bounded at 45 s
+# internally) must never be cut off by its own watchdog.
+#
+# ORDER MATTERS on UserPromptSubmit: turn-start.sh is a ~5 ms stamp and
+# must not sit behind the recall's budget, and the recall's stdout is the
 # last thing written, which is what Claude Code injects.
 case "$EV" in
-  PreCompact | SessionEnd) CHILDREN="flush-session-to-kb.sh" ;;
-  SessionStart) CHILDREN="kb-session-brief.sh" ;;
-  UserPromptSubmit) CHILDREN="turn-start.sh kb-session-brief.sh" ;;
-  Stop) CHILDREN="notify-complete.sh" ;;
+  PreCompact | SessionEnd) CHILDREN="flush-session-to-kb.sh:300" ;;
+  SessionStart) CHILDREN="kb-session-brief.sh:34" ;;
+  UserPromptSubmit) CHILDREN="turn-start.sh:5 kb-session-brief.sh:34" ;;
+  Stop) CHILDREN="notify-complete.sh:12" ;;
   *)
     # Unknown (or missing) event: run nothing. Still drain stdin so the writer
     # upstream never blocks or takes a SIGPIPE on our account.
@@ -92,10 +161,21 @@ fi
 # Sequential fan-out. `bash <script>` rather than executing it directly: on Git
 # Bash the exec bit is not always meaningful, and we are already a bash process
 # so $BASH is the interpreter we know exists.
+#
+# THE EVENT NAME TRAVELS AS $1. The dispatcher is the only process that reliably
+# knows it -- it arrives on OUR argv from the settings.json registration, so an
+# event whose stdin came up EMPTY (the residual upstream bug logged above) still
+# carries it -- while a child re-deriving it from the stdin JSON reads nothing at
+# all in exactly that case. Children that do not need it ignore extra argv.
+#
+# `|| true` covers a failing AND a timed-out (rc 124) child: neither may stop a
+# later sibling or the exit code.
 for _kbc in $CHILDREN; do
-  _kbs="$HOOKDIR/$_kbc"
+  _kbn="${_kbc%%:*}"
+  _kbb="${_kbc##*:}"
+  _kbs="$HOOKDIR/$_kbn"
   [ -f "$_kbs" ] || continue
-  printf '%s' "$INPUT" | "${BASH:-bash}" "$_kbs" || true
+  printf '%s' "$INPUT" | kb_timeout "$_kbb" "${BASH:-bash}" "$_kbs" "$EV" || true
 done
 
 exit 0

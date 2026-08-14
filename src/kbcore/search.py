@@ -191,14 +191,18 @@ def search(
                 settings.kb_rerank_top_n,
                 evidence=_rerank_evidence(fused),
             )
-        # (4) Rank-time twin collapse: fold a cross-project 'alternative_to' twin
+        # (4) Rank-time twin collapse: fold a cross-project 'alternative_to' twin.
+        # The {winner: [losers]} map is KEPT (review #3, KB 19663), not discarded.
+        folded: dict[int, list[int]] = {}
         if settings.kb_collapse_alternatives and fused:
-            fused, _ = search_rank.collapse_alternatives(conn, fused)
+            fused, folded = search_rank.collapse_alternatives(conn, fused)
     # Materialize ALL fused candidates before truncating: the verified >=
     # unverified tie-break must apply globally, not only inside the top-k
     # window (review finding — an unverified item tied at the k boundary used
     # to displace a verified one).
     hits = _to_hits(fused)[:k]
+    for h in hits:  # stamp the collapse map on the kept hit (additive; [] when off)
+        h.collapsed = folded.get(h.item_id, [])
     # tool=None → skip access logging (the eval harness replays golden queries and
     # must not stamp items 'recently used', which would pin them against archiving).
     if tool is not None:
@@ -382,5 +386,8 @@ def _log_access(hits: list[SearchHit], tool: str, query: str) -> None:
     with transaction() as conn:
         conn.cursor().executemany(
             "INSERT INTO access_log (item_id, tool, query, principal) VALUES (%s, %s, %s, %s)",
-            [(h.item_id, tool, query, pname) for h in hits],
+            # A hit's collapsed twins were RECALLED too — folded into the winner, not
+            # absent — so the LOSER is logged at the same chokepoint (KB 19663): being
+            # folded must never route an item into 'never recalled' expiry/archive paths.
+            [(i, tool, query, pname) for h in hits for i in (h.item_id, *h.collapsed)],
         )

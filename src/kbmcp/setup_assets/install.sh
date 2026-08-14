@@ -413,6 +413,13 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
         [ -f "$TOKENS_ENV" ] || install -m 600 /dev/null "$TOKENS_ENV"
         PKEY=$(printf '%s' "$ENROL_PROJ" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')
         # Replace any previous line for this project rather than appending.
+        # The TEMP is 0600 AT CREATION too (the LOW-3 fix, applied to the one
+        # credential write that had missed it): a default-umask `>` creates the
+        # temp 0644 with the token in it, and mv PRESERVES that mode -- so the
+        # file was world-readable until the chmod below, and permanently if the
+        # installer died in between. install(1) sets the mode atomically; the
+        # `>` truncate keeps an existing file's mode.
+        install -m 600 /dev/null "$TOKENS_ENV.t"
         grep -v "^KB_TOKEN_${PKEY}=" "$TOKENS_ENV" >"$TOKENS_ENV.t" 2>/dev/null || true
         printf 'KB_TOKEN_%s=%s\n' "$PKEY" "$ENROL_TOK" >>"$TOKENS_ENV.t"
         mv "$TOKENS_ENV.t" "$TOKENS_ENV"
@@ -786,8 +793,13 @@ if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_SETUP_BEARER:-}${KB_TOKEN:-}${KB_ENRO
     if [ -f "$_nf" ]; then
       echo "notify:   $_nf already exists — left alone (delete it to re-fetch)"
     else
-      umask 077
-      printf '%s' "$_notify" > "$_nf"
+      # The umask is scoped to a SUBSHELL (the LOW-3 discipline): the file is
+      # 0600 from its first byte, and the installer's own umask is not silently
+      # rewritten for whatever runs after this block.
+      (
+        umask 077
+        printf '%s' "$_notify" > "$_nf"
+      )
       chmod 600 "$_nf" 2>/dev/null || true
       # The token is never echoed — only that a channel was configured.
       echo "notify:   $_nf written (completion notifications enabled)"

@@ -11,7 +11,7 @@ from datetime import datetime
 
 import typer
 
-from kbcli import expire_cmds
+from kbcli import expire_cmds, promote_cmds
 from kbcore import render, review_apply, review_auto, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
@@ -25,6 +25,10 @@ review_app = typer.Typer(help="Review queue: promote/reject/supersede unverified
 # does, so the two commands behave like any other in the group.
 review_app.command("expire")(expire_cmds.review_expire_cmd)
 review_app.command("undo-expiry")(expire_cmds.review_undo_expiry)
+# The PROMOTE PROGRAM pair (review #3 P1, KB 19663) lives in kbcli.promote_cmds
+# for the same ratchet reason: `kb review promote-candidates` / `promote-batch`.
+review_app.command("promote-candidates")(promote_cmds.review_promote_candidates)
+review_app.command("promote-batch")(promote_cmds.review_promote_batch)
 
 
 def _fail(err: Exception) -> None:

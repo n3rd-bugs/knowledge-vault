@@ -62,7 +62,26 @@ RESULT="$(systemctl --user show -p Result --value "$UNIT" 2>/dev/null || true)"
 # credential still appears in the clear (the KB scrubs what it stores; journald
 # does not). Two lines, 160 characters — enough to tell "OOM" from "no such
 # host", with `journalctl --user -u <unit>` one command away for the rest.
-TAIL="$(journalctl --user -u "$UNIT" -n 2 --no-pager -o cat 2>/dev/null | tr '\n' ' ' | cut -c1-160 || true)"
+#
+# REDACTED before it leaves the box. The excerpt is raw journald text and ships
+# to an external ntfy server, so it passes through a shell-side redaction first:
+# the shell-greppable prefixes of kbcore.scrub's SECRET_PATTERNS — kbg_/kbe_
+# (the credentials this system itself mints), ghp_, tk_ (the ntfy token, which
+# is exactly the secret most likely to appear in THIS unit's journal), the age
+# backup identity, the Google refresh token, and any Bearer value — each
+# replaced with a plain ASCII '***'. Redaction runs BEFORE the 160-char cut, so
+# the cut can never leave a live token half visible at the boundary; the output
+# stays ASCII and stays bounded exactly as before.
+kb_redact() { # stdin -> stdout with credential shapes replaced by ***
+  sed -E \
+    -e 's/kb[ge]_[A-Za-z0-9_-]+/***/g' \
+    -e 's/ghp_[A-Za-z0-9]+/***/g' \
+    -e 's/tk_[A-Za-z0-9]+/***/g' \
+    -e 's/AGE-SECRET-KEY-[0-9A-Z]+/***/g' \
+    -e 's|1//0[A-Za-z0-9_-]+|***|g' \
+    -e 's/[Bb]earer +[A-Za-z0-9+/=._-]+/Bearer ***/g'
+}
+TAIL="$(journalctl --user -u "$UNIT" -n 2 --no-pager -o cat 2>/dev/null | tr '\n' ' ' | kb_redact | cut -c1-160 || true)"
 MSG="FAILED: ${UNIT} @ ${MACHINE} (result=${RESULT:-unknown}) ${TAIL}"
 
 # BOUNDED RETRY WITH BACKOFF. The failures most worth alerting on cluster around

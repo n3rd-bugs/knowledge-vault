@@ -353,6 +353,20 @@ def test_digest_surfaces_the_auto_apply_row_only_dispositions():
     assert all(line.isascii() for line in lines), "this goes out over ntfy to a phone"
 
 
+def test_digest_carries_the_promote_worthy_line_positive_only():
+    """The PROMOTE PROGRAM (review #3 strategic P1, KB 19663): the owner sees the
+    recall-proven unverified queue exists without asking. POSITIVE-ONLY like its
+    neighbours — a nightly 'promote-worthy: 0' would be noise — and pure ASCII
+    (this goes out over ntfy to a phone). ADD-only: existing lines untouched."""
+    lines = tail_steps.digest_lines({"queued_drained": 1, "promote_candidates": 12})
+    assert "drained: 1" in lines
+    assert "promote-worthy: 12" in lines
+    assert all(line.isascii() for line in lines)
+    for counts in ({"queued_drained": 1, "promote_candidates": 0}, {"queued_drained": 1}):
+        quiet = tail_steps.digest_lines(counts)
+        assert not any(line.startswith("promote-worthy") for line in quiet)
+
+
 def test_digest_says_nothing_about_winners_when_there_were_none():
     """POSITIVE-ONLY, like every other auto-apply line: a nightly 'cluster winners:
     0' would be noise in the message that has to stay worth reading."""

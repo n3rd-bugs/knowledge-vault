@@ -120,6 +120,11 @@ class SearchHit(BaseModel):
     valid_from: datetime | None = None  # valid-time interval (WP1); NULL = unbounded
     valid_to: datetime | None = None  # NULL = still true (half-open, valid_to exclusive)
     score: float
+    # Rank-time twin collapse (kb_collapse_alternatives, KB 19663): item ids FOLDED
+    # into this hit. ADDITIVE with a default, so REST/MCP payloads inherit it and
+    # pre-collapse payloads still validate; [] whenever the dial is off or no
+    # cross-project 'alternative_to' twin landed in the same result set.
+    collapsed: list[int] = Field(default_factory=list)
 
     def provenance_header(self) -> str:
         """SEC-3 wrapper line callers must render above the content."""

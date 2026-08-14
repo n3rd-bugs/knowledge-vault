@@ -757,6 +757,8 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         counts["review_queue_open"] = consolidation.open_review_count()
         counts["ingest_queue_pending"] = ingest_queue.queue_depth()
         _run_step(counts, "fleet_degenerate_by_project", fleet_health.degenerate_by_project)
+        # ADDED key, never a rename (KB 19663): the same staleness split BY BOX.
+        _run_step(counts, "fleet_by_box", fleet_health.fleet_by_box)
         counts["disk_pct"] = _disk_pct()
         counts["extraction_rejection_rate"] = _rejection_rate()
 

@@ -93,6 +93,10 @@ def issue(
     Re-issuing REVOKES the previous token for the same (project, machine) in the
     same transaction, so a machine only ever has one live credential per project
     and a leaked one stops working the moment it is replaced.
+
+    Returns the plaintext secret exactly once — only its hash is stored (the
+    marker sentence: :data:`kbcore.scrub.MINTED_SECRETS` must list this
+    function).
     """
     proj, mach = _validate(project, machine)
     me = scope.current()

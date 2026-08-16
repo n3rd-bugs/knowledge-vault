@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastmcp import Client
@@ -313,6 +313,16 @@ def _one_row(project: str) -> tuple[str, int]:
         ).fetchone()
 
 
+def _every_run_is_a_fresh_day(monkeypatch) -> None:
+    """Collapse the per-DAY attempt budget (review #4) back to per-RUN: these
+    taxonomy tests compress several nights of drains into one process, which the
+    day bound would otherwise stop at attempt 1 "today". The bound itself is
+    pinned in tests/test_drain_refill.py."""
+    monkeypatch.setattr(
+        ingest_queue, "drain_day_start", lambda: datetime.now(UTC) + timedelta(days=1)
+    )
+
+
 def test_drain_connectivity_failure_leaves_row_pending_attempts_unchanged(kb, monkeypatch):
     ingest_queue.enqueue("qconn", "User: a\nAssistant: b", kind="session")
 
@@ -331,6 +341,7 @@ def test_drain_content_failure_marks_failed_and_is_bounded(kb, monkeypatch):
         raise ExtractionFailed("unparseable model output")
 
     monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    _every_run_is_a_fresh_day(monkeypatch)
     for _ in range(5):  # more runs than the cap
         consolidate._drain_ingest_queue()
     assert _one_row("qcontent") == ("failed", ingest_queue.MAX_ATTEMPTS), "poison row stops at cap"
@@ -345,6 +356,7 @@ def test_terminal_row_is_requeued_on_resubmit(kb, monkeypatch):
         raise ExtractionFailed("unparseable")
 
     monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    _every_run_is_a_fresh_day(monkeypatch)
     for _ in range(5):
         consolidate._drain_ingest_queue()
     assert _one_row("qrequeue") == ("failed", ingest_queue.MAX_ATTEMPTS)
@@ -393,6 +405,7 @@ def test_requeue_is_bounded_then_permanently_failed(kb, monkeypatch):
         raise ExtractionFailed("deterministic poison")
 
     monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    _every_run_is_a_fresh_day(monkeypatch)
     for _ in range(ingest_queue.MAX_REQUEUES):
         for _ in range(5):  # drive the (re-opened) row back to terminal
             consolidate._drain_ingest_queue()
@@ -423,6 +436,7 @@ def test_mcp_ingest_session_message_distinguishes_requeue(kb, monkeypatch):
         raise ExtractionFailed("unparseable")
 
     monkeypatch.setattr(sessions, "extract_and_ingest", bad)
+    _every_run_is_a_fresh_day(monkeypatch)
     for _ in range(5):
         consolidate._drain_ingest_queue()
     out = _mcp_call("kb_ingest_session", {"project": "qmcpmsg", "transcript": content})

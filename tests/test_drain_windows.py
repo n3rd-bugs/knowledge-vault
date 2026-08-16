@@ -21,6 +21,7 @@ import pytest
 
 from kbcore import ingest_queue
 from kbcore.config import settings
+from kbcore.db import transaction
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 from kbworker import consolidate, sessions
 
@@ -226,6 +227,15 @@ def test_a_failing_window_fails_the_WHOLE_group_and_skips_the_rest(kb, big_row, 
 
     assert len(calls) == 2, "windows kept extracting after the group had already failed"
     assert _status(big_row)[0] == "failed", "the whole group was not failed by its bad window"
+    # The calendar turns: a content-failed row is not drainable again until the
+    # civil day does (the per-DAY attempt budget, review #4 — pinned in
+    # tests/test_drain_refill.py). Backdate the failure stamp to assert the
+    # group is retryable TOMORROW, not retired.
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET processed_at = processed_at - interval '1 day' WHERE id = %s",
+            (big_row,),
+        )
     assert any(r["id"] == big_row for g in ingest_queue.pending_groups() for r in g["rows"]), (
         "one content failure retired the group instead of spending one attempt"
     )

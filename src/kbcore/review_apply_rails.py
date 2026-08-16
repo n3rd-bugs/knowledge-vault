@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 from kbcore import review_apply_dups
 from kbcore.db import connect
+from kbcore.triage_sql import sql_triage_field, sql_triage_prior_field
 
 # Only these two. 'keep' is excluded BY CONSTRUCTION, not by a filter someone
 # could widen later: it is absent from this tuple, and the tuple is what the
@@ -128,15 +129,15 @@ def candidates() -> list[Row]:
     """
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT rq.id, rq.item_id,
-                   rq.detail->'triage'->>'action',
-                   rq.detail->'triage'->>'dup_of',
-                   rq.detail->'triage'->>'at',
+                   {sql_triage_field("action")},
+                   {sql_triage_field("dup_of")},
+                   {sql_triage_field("at")},
                    EXISTS (SELECT 1 FROM access_log al
                            WHERE al.item_id = rq.item_id
                              AND al.ts > now() - make_interval(days => %(win)s)),
-                   rq.detail->'triage_prior'->>'dup_of'
+                   {sql_triage_prior_field("dup_of")}
             FROM review_queue rq
             JOIN items i ON i.id = rq.item_id
             LEFT JOIN sources s ON s.id = i.source_id
@@ -144,10 +145,10 @@ def candidates() -> list[Row]:
               AND rq.reason = 'unverified_extraction'
               AND i.status = 'active'
               AND COALESCE(s.trust, 'verified') = 'unverified'
-              AND rq.detail->'triage'->>'action' = ANY(%(actions)s)
+              AND {sql_triage_field("action")} = ANY(%(actions)s)
               AND rq.detail->'auto_resolution'->>'undone_at' IS NULL
             ORDER BY rq.id
-            """,
+            """,  # noqa: S608 — constant triage-SQL fragments; values ride parameters
             {"win": ACCESS_WINDOW_DAYS, "actions": list(AUTO_APPLY_ACTIONS)},
         ).fetchall()
     out = []

@@ -42,6 +42,7 @@ from kbcore import llm
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
+from kbcore.triage_sql import sql_has_triage, sql_triage_field
 
 logger = logging.getLogger("kbcore.review_expire")
 
@@ -57,9 +58,10 @@ REJECT_TRIAGE_ACTIONS = tuple(a for a in llm.TRIAGE_ACTIONS if a.startswith("rej
 
 # The quiet-expiry predicate, shared by the sweep and the "when does the first
 # row expire" report count so the two can never drift. Constant SQL text with
-# named placeholders — no value is ever formatted in (Invariant 2). ``i`` is the
-# joined items row; ``%(reject)s`` is the REJECT_TRIAGE_ACTIONS array.
-QUIET_ELIGIBLE = """
+# named placeholders — no value is ever formatted in (Invariant 2); the triage
+# JSON paths come from their single owner (kbcore.review_triage, KB 21332).
+# ``i`` is the joined items row; ``%(reject)s`` is the REJECT_TRIAGE_ACTIONS array.
+QUIET_ELIGIBLE = f"""
               rq.resolved = false
               AND rq.reason = 'unverified_extraction'
               AND i.status = 'active'
@@ -73,7 +75,7 @@ QUIET_ELIGIBLE = """
               -- the row and leaves the item active + unverified, which is
               -- byte-for-byte the end state quiet expiry produces, so holding it
               -- open buys nothing.
-              AND NOT (COALESCE(rq.detail->'triage'->>'action', '') = ANY(%(reject)s))
+              AND NOT (COALESCE({sql_triage_field("action")}, '') = ANY(%(reject)s))
               AND NOT EXISTS (
                   SELECT 1 FROM access_log al WHERE al.item_id = rq.item_id
               )
@@ -84,8 +86,8 @@ QUIET_ELIGIBLE = """
 # without a second copy. Both halves are "this row may actually close": it was
 # EXAMINED (a triage verdict is stored), and no owner has vetoed its closure by
 # undoing an earlier expiry of it.
-EXPIRY_GATE = """(
-                  COALESCE(rq.detail, '{}'::jsonb) ? 'triage'
+EXPIRY_GATE = f"""(
+                  {sql_has_triage()}
                   AND rq.detail->'auto_resolution'->>'undone_at' IS NULL
               )"""
 

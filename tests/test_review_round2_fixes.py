@@ -70,9 +70,21 @@ def test_whitespace_only_window_skipped(kb, tmp_path, monkeypatch):
     assert s.saved == len(rows)
 
 
+def _calendar_turns(qid: int) -> None:
+    """Move the last-failure stamp back one day so the per-DAY attempt budget
+    refreshes (review #4: a failed row is not re-offered the same civil day)."""
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET processed_at = processed_at - interval '1 day' WHERE id = %s",
+            (qid,),
+        )
+
+
 def test_failed_row_self_heals_on_retry(kb, monkeypatch):
     """A failed row is re-drained and recovers when the cause clears — no
-    operator requeue needed (standalone self-heal)."""
+    operator requeue needed (standalone self-heal). Since review #4 the retry
+    is NEXT-day business: the same-day run must skip it (one attempt per civil
+    day), and the following night's drain heals it."""
     from kbcore import ingest_queue
     from kbworker import consolidate, sessions
 
@@ -92,13 +104,17 @@ def test_failed_row_self_heals_on_retry(kb, monkeypatch):
             "SELECT status, attempts FROM ingest_queue WHERE id = %s", (qid,)
         ).fetchone()
     assert st == "failed" and att == 1
-    consolidate._drain_ingest_queue()  # retried, now succeeds
+    consolidate._drain_ingest_queue()  # same day: the attempt budget is spent
+    assert calls["n"] == 1, "a failed row must not burn a second attempt the same day"
+    _calendar_turns(qid)
+    consolidate._drain_ingest_queue()  # tomorrow's nightly — retried, now succeeds
     with db.connect() as conn:
         st = conn.execute("SELECT status FROM ingest_queue WHERE id = %s", (qid,)).fetchone()[0]
     assert st == "extracted", "the failed row self-healed without any manual requeue"
 
 
 def test_failed_row_retries_are_bounded(kb, monkeypatch):
+    """MAX_ATTEMPTS is the terminal bound; each attempt costs a civil day."""
     from kbcore import ingest_queue
     from kbworker import consolidate, sessions
 
@@ -110,6 +126,7 @@ def test_failed_row_retries_are_bounded(kb, monkeypatch):
     monkeypatch.setattr(sessions, "extract_and_ingest", always_bad)
     for _ in range(6):
         consolidate._drain_ingest_queue()
+        _calendar_turns(qid)
     with db.connect() as conn:
         st, att = conn.execute(
             "SELECT status, attempts FROM ingest_queue WHERE id = %s", (qid,)

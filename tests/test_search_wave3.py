@@ -23,11 +23,11 @@ from pathlib import Path
 
 import pytest
 
-from kbcore import consolidation, db, graph
+from kbcore import consolidation, db, graph, search_rank
 from kbcore.config import settings
 from kbcore.ingest import ingest
-from kbcore.search import _apply_bonuses, search
-from kbcore.search_legs import RRF_K
+from kbcore.search import EXACT_ID_BONUS, _apply_bonuses, search
+from kbcore.search_legs import CANDIDATES, RRF_K
 
 pytestmark = pytest.mark.usefixtures("kb")
 
@@ -144,6 +144,79 @@ def test_rare_token_leg_leaves_a_common_token_query_unchanged(monkeypatch):
     assert on == off, "a common id token admits nothing new — candidate set unchanged"
 
 
+# --- (3b) the rare-only never-outrank guarantee holds WITH bonuses ------------
+# Review #4 P1 (Opus): the rank-offset bounds the rare row's RRF contribution,
+# but the exact-identifier bonus then composed ON TOP for the SAME token —
+# lifting a rare-only candidate above real lexical hits. The fuse now reports
+# which ids it INTRODUCED and _apply_bonuses exempts those from the admitting
+# tokens' bonus.
+
+
+def test_rare_only_candidate_never_outranks_weakest_lexical_hit_with_bonuses():
+    weak = ingest("p", "note", "weak real hit", "ordinary lexical body with no symbol")
+    lurker = ingest("p", "note", "rare lurker", "the ZRQX9 symbol body")
+    weakest = 1.0 / (RRF_K + CANDIDATES)  # weakest possible single-leg lexical hit
+    fused, introduced = search_rank.fuse_rare_id_rows(
+        [(weak, weakest, "w")], [(lurker, "the ZRQX9 symbol body")]
+    )
+    assert introduced == {lurker}, "the fuse reports the id it introduced (provenance)"
+    base = {i: s for i, s, _ in fused}
+    # The finding's arithmetic, pinned non-vacuously: WITHOUT the exemption the
+    # admitting token's bonus would lift the rare-only candidate past the hit.
+    assert base[lurker] + EXACT_ID_BONUS > weakest
+
+    with db.connect() as conn:
+        out = _apply_bonuses(conn, fused, None, ["ZRQX9"], {}, introduced, ["ZRQX9"])
+
+    scores = {i: s for i, s, _ in out}
+    assert scores[lurker] == base[lurker], "no exact-id bonus from the admitting token"
+    assert scores[lurker] < scores[weak], "rare-only stays below the weakest real hit"
+
+
+def test_a_real_hit_nudged_by_the_rare_leg_keeps_its_exact_id_bonus():
+    """Provenance is INTRODUCTION, not participation: a candidate the legs already
+    found is merely nudged by the rare fold and keeps every bonus (and the
+    id-DOMINANT path never reaches the fold at all, so it is untouched)."""
+    real = ingest("p", "note", "real hit with symbol", "lexical body containing ZRQY7 too")
+    fused, introduced = search_rank.fuse_rare_id_rows(
+        [(real, 2.0 / (RRF_K + 1), "r")], [(real, "lexical body containing ZRQY7 too")]
+    )
+    assert introduced == set(), "an already-fused candidate is never 'introduced'"
+    base = {i: s for i, s, _ in fused}[real]
+    with db.connect() as conn:
+        out = _apply_bonuses(conn, fused, None, ["ZRQY7"], {}, introduced, ["ZRQY7"])
+    assert {i: s for i, s, _ in out}[real] == pytest.approx(base + EXACT_ID_BONUS)
+
+
+def test_dominant_path_is_byte_identical_with_the_rare_dial_on(monkeypatch):
+    """An id-DOMINANT query never runs the rare leg: ids AND scores must be
+    byte-identical whether the dial is on or off."""
+    target = ingest("p", "note", "dom fix", "Fix lives in /src/drv/zqdom_write.c line 4.")
+    for i in range(3):
+        ingest("p", "note", f"dom filler {i}", f"dominant filler body {i}")
+    _blind(target)
+    monkeypatch.setattr(settings, "kb_id_leg_rare_tokens", False)
+    off = [(h.item_id, h.score) for h in search("zqdom_write", k=10, tool=None)]
+    monkeypatch.setattr(settings, "kb_id_leg_rare_tokens", True)
+    monkeypatch.setattr(settings, "kb_id_leg_rare_max_df", 2)
+    on = [(h.item_id, h.score) for h in search("zqdom_write", k=10, tool=None)]
+    assert on == off and target in [i for i, _ in on]
+
+
+def test_rare_only_candidate_ranks_below_real_lexical_hits_end_to_end(monkeypatch):
+    monkeypatch.setattr(settings, "kb_id_leg_rare_tokens", True)
+    monkeypatch.setattr(settings, "kb_id_leg_rare_max_df", 2)
+    real = ingest("p", "note", "zqfoo remediation", "zqfoo remediation steps body")
+    lurk = ingest("p", "note", "lurker", "Fixed at /src/ZQRARE9/mod.c line 2.")
+    _blind(lurk)  # rare-leg-only: vector-blind, and the path token hides it from tsquery
+
+    hits = search("zqfoo remediation ZQRARE9 steps", k=10, tool=None)  # non-dominant
+
+    ids = [h.item_id for h in hits]
+    assert real in ids and lurk in ids, "both the lexical hit and the rare lurker surface"
+    assert ids.index(real) < ids.index(lurk), "the rare-only candidate ranks below"
+
+
 # --- (4) kb_collapse_alternatives ---------------------------------------------
 
 
@@ -166,6 +239,54 @@ def test_cross_project_alternative_twins_collapse_under_the_flag(monkeypatch):
     on_ids = [h.item_id for h in search(q, k=10)]
     assert winner in on_ids, "the higher-scored twin is kept"
     assert loser not in on_ids, "the lower-scored twin is collapsed out of the rendered hits"
+
+
+def test_collapse_prefers_the_verified_twin_in_a_near_tie():
+    """Review #4 P2: winner selection was post-rerank score ALONE, so a verified
+    item could be dropped for an unverified twin at +0.001. Inside
+    COLLAPSE_TRUST_EPSILON the verified twin survives; the kept score is still
+    the pair MAX (dedupe semantics untouched)."""
+    v = ingest("alpha", "note", "verified twin", "twin body v", trust="verified")
+    u = ingest("beta", "note", "unverified twin", "twin body u", trust="unverified")
+    graph.link(v, "alternative_to", u)
+    hi = 2.0 / (RRF_K + 1)
+    near = hi - 0.001  # the review's observed gap — a near-tie
+
+    with db.connect() as conn:
+        pruned, folded = search_rank.collapse_alternatives(conn, [(u, hi, "u"), (v, near, "v")])
+
+    assert folded == {v: [u]}, "the verified twin is the winner inside the epsilon"
+    assert [(i, s) for i, s, _ in pruned] == [(v, hi)], "kept at the pair MAX, never boosted"
+
+
+def test_collapse_verified_twin_loses_only_when_clearly_outscored():
+    v = ingest("alpha", "note", "verified twin 2", "twin body v2", trust="verified")
+    u = ingest("beta", "note", "unverified twin 2", "twin body u2", trust="unverified")
+    graph.link(v, "alternative_to", u)
+    lo = 2.0 / (RRF_K + 1)
+    hi = lo + 2 * search_rank.COLLAPSE_TRUST_EPSILON  # beyond the near-tie window
+
+    with db.connect() as conn:
+        pruned, folded = search_rank.collapse_alternatives(conn, [(u, hi, "u"), (v, lo, "v")])
+
+    assert folded == {u: [v]}, "clearly outscored: the rerank verdict stands, trust defers"
+    assert [(i, s) for i, s, _ in pruned] == [(u, hi)]
+
+
+def test_collapse_same_trust_near_tie_keeps_the_higher_score():
+    """No trust difference -> the pre-existing score pick, byte-identical."""
+    x = ingest("alpha", "note", "same trust x", "twin body x", trust="unverified")
+    y = ingest("beta", "note", "same trust y", "twin body y", trust="unverified")
+    graph.link(x, "alternative_to", y)
+    hi = 2.0 / (RRF_K + 1)
+
+    with db.connect() as conn:
+        pruned, folded = search_rank.collapse_alternatives(
+            conn, [(y, hi, "y"), (x, hi - 0.001, "x")]
+        )
+
+    assert folded == {y: [x]}, "same trust: the higher score wins exactly as before"
+    assert [(i, s) for i, s, _ in pruned] == [(y, hi)]
 
 
 def test_collapse_needs_both_the_flag_and_a_cross_project_edge(monkeypatch):

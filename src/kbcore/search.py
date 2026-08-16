@@ -159,13 +159,15 @@ def search(
         fused = _rrf_fuse(vec_rows, kw_rows, id_rows)  # RAW RRF, no bonuses yet
         # (3) Rare-token id leg (KB 16601): for a NON-dominant query, admit the id
         # leg for tokens too rare to be noise, fused below any real hit (search_rank).
+        rare_only: set[int] = set()  # rare-leg PROVENANCE -> _apply_bonuses (review #4 P1)
+        rare_tokens: list[str] = []  # the tokens that admitted those candidates
         if settings.kb_id_leg_rare_tokens and id_tokens and not dominant:
-            rare = search_rank.rare_identifier_tokens(
+            rare_tokens = search_rank.rare_identifier_tokens(
                 conn, id_tokens, settings.kb_id_leg_rare_max_df
             )
-            if rare:
-                fused = search_rank.fuse_rare_id_rows(
-                    fused, _identifier_leg(conn, rare, where, params)
+            if rare_tokens:
+                fused, rare_only = search_rank.fuse_rare_id_rows(
+                    fused, _identifier_leg(conn, rare_tokens, where, params)
                 )
         expansion_origin: dict[int, int] = {}
         if hops > 0 and fused:
@@ -179,7 +181,9 @@ def search(
         # Bonuses apply AFTER the merge so they lift any candidate (direct OR
         # neighbor) and the seed_floor stays on raw scores (un-boosted rank-1 can
         # seed; finding). Reuse the legs' connection — no extra connect (finding).
-        fused = _apply_bonuses(conn, fused, boost_project, id_tokens, expansion_origin)
+        fused = _apply_bonuses(
+            conn, fused, boost_project, id_tokens, expansion_origin, rare_only, rare_tokens
+        )
         # Optional cross-encoder rerank of the top window (kb_rerank_url set):
         # reorders only, fail-open, scores remapped so the order survives the
         # _to_hits re-sort (see kbcore.rerank). Reuses the legs' connection.
@@ -203,6 +207,15 @@ def search(
     hits = _to_hits(fused)[:k]
     for h in hits:  # stamp the collapse map on the kept hit (additive; [] when off)
         h.collapsed = folded.get(h.item_id, [])
+    if tool is not None and not hits:
+        # Zero-hit DEMAND telemetry (review #4 Wave E, KB 21332): a search that
+        # returns nothing is the KB seeing its own gap. Best-effort (record never
+        # raises) and NEVER for eval replays — they pass tool=None, the same
+        # exemption the access log applies below. Lazy import: this single hook
+        # is search's only coupling to the telemetry module.
+        from kbcore import search_misses
+
+        search_misses.record(query, project, tool)
     # tool=None → skip access logging (the eval harness replays golden queries and
     # must not stamp items 'recently used', which would pin them against archiving).
     if tool is not None:
@@ -210,26 +223,9 @@ def search(
     return hits
 
 
-def _rerank_evidence(fused: list[tuple[int, float, str]]) -> dict[int, str] | None:
-    """Best-matching CHUNK text per candidate for the reranker, or None when OFF.
-
-    The fusion step already collapsed each item to the chunk that actually
-    matched the query (``_rrf_fuse`` keeps the best chunk's text as the third
-    tuple element), and that text was then DISCARDED: kbcore.rerank re-reads a
-    body PREFIX from ``items``, so the reranker never sees the matching passage
-    of a long item. Handing it that passage is a plausible retrieval win and a
-    plausible loss (less surrounding context), so it is gated on
-    ``kb_rerank_use_chunk`` — default False, awaiting the owner's A/B on the real
-    corpus (config.py). With the flag OFF this returns None and the reranker's
-    inputs stay BYTE-IDENTICAL to the pre-flag behaviour (regression-pinned in
-    tests/test_eval_plumbing.py).
-
-    Candidates with no chunk text (pure graph neighbours, identifier title
-    matches) are omitted and keep the body-prefix document.
-    """
-    if not settings.kb_rerank_use_chunk:
-        return None
-    return {item_id: snippet for item_id, _score, snippet in fused if snippet}
+# Moved to search_rank (dial-gated helper; size ratchet); aliased for the
+# regression pin in tests/test_eval_plumbing.py and any other caller.
+_rerank_evidence = search_rank.rerank_evidence
 
 
 def _apply_bonuses(
@@ -238,6 +234,8 @@ def _apply_bonuses(
     boost_project: str | None,
     id_tokens: list[str],
     expansion_origin: dict[int, int],
+    rare_only: set[int] = frozenset(),  # type: ignore[assignment]
+    rare_tokens: list[str] = (),  # type: ignore[assignment]
 ) -> list[tuple[int, float, str]]:
     """Return ``fused`` re-scored with the project boost + exact-identifier bonus.
 
@@ -253,6 +251,8 @@ def _apply_bonuses(
     low-scoring seed, breaking the documented 'never outranks its seed'
     guarantee (finding). ``expansion_origin`` maps each pure-neighbor id → the
     direct-hit seed that vouches for it (threaded out of search_expand).
+    ``rare_only``/``rare_tokens``: no bonus from an admitting rare token
+    (search_rank.exact_id_match_counts, review #4 P1).
     """
     if not fused:
         return fused
@@ -277,22 +277,9 @@ def _apply_bonuses(
             (ids, boost_project),
         ).fetchall():
             scores[item_id] *= BOOST_FACTOR
-    matches: dict[int, int] = {}
-    for token in id_tokens:
-        # \m..\M are Postgres word boundaries; identifier tokens are
-        # [A-Za-z0-9_] so no regex metachar escaping is needed.
-        pattern = rf"\m{token}\M"
-        for (item_id,) in conn.execute(
-            """
-            SELECT i.id FROM items i
-            WHERE i.id = ANY(%(ids)s) AND (
-                i.title ~* %(pat)s
-                OR EXISTS (SELECT 1 FROM chunks c WHERE c.item_id = i.id AND c.text ~* %(pat)s)
-            )
-            """,
-            {"ids": ids, "pat": pattern},
-        ).fetchall():
-            matches[item_id] = matches.get(item_id, 0) + 1
+    matches = search_rank.exact_id_match_counts(
+        conn, ids, id_tokens, exempt_ids=rare_only, exempt_tokens=set(rare_tokens)
+    )
     for item_id, n in matches.items():
         scores[item_id] += min(n * EXACT_ID_BONUS, EXACT_ID_BONUS_CAP)
     # Restore the seed guarantee post-bonus: a neighbor surfaced ONLY by expansion
@@ -383,11 +370,16 @@ def _log_access(hits: list[SearchHit], tool: str, query: str) -> None:
         return
     p = scope.current()
     pname = None if p.is_owner else p.name  # audit: grantee name; NULL for owner
+    mark = tool + search_rank.COLLAPSE_PARITY_SUFFIX  # parity-row marker (review #4 P2)
     with transaction() as conn:
         conn.cursor().executemany(
             "INSERT INTO access_log (item_id, tool, query, principal) VALUES (%s, %s, %s, %s)",
-            # A hit's collapsed twins were RECALLED too — folded into the winner, not
-            # absent — so the LOSER is logged at the same chokepoint (KB 19663): being
-            # folded must never route an item into 'never recalled' expiry/archive paths.
-            [(i, tool, query, pname) for h in hits for i in (h.item_id, *h.collapsed)],
+            # Collapsed twins were RECALLED too (KB 19663): the LOSER logs at this
+            # same chokepoint so folding never routes it into 'never recalled'
+            # expiry/archive; its parity SUFFIX lets the promote queue exclude folds.
+            [
+                (i, tool if i == h.item_id else mark, query, pname)
+                for h in hits
+                for i in (h.item_id, *h.collapsed)
+            ],
         )

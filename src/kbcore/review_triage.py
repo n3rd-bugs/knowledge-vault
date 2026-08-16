@@ -32,6 +32,9 @@ from kbcore.errors import (
     InvalidOperation,
 )
 
+# Triage JSON-path SQL is SINGLE-OWNED by kbcore.triage_sql (review #4, KB 21332).
+from kbcore.triage_sql import TRIAGE_KEY, sql_has_triage, sql_not_triaged
+
 logger = logging.getLogger("kbcore.review_triage")
 
 TRIAGE_SIMILAR_K = 5  # neighbor candidates offered to the judge as dup targets
@@ -65,18 +68,18 @@ def pending_triage(limit: int) -> list[dict[str, Any]]:
         return []
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT rq.id, i.id, i.project, i.type, i.title, i.body, i.tags,
                    (SELECT count(*) FROM access_log al WHERE al.item_id = i.id),
-                   COALESCE(i.meta, '{}'::jsonb)
+                   COALESCE(i.meta, '{{}}'::jsonb)
             FROM review_queue rq
             JOIN items i ON i.id = rq.item_id
             WHERE rq.resolved = false
               AND rq.reason = 'unverified_extraction'
-              AND NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage')
-            ORDER BY (COALESCE(rq.detail, '{}'::jsonb) ? 'priority') DESC, rq.id
+              AND {sql_not_triaged()}
+            ORDER BY (COALESCE(rq.detail, '{{}}'::jsonb) ? 'priority') DESC, rq.id
             LIMIT %s
-            """,
+            """,  # noqa: S608 — constant fragments only; every value rides a parameter
             (limit,),
         ).fetchall()
     return [
@@ -108,7 +111,7 @@ def store_triage(queue_id: int, triage: dict[str, Any]) -> bool:
     (returns False); sibling detail keys are never clobbered (jsonb merge).
     """
     stamp = {
-        "triage": {
+        TRIAGE_KEY: {
             **triage,
             "model": settings.kb_extract_model,
             "at": datetime.now(UTC).isoformat(),
@@ -294,14 +297,14 @@ def apply_triage(
             )
     wanted = set(actions) if actions else set(llm.TRIAGE_ACTIONS)
     sql = [
-        """
+        f"""
         SELECT rq.id, rq.item_id, rq.detail
         FROM review_queue rq
         JOIN items i ON i.id = rq.item_id
         WHERE rq.resolved = false
           AND rq.reason = 'unverified_extraction'
-          AND COALESCE(rq.detail, '{}'::jsonb) ? 'triage'
-        """
+          AND {sql_has_triage()}
+        """  # noqa: S608 — constant fragment only; values ride parameters below
     ]
     params: list[Any] = []
     if queue_ids:
@@ -324,7 +327,7 @@ def apply_triage(
 
     selected: list[tuple[int, int, str, dict[str, Any]]] = []
     for qid, item_id, detail in rows:
-        triage = (detail if isinstance(detail, dict) else {}).get("triage") or {}
+        triage = (detail if isinstance(detail, dict) else {}).get(TRIAGE_KEY) or {}
         action = triage.get("action")
         if action in wanted:
             selected.append((qid, item_id, action, triage))

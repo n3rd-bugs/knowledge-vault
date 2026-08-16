@@ -92,6 +92,46 @@ def _no_real_notifications(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _sentinel_floors_at_code_defaults(monkeypatch):
+    """Tests must not inherit the box's .env eval floors (same hermeticity gotcha
+    as _ranking_dials_at_code_defaults). Review #4's P0 fix anchored
+    KB_EVAL_MIN_HIT5=0.97 / KB_EVAL_MIN_MRR=0.85 in the live .env (2026-08-16),
+    and the eval_sentinel suite's epsilon/floor fixtures promptly failed by
+    inheriting them. Every test sees the CODE defaults; a test probing the floor
+    sets it deliberately."""
+    from kbcore.config import settings as _s
+
+    monkeypatch.setattr(_s, "kb_eval_min_hit5", 0.75)
+    monkeypatch.setattr(_s, "kb_eval_min_mrr", 0.5)
+
+
+@pytest.fixture(autouse=True)
+def _no_weekly_report(monkeypatch):
+    """The weekly trend report (kbworker.weekly) is day-gated on the REAL calendar
+    (kb_weekly_day), so on its configured day every test driving push_run_digest
+    would suddenly read the DB and mint a kb-system report item — the same
+    hermeticity class as _no_real_notifications. OFF for every test; the weekly
+    suite flips the knob (and pins `now`) explicitly.
+    """
+    from kbcore.config import settings as _s
+
+    monkeypatch.setattr(_s, "kb_weekly_report", False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_search_miss_count(monkeypatch):
+    """push_run_digest counts the day's zero-hit searches (kbcore.search_misses).
+    search_misses is TELEMETRY and outlives the kb fixture's per-test truncate,
+    so rows minted by one test's searches would leak a 'search misses: N' line
+    into any later digest assertion. Pin the ambient count to 0; tests that
+    exercise the line re-patch or stash the counts key themselves.
+    """
+    from kbcore import search_misses
+
+    monkeypatch.setattr(search_misses, "count_since", lambda *a, **kw: 0)
+
+
+@pytest.fixture(autouse=True)
 def fake_embeddings(monkeypatch):
     """Mock Ollama for every test: embed_texts returns deterministic vectors."""
     # **kw so the stub keeps matching the real signature: embed_texts gained a
@@ -199,6 +239,7 @@ _KB_TEST_TABLES = (
     "principal_grants",
     "principals",
     "enrolment_codes",
+    "search_misses",
 )
 
 

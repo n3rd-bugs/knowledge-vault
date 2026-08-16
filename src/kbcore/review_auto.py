@@ -25,12 +25,20 @@ from kbcore import review, review_promote
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.review_expire import EXPIRY_GATE, QUIET_ELIGIBLE, REJECT_TRIAGE_ACTIONS
+from kbcore.triage_sql import (
+    TRIAGE_KEY,
+    TRIAGE_PRIOR_KEY,
+    sql_has_triage,
+    sql_not_triaged,
+    sql_triage_field,
+)
 
 BULK_ACTIONS = ("promote", "reject", "dismiss")
 #: A row carrying EITHER key has been examined by the judge. ``triage_prior`` holds
 #: the verdict auto-apply's dead-target re-queue moved aside, and a re-queued row
-#: is waiting for a SECOND look, not a first one.
-EXAMINED_DETAIL_KEYS = ("triage", "triage_prior")
+#: is waiting for a SECOND look, not a first one. Key spellings come from their
+#: single owner (kbcore.review_triage, KB 21332).
+EXAMINED_DETAIL_KEYS = (TRIAGE_KEY, TRIAGE_PRIOR_KEY)
 
 
 def close_moot_rows() -> int:
@@ -118,13 +126,13 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
     reject = list(REJECT_TRIAGE_ACTIONS)
     with connect() as conn:
         triaged, rejecting, never_triaged = conn.execute(
-            """
-            SELECT count(*) FILTER (WHERE COALESCE(rq.detail, '{}'::jsonb) ? 'triage'),
-                   count(*) FILTER (WHERE rq.detail->'triage'->>'action' = ANY(%(reject)s)),
-                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{}'::jsonb) ?| %(examined)s))
+            f"""
+            SELECT count(*) FILTER (WHERE {sql_has_triage()}),
+                   count(*) FILTER (WHERE {sql_triage_field("action")} = ANY(%(reject)s)),
+                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{{}}'::jsonb) ?| %(examined)s))
             FROM review_queue rq
             WHERE rq.resolved = false AND rq.reason = 'unverified_extraction'
-            """,
+            """,  # noqa: S608 — constant triage-SQL fragments; values ride parameters
             {"reject": reject, "examined": list(EXAMINED_DETAIL_KEYS)},
         ).fetchone()
         first_expiry = None
@@ -134,7 +142,7 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
             # triaged, not undo-vetoed); the two horizon counts narrow the other
             # way, to UNTRIAGED rows the gate now holds open. One scan, three
             # FILTERs, so the report and the sweep read the same predicate.
-            untriaged = "NOT (COALESCE(rq.detail, '{}'::jsonb) ? 'triage')"
+            untriaged = sql_not_triaged()
             expiry = "rq.created_at + make_interval(days => %(days)s)"
             row = conn.execute(
                 f"""
@@ -166,19 +174,19 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
             "  AND created_at >= now() - make_interval(days => 1)"
         ).fetchone()
         (left,) = conn.execute(
-            """
+            f"""
             SELECT count(DISTINCT rq.id)
             FROM review_queue rq
             WHERE rq.reason = 'unverified_extraction'
               AND (
-                  (rq.detail->'triage'->>'at')::timestamptz >= now() - make_interval(days => 1)
+                  ({sql_triage_field("at")})::timestamptz >= now() - make_interval(days => 1)
                   OR EXISTS (
                       SELECT 1 FROM access_log al
                       WHERE al.item_id = rq.item_id
                         AND al.ts >= now() - make_interval(days => 1)
                   )
               )
-            """
+            """  # noqa: S608 — constant triage-SQL fragment; no value interpolated
         ).fetchone()
     return {
         "triage_awaiting_apply": int(triaged),

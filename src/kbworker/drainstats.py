@@ -62,6 +62,13 @@ def reset_cohort_stats(cohort_size: int) -> None:
             # owner looked.
             "deferral_escalations": 0,
             "groups_near_deferral_cap": 0,
+            # Content-failure visibility (ADDED 2026-08-16, review #4 P0 rider):
+            # groups that failed CONTENT-deterministically this run, and groups
+            # every row of which hit the attempts cap doing so. The terminal
+            # retirement gets the digest line KB 19666's watchlist promised;
+            # sub-cap content failures stay report-only (they retry tomorrow).
+            "content_failures": 0,
+            "attempts_cap_retirements": 0,
         }
     )
 

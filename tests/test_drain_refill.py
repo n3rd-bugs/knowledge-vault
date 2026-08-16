@@ -447,3 +447,125 @@ def test_the_refill_loop_has_a_backstop(kb, monkeypatch, caplog):
     assert drained == 2, "the backstop did not bound the loop"
     assert "refill backstop" in caplog.text, "the backstop fired silently"
     assert ingest_queue.queue_depth() == 3, "the remainder must stay pending, never lost"
+
+
+# ------------------------------------- content-failure visibility (review #4)
+
+
+def _set_attempts(ids: list[int], n: int) -> None:
+    """Backdate a row's attempt history (kb_test-owned data) instead of running
+    n nightly drains to accumulate it."""
+    with transaction() as conn:
+        conn.execute("UPDATE ingest_queue SET attempts = %s WHERE id = ANY(%s)", (n, list(ids)))
+
+
+def _yesterday(ids: list[int]) -> None:
+    """Turn the calendar: move the last-failure stamp back one day so the
+    per-DAY attempt budget refreshes."""
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET processed_at = processed_at - interval '1 day' "
+            "WHERE id = ANY(%s)",
+            (list(ids),),
+        )
+
+
+def test_a_content_failure_is_counted_into_the_run_report(kb, monkeypatch):
+    """The ExtractionFailed branch incremented NO counter (review #4 P0 rider),
+    so a content-failing group existed only in journald (<36h retention)."""
+    monkeypatch.setattr(settings, "kb_drain_cohort", 1)
+    bad = _enqueue("content-count", "User: poison\nAssistant: payload")
+    _recorder(monkeypatch, fail_on={f"queue:session:{bad}": ExtractionFailed("unparseable")})
+
+    consolidate._drain_ingest_queue()
+
+    assert consolidate._COHORT_STATS["content_failures"] == 1
+    assert consolidate._COHORT_STATS["attempts_cap_retirements"] == 0, (
+        "attempt 1 of 3 is not a retirement"
+    )
+
+
+def test_an_attempts_cap_retirement_is_counted_and_reaches_the_digest(kb, monkeypatch):
+    """The P0's missing half: the terminal retirement is the queue's LAST offer
+    of a group, so the owner hears it from the digest or from nobody."""
+    from kbworker import tail_steps
+
+    monkeypatch.setattr(settings, "kb_drain_cohort", 1)
+    bad = _enqueue("cap-retire", "User: poison\nAssistant: payload")
+    _set_attempts([bad], ingest_queue.MAX_ATTEMPTS - 1)  # tonight's failure is the last
+    _recorder(monkeypatch, fail_on={f"queue:session:{bad}": ExtractionFailed("unparseable")})
+
+    consolidate._drain_ingest_queue()
+
+    assert _row(bad) == ("failed", ingest_queue.MAX_ATTEMPTS, 0)
+    assert consolidate._COHORT_STATS["content_failures"] == 1
+    assert consolidate._COHORT_STATS["attempts_cap_retirements"] == 1
+
+    lines = tail_steps.digest_lines(dict(consolidate._COHORT_STATS))
+    assert "drain: 1 group(s) retired at attempts cap" in lines
+    assert not any("content" in line for line in lines), (
+        "sub-cap content failures stay report-only (noise budget, review #4)"
+    )
+
+
+def test_the_retirement_digest_line_is_positive_only(kb):
+    """A zero must contribute NO line — the digest is the one message the owner
+    reads without going looking (same rule as its deferral-cap neighbours)."""
+    from kbworker import tail_steps
+
+    lines = tail_steps.digest_lines(
+        {"queued_drained": 1, "attempts_cap_retirements": 0, "content_failures": 2}
+    )
+    assert not any("retired at attempts cap" in line for line in lines)
+    assert not any("content" in line for line in lines)
+
+
+# --------------------------------------- the per-DAY attempt bound (review #4)
+
+
+def test_an_attempt_is_budgeted_per_DAY_not_per_run(kb, monkeypatch):
+    """The 08-15 double-burn: the once-per-night policy was a per-RUN exclusion
+    set, so the boot catch-up run re-drained a group that had already
+    content-failed at 01:00 that morning — 2 of its 3 attempts in one day. The
+    bound is now the failure's civil DAY (queue_repair.drain_day_start): failed
+    at 01:00 means skipped at 21:00 and drained tomorrow, while the catch-up
+    still drains everything else."""
+    monkeypatch.setattr(settings, "kb_drain_cohort", 1)
+    bad = _enqueue("day-budget", "User: poison\nAssistant: payload")
+    uri = f"queue:session:{bad}"
+    seen = _recorder(monkeypatch, fail_on={uri: ExtractionFailed("unparseable")})
+
+    consolidate._drain_ingest_queue()  # the 01:00 nightly
+    assert _row(bad) == ("failed", 1, 0)
+
+    ok = _enqueue("day-budget", "User: healthy\nAssistant: fine")
+    consolidate._drain_ingest_queue()  # the 21:00 boot catch-up, same day
+    assert seen.count(uri) == 1, "the same-day catch-up re-burned an attempt (review #4)"
+    assert _row(bad) == ("failed", 1, 0), "one day must cost exactly one attempt"
+    assert _row(ok)[0] == "extracted", "the day bound must not hold back the rest of the catch-up"
+
+    _yesterday([bad])  # the calendar turns
+    consolidate._drain_ingest_queue()  # tomorrow's nightly
+    assert seen.count(uri) == 2, "the next day did not re-offer the group"
+    assert _row(bad) == ("failed", 2, 0)
+
+
+def test_a_requeued_row_is_eligible_the_SAME_day(kb):
+    """The owner's requeue (and the enqueue re-arm) resets processed_at to NULL:
+    a deliberate retry is a fresh grant, not tomorrow's business."""
+    bad = _enqueue("day-requeue", "User: poison\nAssistant: payload")
+    ingest_queue.mark_failed(bad, "boom")
+    assert ingest_queue.pending_groups(limit=10) == [], "failed TODAY must be skipped"
+
+    ingest_queue.requeue_failed(reason="pipeline fixed")
+
+    groups = ingest_queue.pending_groups(limit=10)
+    assert [r["id"] for g in groups for r in g["rows"]] == [bad]
+
+
+def test_mark_failed_reports_whether_the_cap_was_hit(kb):
+    """The bool is what lets the drain count a retirement without a second
+    query; sub-cap failures must stay False."""
+    qid = _enqueue("cap-bool", "User: a\nAssistant: b")
+    for expect in (False,) * (ingest_queue.MAX_ATTEMPTS - 1) + (True,):
+        assert ingest_queue.mark_failed(qid, "boom") is expect

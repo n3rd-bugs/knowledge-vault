@@ -15,6 +15,14 @@ journald under ``kbcore.ingest_queue`` and grep recipes depend on that.
 Invariant 5 is what makes both repairs possible: automation flips ``status`` and
 never deletes, so when a verdict turns out to be wrong the content is still
 there to re-judge.
+
+2026-08-16 (review #4 wave E): this module also hosts two drain-REACH helpers —
+``drain_day_start``, the per-DAY attempt boundary, and
+``near_deferral_cap_groups``, moved VERBATIM from ``ingest_queue`` when the
+per-day bound pushed that file against its ratchet ceiling. Both are re-exported
+by ``ingest_queue`` (the established seam), so no caller sees the move. The
+"called by no automatic path" claim above stays true of the two REPAIRS; the
+reach helpers are read by the drain and its telemetry.
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from kbcore.db import transaction
+from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.queue_checkpoint import CHECKPOINT_KEY
 
@@ -184,3 +192,49 @@ def requeue_extracted(
         reason or "(no reason given)",
     )
     return out
+
+
+def drain_day_start() -> datetime:
+    """LOCAL midnight, tz-aware — the boundary of the per-DAY attempt budget.
+
+    The once-per-night policy on retryable-FAILED rows was enforced by a per-RUN
+    exclusion set, so the 2026-08-15 boot catch-up run re-drained a group that
+    had already content-failed at 01:00 that morning — 2 of its 3 attempts
+    burned in one day (review #4). ``ingest_queue._DRAINABLE`` now skips failed
+    rows whose ``processed_at`` (stamped by ``mark_failed``) falls on or after
+    this boundary: failed at 01:00 means not re-offered at 21:00, drainable
+    again tomorrow. Computed in PYTHON because the boundary is the BOX's civil
+    day — ``processed_at::date = current_date`` would move with the DB session's
+    TimeZone GUC, not the box's clock, and could land inside the nightly window
+    itself. Owner requeues and the enqueue re-arm reset ``processed_at`` to
+    NULL, so a deliberate retry is eligible immediately, today.
+    """
+    return datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def near_deferral_cap_groups() -> int:
+    """Still-'pending' GROUPS whose rows sit within 2 deferrals of the cap.
+
+    Drain telemetry (review #3 P1 rider): a terminal escalation used to be silent —
+    no digest line, and journald retention (<36h) beat the owner to the evidence.
+    This count precedes one by ~2 nights of deferrals. Grouped the way
+    ``ingest_queue.pending_groups`` groups, so a giant session counts once, not
+    per row.
+    """
+    # Lazy import: ingest_queue imports THIS module at its top (the seam), and
+    # the SQL fragment must stay beside its Python twin over there.
+    from kbcore.ingest_queue import _DEGENERATE_URI_SQL, DEFERRAL_CAP
+
+    with connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT count(DISTINCT (project,
+                     CASE WHEN {_DEGENERATE_URI_SQL}
+                          THEN 'queue:' || kind || ':' || id::text
+                          ELSE btrim(meta->>'source_uri') END))
+              FROM ingest_queue
+             WHERE status = 'pending' AND deferrals >= %(near)s
+            """,  # noqa: S608 — _DEGENERATE_URI_SQL is a constant fragment
+            {"near": DEFERRAL_CAP - 2},
+        ).fetchone()
+    return int(row[0])

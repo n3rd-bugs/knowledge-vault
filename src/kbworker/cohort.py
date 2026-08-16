@@ -153,6 +153,23 @@ def _record_window(state: dict[str, Any], job: dict[str, Any]) -> None:
         logger.warning("window checkpoint for group %s failed", state["ids"], exc_info=True)
 
 
+def _fail_group(ids: list[int], error: str) -> None:
+    """``mark_failed`` every row of a group, counting a TERMINAL retirement.
+
+    Review #4 P0 rider (the digest line KB 19666's watchlist promised):
+    ``mark_failed`` returns True when that row's attempts just hit the cap. A
+    group whose EVERY row is now terminal will never be offered again, and its
+    retirement used to exist only in journald (<36h retention) — the owner's
+    first evidence was a queue that had quietly stopped retrying. Counted per
+    GROUP, which is how the digest line reads.
+    """
+    terminal = [ingest_queue.mark_failed(rid, error) for rid in ids]
+    if terminal and all(terminal):
+        _COHORT_STATS["attempts_cap_retirements"] = (
+            _COHORT_STATS.get("attempts_cap_retirements", 0) + 1
+        )
+
+
 def _drain_job(
     job: dict[str, Any], *, pre_extracted: dict | None, planned: EnsemblePlan | None
 ) -> tuple[int, int]:
@@ -256,11 +273,13 @@ def _drain_job(
         # per-row read timeout, a 4xx): re-running the 14B on this exact row
         # fails identically, so bound it with the attempts cap instead of
         # retrying every nightly run forever (queue self-heal taxonomy).
+        # Counted (review #4 P0 rider): this branch used to increment NOTHING,
+        # so a failing group — and its eventual terminal retirement, counted
+        # per group in _fail_group — was journald-only.
         logger.warning("group %s extraction failed (content): %s", ids, e)
-        for rid in ids:
-            ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
+        _COHORT_STATS["content_failures"] = _COHORT_STATS.get("content_failures", 0) + 1
+        _fail_group(ids, f"{type(e).__name__}: {e}")
     except Exception as e:  # noqa: BLE001 — one bad submission must not abort the drain
         logger.exception("draining ingest_queue group %s failed", ids)
-        for rid in ids:
-            ingest_queue.mark_failed(rid, f"{type(e).__name__}: {e}")
+        _fail_group(ids, f"{type(e).__name__}: {e}")
     return 0, 0

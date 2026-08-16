@@ -89,7 +89,12 @@ from kbworker.tail_ops import (  # noqa: F401
 logger = logging.getLogger("kbworker.consolidate")
 
 ADVISORY_KEY = 42
-EVIDENCE_PAIR_CAP = 20  # max contradiction pairs evidence-judged per nightly run
+# Raised 20 -> 32 (review #4 P2, 2026-08-16): 113-125 open pairs against 20 a
+# night was permanently under water. 32 x ~110 s/pair ~= 59 min, which fits the
+# post-share weekday tail; the streak reserve is still
+# EVIDENCE_PAIR_CAP // EVIDENCE_STREAK_RESERVE_DIVISOR (now 16) — the divisor
+# semantics are unchanged.
+EVIDENCE_PAIR_CAP = 32  # max contradiction pairs evidence-judged per nightly run
 
 # MEANING CHANGED 2026-08-01: this is the ceiling on ingest_queue ROWS one REFILL
 # may materialise — a memory bound — and no longer the budget for a whole run.

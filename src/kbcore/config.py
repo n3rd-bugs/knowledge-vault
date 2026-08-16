@@ -95,6 +95,13 @@ class Settings(SettingsViews, BaseSettings):
     kb_notify_url: str = ""
     kb_notify_topic: str = ""
     kb_notify_token: str = ""
+    # WEEKLY TREND REPORT (review #4 P1, KB 21332; kbworker.weekly): on this day's
+    # nightly the digest step also pushes ONE 'KB weekly' summary + a kb-system
+    # report item (dial trends, top search misses, promote uptake) over the ntfy
+    # channel above — no new timer, no new secret. false = kill switch; the day is
+    # lowercase mon..sun and a malformed value fails toward OFF (topup pattern).
+    kb_weekly_report: bool = True
+    kb_weekly_day: str = "sun"
     # 401-burst alert (Package O): >N failed-auth/10min pushes one ntfy line, 1/h max; 0=off.
     kb_auth_alert_threshold: int = 20
     # Lifetime of the FastMCP-issued access token. Decoupled from Google's ~1h

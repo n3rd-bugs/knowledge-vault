@@ -6,7 +6,10 @@ Two halves, both additive and inert while ``kb_collapse_alternatives`` is off:
   ``[]``, so pre-collapse payloads still validate);
 * ACCESS PARITY — the folded LOSER is access-logged at the same chokepoint the
   winner's hit uses, so being collapsed never counts as being forgotten (the
-  quiet-expiry/archive paths key on 'never recalled').
+  quiet-expiry/archive paths key on 'never recalled'). Loser rows carry the
+  ``search_rank.COLLAPSE_PARITY_SUFFIX`` tool marker (review #4 P2) so counting
+  surfaces (the promote queue) can exclude folds while every EXISTS-style
+  never-recalled consumer still sees the row.
 
 Real DB in kb_test; Ollama mocked by conftest; the REST leg runs in-process via
 Starlette's TestClient with kb-mcp's bearer, like tests/test_phase6_rest.py.
@@ -22,6 +25,7 @@ from kbcore.config import settings
 from kbcore.ingest import ingest
 from kbcore.models import SearchHit
 from kbcore.search import search
+from kbcore.search_rank import COLLAPSE_PARITY_SUFFIX
 
 pytestmark = pytest.mark.usefixtures("kb")
 
@@ -125,8 +129,9 @@ def test_the_folded_loser_is_access_logged_as_recalled(monkeypatch):
 
     assert loser not in [h.item_id for h in hits], "suppressed from the rendered set"
     assert _access_rows(winner) == [("search", Q)]
-    assert _access_rows(loser) == [("search", Q)], (
-        "the loser was RECALLED (folded into the winner) — same chokepoint, same stamp"
+    assert _access_rows(loser) == [("search" + COLLAPSE_PARITY_SUFFIX, Q)], (
+        "the loser was RECALLED (folded into the winner) — same chokepoint, same query,"
+        " marked as a fold so counting surfaces can tell it from a rendered hit"
     )
 
 

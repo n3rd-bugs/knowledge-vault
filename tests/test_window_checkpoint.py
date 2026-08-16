@@ -29,6 +29,8 @@ a single-window group is never checkpointed at all.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from kbcore import ingest_queue
@@ -65,6 +67,18 @@ def _no_stand_down(monkeypatch):
     yield
     consolidate.reset_stop_cache()
     consolidate._STOP_LOG.clear()
+
+
+@pytest.fixture(autouse=True)
+def _two_nights_in_one_day(monkeypatch):
+    """These tests compress 'tomorrow night' into a second ``_drive`` seconds
+    later, which the per-DAY attempt budget (review #4) would otherwise skip: a
+    content-failed row is not re-offered until the civil day turns. Pin the
+    boundary to the future so every drive counts as a fresh day; the budget
+    itself is pinned in tests/test_drain_refill.py."""
+    monkeypatch.setattr(
+        ingest_queue, "drain_day_start", lambda: datetime.now(UTC) + timedelta(days=1)
+    )
 
 
 def _enqueue(project: str, body: str, source_uri: str | None = None) -> int:
@@ -446,3 +460,38 @@ def test_a_multi_window_group_DOES_reach_the_store(kb, monkeypatch):
     assert calls == [qid] * (WINDOWS - 1), (
         f"expected one checkpoint per landed window bar the last, got {len(calls)}"
     )
+
+
+# ------------------------------------------------ the re-arm keeps the memory
+
+
+def test_an_identical_resubmission_over_a_terminal_row_keeps_the_checkpoint(kb):
+    """Review #4 P2: enqueue's ON CONFLICT re-arm set meta = EXCLUDED.meta,
+    wiping extract_checkpoint on IDENTICAL resubmission — the one case where the
+    fingerprint is MOST likely to still match. queue_repair.requeue_failed
+    preserves it for the same reason; the re-arm now merges it forward."""
+    body = "".join(f"User: q{i}\nAssistant: a{i}\n" for i in range(120))
+    qid = _enqueue("cp-rearm", body)
+    with transaction() as conn:  # terminally failed: the re-arm's WHERE clause
+        conn.execute(
+            "UPDATE ingest_queue SET status = 'failed', attempts = %s WHERE id = %s",
+            (ingest_queue.MAX_ATTEMPTS, qid),
+        )
+    ingest_queue.save_window_checkpoint(qid, fp="f" * 64, done=[0, 1], saved=2, rejected=1)
+    banked = _checkpoint(qid)
+    assert banked is not None, "setup failed to bank a checkpoint"
+
+    res = ingest_queue.enqueue("cp-rearm", body, kind="session")
+    assert (res.id, res.requeued) == (qid, True), "setup did not re-arm the terminal row"
+
+    assert _checkpoint(qid) == banked, "the re-arm merge clobbered the banked checkpoint"
+    with connect() as conn:
+        meta = conn.execute("SELECT meta FROM ingest_queue WHERE id = %s", (qid,)).fetchone()[0]
+    assert meta.get("submitted_by"), "the rest of meta must still be the FRESH submission's"
+
+
+def test_a_fresh_enqueue_carries_no_checkpoint_residue(kb):
+    """The preserve-slice collapses to '{}' when there is nothing to preserve —
+    a brand-new row must not grow an extract_checkpoint key."""
+    qid = _enqueue("cp-fresh", "User: new\nAssistant: row")
+    assert _checkpoint(qid) is None

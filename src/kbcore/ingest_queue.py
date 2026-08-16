@@ -26,12 +26,18 @@ from kbcore.errors import InvalidOperation
 # to any of them. Same pattern as kbworker.consolidate's re-exports.
 from kbcore.queue_checkpoint import (  # noqa: F401
     CHECKPOINT_KEY,
+    CHECKPOINT_PRESERVE_SQL,
     resume_windows,
     save_window_checkpoint,
     window_checkpoint,
     window_fingerprint,
 )
-from kbcore.queue_repair import requeue_extracted, requeue_failed  # noqa: F401
+from kbcore.queue_repair import (  # noqa: F401
+    drain_day_start,
+    near_deferral_cap_groups,
+    requeue_extracted,
+    requeue_failed,
+)
 from kbcore.scrub import scrub
 
 logger = logging.getLogger("kbcore.ingest_queue")
@@ -129,6 +135,9 @@ def enqueue(
     (id=None) so a live submission is never disturbed. Re-arming is BOUNDED at
     :data:`MAX_REQUEUES`: past that a recurring poison payload is left permanently
     failed and its id is returned with ``permanently_failed=True`` (finding).
+    The re-arm keeps the FRESH submission's meta but CARRIES the old row's
+    per-window checkpoint forward (review #4 P2): a byte-identical resubmission
+    is the case most likely to still fingerprint-match (CHECKPOINT_PRESERVE_SQL).
     """
     if kind not in QUEUE_KINDS:
         raise InvalidOperation(f"unknown ingest kind {kind!r}; one of {', '.join(QUEUE_KINDS)}")
@@ -175,7 +184,7 @@ def enqueue(
         # attempts forever. xmax is 0 on a fresh INSERT and non-zero on an UPDATE, and
         # the returned status tells a re-open apart from a permanent-failure touch.
         row = conn.execute(
-            """
+            f"""
             INSERT INTO ingest_queue (project, kind, content, content_hash, meta)
             VALUES (%(project)s, %(kind)s, %(content)s, %(hash)s, %(meta)s)
             ON CONFLICT (kind, project, content_hash) DO UPDATE
@@ -190,12 +199,12 @@ def enqueue(
                                THEN NULL ELSE ingest_queue.error END,
                   deferrals = CASE WHEN ingest_queue.requeue_count < %(cap)s
                                    THEN 0 ELSE ingest_queue.deferrals END,
-                  meta = EXCLUDED.meta,
+                  meta = EXCLUDED.meta || {CHECKPOINT_PRESERVE_SQL},
                   processed_at = CASE WHEN ingest_queue.requeue_count < %(cap)s
                                       THEN NULL ELSE ingest_queue.processed_at END
               WHERE ingest_queue.status = 'failed' AND ingest_queue.attempts >= %(maxa)s
             RETURNING id, (xmax <> 0), (status = 'pending')
-            """,
+            """,  # noqa: S608 — CHECKPOINT_PRESERVE_SQL is a constant fragment
             {
                 "project": project,
                 "kind": kind,
@@ -218,26 +227,26 @@ def enqueue(
 def pending(limit: int = 50) -> list[dict[str, Any]]:
     """Claim up to ``limit`` drainable rows (FOR UPDATE SKIP LOCKED).
 
-    Drainable = still 'pending', OR 'failed' but under :data:`MAX_ATTEMPTS` (the
-    self-heal set). Ordering: fresh (never-deferred) pending rows first, THEN
-    already-deferred pending rows, then retryable failed rows. Sorting by
-    ``deferrals`` before ``id`` means a stuck low-id row that keeps hitting a
-    "transient" 5xx can no longer sit at the HEAD of every nightly batch and starve
-    new content — it drifts to the back as it accumulates deferrals (review finding).
-    SKIP LOCKED means a concurrent/crashed drainer can never wedge the queue.
+    Drainable is :data:`_DRAINABLE` — still 'pending', or retryable-'failed'
+    and not content-failed TODAY (the per-DAY attempt budget, review #4).
+    Ordering: fresh (never-deferred) pending rows first, THEN already-deferred
+    pending rows, then retryable failed rows. Sorting by ``deferrals`` before
+    ``id`` means a stuck low-id row that keeps hitting a "transient" 5xx can no
+    longer sit at the HEAD of every nightly batch and starve new content — it
+    drifts to the back as it accumulates deferrals (review finding). SKIP LOCKED
+    means a concurrent/crashed drainer can never wedge the queue.
     """
     with connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, project, kind, content, meta
             FROM ingest_queue
-            WHERE status = 'pending'
-               OR (status = 'failed' AND attempts < %s)
+            WHERE {_DRAINABLE}
             ORDER BY (status = 'failed'), deferrals, id
-            LIMIT %s
+            LIMIT %(limit)s
             FOR UPDATE SKIP LOCKED
-            """,
-            (MAX_ATTEMPTS, limit),
+            """,  # noqa: S608 — _DRAINABLE is a constant fragment
+            {"maxa": MAX_ATTEMPTS, "day0": drain_day_start(), "limit": limit},
         ).fetchall()
     return [
         {"id": r[0], "project": r[1], "kind": r[2], "content": r[3], "meta": r[4] or {}}
@@ -258,18 +267,22 @@ def mark_extracted(queue_id: int, saved: int, rejected: int) -> None:
         )
 
 
-def mark_failed(queue_id: int, error: str) -> None:
+def mark_failed(queue_id: int, error: str) -> bool:
     """Record a failed drain (kept 'failed', not deleted — inspectable + retried).
 
     Increments ``attempts``; once it reaches :data:`MAX_ATTEMPTS` the row is no
     longer selected by :func:`pending`, so a genuinely-bad row stops looping.
+    Returns True when THIS call took the row terminal (attempts hit the cap), so
+    the drain can count the retirement into the run report and digest instead of
+    leaving it journald-only (<36h retention — review #4 P0 rider).
     """
     with transaction() as conn:
-        conn.execute(
+        row = conn.execute(
             "UPDATE ingest_queue SET status = 'failed', attempts = attempts + 1, "
-            "error = %s, processed_at = now() WHERE id = %s",
+            "error = %s, processed_at = now() WHERE id = %s RETURNING attempts",
             (error[:2000], queue_id),
-        )
+        ).fetchone()
+    return row is not None and int(row[0]) >= MAX_ATTEMPTS
 
 
 def mark_deferred(queue_id: int, error: str) -> bool:
@@ -298,29 +311,6 @@ def mark_deferred(queue_id: int, error: str) -> bool:
     return False
 
 
-def near_deferral_cap_groups() -> int:
-    """Still-'pending' GROUPS whose rows sit within 2 deferrals of :data:`DEFERRAL_CAP`.
-
-    Drain telemetry (review #3 P1 rider): a terminal escalation used to be silent —
-    no digest line, and journald retention (<36h) beat the owner to the evidence.
-    This count precedes one by ~2 nights of deferrals. Grouped the way
-    :func:`pending_groups` groups, so a giant session counts once, not per row.
-    """
-    with connect() as conn:
-        row = conn.execute(
-            f"""
-            SELECT count(DISTINCT (project,
-                     CASE WHEN {_DEGENERATE_URI_SQL}
-                          THEN 'queue:' || kind || ':' || id::text
-                          ELSE btrim(meta->>'source_uri') END))
-              FROM ingest_queue
-             WHERE status = 'pending' AND deferrals >= %(near)s
-            """,  # noqa: S608 — _DEGENERATE_URI_SQL is a constant fragment
-            {"near": DEFERRAL_CAP - 2},
-        ).fetchone()
-    return int(row[0])
-
-
 def queue_depth() -> int:
     """Count of pending submissions. Resilient to migration 002 not yet applied."""
     with connect() as conn:
@@ -338,8 +328,17 @@ def queue_depth() -> int:
 COALESCE_QUIET_MINUTES = 30
 
 # The same drainable set pending() uses: still pending, or failed but under the
-# retry budget. Named once so the two paths cannot drift apart.
-_DRAINABLE = "(status = 'pending' OR (status = 'failed' AND attempts < %(maxa)s))"
+# retry budget AND not content-failed TODAY — attempts are budgeted per DAY, not
+# per run, since a per-RUN exclusion let the 08-15 boot catch-up double-burn a
+# group failed at 01:00 (review #4; %(day0)s = queue_repair.drain_day_start(),
+# local midnight). Owner requeues and the re-arm NULL processed_at, so a
+# deliberate retry is eligible today; deferrals leave rows 'pending' with
+# attempts untouched, so outages are exempt. Named once so the paths cannot
+# drift apart.
+_DRAINABLE = (
+    "(status = 'pending' OR (status = 'failed' AND attempts < %(maxa)s"
+    " AND (processed_at IS NULL OR processed_at < %(day0)s)))"
+)
 
 # The SQL twin of :func:`normalise_source_uri`, applied to rows ALREADY STORED.
 # The enqueue guard protects new submissions; this protects the 137 rows that
@@ -491,6 +490,7 @@ def pending_groups(
             """,  # noqa: S608 — _DRAINABLE/_DEGENERATE_URI_SQL are constant fragments
             {
                 "maxa": MAX_ATTEMPTS,
+                "day0": drain_day_start(),
                 "quiet": int(quiet_minutes),
                 "rows": max(1, int(limit)),
                 "groups": None if max_groups is None else max(1, int(max_groups)),

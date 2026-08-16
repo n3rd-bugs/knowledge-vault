@@ -21,7 +21,7 @@ from kbcore import search as search_mod
 from kbcore import supersede as supersede_mod
 from kbcore.config import settings
 from kbcore.errors import KBError
-from kbcore.models import RELATIONS
+from kbcore.models import RELATIONS, SearchHit
 from kbmcp import (
     ANNOTATIONS_READ,
     ANNOTATIONS_WRITE,
@@ -337,9 +337,26 @@ def kb_search(
             tool="mcp.kb_search",
         )
         log.info("kb_search q=%r project=%s hits=%d", query, project, len(hits))
-        return render.render_hits(hits)
+        return _render_hits_with_folds(hits)
     except KBError as e:
         raise _wrap(e) from e
+
+
+def _render_hits_with_folds(hits: list[SearchHit]) -> str:
+    """render_hits + collapse observability (review #4 P2, KB 21332): a hit that
+    folded cross-project twins (``SearchHit.collapsed``, KB 19663) gains
+    ``(+N folded: ids)`` so an agent can kb_get a folded twin instead of
+    concluding it vanished. MCP-only; with nothing folded the bytes match
+    ``render.render_hits`` exactly (pinned in tests)."""
+    if not hits:
+        return render.render_hits(hits)
+    blocks = []
+    for i, hit in enumerate(hits, 1):
+        block = render.render_hit(hit, i)
+        if hit.collapsed:
+            block += f"\n   (+{len(hit.collapsed)} folded: {', '.join(map(str, hit.collapsed))})"
+        blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 @mcp.tool(annotations=ANNOTATIONS_READ)

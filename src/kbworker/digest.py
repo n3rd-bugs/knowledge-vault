@@ -54,6 +54,13 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
         lines.append(f"drain: {near_cap} group(s) near deferral cap")
     if escalations := counts.get("deferral_escalations"):
         lines.append(f"drain: {escalations} row(s) escalated to failed at the deferral cap")
+    # Attempts-cap retirement (review #4 P0 rider, 2026-08-16): a content-failing
+    # group's LAST act — after this the queue never offers it again, so the owner
+    # hears it here or from nobody. POSITIVE-ONLY and pure ASCII like its
+    # neighbours; content_failures stays report-only by default (a sub-cap
+    # failure retries tomorrow and is not yet news — noise budget, review #4).
+    if retired := counts.get("attempts_cap_retirements"):
+        lines.append(f"drain: {retired} group(s) retired at attempts cap")
     # The weekend top-up, POSITIVE-ONLY (unlike the spec above): it does not run
     # on a deadline day at all, so a "topup triaged: 0" every weekday night would
     # be noise in the one message the owner reads without going looking.
@@ -87,6 +94,12 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     # exists without asking. POSITIVE-ONLY and pure ASCII, like its neighbours.
     if promotable := counts.get("promote_candidates"):
         lines.append(f"promote-worthy: {promotable}")
+    # Demand-side gap counter (review #4 Wave E, KB 21332): zero-hit searches in
+    # the last day (kbcore.search_misses, stashed by push_run_digest). POSITIVE-
+    # ONLY and pure ASCII like its neighbours — a night with no misses says
+    # nothing rather than a noise line of 'search misses: 0'.
+    if misses := counts.get("search_misses_24h"):
+        lines.append(f"search misses: {misses}")
     expiry = counts.get("first_expiry_date")
     if expiry and _expiring_soon(expiry):
         lines.append(f"review rows start expiring {expiry}")
@@ -124,15 +137,55 @@ def push_run_digest(counts: Mapping[str, Any]) -> bool:
 
     The digest is the only part of the pass an owner sees without going looking,
     so it must never break the pass that produced it. The credential stays inside
-    ``kbcore.notify`` — that is where "never log the token" lives.
+    ``kbcore.notify`` — that is where "never log the token" lives. Two riders,
+    each fully guarded: the day's zero-hit count is stashed before the lines are
+    built, and the WEEKLY report step runs after the nightly push (day-gated
+    inside kbworker.weekly — no new timer; review #4, KB 21332).
     """
+    _note_search_misses(counts)
     lines = digest_lines(counts)
-    if not lines:
-        return False
-    try:
-        from kbcore import notify
+    pushed = False
+    if lines:
+        try:
+            from kbcore import notify
 
-        return bool(notify.push_digest(lines))
-    except Exception:  # noqa: BLE001 — a digest can never fail the run that made it
-        logger.warning("nightly digest push unavailable", exc_info=True)
-        return False
+            pushed = bool(notify.push_digest(lines))
+        except Exception:  # noqa: BLE001 — a digest can never fail the run that made it
+            logger.warning("nightly digest push unavailable", exc_info=True)
+    _maybe_weekly(counts)
+    return pushed
+
+
+def _note_search_misses(counts: Mapping[str, Any]) -> None:
+    """Stash the last day's zero-hit search count into ``counts`` (ADDED key).
+
+    The producer lives in kbcore.search_misses (migration 018). Fail-open and
+    lazily imported like every digest dependency: a missing module, schema or DB
+    costs this ONE line, never the digest — which is the last thing standing
+    between a finished run and the owner's phone.
+    """
+    if not isinstance(counts, dict):
+        return
+    try:
+        from kbcore import search_misses
+
+        counts["search_misses_24h"] = search_misses.count_since(days=1)
+    except Exception:  # noqa: BLE001 — telemetry may never cost the digest
+        logger.warning("search-miss count unavailable for the digest", exc_info=True)
+
+
+def _maybe_weekly(counts: Mapping[str, Any]) -> None:
+    """WEEKLY TREND REPORT rider (review #4 strategy P1, KB 21332).
+
+    Day-gated INSIDE :func:`kbworker.weekly.maybe_weekly` (kb_weekly_report /
+    kb_weekly_day), so most nights this is a no-op. Lazily imported and fully
+    guarded — the weekly can never fail the nightly that carries it.
+    """
+    if not isinstance(counts, dict):
+        return
+    try:
+        from kbworker import weekly
+
+        weekly.maybe_weekly(counts)
+    except Exception:  # noqa: BLE001 — the weekly may never fail the nightly
+        logger.warning("weekly report step failed; nightly digest unaffected", exc_info=True)

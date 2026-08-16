@@ -8,6 +8,10 @@ only on explicit, confirmed invocation:
 
 * candidate enumeration is READ-ONLY, recall-proven, ordered, paginated, and
   never proposes consolidation output (summary/report);
+* candidate ORDERING is steering-resistant (review #4 P1): distinct UTC access
+  days (owner-attributed days first), never raw recall count — a grantee burst
+  collapses to one day-unit and can never outrank owner-recalled items; collapse
+  ACCESS-PARITY rows (``search_rank.COLLAPSE_PARITY_SUFFIX``) never count;
 * ``promote_batch`` dry-run writes NOTHING (table-snapshot proof) and its apply
   path matches the singular ``review.promote`` end state byte-for-byte;
 * the CLI defaults to a dry run and a DECLINED confirmation writes nothing;
@@ -42,8 +46,32 @@ def _unverified(tag: str, project: str = "pp", type_: str = "note") -> tuple[int
 
 
 def _recall(item_id: int, n: int) -> None:
+    """n recalls, all TODAY (one distinct access day)."""
     for _ in range(n):
         log_access(item_id, "kb_search")
+
+
+def _recall_days(
+    item_id: int,
+    days: int,
+    *,
+    per_day: int = 1,
+    principal: str | None = None,
+    tool: str = "kb_search",
+) -> None:
+    """Recalls spread over ``days`` DISTINCT UTC days (backdated, kb_test data).
+
+    Rows are exactly 24h apart so the day buckets are always distinct; NULL
+    ``principal`` is the owner (011_principals.sql), a name is a grantee.
+    """
+    with db.transaction() as conn:
+        for d in range(1, days + 1):
+            for _ in range(per_day):
+                conn.execute(
+                    "INSERT INTO access_log (item_id, tool, principal, ts)"
+                    " VALUES (%s, %s, %s, now() - make_interval(days => %s))",
+                    (item_id, tool, principal, d),
+                )
 
 
 def _age_item(item_id: int, days: int) -> None:
@@ -92,43 +120,44 @@ def _promote_defaults(monkeypatch):
 
 
 def test_candidates_are_recall_proven_ordered_and_exclude_consolidation_output(kb):
-    a, qa = _unverified("a")  # 5 recalls, 40d old -> rank 1 (ties break oldest-first)
-    _recall(a, 5)
+    a, qa = _unverified("a")  # 5 access days, 40d old -> rank 1 (ties break oldest-first)
+    _recall_days(a, 5)
     _age_item(a, 40)
-    b, qb = _unverified("b")  # 5 recalls, fresh   -> rank 2
-    _recall(b, 5)
-    i, qi = _unverified("i")  # 4 recalls, row already closed -> still a candidate
-    _recall(i, 4)
+    b, qb = _unverified("b")  # 5 access days, fresh   -> rank 2
+    _recall_days(b, 5)
+    i, qi = _unverified("i")  # 4 access days, row already closed -> still a candidate
+    _recall_days(i, 4)
     review_mod.resolve_review(qi)
-    c, qc = _unverified("c")  # 3 recalls, at the floor -> rank 4
-    _recall(c, 3)
+    c, qc = _unverified("c")  # 3 recalls at the row floor -> rank 4
+    _recall_days(c, 3)
     d, _qd = _unverified("d")  # 2 recalls: below the floor
     _recall(d, 2)
     e, _qe = _unverified("e", type_="summary")  # consolidation output, recalled
-    _recall(e, 5)
+    _recall_days(e, 5)
     f, _qf = _unverified("f", type_="report")
-    _recall(f, 5)
+    _recall_days(f, 5)
     g = ingest("pp", "note", "t g", "b g", uri="g")  # verified: nothing to promote
-    _recall(g, 5)
+    _recall_days(g, 5)
     h, _qh = _unverified("h")  # unverified but retired
-    _recall(h, 5)
+    _recall_days(h, 5)
     with db.transaction() as conn:
         conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (h,))
 
     rows = review_promote.list_promote_candidates()
 
-    assert [r["item_id"] for r in rows] == [a, b, i, c], "recalls DESC, then oldest first"
+    assert [r["item_id"] for r in rows] == [a, b, i, c], "access days DESC, then oldest first"
     assert [r["queue_id"] for r in rows] == [qa, qb, None, qc], "open row id, or None"
     top = rows[0]
     assert (top["project"], top["type"], top["title"]) == ("pp", "note", "t a")
     assert top["recalls"] == 5 and top["age_days"] == 40
+    assert top["recall_days"] == 5 and top["owner_recall_days"] == 5, "ADDED keys ride along"
 
 
 def test_candidate_threshold_defaults_to_the_knob_and_zero_is_a_floor(kb, monkeypatch):
     lo, _q1 = _unverified("lo")  # 1 recall
     _recall(lo, 1)
-    hi, _q2 = _unverified("hi")  # 4 recalls
-    _recall(hi, 4)
+    hi, _q2 = _unverified("hi")  # 4 recalls over 4 days (ranks above lo's 1 day)
+    _recall_days(hi, 4)
     never, _q3 = _unverified("never")  # 0 recalls
 
     assert [r["item_id"] for r in review_promote.list_promote_candidates()] == [hi]
@@ -166,6 +195,59 @@ def test_count_matches_the_list_at_the_default_threshold(kb):
     assert review_promote.count_promote_candidates() == len(
         review_promote.list_promote_candidates()
     )
+
+
+# --- 1b. steering resistance (review #4 P1 security + P2 parity) --------------
+# access_log is writable by ANY grantee's searches; the ordering must not be.
+
+
+def test_burst_inflation_collapses_to_day_count(kb):
+    burst, _q1 = _unverified("st-burst")
+    _recall(burst, 50)  # 50 rows hammered in ONE day
+    steady, _q2 = _unverified("st-steady")
+    _recall_days(steady, 3)  # 3 rows over THREE days
+
+    rows = review_promote.list_promote_candidates()
+
+    assert [r["item_id"] for r in rows] == [steady, burst], (
+        "distinct access days rank the queue — a same-day burst collapses to one unit"
+    )
+    by = {r["item_id"]: r for r in rows}
+    assert by[burst]["recalls"] == 50 and by[burst]["recall_days"] == 1
+    assert by[steady]["recalls"] == 3 and by[steady]["recall_days"] == 3
+
+
+def test_owner_recall_days_outrank_any_grantee_volume(kb):
+    hammered, _q1 = _unverified("st-grantee")
+    _recall_days(hammered, 5, per_day=4, principal="mallory")  # 20 grantee rows, 5 days
+    owned, _q2 = _unverified("st-owner")
+    _recall_days(owned, 2, per_day=2)  # 4 owner rows, 2 days
+
+    rows = review_promote.list_promote_candidates()
+
+    assert [r["item_id"] for r in rows] == [owned, hammered], (
+        "a compromised grantee box cannot lift its item above anything the owner uses"
+    )
+    by = {r["item_id"]: r for r in rows}
+    assert by[hammered]["owner_recall_days"] == 0 and by[hammered]["recall_days"] == 5
+    assert by[owned]["owner_recall_days"] == 2
+
+
+def test_collapse_parity_rows_never_count_for_promotion(kb):
+    from kbcore.search_rank import COLLAPSE_PARITY_SUFFIX
+
+    folded, _q1 = _unverified("st-folded")  # only ever recalled as a folded loser
+    _recall_days(folded, 5, tool="mcp.kb_search" + COLLAPSE_PARITY_SUFFIX)
+    genuine, _q2 = _unverified("st-genuine")
+    _recall_days(genuine, 3)
+
+    rows = review_promote.list_promote_candidates()
+
+    assert [r["item_id"] for r in rows] == [genuine], (
+        "a fold protects the loser from expiry; it is not recall evidence for promotion"
+    )
+    assert review_promote.count_promote_candidates() == 1, "the digest count agrees"
+    assert rows[0]["recalls"] == 3, "and parity rows are absent from the displayed count"
 
 
 # --- 2. promote_batch: dry run writes nothing (table-snapshot proof) ----------

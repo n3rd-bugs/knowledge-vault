@@ -22,6 +22,12 @@ from psycopg.types.json import Jsonb
 
 from kbcore import review_triage
 from kbcore.db import transaction
+from kbcore.triage_sql import (
+    TRIAGE_KEY_SQL,
+    TRIAGE_PRIOR_KEY_SQL,
+    sql_has_triage,
+    sql_triage_obj,
+)
 
 #: Stamped on a cluster-winner close so :func:`kbcore.review_apply.undo_auto_applied`
 #: can find it. The close is a row flip and nothing else, so its undo is a row
@@ -68,15 +74,15 @@ def invalidate_dead_dup(qid: int) -> bool:
     }
     with transaction() as conn:
         row = conn.execute(
-            """
+            f"""
             UPDATE review_queue
-            SET detail = ((COALESCE(detail, '{}'::jsonb) - 'triage')
-                          || jsonb_build_object('triage_prior', detail->'triage'))
+            SET detail = ((COALESCE(detail, '{{}}'::jsonb) - {TRIAGE_KEY_SQL})
+                          || jsonb_build_object({TRIAGE_PRIOR_KEY_SQL}, {sql_triage_obj("detail")}))
                           || %(stamp)s
             WHERE id = %(qid)s AND resolved = false
-              AND COALESCE(detail, '{}'::jsonb) ? 'triage'
+              AND {sql_has_triage("detail")}
             RETURNING id
-            """,
+            """,  # noqa: S608 — constant triage-SQL fragments; values ride parameters
             {"stamp": Jsonb(stamp), "qid": qid},
         ).fetchone()
     return row is not None

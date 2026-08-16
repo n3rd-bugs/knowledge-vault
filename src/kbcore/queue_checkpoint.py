@@ -44,6 +44,20 @@ from kbcore.db import transaction
 # which is why every write below is a MERGE and never an overwrite.
 CHECKPOINT_KEY = "extract_checkpoint"
 
+# The jsonb slice of the EXISTING row that enqueue's ON CONFLICT re-arm merges
+# over the fresh EXCLUDED.meta (review #4 P2). ``meta = EXCLUDED.meta`` wiped a
+# banked checkpoint on IDENTICAL resubmission — the one case (same bytes, so
+# likely the same assembled text) where the fingerprint is MOST likely to still
+# match and spare the GPU the done windows. jsonb_strip_nulls collapses the
+# no-checkpoint case to '{}', a no-op merge, so fresh rows are untouched; a
+# text that DID drift is discarded by the fingerprint as always.
+# ``queue_repair.requeue_failed`` preserves this key for the same reason;
+# ``requeue_extracted`` deliberately clears it (re-mining is the point there).
+CHECKPOINT_PRESERVE_SQL = (
+    f"jsonb_strip_nulls(jsonb_build_object('{CHECKPOINT_KEY}', "
+    f"ingest_queue.meta -> '{CHECKPOINT_KEY}'))"
+)
+
 
 def window_fingerprint(windows: list[str]) -> str:
     """sha256 over the WINDOWS — content AND geometry — that a checkpoint is valid for.

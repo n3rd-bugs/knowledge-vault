@@ -162,7 +162,12 @@
   # revision carries in its title, and let the chain churn freely underneath.
   expect_substr: ["RM3_SCADA_JSON_API"]
 - q: "mTLS fleet agent deferred config-sync"
-  expect_item_id: 68
+  # was 68: same churn as RM3_SCADA_JSON_API above — the rm3 config-sync work
+  # resumed 2026-08-17 and doc-refresh superseded the 07-03 revision (68 ->
+  # 21589), which default search then rightly excludes. Two red nights
+  # (08-18/19, hit@5 0.9615 vs floor 0.97) until repointed to the doc's stable
+  # title identity.
+  expect_substr: ["CONFIG_SYNC_HARDENING_PLAN"]
 
 # --- GRAPH-EXPANSION A/B (kbworker.eval_sentinel._graph_expansion_ab) ---------
 # PARKED 2026-08-09 (GRAPH_AB_ENABLED = False). When armed, the sentinel replays

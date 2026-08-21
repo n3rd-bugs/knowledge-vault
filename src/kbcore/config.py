@@ -285,14 +285,27 @@ class Settings(SettingsViews, BaseSettings):
     kb_rerank_url: str = ""
     kb_rerank_top_n: int = 20
     kb_rerank_timeout: float = 2.0
-    # Rerank EVIDENCE source (A/B PENDING — do not flip the default without one). False (today's
-    # behaviour): the reranker scores `title + body prefix` read back from items. True: it scores
-    # `title + the best-matching CHUNK` that the RRF fusion already computed and then threw away —
-    # the passage that actually matched the query, at the cost of less surrounding context (a chunk
-    # is 300-500 tokens, the body prefix is 1500 chars). Which wins is empirical, so this ships
-    # OFF: flip it, run `make eval` against the real corpus, compare hit@5/MRR with the OFF
-    # baseline, and only then consider a new default.
+    # Rerank EVIDENCE source. False: the reranker scores `title + body prefix` read back from
+    # items. True: it scores `title + the best-matching CHUNK` that the RRF fusion already
+    # computed — the passage that actually matched the query, at the cost of less surrounding
+    # context (a chunk is 300-500 tokens, the body prefix is 1500 chars). The owner's A/B RAN
+    # 2026-08-01 and the flag is ENABLED in this deployment's .env (verified KB 6495): hit@5
+    # 0.86 -> 0.89, MRR 0.84 -> 0.82 — the MRR dip was accepted for the hit@5 gain. The CODE
+    # default deliberately stays False so a fresh install starts from the measured-safe baseline;
+    # flip it per deployment after your own `make eval` comparison, and do NOT "fix" the live
+    # .env back to False — that would silently revert a recorded owner decision.
     kb_rerank_use_chunk: bool = False
+    # Relevance-based thin-miss instrument (review #5 val-1, migration 019): a search that
+    # RETURNED results still records a subtype='thin' search-miss row when the rerank sidecar
+    # scored its top answer BELOW this floor (golden pairs score ~0.99994 vs ~3e-05 for
+    # irrelevant — e.g. 0.05 separates them by orders of magnitude); with the sidecar absent, a
+    # thin miss is instead a top candidate with NO keyword/identifier-leg contribution — NEVER a
+    # fused-score floor, which a vector-only top-1 always clears by construction (review #5
+    # guard). 0 = OFF, the default and the calibration week's setting: no thin miss is recorded,
+    # but every sidecar-scored search logs its would-be top relevance as a subtype='calibration'
+    # row (excluded from all miss counts) so a week of real data sizes the floor. Calibrate
+    # against the 52q golden set — no golden query should register thin — before enabling.
+    kb_miss_relevance_floor: float = 0.0
     # Cross-family judge for PRIMARY-sourced ensemble singletons (probe-benched 2026-07-18:
     # granite4.1:8b approved 7/7 reals, caught 6/6 fabricated probes, ~2.7s/item). Empty = primary
     # singletons pass unjudged (the pre-secondary behavior). A judge FAIL still ingests, flagged

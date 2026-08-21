@@ -40,8 +40,15 @@ TITLE = "KB nightly"
 MAX_BODY_CHARS = 3500
 
 
-def push_digest(lines: list[str]) -> bool:
-    """POST ``lines`` as one ntfy message titled "KB nightly". True iff delivered.
+def push_digest(lines: list[str], *, title: str = TITLE, priority: str = "default") -> bool:
+    """POST ``lines`` as one ntfy message. True iff delivered.
+
+    Defaults are byte-identical to the historical behavior (title "KB nightly",
+    priority "default") — the keyword overrides exist because a red-eval night
+    used to arrive looking exactly like a healthy one (08-18/19: eval_regression
+    true, yet the phone showed a normal 'KB nightly'; OnFailure never fires for
+    a SUCCESSFUL unit run). The nightly passes ``title='KB ALERT'`` /
+    ``priority='high'`` on red nights; the weekly passes ``title='KB weekly'``.
 
     Returns False WITHOUT contacting anything when the channel is not configured
     (empty ``kb_notify_url``/``kb_notify_topic`` — the documented "feature off"
@@ -52,7 +59,7 @@ def push_digest(lines: list[str]) -> bool:
     body = "\n".join(str(line) for line in lines if str(line).strip())
     if not (base and topic and body):
         return False
-    headers = {"Title": TITLE, "Priority": "default"}
+    headers = {"Title": title, "Priority": priority}
     if settings.kb_notify_token:
         headers["Authorization"] = f"Bearer {settings.kb_notify_token}"
     try:

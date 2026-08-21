@@ -15,13 +15,18 @@ Score handling: ``_to_hits`` re-sorts by score (verified-first tie-break), so
 reordering the list alone would be undone. Instead the existing score
 MULTISET of the reranked window is reassigned to the new order (best rerank
 gets the window's highest fused score, and so on) — order survives the
-re-sort while the score scale, expansion clamps, and bonus semantics stay
-exactly as fused.
+re-sort and the score SCALE stays as fused. Within the window that
+reassignment CAN reorder an expansion neighbor above its seed (review #5
+val-2): deliberate — the cross-encoder read both documents against the query,
+which outranks the query-blind seed clamp. The tail beyond the window is
+never touched.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 import httpx
 
@@ -31,15 +36,98 @@ logger = logging.getLogger("kbcore.rerank")
 
 _DOC_BODY_CHARS = 1500  # title + this much body per candidate document
 
+# --- participation telemetry (review #5 ops-4 / ret-rerank-2 / val-1) ---------
+# Which ranking system did THIS search actually measure? Thread-local so
+# concurrent server threads cannot cross-talk; writer and reader share a thread
+# by construction (kbcore.search reads inline right after the rerank step, and
+# the eval sentinel replays the harness synchronously, reading per case).
+_participation = threading.local()
+
+
+def _note(outcome: str, top_relevance: float | None = None) -> None:
+    _participation.outcome = outcome
+    _participation.top_relevance = top_relevance
+
+
+def last_outcome() -> str:
+    """Most recent rerank participation in this thread: 'active'|'fallback'|'off'.
+
+    'active' = the sidecar scored the window; 'fallback' = it was attempted and
+    failed, fused order stood; 'off' = it did not participate (no URL configured,
+    or nothing to reorder). Wave-F cross-package contract: the eval sentinel
+    reads this after harness runs so a red night's meta says which ranking
+    system was measured — attribution from a meta field, not journald archaeology.
+    """
+    return getattr(_participation, "outcome", "off")
+
+
+def last_top_relevance() -> float | None:
+    """Top-1 relevance score of this thread's last 'active' rerank, else None.
+
+    Consumed by kbcore.search_misses.observe for the thin-miss floor and the
+    calibration-week score distribution (review #5 val-1).
+    """
+    return getattr(_participation, "top_relevance", None)
+
+
+def reset_outcome() -> None:
+    """Mark 'off' — kbcore.search calls this when the rerank leg does not run."""
+    _note("off")
+
+
+# Fixed pair for :func:`probe`: the first document answers the query, the second
+# cannot. A healthy sidecar separates them by orders of magnitude (golden-pair
+# sanity 0.99994 vs 3e-05); the known-bad GGUF mode scores everything uniformly
+# (~e-23), so the probe checks DISCRIMINATION, not just HTTP 200.
+_PROBE_QUERY = "wireguard handshake timeout fix"
+_PROBE_DOCS = [
+    "WireGuard handshake timeouts: check PersistentKeepalive and that the UDP "
+    "port is reachable; an MTU mismatch also stalls the handshake.",
+    "The bakery's sourdough starter needs feeding twice a day in summer.",
+]
+
+
+def probe() -> dict[str, bool | int | None]:
+    """One fixed two-document sidecar probe: ``{'ok': bool, 'latency_ms': int|None}``.
+
+    Fail-open and NEVER raises (Wave-F cross-package contract): the nightly
+    consolidate tail step calls this into ``counts['rerank_probe']`` /
+    ``counts['rerank_probe_ms']`` and the digest renders a positive-only line on
+    failure. ``ok`` requires the relevant document to OUTSCORE the irrelevant
+    one — a liveness-only check would miss the broken-GGUF uniform-score mode.
+    With ``kb_rerank_url`` unset this reports failure without any HTTP call
+    (callers gate on the setting). Never touches the per-search participation
+    state above.
+    """
+    if not settings.kb_rerank_url:
+        return {"ok": False, "latency_ms": None}
+    try:
+        t0 = time.monotonic()
+        resp = httpx.post(
+            f"{settings.kb_rerank_url.rstrip('/')}/v1/rerank",
+            json={"model": "reranker", "query": _PROBE_QUERY, "documents": _PROBE_DOCS},
+            timeout=settings.kb_rerank_timeout,
+        )
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        resp.raise_for_status()
+        scores = [0.0, 0.0]
+        for r in resp.json()["results"]:
+            scores[int(r["index"])] = float(r["relevance_score"])
+        return {"ok": scores[0] > scores[1], "latency_ms": latency_ms}
+    except Exception as e:  # noqa: BLE001 — the probe itself must be fail-open
+        logger.warning("rerank probe failed (%s: %s)", e.__class__.__name__, e)
+        return {"ok": False, "latency_ms": None}
+
 
 def _documents(conn, item_ids: list[int], evidence: dict[int, str] | None = None) -> dict[int, str]:
     """title + body-prefix per candidate, one parameterized query.
 
-    ``evidence`` (search._rerank_evidence, gated on ``kb_rerank_use_chunk``,
-    default None/OFF) optionally supplies the best-matching CHUNK text per item
-    to score INSTEAD of the body prefix. Absent/empty entries fall back to the
-    body prefix, and with ``evidence=None`` every document is byte-identical to
-    the pre-flag behaviour.
+    ``evidence`` (search._rerank_evidence, gated on ``kb_rerank_use_chunk`` —
+    code default OFF; this deployment's .env enabled it 2026-08-01 after the
+    A/B, verified KB 6495) optionally supplies the best-matching CHUNK text per
+    item to score INSTEAD of the body prefix. Absent/empty entries fall back to
+    the body prefix, and with ``evidence=None`` every document is byte-identical
+    to the pre-flag behaviour.
     """
     rows = conn.execute(
         "SELECT id, title, left(body, %s) FROM items WHERE id = ANY(%s)",
@@ -67,6 +155,11 @@ def _scores(query: str, documents: list[str]) -> list[float] | None:
             out[int(r["index"])] = float(r["relevance_score"])
         return out
     except Exception as e:  # noqa: BLE001 — reranking must never fail a search
+        # 'fallback' marks the search as measured on the FUSED order (review #5
+        # ops-4): the WARNING below lives in <36h journald retention, so the
+        # durable record of "which ranking system ran" is this marker, read by
+        # search_misses.observe and the eval sentinel via last_outcome().
+        _note("fallback")
         logger.warning(
             "rerank sidecar unavailable/failed (%s: %s); fused order stands",
             e.__class__.__name__,
@@ -87,9 +180,15 @@ def rerank_fused(
     Returns ``fused`` unchanged on any failure or when there is nothing to
     reorder. The tail beyond ``top_n`` is never touched. ``evidence`` is the
     optional per-item chunk text to score instead of the body prefix (see
-    :func:`_documents`); None — the default and the shipped configuration —
-    keeps the documents byte-identical to the pre-flag behaviour.
+    :func:`_documents`); None — the code default for a fresh install — keeps
+    the documents byte-identical to the pre-flag behaviour (this deployment
+    passes chunk evidence: .env flag ON since the 2026-08-01 A/B, KB 6495).
+
+    Participation telemetry: entry marks 'off'; a failed sidecar call marks
+    'fallback' (in :func:`_scores`); success marks 'active' with the top-1
+    relevance score (see :func:`last_outcome` / :func:`last_top_relevance`).
     """
+    _note("off")  # not attempted yet; early returns leave it that way
     if top_n < 2 or len(fused) < 2:
         return fused
     ordered = sorted(fused, key=lambda t: -t[1])
@@ -101,6 +200,7 @@ def rerank_fused(
     scores = _scores(query, [docs_by_id[i] for i in ranked_ids])
     if scores is None:
         return fused
+    _note("active", max(scores))
     by_id = {t[0]: t for t in head}
     rerank_order = [i for _, i in sorted(zip(scores, ranked_ids, strict=True), key=lambda p: -p[0])]
     rerank_order += [t[0] for t in head if t[0] not in docs_by_id]  # doc-less keep rank

@@ -27,15 +27,22 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from kbcore import consolidation, eval_harness, search_expand
-from kbcore import review as review_mod
+from kbcore import eval_harness, search_expand
 from kbcore.config import settings
 from kbcore.search import search
+from kbworker import eval_trust
+
+# THE ESTABLISHED SEAM (mechanical split, review #5 Wave F): the regression
+# detector moved to its own module when the verified-lift watch reached this
+# file's 300-line ratchet. Every caller and test keeps reaching it as
+# ``eval_sentinel.<name>`` — same pattern as kbworker.tail_steps / digest.
+from kbworker.eval_regression import (  # noqa: F401
+    REGRESSION_EPSILON,
+    REVIEW_REASON,
+    _detect_regression,
+)
 
 logger = logging.getLogger("kbworker.eval_sentinel")
-
-REGRESSION_EPSILON = 0.05  # absolute hit@5 / MRR drop vs the prior run that trips it
-REVIEW_REASON = "search_regression"
 # Instrument switches. Deliberately module constants, not config knobs: these
 # only decide whether a measurement is TAKEN — no production retrieval path
 # reads them, and a .env-tunable measurement is one more thing that can silently
@@ -79,6 +86,20 @@ def _run(counts: dict[str, Any]) -> None:
     counts["eval_mrr"] = round(mrr, 4)
     counts["eval_queries"] = len(golden)
     counts["eval_regression"] = False
+    # Chain-resolution telemetry (review #5 ret-eval-1): how many id pins the
+    # harness followed to a live chain head tonight — doc-refresh churn becomes
+    # a meta number instead of a red night. getattr, so a stubbed evaluate()
+    # returning bare tuples (the sentinel test rig) still counts 0.
+    counts["eval_chain_resolved"] = sum(1 for r in _results if getattr(r, "chain_resolved", False))
+    # Review #5 ops-4: which rerank path scored tonight's replay — 'active'
+    # (sidecar scored), 'fallback' (sidecar failed, fused order stood), 'off'.
+    # A red night reads differently if the reranker silently sat out.
+    try:
+        from kbcore import rerank as _rerank
+
+        counts["eval_rerank_outcome"] = _rerank.last_outcome()
+    except Exception:  # noqa: BLE001 — observability may never fail the eval
+        pass
     logger.info(
         "search-quality eval: hit@5=%.3f MRR=%.3f over %d queries", hit_at_5, mrr, len(golden)
     )
@@ -102,81 +123,16 @@ def _instrument(
 
     The measurement returns its whole result dict, so a failure leaves NO partial
     metrics behind — the owner reads either a complete instrument or
-    ``<status_key> = error``, never half a number they might act on.
+    ``<status_key> = error``, never half a number they might act on. A
+    measurement may set its OWN status (the trust watch reports 'watch');
+    'ok' fills in only when it did not.
     """
     try:
         counts.update(measure())
-        counts[status_key] = "ok"
+        counts.setdefault(status_key, "ok")
     except Exception:  # noqa: BLE001 — an instrument must never break the sentinel
         logger.exception("%s: instrument failed; primary eval metrics unaffected", status_key)
         counts[status_key] = "error"
-
-
-def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> None:
-    prior = consolidation.previous_eval_metrics()
-    open_row = review_mod.open_review_by_reason(REVIEW_REASON)
-    floor_h = settings.kb_eval_min_hit5
-    floor_m = settings.kb_eval_min_mrr
-
-    # Two independent trips: (1) a drop beyond epsilon vs the previous run, and
-    # (2) an ANCHORED ABSOLUTE floor. The floor catches a gradual sub-epsilon drift
-    # the previous-run comparison can never see (0.90 → 0.0 at 0.05/night is silent
-    # otherwise), and it fixes the downward-ratcheting auto-resolve baseline (finding).
-    below_floor = hit_at_5 < floor_h or mrr < floor_m
-    dropped = prior is not None and (
-        prior["hit_at_5"] - hit_at_5 > REGRESSION_EPSILON or prior["mrr"] - mrr > REGRESSION_EPSILON
-    )
-    if below_floor or dropped:
-        counts["eval_regression"] = True
-        # Recovery ANCHOR = the pre-drift baseline we must climb back to. Never let
-        # it ratchet DOWN: take the max of the prior run, the floor, and any anchor
-        # already on the open row — so a partial rebound cannot self-close a still
-        # degraded state (the flap the finding describes).
-        base_h = max(prior["hit_at_5"] if prior else 0.0, floor_h)
-        base_m = max(prior["mrr"] if prior else 0.0, floor_m)
-        if open_row is not None:
-            _qid, det = open_row
-            base_h = max(base_h, float(det.get("baseline_hit_at_5", 0.0)))
-            base_m = max(base_m, float(det.get("baseline_mrr", 0.0)))
-        logger.warning(
-            "SEARCH-QUALITY REGRESSION: hit@5 %.3f MRR %.3f (prior %s, floor %.2f/%.2f, "
-            "recovery anchor %.3f/%.3f, epsilon %.2f)",
-            hit_at_5,
-            mrr,
-            f"{prior['hit_at_5']:.3f}/{prior['mrr']:.3f}" if prior else "none",
-            floor_h,
-            floor_m,
-            base_h,
-            base_m,
-            REGRESSION_EPSILON,
-        )
-        if open_row is None:  # dedup: exactly one open flag at a time
-            review_mod.queue_review(
-                None,
-                REVIEW_REASON,
-                {
-                    "baseline_hit_at_5": round(base_h, 4),
-                    "baseline_mrr": round(base_m, 4),
-                    "observed_hit_at_5": round(hit_at_5, 4),
-                    "observed_mrr": round(mrr, 4),
-                    "floor_hit_at_5": floor_h,
-                    "floor_mrr": floor_m,
-                    "epsilon": REGRESSION_EPSILON,
-                },
-            )
-        return
-    # No regression: self-heal a stale flag only on FULL recovery to the SAME
-    # anchor (>= baseline, not baseline − epsilon) AND above the floor, so a partial
-    # rebound never auto-retracts a still-degraded state and drags the baseline down.
-    if open_row is not None:
-        queue_id, detail = open_row
-        base_h = float(detail.get("baseline_hit_at_5", 0.0))
-        base_m = float(detail.get("baseline_mrr", 0.0))
-        if hit_at_5 >= base_h and mrr >= base_m and hit_at_5 >= floor_h and mrr >= floor_m:
-            review_mod.resolve_review(queue_id)
-            logger.info(
-                "search-quality recovered to baseline; auto-resolved review row %d", queue_id
-            )
 
 
 # --- instrument 1: graph-expansion A/B ---------------------------------------
@@ -265,10 +221,17 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
     returns numbers. Retrieval order is unchanged. Measured on the PRODUCTION
     DEFAULT config — plain query, default hops, no per-case knobs — because the
     question is what an ordinary agent query surfaces.
+
+    Two Wave-F riders on the same read-only pass (review #5): the DISTINCT top-5
+    item ids are persisted (``eval_top5_item_ids`` — the weekly promote table
+    prefers candidates the eval actually surfaces; they were counted but never
+    persisted), and :func:`kbworker.eval_trust.verified_lift` turns the share
+    into the watched lift ratio (+ ``eval_trust_status='watch'`` on a trip).
     """
     unverified = 0
     summary = 0
     total = 0
+    top5_ids: set[int] = set()
     for case in golden:
         query = case.get("q")
         if not query:
@@ -277,6 +240,7 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
             total += 1
             unverified += int(hit.trust != "verified")
             summary += int(hit.type == "summary")
+            top5_ids.add(hit.item_id)
     unverified_share = round(unverified / total, 4) if total else 0.0
     summary_share = round(summary / total, 4) if total else 0.0
     logger.info(
@@ -290,10 +254,13 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
         total,
         100 * summary_share,
     )
-    return {
+    result = {
         "eval_top5_unverified_share": unverified_share,
         "eval_top5_unverified": unverified,
         "eval_top5_summary_share": summary_share,
         "eval_top5_summary": summary,
         "eval_top5_results": total,
+        "eval_top5_item_ids": sorted(top5_ids),
     }
+    result.update(eval_trust.verified_lift(unverified_share, len(golden)))
+    return result

@@ -26,7 +26,7 @@ import pytest
 from kbcore import consolidation, db, graph, search_rank
 from kbcore.config import settings
 from kbcore.ingest import ingest
-from kbcore.search import EXACT_ID_BONUS, _apply_bonuses, search
+from kbcore.search import BOOST_FACTOR, EXACT_ID_BONUS, _apply_bonuses, search
 from kbcore.search_legs import CANDIDATES, RRF_K
 
 pytestmark = pytest.mark.usefixtures("kb")
@@ -301,3 +301,29 @@ def test_collapse_needs_both_the_flag_and_a_cross_project_edge(monkeypatch):
     ids = [h.item_id for h in search("widgetsync approach", k=20)]
     assert c in ids and d in ids, "an unlinked pair is never collapsed"
     assert e in ids and f in ids, "a same-project alternative_to pair is not collapsed"
+
+
+# --- (3b) rare-only seal: the ACTUAL bound (review #5 ret-seal-1) -------------
+
+
+def test_rare_only_seal_residual_crossings_pinned():
+    """The seal comment (search_rank.RARE_ID_RANK_OFFSET) claims only this: a
+    rare-only candidate stays below any lexical hit ABSENT independent
+    identifier evidence and the near-tie dials. These pins prove the three
+    residual crossings it names are REAL with the live constants — if any
+    constant moves and a pin flips, re-derive the comment, don't delete the pin.
+    (Do NOT 'fix' the crossings by clamping rare-only candidates below every
+    non-rare candidate post-bonus — 'independent evidence stays rewarded' is the
+    settled composition; review #5 guard.)"""
+    rank1_rare = 1.0 / (RRF_K + search_rank.RARE_ID_RANK_OFFSET + 1)  # 1/101
+    weakest_lexical = 1.0 / (RRF_K + CANDIDATES)  # 1/100
+
+    # The base seal DOES hold: every dial inert, no independent evidence.
+    assert rank1_rare < weakest_lexical
+    # Crossing 1 — exact-id bonus from a NON-admitting token:
+    # 1/101 + 1/122 = 0.01810 > 1/61 (a rank-1 single-leg lexical hit).
+    assert rank1_rare + EXACT_ID_BONUS > 1.0 / (RRF_K + 1)
+    # Crossing 2 — the trust dial at its documented near-tie size: 1/101 * 1.02 > 1/100.
+    assert rank1_rare * 1.02 > weakest_lexical
+    # Crossing 3 — the project boost: 1.25/101 > 1/81 (a rank-21 lexical hit).
+    assert BOOST_FACTOR * rank1_rare > 1.0 / (RRF_K + 21)

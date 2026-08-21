@@ -13,7 +13,7 @@ drain, 0 rows drained, 0 items saved. The same restart waste hits any giant
 interrupted by the tail reserve or the deadline.
 
 WHAT CHANGED, AND WHAT DID NOT. Row flips are untouched: still group-atomic,
-still one attempt/deferral per run, same failure taxonomy. Only the extraction
+still one attempt/deferral per local day, same failure taxonomy. Only the extraction
 calls remember — a window whose ``extract_and_ingest`` RETURNED has its items
 durably stored (Invariant 3), so re-running it is pure waste, and the checkpoint
 records which those were, keyed to a fingerprint of the assembled text.
@@ -327,15 +327,18 @@ def test_the_kill_switch_restores_the_old_full_re_extract_behaviour(kb, monkeypa
 
 def test_the_deferral_counter_still_climbs_on_the_same_failing_window(kb, monkeypatch):
     """Escalation via DEFERRAL_CAP is untouched — a poisonous window still
-    escalates, it just gets there without re-extracting the good windows first."""
+    escalates, it just gets there without re-extracting the good windows first.
+    One run per LOCAL day here: the burn is bounded per day (review #5 pipe-2),
+    so a same-day boot catch-up no longer advances the counter."""
     qid, wins = _big("cp-defer")
 
     for run in (1, 2, 3):
+        monkeypatch.setattr(ingest_queue, "drain_day_start", lambda run=run: datetime(2026, 1, run))
         ext = _Extractor({}, fail_at=2, exc=ExtractorUnavailable("ollama restarting"))
         _drive(monkeypatch, ext)
         status, attempts, deferrals, _s, _r = _row(qid)
         assert (status, attempts, deferrals) == ("pending", 0, run), (
-            f"run {run}: an outage must defer once per run and burn no attempt"
+            f"run {run}: an outage must defer once per day and burn no attempt"
         )
         expected = wins[:3] if run == 1 else wins[2:3]
         assert ext.seen == expected, (

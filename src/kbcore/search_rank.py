@@ -24,9 +24,16 @@ from kbcore.search_legs import CANDIDATES, RRF_K
 # A rare-token identifier row enters fusion at this rank OFFSET: the strongest
 # (rank-1) rare row scores 1/(RRF_K + OFFSET + 1) which, with OFFSET = CANDIDATES,
 # is strictly below 1/(RRF_K + CANDIDATES) — the weakest possible single-leg
-# lexical hit. So a rare-token-ONLY candidate can never outrank a real lexical hit.
-# That bound only holds if the SAME token cannot then re-enter as an exact-id
-# bonus on top of the offset (review #4 P1) — see exact_id_match_counts.
+# lexical hit. THE ACTUAL BOUND (review #5 ret-seal-1): a rare-only candidate
+# stays below any lexical hit ABSENT independent identifier evidence and the
+# near-tie dials — the seal is not absolute. Three residual crossings exist by
+# deliberate composition ("independent evidence stays rewarded"; pinned in
+# tests/test_search_wave3.py with the live constants RRF_K=60, EXACT_ID_BONUS=
+# 1/122, BOOST_FACTOR=1.25): an exact-id bonus from a NON-admitting token
+# (1/101 + 1/122 = 0.01810 > 1/61), the trust dial (1/101 * 1.02 > 1/100), and
+# the project boost (1.25/101 > 1/81). What CANNOT compose over the offset is
+# the admitting token itself re-entering as a bonus (review #4 P1) — see
+# exact_id_match_counts.
 RARE_ID_RANK_OFFSET = CANDIDATES
 
 # Collapse ACCESS-PARITY marker (review #4 P2, coordinates with review_promote):
@@ -60,10 +67,12 @@ def rerank_evidence(fused: list[tuple[int, float, str]]) -> dict[int, str] | Non
     body PREFIX from ``items``, so the reranker never sees the matching passage
     of a long item. Handing it that passage is a plausible retrieval win and a
     plausible loss (less surrounding context), so it is gated on
-    ``kb_rerank_use_chunk`` — default False, awaiting the owner's A/B on the real
-    corpus (config.py). With the flag OFF this returns None and the reranker's
-    inputs stay BYTE-IDENTICAL to the pre-flag behaviour (regression-pinned in
-    tests/test_eval_plumbing.py).
+    ``kb_rerank_use_chunk``. The owner's A/B ran 2026-08-01 and ENABLED the flag
+    in this deployment's .env (verified KB 6495: hit@5 0.86 -> 0.89, MRR
+    0.84 -> 0.82 accepted); the CODE default stays False so a fresh install
+    starts from the measured-safe baseline (config.py). With the flag OFF this
+    returns None and the reranker's inputs stay BYTE-IDENTICAL to the pre-flag
+    behaviour (regression-pinned in tests/test_eval_plumbing.py).
 
     Candidates with no chunk text (pure graph neighbours, identifier title
     matches) are omitted and keep the body-prefix document.

@@ -219,6 +219,30 @@ All tests use `kb_test`, mock Ollama, and a fake token shaped like the real one.
 
 ## 4. Ranked enhancement roadmap
 
+### 4.0 Status ledger (reconciled 2026-08-21, review #5 strat-6/strat-10)
+
+This plan predates the sharing/pipeline/review-automation campaigns; the table below is the
+ground truth for what §4 promised versus what the tree actually contains. Rows were verified
+against the working tree at reconciliation time — each carries its evidence ref. The roadmap
+text underneath is retained UNCHANGED as the historical plan of record; where it disagrees
+with this table, the table wins.
+
+| # | Item | Status (2026-08-21) | Evidence |
+|---|---|---|---|
+| B1 | Encrypted offsite backups | **SHIPPED** | `src/kbcore/config.py` `kb_rclone_remote` (:387) / `kb_age_recipient` (:390); `scripts/offsite.sh` + the offsite leg in `scripts/backup.sh` (age-encrypt locally, push ciphertext only); web status view `src/kbweb/views_backup.py` exists. |
+| B2 | 2026-07-28 stateless MCP spec prep | **RETIRED (overtaken)** | The dated deadline passed with no breakage; the public connector is alive on fastmcp 3.4.4 (`kb.n3rd-bugs.dev/mcp`, §1). No remaining work item. |
+| B3 | Flip OAuth onboarding to CIMD | **CONTRADICTED** | The live claude.ai connector attach requires `enable_cimd=False` (working deployment recipe, 2026-08 — see the `claudeai-mcp-connector` deployment record). The predicted DCR drop did not materialize; the flip as written would break onboarding, not future-proof it. `KB_OAUTH_CIMD` stays `false`. |
+| F1 | Email/username + password auth (§3) | **UNSHIPPED — parked (Wave G, pending demand)** | No `passwords.py` / `login_throttle.py` in the tree. NOTE: the migration number this plan reserved was repurposed — `migrations/012_principal_roles.sql` is principal ROLES, not password auth. If F1 is ever built, §3.2's DDL must be renumbered to the next free migration and re-reviewed against the by-then-current principals schema. |
+| G1 | Grantee write-audit surface | **UNSHIPPED — parked (Wave G, pending demand)** | No `/audit` view or audit read function in the tree; `access_log.principal` attribution (the substrate) exists. See the governance clause below — G1 is the PRECONDITION for external `rw`. |
+| R1 | Decay/recency scoring | **RETIRED** | Verified survey verdict KB 762: defer/skip. Recency remains a post-fusion tiebreak only; no `kb_recency_half_life_days` knob exists, by decision rather than omission. |
+
+**Governance clause (rw grants, recorded 2026-08-21):** no `rw` grant to any EXTERNAL
+principal until the G1 audit surface ships. This is G1's own irreversibility argument made
+binding: writes made before the audit trail exists can never be attributed afterwards, so
+granting first and auditing later is not a recoverable ordering. F1/G1 are parked in Wave G
+pending actual demand; parking them does not weaken this clause — demand for external write
+access is exactly what un-parks G1 FIRST.
+
 Value/effort/risk are from the campaign retrospective, re-checked against code. Sequenced into waves; the auth feature is slotted after the top-risk and time-boxed items.
 
 | # | Item | Value | Effort | Risk if skipped | Wave |

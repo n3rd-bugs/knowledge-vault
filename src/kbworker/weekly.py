@@ -16,8 +16,9 @@ READS: the week's nightly consolidation reports (kb-system ``report`` items,
 item's meta: promotes have no ``resolved_at`` to window on, so 'promoted this
 week' is a CHECKPOINT DIFF against the ``promoted_total`` each weekly persists.
 WRITES: one kb-system ``report`` item (full table, ``meta.weekly_report``) and
-ONE push through kbcore.notify — pure ASCII, <20 lines, titled by its first
-line ('KB weekly …') since the shared channel owns the ntfy header. Search-miss
+ONE push through kbcore.notify — pure ASCII, <20 lines, sent with
+``title='KB weekly'`` (push_digest keyword override, review #5 ops-1) so the
+phone distinguishes it from the nightly at a glance. Search-miss
 retention rides along (:func:`kbcore.search_misses.sweep_old`, the migration-018
 carve-out). Counts keys are ADDED, never renamed: ``weekly_report_pushed``,
 ``weekly_report_item_id``, ``search_misses_swept``.
@@ -37,13 +38,31 @@ from kbcore.db import connect
 from kbcore.drainsched import _DAYS  # the ONE mon..sun table (no second copy)
 from kbcore.ingest import ingest
 
+# THE ESTABLISHED SEAM (mechanical split, review #5 Wave F): rendering moved to
+# kbworker.weekly_render when the promote table + injection fence reached this
+# file's 300-line ratchet. Every caller and test keeps reaching the names here
+# (``weekly.PUSH_MAX_LINES``, …) — same pattern as kbworker.tail_steps/digest.
+from kbworker.weekly_render import (  # noqa: F401
+    MISSES_FENCE,
+    PROMOTE_TABLE_ROWS,
+    PUSH_MAX_LINES,
+    PUSH_QUERY_CHARS,
+    PUSH_TOP_MISSES,
+    REPORT_QUERY_CHARS,
+    TOP_MISSES,
+    WINDOW_DAYS,
+    _ascii,
+    _cell,
+    _push_lines,
+    _report_body,
+    _series,
+    _sum,
+    _trend,
+)
+
 logger = logging.getLogger("kbworker.weekly")
 
-WINDOW_DAYS = 7
-TOP_MISSES = 10  # rows tabled in the report item; PUSH_TOP_MISSES of them pushed
-PUSH_TOP_MISSES = 3
-PUSH_MAX_LINES = 20  # contract: the push stays under this (ntfy to a phone)
-PUSH_QUERY_CHARS = 48  # a missed query is previewed on the phone, not quoted whole
+PROMOTE_SCAN_LIMIT = 50  # candidate rows scanned to fill the eval-preferred table
 
 
 def maybe_weekly(counts: dict[str, Any], now: datetime | None = None) -> bool:
@@ -95,6 +114,7 @@ def _run(counts: dict[str, Any]) -> bool | None:
     miss_stats = search_misses.stats(days=WINDOW_DAYS)
     top = search_misses.top_misses(days=WINDOW_DAYS, limit=TOP_MISSES)
     candidates = review_promote.count_promote_candidates()
+    promote_rows = _promote_rows(reports)
     promoted_total = _promoted_total()
     promoted_7d = None
     if prior is not None:
@@ -115,11 +135,22 @@ def _run(counts: dict[str, Any]) -> bool | None:
     }
     if promoted_7d is not None:
         meta["promoted_7d"] = promoted_7d
+    body = _report_body(
+        now,
+        reports,
+        miss_stats,
+        top,
+        candidates,
+        promoted_total,
+        promoted_7d,
+        swept,
+        promote_rows,
+    )
     item_id = ingest(
         "kb-system",
         "report",
         f"KB weekly report {now.date().isoformat()}",
-        _report_body(now, reports, miss_stats, top, candidates, promoted_total, promoted_7d, swept),
+        body,
         kind="chat",
         uri=f"weekly-report:{now.isoformat()}",
         trust="verified",
@@ -127,7 +158,7 @@ def _run(counts: dict[str, Any]) -> bool | None:
     )
     counts["weekly_report_item_id"] = item_id
     lines = _push_lines(now, reports, miss_stats, top, candidates, promoted_7d, item_id)
-    pushed = bool(notify.push_digest(lines))
+    pushed = bool(notify.push_digest(lines, title="KB weekly"))
     logger.info(
         "weekly report written (item %s), push %s", item_id, "sent" if pushed else "not sent"
     )
@@ -181,120 +212,24 @@ def _promoted_total() -> int:
     return int(row[0])
 
 
-def _series(reports: list[tuple[datetime, dict[str, Any]]], key: str) -> list[float]:
-    """The numeric series a meta key traces across the window's reports."""
-    out: list[float] = []
-    for _at, meta in reports:
-        v = meta.get(key)
-        if isinstance(v, int | float) and not isinstance(v, bool):
-            out.append(float(v))
-    return out
+def _promote_rows(reports: list[tuple[datetime, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """The report body's promote-candidate rows, eval-top-5-preferred (strat-3).
 
-
-def _trend(vals: list[float]) -> str:
-    """``first -> last`` over a series; a single point stands alone; empty = n/a."""
-    if not vals:
-        return "n/a"
-    if len(vals) == 1:
-        return f"{vals[0]:.3f}"
-    return f"{vals[0]:.3f} -> {vals[-1]:.3f}"
-
-
-def _sum(reports: list[tuple[datetime, dict[str, Any]]], key: str) -> int:
-    total = 0
-    for _at, meta in reports:
-        v = meta.get(key)
-        if isinstance(v, int | float) and not isinstance(v, bool):
-            total += int(v)
-    return total
-
-
-def _ascii(text: str, limit: int) -> str:
-    """Pure-ASCII single-line preview for the phone push, bounded to ``limit``."""
-    flat = " ".join(str(text).split())
-    return flat.encode("ascii", "replace").decode("ascii")[:limit]
-
-
-def _push_lines(
-    now: datetime,
-    reports: list[tuple[datetime, dict[str, Any]]],
-    miss_stats: dict[str, int],
-    top: list[tuple[str, int]],
-    candidates: int,
-    promoted_7d: int | None,
-    item_id: int | None,
-) -> list[str]:
-    """The <20-line, pure-ASCII 'KB weekly' push body."""
-    lines = [
-        f"KB weekly {now.date().isoformat()}",
-        f"nights reported: {len(reports)}",
-        (
-            f"7d: drained {_sum(reports, 'queued_drained')}, "
-            f"saved {_sum(reports, 'queued_items_saved')}, "
-            f"triaged {_sum(reports, 'review_triaged')}"
-        ),
-        f"eval hit@5: {_trend(_series(reports, 'eval_hit_at_5'))}",
-        f"eval mrr: {_trend(_series(reports, 'eval_mrr'))}",
-        f"top5 unverified: {_trend(_series(reports, 'eval_top5_unverified_share'))}",
-        f"search misses: {miss_stats['total']} ({miss_stats['distinct']} distinct)",
-    ]
-    for q, n in top[:PUSH_TOP_MISSES]:
-        lines.append(f"  {n}x {_ascii(q, PUSH_QUERY_CHARS)}")
-    if promoted_7d is None:
-        lines.append(f"promotes: checkpoint minted; {candidates} candidates open")
-    else:
-        lines.append(f"promotes: {promoted_7d} in 7d, {candidates} candidates open")
-    lines.append(f"full table: kb-system item {item_id}")
-    return lines[:PUSH_MAX_LINES]
-
-
-def _cell(v: Any, floats: bool = False) -> str:
-    ok = not isinstance(v, bool) and isinstance(v, int | float)
-    return (f"{float(v):.3f}" if floats else str(int(v))) if ok else "-"
-
-
-def _report_body(
-    now: datetime,
-    reports: list[tuple[datetime, dict[str, Any]]],
-    miss_stats: dict[str, int],
-    top: list[tuple[str, int]],
-    candidates: int,
-    promoted_total: int,
-    promoted_7d: int | None,
-    swept: int,
-) -> str:
-    """The full weekly table persisted as the kb-system report item's body."""
-    lines = [
-        "KB weekly trend report",
-        "",
-        f"window: {WINDOW_DAYS}d ending {now.date().isoformat()}; nightly reports: {len(reports)}",
-        "",
-        "night       drained  saved  triaged  hit@5   mrr     unv-top5",
-    ]
-    for at, meta in reports:
-        lines.append(
-            f"{at.date().isoformat():<11} "
-            f"{_cell(meta.get('queued_drained')):>7}  "
-            f"{_cell(meta.get('queued_items_saved')):>5}  "
-            f"{_cell(meta.get('review_triaged')):>7}  "
-            f"{_cell(meta.get('eval_hit_at_5'), floats=True):>6}  "
-            f"{_cell(meta.get('eval_mrr'), floats=True):>6}  "
-            f"{_cell(meta.get('eval_top5_unverified_share'), floats=True):>8}"
-        )
-    lines += [
-        "",
-        f"search misses ({WINDOW_DAYS}d): {miss_stats['total']} total, "
-        f"{miss_stats['distinct']} distinct; top {len(top)}:",
-    ]
-    for q, n in top:
-        lines.append(f"  {n:>3}x  {q}")
-    if promoted_7d is None:
-        promoted = f"checkpoint minted (total promoted extractions: {promoted_total})"
-    else:
-        promoted = f"{promoted_7d} promoted in 7d (total {promoted_total})"
-    lines += [
-        "",
-        f"promote uptake: {promoted}; {candidates} candidates open",
-        f"search-miss retention: {swept} row(s) older than {search_misses.RETENTION_DAYS}d pruned",
-    ]
-    return "\n".join(lines)
+    Reads the NEWEST nightly report meta carrying ``eval_top5_item_ids`` (the
+    ids the sentinel persists at compute time), then orders the candidate
+    surface's page so candidates the eval actually surfaces come first — the
+    steering-resistant candidate ORDER within each partition is untouched
+    (kbcore.review_promote's owner-days ranking). READ-ONLY; the paste-ready
+    command the table ends with is run by the HUMAN (V4 — no new authority).
+    """
+    top5_ids: set[int] = set()
+    for _at, meta in reversed(reports):  # reports are oldest-first
+        ids = meta.get("eval_top5_item_ids")
+        if isinstance(ids, list):
+            top5_ids = {i for i in ids if isinstance(i, int) and not isinstance(i, bool)}
+            break
+    rows = review_promote.list_promote_candidates(limit=PROMOTE_SCAN_LIMIT)
+    preferred = [r for r in rows if r["item_id"] in top5_ids]
+    rest = [r for r in rows if r["item_id"] not in top5_ids]
+    chosen = (preferred + rest)[:PROMOTE_TABLE_ROWS]
+    return [{**r, "in_eval_top5": r["item_id"] in top5_ids} for r in chosen]

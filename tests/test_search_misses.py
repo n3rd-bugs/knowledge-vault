@@ -1,16 +1,20 @@
-"""Zero-hit search telemetry (review #4 Wave E, KB 21332; migration 018).
+"""Search-miss telemetry (Wave E KB 21332, migration 018; review #5 Wave F,
+migration 019).
 
 The KB records the searches it FAILED to answer — demand-side observability —
 without ever letting telemetry break a search, pollute itself with eval
-replays, or store unbounded query text. Real-DB tests in kb_test; Ollama is
-the deterministic conftest stub (CLAUDE.md).
+replays, store unbounded query text, or (review #5 sec-1/sec-2) hold a raw
+secret or a multi-line report-forging query in either durable sink. The thin
+instrument (subtype 'thin'/'calibration') is dial-gated and ships OFF. Real-DB
+tests in kb_test; Ollama is the deterministic conftest stub (CLAUDE.md).
 """
 
 from __future__ import annotations
 
 import pytest
 
-from kbcore import search_misses
+from kbcore import rerank, search_misses
+from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.ingest import ingest
 from kbcore.search import search
@@ -22,11 +26,32 @@ pytestmark = pytest.mark.skipif(not DB_UP, reason="compose Postgres not reachabl
 # ambient count to 0 (that stub protects OTHER suites' digest assertions).
 _REAL_COUNT_SINCE = search_misses.count_since
 
+GHP = "ghp_" + "0" * 36  # fake token shaped like a real one (CLAUDE.md hygiene)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_thin_dial(monkeypatch):
+    """Pin the thin-miss dial to its code default and clear the thread-local
+    rerank participation marker — it outlives tests (same hermeticity class as
+    conftest's _ranking_dials_at_code_defaults; a prior suite's rerank stub
+    could otherwise leak 'active' in and mint calibration rows here)."""
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.0)
+    rerank.reset_outcome()
+    yield
+    rerank.reset_outcome()
+
 
 def _rows() -> list[tuple[str, str | None, str]]:
     with connect() as conn:
         return conn.execute(
             "SELECT query, project_scope, tool FROM search_misses ORDER BY id"
+        ).fetchall()
+
+
+def _full_rows() -> list[tuple[str, str, float | None, str | None]]:
+    with connect() as conn:
+        return conn.execute(
+            "SELECT query, subtype, top_score, top_legs FROM search_misses ORDER BY id"
         ).fetchall()
 
 
@@ -78,7 +103,7 @@ def test_stats_and_top_misses_group_by_query(kb):
         search_misses.record("esp32 ledc fade", None, "mcp.kb_search")
     search_misses.record("systemd oneshot timer", "infra", "rest.search")
     stats = search_misses.stats(days=7)
-    assert stats == {"total": 4, "distinct": 2}
+    assert stats == {"total": 4, "distinct": 2, "empty": 4, "thin": 0, "calibration": 0}
     top = search_misses.top_misses(days=7, limit=10)
     assert top[0] == ("esp32 ledc fade", 3)
     assert top[1] == ("systemd oneshot timer", 1)
@@ -100,3 +125,112 @@ def test_sweep_old_prunes_only_aged_rows(kb):
     assert search_misses.sweep_old(0) == 0, "a zero horizon must never mean 'sweep everything'"
     assert search_misses.sweep_old() == 1
     assert [r[0] for r in _rows()] == ["fresh miss"]
+
+
+# --- review #5 sec-1/sec-2: scrub + flatten at the durable sinks --------------
+
+
+def test_secret_query_scrubbed_at_both_sinks(kb):
+    """Neither durable sink may hold a raw credential: search scrubs ONCE and
+    feeds the same clean text to search_misses AND access_log (sec-1 — the
+    access_log column retains indefinitely and was the primary live exposure)."""
+    assert search(f"rotate {GHP} zorbltx-neverfound", tool="mcp.kb_search") == []
+    assert _rows() == [("rotate [REDACTED:github_token] zorbltx-neverfound", None, "mcp.kb_search")]
+    ingest("p1", "note", "spi timing gotcha", "the spi bus needs a pulldown", uri="t:1")
+    assert search(f"spi timing gotcha {GHP}", tool="mcp.kb_search")
+    with connect() as conn:
+        logged = {r[0] for r in conn.execute("SELECT query FROM access_log").fetchall()}
+    assert logged == {"spi timing gotcha [REDACTED:github_token]"}
+
+
+def test_multiline_query_stores_single_line(kb):
+    """sec-2 (this module's half): internal whitespace collapses to one line, so
+    a crafted query cannot forge extra lines in the weekly report's miss table."""
+    assert search("line one\nsecond line\t\tzorbltx-neverfound", tool="mcp.kb_search") == []
+    assert _rows()[0][0] == "line one second line zorbltx-neverfound"
+
+
+def test_record_scrubs_before_truncation(kb):
+    """Defensive scrub at the sink runs BEFORE the length bound — truncation can
+    never split a secret past its pattern (sec-1)."""
+    q = "x" * (search_misses.MAX_QUERY_CHARS - 60) + f" {GHP} tail"
+    assert search_misses.record(q, None, "t") is True
+    stored = _rows()[0][0]
+    assert "[REDACTED:github_token]" in stored
+    assert "ghp_0" not in stored
+
+
+# --- review #5 val-1: the relevance-based thin-miss instrument ----------------
+
+
+def test_thin_miss_sidecar_absent_is_dial_gated(kb, monkeypatch):
+    """Sidecar-absent path: a vector-only top hit records 'thin' ONLY while the
+    floor dial is ON — the code default (0 = OFF) records nothing."""
+    ingest("p1", "note", "croissant lamination", "butter fold schedule for croissants", uri="t:2")
+    assert search("zorbltx flux capacitor", tool="mcp.kb_search")  # vector-only hits
+    assert _rows() == [], "dial OFF: results-with-no-lexical-support record nothing"
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.05)
+    assert search("zorbltx flux capacitor", tool="mcp.kb_search")
+    assert _full_rows() == [("zorbltx flux capacitor", "thin", None, "vector")]
+
+
+def test_lexically_supported_top_is_never_thin(kb, monkeypatch):
+    """A keyword-leg top hit is not a miss on the sidecar-absent path, dial ON."""
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.05)
+    ingest("p1", "note", "spi timing gotcha", "the spi bus needs a pulldown", uri="t:1")
+    assert search("spi timing gotcha", tool="mcp.kb_search")
+    assert _rows() == []
+
+
+def test_thin_miss_sidecar_relevance_floor(kb, monkeypatch):
+    """Sidecar-active path: top-1 relevance below the floor records 'thin' with
+    the score; above the floor records nothing (dial ON)."""
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.05)
+    legs = ([(7, "x")], [], [])
+    rerank._note("active", 3e-05)
+    assert search_misses.observe("weird rtos tick", None, "t", top_id=7, legs=legs)
+    rerank._note("active", 0.99994)
+    assert not search_misses.observe("weird rtos tick", None, "t", top_id=7, legs=legs)
+    assert _full_rows() == [("weird rtos tick", "thin", 3e-05, "vector")]
+
+
+def test_calibration_rows_when_floor_off_and_excluded_from_counts(kb):
+    """Dial OFF + sidecar scored: the would-be score lands as 'calibration' —
+    durable for the calibration week, invisible to every default miss count."""
+    rerank._note("active", 0.42)
+    assert search_misses.observe("cal query", None, "t", top_id=1, legs=([], [(1, "y")], []))
+    search_misses.record("real empty miss", None, "t")
+    assert _full_rows()[0] == ("cal query", "calibration", 0.42, "keyword")
+    assert _REAL_COUNT_SINCE(days=1) == 1, "count_since keeps its Wave-E 'empty' meaning"
+    assert _REAL_COUNT_SINCE(days=1, subtype="thin") == 0
+    stats = search_misses.stats(days=1)
+    assert stats == {"total": 1, "distinct": 1, "empty": 1, "thin": 0, "calibration": 1}
+    assert search_misses.top_misses(days=1) == [("real empty miss", 1)]
+    assert search_misses.top_misses(days=1, subtype="calibration") == [("cal query", 1)]
+
+
+def test_search_with_sidecar_records_calibration_row(kb, monkeypatch):
+    """End to end through search(): dial OFF + live sidecar logs the top-1
+    relevance and the top hit's leg provenance (review #5 calibration aid)."""
+    # The second item shares NO lexeme with the query, so the keyword leg (AND
+    # or OR-fallback) carries only the first — no RRF tie, a deterministic top.
+    ingest("p1", "note", "spi timing gotcha", "the spi bus needs a pulldown", uri="t:1")
+    ingest("p1", "note", "i2c pullup note", "the i2c bus needs pullups", uri="t:3")
+    monkeypatch.setattr(settings, "kb_rerank_url", "http://127.0.0.1:9")
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "results": [
+                    {"index": 0, "relevance_score": 0.61},
+                    {"index": 1, "relevance_score": 0.02},
+                ]
+            }
+
+    monkeypatch.setattr(rerank.httpx, "post", lambda *a, **kw: _Resp())
+    hits = search("spi timing gotcha", tool="mcp.kb_search")
+    assert hits and hits[0].title == "spi timing gotcha"
+    assert _full_rows() == [("spi timing gotcha", "calibration", 0.61, "vector+keyword")]

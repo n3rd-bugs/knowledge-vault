@@ -53,12 +53,25 @@ def test_requeue_never_touches_extracted_or_pending_rows(kb, as_owner):
     assert done not in ids and live not in ids
 
 
-def test_requeue_rearms_the_deferral_budget_alongside_attempts(kb, as_owner):
+def test_requeue_rearms_the_deferral_budget_alongside_attempts(kb, as_owner, monkeypatch):
     """Round trip for a deferral-cap escalation (review #3 P2, KB 19663). The
     owner's requeue is a fresh grant of BOTH budgets: without deferrals=0 the
     documented repair was a no-op — the row came back 'pending' still at the cap,
-    so its very first re-defer escalated it straight back to 'failed'."""
+    so its very first re-defer escalated it straight back to 'failed'.
+
+    Deferral burns are bounded per LOCAL day (review #5 pipe-2), so the
+    multi-night outage is simulated by advancing the day boundary per defer."""
+    from datetime import datetime, timedelta
+
     from kbcore.db import connect
+
+    tick = {"n": 0}
+
+    def _next_day():
+        tick["n"] += 1
+        return datetime(2026, 1, 1) + timedelta(days=tick["n"])
+
+    monkeypatch.setattr(ingest_queue, "drain_day_start", _next_day)
 
     qid = _mk("proj", "a poison window escalated this group")
     escalated = False

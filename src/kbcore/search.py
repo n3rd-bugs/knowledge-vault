@@ -22,6 +22,7 @@ from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.ingest import _as_utc
 from kbcore.models import CodeRef, SearchHit
+from kbcore.scrub import scrub
 from kbcore.search_legs import (
     MAX_ID_TOKENS,
     RRF_K,
@@ -161,14 +162,14 @@ def search(
         # leg for tokens too rare to be noise, fused below any real hit (search_rank).
         rare_only: set[int] = set()  # rare-leg PROVENANCE -> _apply_bonuses (review #4 P1)
         rare_tokens: list[str] = []  # the tokens that admitted those candidates
+        rare_rows: list[tuple[int, str]] = []  # kept for miss-telemetry leg provenance
         if settings.kb_id_leg_rare_tokens and id_tokens and not dominant:
             rare_tokens = search_rank.rare_identifier_tokens(
                 conn, id_tokens, settings.kb_id_leg_rare_max_df
             )
             if rare_tokens:
-                fused, rare_only = search_rank.fuse_rare_id_rows(
-                    fused, _identifier_leg(conn, rare_tokens, where, params)
-                )
+                rare_rows = _identifier_leg(conn, rare_tokens, where, params)
+                fused, rare_only = search_rank.fuse_rare_id_rows(fused, rare_rows)
         expansion_origin: dict[int, int] = {}
         if hops > 0 and fused:
             # expand_fused walls every neighbor against the SAME where per BFS
@@ -195,6 +196,8 @@ def search(
                 settings.kb_rerank_top_n,
                 evidence=_rerank_evidence(fused),
             )
+        else:
+            rerank_mod.reset_outcome()  # participation telemetry: rerank did not run
         # (4) Rank-time twin collapse: fold a cross-project 'alternative_to' twin.
         # The {winner: [losers]} map is KEPT (review #3, KB 19663), not discarded.
         folded: dict[int, list[int]] = {}
@@ -207,19 +210,19 @@ def search(
     hits = _to_hits(fused)[:k]
     for h in hits:  # stamp the collapse map on the kept hit (additive; [] when off)
         h.collapsed = folded.get(h.item_id, [])
-    if tool is not None and not hits:
-        # Zero-hit DEMAND telemetry (review #4 Wave E, KB 21332): a search that
-        # returns nothing is the KB seeing its own gap. Best-effort (record never
-        # raises) and NEVER for eval replays — they pass tool=None, the same
-        # exemption the access log applies below. Lazy import: this single hook
-        # is search's only coupling to the telemetry module.
+    if tool is not None:
+        # Telemetry chokepoint (review #5 sec-1): scrub ONCE, feed the SAME clean
+        # text to BOTH durable sinks — search_misses (empty/thin demand, KB 21332)
+        # and access_log (indefinite retention). Eval replays pass tool=None and
+        # skip both sinks. Lazy import: search's only coupling to the miss module.
         from kbcore import search_misses
 
-        search_misses.record(query, project, tool)
-    # tool=None → skip access logging (the eval harness replays golden queries and
-    # must not stamp items 'recently used', which would pin them against archiving).
-    if tool is not None:
-        _log_access(hits, tool, query)
+        q_clean, _ = scrub(query)
+        top_id = hits[0].item_id if hits else None
+        search_misses.observe(
+            q_clean, project, tool, top_id, (vec_rows, kw_rows, id_rows + rare_rows)
+        )
+        _log_access(hits, tool, q_clean)
     return hits
 
 
@@ -366,6 +369,7 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
 
 
 def _log_access(hits: list[SearchHit], tool: str, query: str) -> None:
+    """``query`` MUST be the scrubbed text — this column retains indefinitely (sec-1)."""
     if not hits:
         return
     p = scope.current()

@@ -21,8 +21,8 @@ drain first, cap its appetite).
 * **Tail debt compounds invisibly.** Nothing records "triage did not run":
   verdicts sit unapplied so the queue grows; unjudged contradictions never write
   the per-pair memory that makes the NEXT night cheaper; evidence auto-resolution
-  needs ``AUTO_RESOLVE_STREAK`` CONSECUTIVE nightly visits, so a skipped night
-  RESETS a resolution. The cost is the work that never converges.
+  advances only on a REVISIT (the streak folds off the PRIOR stored detail — a
+  skipped night delays, never resets). The cost is the work that never converges.
 
 So the drain stops admitting NEW refill cohorts once the next cohort's estimated
 cost would eat into ``kb_tail_reserve_minutes`` (180; 0 restores the old

@@ -6,7 +6,7 @@
   "src/kbcore/enrolment.py": 358,
   "src/kbcore/graph.py": 352,
   "src/kbcore/ingest.py": 462,
-  "src/kbcore/ingest_queue.py": 543,
+  "src/kbcore/ingest_queue.py": 328,
   "src/kbcore/items.py": 370,
   "src/kbcore/llm.py": 538,
   "src/kbcore/offsite_config.py": 387,

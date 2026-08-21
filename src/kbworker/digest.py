@@ -61,6 +61,10 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     # failure retries tomorrow and is not yet news — noise budget, review #4).
     if retired := counts.get("attempts_cap_retirements"):
         lines.append(f"drain: {retired} group(s) retired at attempts cap")
+    # Review #5 val-3/strat-8: wall-blocked reject suggestions given their
+    # terminal (reversible) disposition tonight. POSITIVE-ONLY like the rest.
+    if closed := counts.get("wall_blocked_closed"):
+        lines.append(f"wall-blocked rejects closed: {closed}")
     # The weekend top-up, POSITIVE-ONLY (unlike the spec above): it does not run
     # on a deadline day at all, so a "topup triaged: 0" every weekday night would
     # be noise in the one message the owner reads without going looking.
@@ -94,12 +98,41 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
     # exists without asking. POSITIVE-ONLY and pure ASCII, like its neighbours.
     if promotable := counts.get("promote_candidates"):
         lines.append(f"promote-worthy: {promotable}")
-    # Demand-side gap counter (review #4 Wave E, KB 21332): zero-hit searches in
-    # the last day (kbcore.search_misses, stashed by push_run_digest). POSITIVE-
-    # ONLY and pure ASCII like its neighbours — a night with no misses says
-    # nothing rather than a noise line of 'search misses: 0'.
+    # Demand-side gap counters (review #4 Wave E, KB 21332; renamed + thin split
+    # review #5 Wave F). 'empty-result' says exactly what the count measures —
+    # the old 'search misses: 0' read as 'no gaps' when it only meant 'no
+    # zero-hit searches'. The thin-miss line renders once the relevance
+    # instrument (pkg-search) stashes its key. POSITIVE-ONLY, pure ASCII.
     if misses := counts.get("search_misses_24h"):
-        lines.append(f"search misses: {misses}")
+        lines.append(f"empty-result searches: {misses}")
+    if thin := counts.get("search_misses_thin_24h"):
+        lines.append(f"thin-result searches: {thin}")
+    # EVAL RED (review #5 ops-1): the sentinel runs before the digest push, so
+    # eval_regression is already in counts — it just was never rendered, and the
+    # 08-18/19 red nights pushed normal-looking digests. POSITIVE-ONLY: a green
+    # night says nothing.
+    if counts.get("eval_regression"):
+        lines.append(_eval_red_line(counts))
+    # TRUST WATCH (review #5 val-4): the verified-lift instrument flagged the
+    # top-5 trust composition — see kbworker.eval_trust for the three trips.
+    if counts.get("eval_trust_status") == "watch":
+        share = counts.get("eval_top5_unverified_share")
+        lift = counts.get("eval_top5_verified_lift")
+        lines.append(
+            f"TRUST WATCH: top5 unverified {share if share is not None else '?'}, "
+            f"verified lift {f'{lift}x' if lift is not None else 'n/a'}"
+        )
+    # Host swap telemetry (review #5 strat-7/ops-3 contract): consolidate stashes
+    # swap_used_pct; the digest renders it only past the 80% mark (14G/16G on
+    # 08-21 with zero telemetry anywhere). POSITIVE-ONLY by threshold.
+    swap = counts.get("swap_used_pct")
+    if isinstance(swap, int | float) and not isinstance(swap, bool) and swap > 80:
+        lines.append(f"swap: {swap:.0f}% used")
+    # Rerank sidecar probe (review #5 ops-4 contract): the consolidate tail step
+    # stashes counts['rerank_probe'] = 'ok'|'failed'. Only a failure is news —
+    # a red night's meta must say which ranking system was measured.
+    if counts.get("rerank_probe") == "failed":
+        lines.append("rerank probe: failed")
     expiry = counts.get("first_expiry_date")
     if expiry and _expiring_soon(expiry):
         lines.append(f"review rows start expiring {expiry}")
@@ -115,6 +148,23 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
         # a bare number tells an owner nothing about which box to walk over to.
         lines.append(f"STALE HOOKS suspected: {', '.join(stale)}")
     return lines
+
+
+def _eval_red_line(counts: Mapping[str, Any]) -> str:
+    """The red-eval digest line: observed hit@5 against the anchored floor.
+
+    The floor is read lazily (the digest's convention — a broken import costs
+    ONE line, never the digest) at RENDER time, so the line always names the
+    floor the sentinel actually compared against tonight.
+    """
+    try:
+        from kbcore.config import settings
+
+        floor: str = f"{settings.kb_eval_min_hit5:g}"
+    except Exception:  # noqa: BLE001 — a digest line may never cost the digest
+        floor = "?"
+    hit = counts.get("eval_hit_at_5")
+    return f"EVAL RED: hit@5 {hit if hit is not None else '?'} (floor {floor})"
 
 
 def _stale_hook_projects(report: Any) -> list[str]:
@@ -149,7 +199,13 @@ def push_run_digest(counts: Mapping[str, Any]) -> bool:
         try:
             from kbcore import notify
 
-            pushed = bool(notify.push_digest(lines))
+            if counts.get("eval_regression"):
+                # Red eval night (review #5 ops-1): a SUCCESSFUL unit run whose
+                # quality regressed — OnFailure never fires, so the digest itself
+                # must escalate. Green nights keep the byte-identical default call.
+                pushed = bool(notify.push_digest(lines, title="KB ALERT", priority="high"))
+            else:
+                pushed = bool(notify.push_digest(lines))
         except Exception:  # noqa: BLE001 — a digest can never fail the run that made it
             logger.warning("nightly digest push unavailable", exc_info=True)
     _maybe_weekly(counts)
@@ -170,6 +226,15 @@ def _note_search_misses(counts: Mapping[str, Any]) -> None:
         from kbcore import search_misses
 
         counts["search_misses_24h"] = search_misses.count_since(days=1)
+        # Thin-miss stash (review #5 val-1 contract, cross-package): the
+        # relevance instrument records subtype='thin' rows and count_since
+        # gained a subtype parameter (default 'empty' — the key above keeps its
+        # semantics). Guarded so a pre-thin search_misses (no subtype yet)
+        # costs the thin key only, never the digest.
+        try:
+            counts["search_misses_thin_24h"] = search_misses.count_since(days=1, subtype="thin")
+        except TypeError:  # pre-thin signature: no subtype parameter
+            pass
     except Exception:  # noqa: BLE001 — telemetry may never cost the digest
         logger.warning("search-miss count unavailable for the digest", exc_info=True)
 

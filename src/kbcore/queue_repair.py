@@ -221,8 +221,9 @@ def near_deferral_cap_groups() -> int:
     ``ingest_queue.pending_groups`` groups, so a giant session counts once, not
     per row.
     """
-    # Lazy import: ingest_queue imports THIS module at its top (the seam), and
-    # the SQL fragment must stay beside its Python twin over there.
+    # Lazy import: ingest_queue imports THIS module at its top (the seam). The
+    # SQL fragment lives beside its Python twin in kbcore.queue_groups since the
+    # 2026-08-21 split; ingest_queue re-exports it, so the seam still resolves.
     from kbcore.ingest_queue import _DEGENERATE_URI_SQL, DEFERRAL_CAP
 
     with connect() as conn:

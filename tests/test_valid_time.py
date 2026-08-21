@@ -191,10 +191,67 @@ def test_supersede_new_item_path_closes_with_the_new_items_start():
     assert get_item(newer).valid_from == SEP, "the successor item is untouched"
 
 
-def test_supersede_plain_correction_does_not_auto_close():
+def test_supersede_plain_correction_default_closes_at_the_supersession_instant():
+    # strat-5 (2026-08-21, activates the fallow bitemporal plumbing): with NO
+    # interval asserted anywhere, the retired ROW's open window is bounded at the
+    # supersession instant and stamped as INFERRED — while the fact's window
+    # survives, open, on the inheriting replacement (correction semantics intact).
+    before = datetime.now(UTC)
     old = _ingest("still true", valid_from=JAN)  # open, no new start supplied
-    supersede(old, new_body="still true (typo fixed)", reason="typo")
-    assert get_item(old).valid_to is None, "a plain correction leaves the window open"
+    new = supersede(old, new_body="still true (typo fixed)", reason="typo")
+    got = get_item(old)
+    assert got.valid_to is not None and before <= got.valid_to <= datetime.now(UTC)
+    assert got.meta.get("valid_time") == "inferred_transaction_time", (
+        "an inferred close must be distinguishable from an asserted one"
+    )
+    repl = get_item(new)
+    assert repl.valid_from == JAN and repl.valid_to is None, (
+        "the fact's window survives OPEN on the replacement — nothing erased"
+    )
+
+
+def test_supersede_interval_less_successor_default_closes_the_old_row():
+    # Same strat-5 default on the new_item_id path: an interval-less successor
+    # closes the retired row at the supersession instant, inferred-stamped; the
+    # successor's own NULL/NULL interval is untouched.
+    before = datetime.now(UTC)
+    old = _ingest("running v1 open", valid_from=JAN)  # open
+    newer = _ingest("running v2 intervalless")  # NULL/NULL
+    supersede(old, new_item_id=newer, reason="upgraded")
+    got = get_item(old)
+    assert got.valid_to is not None and before <= got.valid_to <= datetime.now(UTC)
+    assert got.meta.get("valid_time") == "inferred_transaction_time"
+    repl = get_item(newer)
+    assert repl.valid_from is None and repl.valid_to is None, "successor untouched"
+
+
+def test_supersede_inferred_close_skips_a_future_dated_fact():
+    # An inferred (transaction-time) close must never invert an ASSERTED interval:
+    # a fact valid only from the future stays open, with no stamp and no error.
+    # Far-future start (not SEP) so the pin never rots as the calendar advances.
+    far = _ingest("far future fact", valid_from=datetime(2199, 1, 1, tzinfo=UTC))
+    supersede(far, new_body="far future fact v2", reason="typo")
+    got = get_item(far)
+    assert got.valid_to is None, "bookkeeping never trumps an asserted valid_from"
+    assert "valid_time" not in got.meta
+
+
+def test_supersede_explicit_close_is_asserted_not_inferred():
+    # The explicit-override path is world-changed semantics: the close IS the
+    # asserted end, so no inferred stamp may appear.
+    old = _ingest("service on host Y2", valid_from=JAN)  # open
+    supersede(old, new_body="service on host Z2", reason="moved", valid_from=T)
+    got = get_item(old)
+    assert got.valid_to == T
+    assert "valid_time" not in got.meta
+
+
+def test_supersede_closed_old_window_is_left_as_recorded():
+    # A row whose window was already CLOSED is never re-bounded or stamped.
+    old = _ingest("bounded still", valid_from=JAN, valid_to=DEC)
+    supersede(old, new_body="bounded still (typo fixed)", reason="typo")
+    got = get_item(old)
+    assert got.valid_to == DEC and "valid_time" not in got.meta
 
 
 def test_supersede_rejects_valid_time_on_the_new_item_path():

@@ -257,7 +257,9 @@ def test_primary_metrics_survive_an_ab_failure(kb, monkeypatch):
     # A failed instrument leaves NO partial numbers behind to be misread.
     for key in ("eval_ab_off_hit_at_5", "eval_ab_on_hit_at_5", "eval_ab_hops_on"):
         assert key not in broken
-    assert broken["eval_trust_status"] == "ok", "the other instrument still ran"
+    # 'watch' is also a completed run (Wave F verified-lift watch) — only
+    # 'error' would mean the other instrument was lost.
+    assert broken["eval_trust_status"] in ("ok", "watch"), "the other instrument still ran"
 
 
 def test_ab_can_be_switched_off(kb, monkeypatch):
@@ -343,7 +345,10 @@ def test_trust_share_computes_on_a_mixed_corpus(kb, monkeypatch):
 
     counts = _run_sentinel(monkeypatch, golden)
 
-    assert counts["eval_trust_status"] == "ok"
+    # Wave F: this corpus (2 verified of 5 → fraction 0.4, verified top-5 share
+    # 0.25 → lift 0.625 < 5x floor) deterministically trips the verified-lift
+    # watch; the composition numbers themselves are unchanged.
+    assert counts["eval_trust_status"] == "watch"
     assert counts["eval_top5_results"] == 4
     assert counts["eval_top5_unverified"] == 3
     assert counts["eval_top5_unverified_share"] == 0.75
@@ -395,7 +400,10 @@ def test_summary_share_counts_summary_typed_top5_hits(kb, monkeypatch):
 
     counts = _run_sentinel(monkeypatch, golden)
 
-    assert counts["eval_trust_status"] == "ok"
+    # Wave F: an all-unverified two-item corpus (share 1.0 > 0.75 ceiling)
+    # deterministically trips the verified-lift watch; the summary-share
+    # numbers themselves are unchanged.
+    assert counts["eval_trust_status"] == "watch"
     assert counts["eval_top5_results"] == 2
     assert counts["eval_top5_summary"] == 1
     assert counts["eval_top5_summary_share"] == 0.5

@@ -25,6 +25,7 @@ from kbcore import (
     ingest_queue,
     llm,  # noqa: F401 — patch surface: tests patch `consolidate.llm.*`
     review_auto,
+    review_rejects,
     review_triage,
 )
 from kbcore import reembed as reembed_mod
@@ -56,6 +57,14 @@ from kbworker.cohort import (  # noqa: F401
     _drain_job,
     record_deferral_pressure,
     reset_cohort_stats,
+)
+
+# The power guard moved to kbworker.powerguard (mechanical split, 2026-08-21,
+# review #5) — re-imported for the same seam reason: should_stop resolves the
+# global ``_on_battery``, and the test suite patches ``consolidate._on_battery``.
+from kbworker.powerguard import (  # noqa: F401
+    _on_battery,
+    _reading_age_seconds,
 )
 from kbworker.prep import (  # noqa: F401
     EXTRACT_BYTES_PER_TOKEN,
@@ -89,12 +98,24 @@ from kbworker.tail_ops import (  # noqa: F401
 logger = logging.getLogger("kbworker.consolidate")
 
 ADVISORY_KEY = 42
-# Raised 20 -> 32 (review #4 P2, 2026-08-16): 113-125 open pairs against 20 a
-# night was permanently under water. 32 x ~110 s/pair ~= 59 min, which fits the
-# post-share weekday tail; the streak reserve is still
-# EVIDENCE_PAIR_CAP // EVIDENCE_STREAK_RESERVE_DIVISOR (now 16) — the divisor
-# semantics are unchanged.
-EVIDENCE_PAIR_CAP = 32  # max contradiction pairs evidence-judged per nightly run
+# DAY-AWARE (review #5 pipe-4, 2026-08-21). The 20 -> 32 raise (review #4 P2)
+# assumed ~110 s/pair; the five post-raise nights MEASURED 129-153 s/pair
+# (mean ~143, call it ~145), so 32 pairs cost 69-82 min a night — 38-46% of
+# the 180-min tail reserve, which the weekday window cannot afford. The cap is
+# therefore 20 on deadline days (~30 weekday minutes back) and 48 on unbounded
+# days (kbcore.drainsched.is_unbounded_day — the single "box is free tonight"
+# definition), where the deeper pass costs nothing anyone is waiting on. Zero
+# convergence loss: the streak tolerates revisit gaps — _evidence increments
+# off the PRIOR STORED detail, so a pair revisited every other night still
+# reaches AUTO_RESOLVE_STREAK, and open_contradiction_rows already cycles
+# refreshes oldest-evidence_updated-first. The streak reserve stays
+# cap // EVIDENCE_STREAK_RESERVE_DIVISOR; the divisor semantics are unchanged.
+EVIDENCE_PAIR_CAP_WEEKDAY = 20  # deadline days: protect the tail reserve
+EVIDENCE_PAIR_CAP_UNBOUNDED = 48  # no-deadline days: catch-up capacity
+# Explicit override (tests patch this; a knob could set it): None = pick by day.
+# Read at call time (_evidence_pair_cap), like the divisor, so a patched cap
+# keeps its exact pre-split meaning.
+EVIDENCE_PAIR_CAP: int | None = None
 
 # MEANING CHANGED 2026-08-01: this is the ceiling on ingest_queue ROWS one REFILL
 # may materialise — a memory bound — and no longer the budget for a whole run.
@@ -115,7 +136,7 @@ QUEUE_BATCH = 200
 # past what a night's GPU window can extract, so hitting it is a loud anomaly.
 MAX_REFILLS = 200
 
-# STARVATION FIX. EVIDENCE_PAIR_CAP // this is reserved, at the FRONT of each
+# STARVATION FIX. The pair cap // this is reserved, at the FRONT of each
 # nightly batch, for rows that already carry a decisive suggestion
 # (suggestion_streak >= 1). evidence.open_contradiction_rows orders
 # never-enriched rows first — right for a fresh contradiction, fatal for a
@@ -151,111 +172,6 @@ def _past_deadline() -> bool:
         logger.warning("KB_DRAIN_DEADLINE %r is not HH:MM — ignoring", raw)
         return False
     return datetime.now() >= cutoff
-
-
-def _reading_age_seconds(ts: Any) -> float | None:
-    """Age of one sungrow reading in seconds; None when the stamp is unparseable.
-
-    INVARIANT 7 CARVE-OUT — the single foreign-DB boundary in this codebase.
-    Everything the KB itself stores is TIMESTAMPTZ/UTC, but the sungrow monitor
-    is another project's Django app and writes NAIVE LOCAL wall-clock
-    (Asia/Karachi, UTC+5). Reading those stamps as UTC made ``now - seen`` about
-    MINUS five hours, so the staleness check could not fire during the first five
-    hours of genuine staleness: a poller that died at 03:00 still read as "fresh"
-    at 07:00, which is exactly the last-known-good trap the freshness check
-    exists to avoid.
-
-    A naive stamp is therefore interpreted in the LOCAL zone — which is what
-    :meth:`datetime.astimezone` does to a naive value — and an offset-carrying
-    stamp is honoured as written, so a future sungrow schema that starts emitting
-    UTC needs no change here. The comparison itself stays UTC-aware.
-    """
-    try:
-        seen = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-    if seen.tzinfo is None:
-        seen = seen.astimezone()  # naive == LOCAL time (Inv. 7 carve-out, above)
-    return (datetime.now(UTC) - seen).total_seconds()
-
-
-def _on_battery() -> bool:
-    """True when the house is running on battery, so the drain should stand down.
-
-    The GPU is the largest load on this box and the UPS could not ride out a grid
-    fluctuation (2026-07-30, power lost mid-run). Hours of inference during an
-    outage is the wrong thing to be doing, so the drain stops between cohorts and
-    resumes when mains returns — the same stop-and-resume path as the deadline,
-    which needs no state of its own because unreached rows stay 'pending'.
-
-    Signal is grid_voltage from the sungrow monitor DB, read-only. Measured over
-    219,304 readings: normal 213-256V, outages cluster below 50V, and the 50-150V
-    band holds only ~170 readings — so the threshold sits in a sparse gap rather
-    than near either mode.
-
-    FAIL-SAFE ON UNKNOWN-BUT-CONFIGURED STATE. A MISSING or unreadable power DB
-    fails OPEN (returns False, warns): the feature is simply not configured on
-    that box, and a pipeline that silently never runs is the worse failure there.
-    But a DB that IS configured whose newest reading is STALE fails SAFE (returns
-    True, ON BATTERY): a reading older than the freshness window right after a
-    grid outage is exactly when the sungrow poller is most likely down, so the ONE
-    time staleness matters the guard used to say 'mains' and kept the GPU running
-    into the outage. A stale value is not evidence the grid is up; on a UPS that
-    cannot ride out a fluctuation, pausing the GPU when house-power state is
-    unknown-but-configured is the safe default. Both branches warn loudly.
-    """
-    path = (settings.kb_power_db or "").strip()
-    if not path:
-        return False
-    try:
-        import sqlite3
-
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
-            rows = conn.execute(
-                "SELECT grid_voltage, timestamp FROM monitor_inverterreading "
-                "ORDER BY timestamp DESC LIMIT ?",
-                (max(1, int(settings.kb_power_window)),),
-            ).fetchall()
-            row = rows[0] if rows else None
-    except Exception as e:  # noqa: BLE001 — another project's DB; never fatal here
-        logger.warning(
-            "power check unavailable (%s: %s) — proceeding on mains assumption", type(e).__name__, e
-        )
-        return False
-    if not row or row[0] is None:
-        logger.warning("power check found no readings — proceeding on mains assumption")
-        return False
-
-    volts, ts = float(row[0]), row[1]
-    age = _reading_age_seconds(ts)
-    if age is None:
-        logger.warning("power check: unparseable timestamp %r — ignoring freshness", ts)
-
-    if age is not None and age > settings.kb_power_max_age_seconds:
-        logger.warning(
-            "power check STALE (%.0fs old, grid=%.1fV) — treating as ON BATTERY and standing "
-            "down; the sungrow poller may be down, and a last-known-good value is not evidence "
-            "the grid is up. Pausing the GPU is the safe default on a UPS that cannot ride out a "
-            "fluctuation; rows stay 'pending' and the next run resumes here",
-            age,
-            volts,
-        )
-        return True
-
-    # ANY dip in the window keeps the GPU down: resuming into a flickering supply
-    # is worse than staying paused a few minutes longer, and a sagging grid is
-    # exactly when the UPS can least absorb a 150W spike.
-    floor = min(float(r[0]) for r in rows if r[0] is not None)
-    if floor < settings.kb_power_min_grid_volts:
-        volts = floor
-        logger.warning(
-            "ON BATTERY (grid=%.1fV < %.1fV) — drain standing down; rows stay 'pending' "
-            "and the next run resumes here",
-            volts,
-            settings.kb_power_min_grid_volts,
-        )
-        return True
-    return False
 
 
 _STOP_CACHE_SECONDS = 5.0
@@ -408,6 +324,21 @@ def _drain_ingest_queue() -> tuple[int, int]:
     return drained, saved_total
 
 
+def _evidence_pair_cap(now: datetime | None = None) -> int:
+    """Tonight's evidence-pair cap: the explicit override when set, else day-aware.
+
+    :data:`EVIDENCE_PAIR_CAP` (int) keeps its exact pre-split meaning for tests
+    and knobs; None picks :data:`EVIDENCE_PAIR_CAP_UNBOUNDED` on no-deadline days
+    and :data:`EVIDENCE_PAIR_CAP_WEEKDAY` otherwise (see the constants' comment).
+    ``now`` exists so tests can day-pin the calendar-sensitive branch.
+    """
+    if EVIDENCE_PAIR_CAP is not None:
+        return int(EVIDENCE_PAIR_CAP)
+    from kbcore.drainsched import is_unbounded_day
+
+    return EVIDENCE_PAIR_CAP_UNBOUNDED if is_unbounded_day(now) else EVIDENCE_PAIR_CAP_WEEKDAY
+
+
 def _evidence_batch(
     rows: list[tuple[int, int, int, dict[str, Any]]],
 ) -> list[tuple[int, int, int, dict[str, Any]]]:
@@ -417,14 +348,14 @@ def _evidence_batch(
     is ONE more visit away from auto-resolution, but it sorts LAST — the query
     puts never-enriched rows first — so a cap smaller than the open set starved
     it forever (12 suggestions stuck at streak=1 against 57 open rows and a cap
-    of 20). Up to ``EVIDENCE_PAIR_CAP // EVIDENCE_STREAK_RESERVE_DIVISOR`` of
+    of 20). Up to ``_evidence_pair_cap() // EVIDENCE_STREAK_RESERVE_DIVISOR`` of
     those go to the FRONT of the batch, so the stop guard cannot truncate them
     away either; the rest of the cap keeps the query's never-enriched-first
     order, which is what stops brand-new contradictions being starved in turn.
-    Both constants are read at call time so a test (or a future knob) can lower
+    Cap and divisor are read at call time so a test (or a future knob) can lower
     the cap and have the reserve follow it.
     """
-    cap = EVIDENCE_PAIR_CAP
+    cap = _evidence_pair_cap()
     reserve = cap // EVIDENCE_STREAK_RESERVE_DIVISOR
     hot = [r for r in rows if r[3].get("suggested_resolution") and r[3].get("suggestion_streak")]
     batch = hot[:reserve]
@@ -446,7 +377,7 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int]:
     that holds for AUTO_RESOLVE_STREAK consecutive refreshes is executed
     (owner V4 refinement; kill switch kb_auto_resolve_evidence). Per-pair
     isolation. ``stop`` (asked every :data:`STOP_CHECK_EVERY` pairs) bounds the
-    step by wall clock/power as well as by EVIDENCE_PAIR_CAP; an unreached row
+    step by wall clock/power as well as by the pair cap; an unreached row
     is just a row whose evidence is one night older. Returns
     ``(refreshed, auto_resolved)``.
     """
@@ -506,10 +437,60 @@ def _disk_pct() -> float:
     return round(usage.used / usage.total * 100, 1)
 
 
+def _host_memory(meminfo: Path = Path("/proc/meminfo")) -> tuple[float, float]:
+    """(swap % used, MemAvailable in GiB) — ONE procfs read, beside disk_pct.
+
+    Swap hit 14G/16G on 2026-08-21 with zero telemetry anywhere (review #5
+    ops-3). Framing per the verifier: cold-page parking under the consolidate
+    cgroup plus Ollama loads, NOT imminent OOM — 43Gi MemAvailable at the peak —
+    so this is telemetry, never an alarm. The digest renders a positive-only
+    line when swap tops 80% (pkg-reporting); both raw numbers ride every run
+    report so the trend is answerable from data. ``meminfo`` is a parameter for
+    hermetic tests only.
+    """
+    fields: dict[str, int] = {}
+    for line in meminfo.read_text(encoding="ascii", errors="replace").splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts and parts[0].isdigit():
+            fields[key] = int(parts[0])  # kB
+    swap_total = fields.get("SwapTotal", 0)
+    swap_pct = (
+        round((swap_total - fields.get("SwapFree", 0)) / swap_total * 100, 1) if swap_total else 0.0
+    )
+    return swap_pct, round(fields.get("MemAvailable", 0) / 1048576, 1)
+
+
 def _rejection_rate() -> float | None:
     rejected, saved = consolidation.extraction_stats()
     total = rejected + saved
     return round(rejected / total, 3) if total else None
+
+
+def _rerank_probe_step(counts: dict[str, Any]) -> None:
+    """Tail step (review #5 ops-4): ask the rerank sidecar to prove it can score.
+
+    ``kbcore.rerank.probe`` (pkg-search) POSTs a fixed two-document probe and
+    returns ``{'ok': bool, 'latency_ms': int|None}``, itself fail-open. Guarded
+    with ``hasattr`` + try/except so this tree imports and runs even before that
+    helper lands: no probe, or no ``kb_rerank_url`` configured, means no keys and
+    therefore no digest line (positive-only). A red eval night's meta must say
+    which ranking system was measured — on 08-18 nothing ruled the sidecar in or
+    out, and it demonstrably parks ~272MB in swap, so first-touch timeouts are
+    armed; ``'failed'`` here is the attribution, in meta instead of journald.
+    """
+    from kbcore import rerank
+
+    if not (settings.kb_rerank_url or "").strip() or not hasattr(rerank, "probe"):
+        return
+    try:
+        result = rerank.probe() or {}
+        counts["rerank_probe"] = "ok" if result.get("ok") else "failed"
+        counts["rerank_probe_ms"] = result.get("latency_ms")
+    except Exception:  # noqa: BLE001 — fail-open like every tail step
+        logger.exception("rerank probe failed")
+        counts["rerank_probe"] = "failed"
+        counts["rerank_probe_ms"] = None
 
 
 def _run_step(counts: dict[str, Any], key: str, fn) -> None:
@@ -687,6 +668,11 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # right after the step that writes them — status flips only, never a
         # delete (Invariant 5). Stop-gated inside; see kbworker.allocator.
         _run_step(counts, "auto_applied", lambda: tail_steps.auto_apply_step(counts, stop))
+        # Review #5 val-3/strat-8: retire the wall-blocked reject-suggestion
+        # stock the apply loop would otherwise rescan forever (monotone 395->
+        # 1264). Reversible status flip via kbcore.review_rejects — same
+        # Invariant-5 posture as the step above; kill switch honored inside.
+        _run_step(counts, "wall_blocked_closed", review_rejects.close_wall_blocked_rows)
         # WP-1 quiet-expiry: close never-recalled unverified rows past the age
         # knob (kb_review_expire_days; 0 = kill switch). Item stays searchable.
         # Capped + STOP-GATED inside the step (kbcore.review_expire). MOVED ahead
@@ -765,7 +751,12 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # ADDED key, never a rename (KB 19663): the same staleness split BY BOX.
         _run_step(counts, "fleet_by_box", fleet_health.fleet_by_box)
         counts["disk_pct"] = _disk_pct()
+        try:  # host memory telemetry (review #5 ops-3): keys absent on failure
+            counts["swap_used_pct"], counts["mem_available_gb"] = _host_memory()
+        except Exception:  # noqa: BLE001 — telemetry only, never fatal
+            logger.exception("host memory telemetry failed")
         counts["extraction_rejection_rate"] = _rejection_rate()
+        _rerank_probe_step(counts)  # sidecar health into tonight's meta (review #5)
 
         report_id = _write_report(counts)
         counts["report_item_id"] = report_id

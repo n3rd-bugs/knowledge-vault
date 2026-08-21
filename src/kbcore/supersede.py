@@ -8,7 +8,9 @@ relation records the edge (Invariant 1/5).
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
+
+from psycopg.types.json import Jsonb
 
 from kbcore import scope
 from kbcore.db import connect, transaction
@@ -38,6 +40,23 @@ def supersede(
     open (valid_to IS NULL), the old row's validity window is CLOSED at that start
     (Zep/SQL:2011 validity-window close, NOT a body edit — items.body stays
     immutable).
+
+    DEFAULT-CLOSE (strat-5, survey ADOPT #1, 2026-08-21): when NO interval
+    information exists at all — ``new_body`` with neither ``valid_from`` nor
+    ``valid_to``, or ``new_item_id`` whose item carries no ``valid_from`` — and
+    the old row's window is OPEN, the old row's ``valid_to`` is closed at the
+    SUPERSESSION INSTANT and its meta gains ``valid_time =
+    'inferred_transaction_time'`` so an inferred close is always
+    distinguishable from an asserted one. This does NOT erase the fact's
+    window: the correction-semantics inheritance above still carries the OLD
+    window (including its openness) onto the live replacement — only the
+    retired ROW's record is bounded, which is what makes every supersession
+    ``as_of``-queryable (with ``include_superseded``) without returning retired
+    text as still-current past its retirement. Same window-close mechanism as
+    above: a status/interval flip on the old row, never a body edit
+    (Invariant 1). One deliberate asymmetry: an inferred close that would
+    precede a FUTURE-DATED old ``valid_from`` is skipped rather than rejected —
+    transaction-time bookkeeping must not invert an asserted interval.
     """
     if (new_item_id is None) == (new_body is None):
         raise InvalidOperation("pass exactly one of new_item_id or new_body")
@@ -73,10 +92,12 @@ def supersede(
         if status == "superseded":
             raise InvalidOperation(f"item {old_id} is already superseded")
 
-        # The instant (if any) at which the OLD fact stopped being true — set only
-        # when the replacement introduces a NEW start (explicit override or the new
-        # item's own valid_from), never for a plain interval-inheriting correction.
+        # The instant (if any) at which the OLD ROW stops being the current record:
+        # a NEW start (explicit override or the new item's own valid_from) when one
+        # is given, else — for an interval-less supersession of a still-open row —
+        # the supersession instant itself, stamped 'inferred' (strat-5 default-close).
         close_from: datetime | None = None
+        inferred_close = False
         if new_body is not None:
             # Carry knowledge anchors (code_ref etc.) onto the replacement;
             # redaction counts belong to the old body, not the new one.
@@ -110,6 +131,14 @@ def supersede(
                 # (inverted visibility; review finding). ingest_in already rejected
                 # a valid_to <= old_valid_from, so this close is > old_valid_from.
                 close_from = _as_utc(valid_to)
+            elif old_valid_to is None:
+                # No interval asserted anywhere and the old window is open: default-
+                # close at the supersession instant (see docstring). The replacement
+                # inherited the OPEN window above, so the fact's window survives on
+                # the live row; only the retired record is bounded, and the meta
+                # stamp below marks the bound as inferred, not asserted.
+                close_from = datetime.now(UTC)
+                inferred_close = True
         else:
             repl = conn.execute(
                 "SELECT status, project, valid_from FROM items WHERE id = %s", (new_item_id,)
@@ -127,6 +156,12 @@ def supersede(
                     f"replacement item {new_item_id} is {repl[0]}; must be active"
                 )
             close_from = repl[2]  # the new item's own start closes the old window
+            if close_from is None and old_valid_to is None:
+                # Interval-less successor over a still-open row: same default-close
+                # as the new_body branch (the successor's own NULL/NULL interval is
+                # untouched; only the retired row's record is bounded + stamped).
+                close_from = datetime.now(UTC)
+                inferred_close = True
         if new_item_id == old_id:
             raise InvalidOperation("an item cannot supersede itself")
 
@@ -144,21 +179,39 @@ def supersede(
         if close_from is not None and old_valid_to is None:
             close_from = _as_utc(close_from)
             if old_valid_from is not None and close_from < old_valid_from:
-                # Strictly earlier would invert the old interval — the replacement
-                # cannot start BEFORE the fact it supersedes began.
-                raise InvalidOperation(
-                    "replacement valid_from precedes the superseded item's valid_from"
-                )
-            if old_valid_from is None or close_from > old_valid_from:
+                if not inferred_close:
+                    # Strictly earlier would invert the old interval — the replacement
+                    # cannot start BEFORE the fact it supersedes began.
+                    raise InvalidOperation(
+                        "replacement valid_from precedes the superseded item's valid_from"
+                    )
+                # Inferred (transaction-time) close of a FUTURE-DATED fact: closing
+                # now would invert the asserted interval, so leave the window open —
+                # bookkeeping never trumps an asserted valid_from (see docstring).
+            elif old_valid_from is None or close_from > old_valid_from:
                 # A strictly-later start SHRINKS the window: close the old row there.
                 # EQUAL start is a same-window takeover — the window is unchanged, so
                 # skip the close (closing AT the start would collapse it to an empty
                 # interval, which ingest forbids). This is the mandated same-window
                 # correction path (review finding); only strict inequality acts.
-                conn.execute(
-                    "UPDATE items SET valid_to = %s, updated_at = now() WHERE id = %s",
-                    (close_from, old_id),
-                )
+                if inferred_close:
+                    # Stamp the close as inferred-from-transaction-time so it can
+                    # never be mistaken for an asserted end of the fact's validity.
+                    conn.execute(
+                        "UPDATE items SET valid_to = %s, "
+                        "meta = COALESCE(meta, '{}'::jsonb) || %s, updated_at = now() "
+                        "WHERE id = %s",
+                        (
+                            close_from,
+                            Jsonb({"valid_time": "inferred_transaction_time"}),
+                            old_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE items SET valid_to = %s, updated_at = now() WHERE id = %s",
+                        (close_from, old_id),
+                    )
         conn.execute(
             """
             INSERT INTO relations (project, src_kind, src_id, rel, dst_kind, dst_id)

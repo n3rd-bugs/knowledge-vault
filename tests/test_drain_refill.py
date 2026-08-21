@@ -278,7 +278,11 @@ def test_a_DEFERRED_group_is_not_retried_within_the_same_run(kb, monkeypatch):
 
 def test_a_deferred_group_IS_eligible_again_on_the_NEXT_run(kb, monkeypatch):
     """The exclusion is per RUN. Making it stick would turn a transient outage
-    into a permanently stranded row, which is the failure it exists to avoid."""
+    into a permanently stranded row, which is the failure it exists to avoid.
+    The deferral BURN, though, is per LOCAL day (review #5 pipe-2): a same-day
+    boot catch-up run re-offers the group but burns no second deferral."""
+    from datetime import UTC, datetime, timedelta
+
     monkeypatch.setattr(settings, "kb_drain_cohort", 2)
     qid = _enqueue("refill-defer-next", "User: outage\nAssistant: x")
     uri = f"queue:session:{qid}"
@@ -289,7 +293,15 @@ def test_a_deferred_group_IS_eligible_again_on_the_NEXT_run(kb, monkeypatch):
 
     consolidate._drain_ingest_queue()
     assert seen == [uri, uri], "the next run did not re-offer the deferred group"
-    assert _row(qid) == ("pending", 0, 2), "each RUN costs exactly one deferral"
+    assert _row(qid) == ("pending", 0, 1), "a same-day catch-up burned a second deferral"
+
+    # Tomorrow's run: still re-offered, and the day boundary re-arms the burn.
+    monkeypatch.setattr(
+        ingest_queue, "drain_day_start", lambda: datetime.now(UTC) + timedelta(days=1)
+    )
+    consolidate._drain_ingest_queue()
+    assert seen == [uri, uri, uri], "the next DAY did not re-offer the deferred group"
+    assert _row(qid) == ("pending", 0, 2), "each DAY costs exactly one deferral"
 
 
 def test_a_CONTENT_FAILED_group_is_not_retried_within_the_same_run(kb, monkeypatch):

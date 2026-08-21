@@ -89,15 +89,18 @@ def test_the_weekly_run_writes_the_item_and_pushes_ascii_under_20_lines(kb, week
     )
     for _ in range(2):
         search_misses.record("esp32 ledc fade é", None, "mcp.kb_search")
-    sent: list[list[str]] = []
-    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines: sent.append(lines) or True)
+    sent: list[tuple[list[str], dict]] = []
+    monkeypatch.setattr(
+        weekly.notify, "push_digest", lambda lines, **kw: sent.append((lines, kw)) or True
+    )
 
     counts: dict = {}
     assert weekly.maybe_weekly(counts, now=A_SUNDAY) is True
     assert counts["weekly_report_pushed"] is True
     assert counts["search_misses_swept"] == 0
 
-    (lines,) = sent
+    ((lines, kw),) = sent
+    assert kw.get("title") == "KB weekly", "the weekly names its own ntfy title (ops-1)"
     assert lines[0].startswith("KB weekly ")
     assert len(lines) < weekly.PUSH_MAX_LINES
     assert all(line.isascii() for line in lines), "ntfy to a phone: pure ASCII"
@@ -114,7 +117,7 @@ def test_the_weekly_run_writes_the_item_and_pushes_ascii_under_20_lines(kb, week
             "SELECT body, meta FROM items WHERE id = %s", (item_id,)
         ).fetchone()
     assert body.startswith("KB weekly trend report")
-    assert "search misses (7d): 2 total, 1 distinct" in body
+    assert "search misses (7d): 2 total (empty 2, thin 0), 1 distinct" in body
     assert meta["weekly_report"] is True
     assert meta["nights"] == 2
     assert isinstance(meta["promoted_total"], int)
@@ -147,7 +150,7 @@ def test_promote_uptake_diffs_against_the_prior_weekly_checkpoint(kb, weekly_on,
     qid = review.queue_review(item, "unverified_extraction")
     review.promote(qid)
 
-    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines: True)
+    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines, **kw: True)
     counts: dict = {}
     assert weekly.maybe_weekly(counts, now=A_SUNDAY) is True
     with connect() as conn:
@@ -160,7 +163,7 @@ def test_promote_uptake_diffs_against_the_prior_weekly_checkpoint(kb, weekly_on,
 
 def test_a_same_week_rerun_skips_without_a_counts_key(kb, weekly_on, monkeypatch):
     """The Sunday boot-catch-up double-fire guard: one weekly item per week."""
-    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines: True)
+    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines, **kw: True)
     first: dict = {}
     assert weekly.maybe_weekly(first, now=A_SUNDAY) is True
     again: dict = {}
@@ -188,7 +191,7 @@ def test_retention_rides_the_weekly_pass(kb, weekly_on, monkeypatch):
 
     with transaction() as conn:
         conn.execute("UPDATE search_misses SET at = now() - make_interval(days => 120)")
-    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines: True)
+    monkeypatch.setattr(weekly.notify, "push_digest", lambda lines, **kw: True)
     counts: dict = {}
     assert weekly.maybe_weekly(counts, now=A_SUNDAY) is True
     assert counts["search_misses_swept"] == 1
@@ -218,12 +221,13 @@ def test_the_digest_line_counts_the_days_misses(monkeypatch):
     counts: dict = {"queued_drained": 1}
     digest_mod._note_search_misses(counts)
     assert counts["search_misses_24h"] == 7
-    assert "search misses: 7" in digest_mod.digest_lines(counts)
+    assert "empty-result searches: 7" in digest_mod.digest_lines(counts)
 
 
 def test_no_misses_means_no_line_and_a_broken_count_costs_one_line_only(monkeypatch, caplog):
-    assert "search misses: 0" not in digest_mod.digest_lines(
-        {"queued_drained": 1, "search_misses_24h": 0}
+    assert not any(
+        "searches:" in line
+        for line in digest_mod.digest_lines({"queued_drained": 1, "search_misses_24h": 0})
     )
 
     def boom(*a, **kw):

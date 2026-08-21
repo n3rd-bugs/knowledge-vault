@@ -136,24 +136,42 @@
   kwargs: {expand: true}
 
 # --- mined from access_log 2026-07-18 (kb eval mine; real search→get confirmations) ---
+# EXPOSED-PIN AUDIT (2026-08-21, review #5 ret-eval-1/val-7). The harness now
+# resolves expect_item_id through items.superseded_by to the live chain head,
+# which covers the doc-refresh/explicit-supersede staleness mode (both 08-18/19
+# red nights). It does NOT cover RE-CAPTURE staleness — a richer twin captured
+# by a later session outranks the pinned item with NO supersedes edge to walk
+# (the 124→858 and 383→488 repoints; 775 is still ACTIVE so 775→8163 would not
+# have resolved either). The four mined pins below are exactly that class —
+# every one is a past or plausible re-capture repoint — so each is converted to
+# the knowledge's STABLE IDENTITY as expect_substr (the RM3/CONFIG_SYNC
+# precedent below). Substrings verified green live 2026-08-21 (kb_search, k=5,
+# expand=false). The 11 pins on the hand-authored motor-ctl/docx/infra seeds
+# 980-985 (984 checked live 2026-08-21: verified motor-ctl seed) are KEPT as
+# ids — deliberate 08-09 precision hardening, immune to doc churn.
 - q: "supersede does not auto-close valid_to valid-time bitemporal as_of design decision"
-  # was 775 ("no auto-close in v1", 3 confirmations). The BEHAVIOR then
-  # reversed: supersede now auto-closes the old validity window (gateway
-  # decision, item 8163; kbcore/supersede.py). The query keeps the historical
-  # phrasing a user would still type; the case tracks the item that answers
-  # it correctly TODAY — a golden case must track the ACTIVE revision.
-  expect_item_id: 8163
+  # was 775 ("no auto-close in v1", 3 confirmations), repointed to 8163 when the
+  # behavior reversed (775 stayed ACTIVE — a re-capture-class repoint, not a
+  # supersede). Identity = the auto-close behavior itself; 8163's title carries
+  # it (rank 3 live 2026-08-21), as does the 8177 guard decision (rank 4).
+  expect_substr: ["auto-close"]
 - q: "extractor model selection qwen3 14b embedding bge-m3 choice rationale ollama"
-  expect_item_id: 313
+  # was pinned to 313 (the 2026-07-03 benchmark decision, rank 5 live) but the
+  # rationale has since been re-captured repeatedly (8001/5321/961 all in
+  # today's top-5). Identity = the chosen model / the config key that records
+  # the choice; any rationale re-capture names one of them.
+  expect_substr: ["KB_EXTRACT_MODEL", "qwen3:14b"]
 - q: "bare-metal redis GET benchmark verify-qemu zebu-layout UART hash pass fail known issue"
-  # was 124 (unroll). The same gotcha was re-captured richer by a later session
-  # (858, muhammadusama) and now outranks the original everywhere; both are
-  # active — cross-project near-twins are invisible to the per-project dedupe.
-  expect_item_id: 858
+  # was 124 (unroll), re-captured richer as 858 (muhammadusama) with both still
+  # active — the exact repoint class chain resolution cannot cover. Identity =
+  # the harness script + the layout name every re-capture names (858 rank 2
+  # live 2026-08-21; 5389/2479 siblings carry the layout too).
+  expect_substr: ["verify-qemu", "zebu-layout"]
 - q: "upload markdown or HTML content as Google Doc, create_file textContent conversion, docx export best practice"
-  # was 383 (unroll runbook). Same knowledge re-captured sharper as 488
-  # (redis-riscv-qemu gotcha: upload text/html, NOT text/markdown), rank 1.
-  expect_item_id: 488
+  # was 383 (unroll runbook), re-captured sharper as 488 (redis-riscv-qemu
+  # gotcha, rank 1 live 2026-08-21). Identity = the fix itself: upload as
+  # text/html, NOT text/markdown.
+  expect_substr: ["text/html"]
 - q: "stream push status sensor settings on-change realtime"
   # was 81 -> 470 -> 6431 -> 16791: the rm3 doc is under ACTIVE development, so
   # its doc-refresh chain moves nightly and any pinned revision id goes stale in

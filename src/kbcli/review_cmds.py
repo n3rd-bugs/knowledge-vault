@@ -11,8 +11,8 @@ from datetime import datetime
 
 import typer
 
-from kbcli import expire_cmds, promote_cmds
-from kbcore import render, review_apply, review_auto, review_triage
+from kbcli import bulk_cmds, expire_cmds, promote_cmds
+from kbcore import render, review_apply, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import KBError
@@ -29,6 +29,9 @@ review_app.command("undo-expiry")(expire_cmds.review_undo_expiry)
 # for the same ratchet reason: `kb review promote-candidates` / `promote-batch`.
 review_app.command("promote-candidates")(promote_cmds.review_promote_candidates)
 review_app.command("promote-batch")(promote_cmds.review_promote_batch)
+# `kb review bulk` moved to kbcli.bulk_cmds (review #5 strat-8) when it grew the
+# --suggested-rejects dry-run/confirm mode; same ratchet seam as the two above.
+review_app.command("bulk")(bulk_cmds.review_bulk)
 
 
 def _fail(err: Exception) -> None:
@@ -85,29 +88,6 @@ def review_dismiss(queue_id: int = typer.Argument(...)) -> None:
     except KBError as e:
         _fail(e)
     typer.echo(f"queue {queue_id} dismissed (item untouched)")
-
-
-@review_app.command("bulk")
-def review_bulk(
-    action: str = typer.Option(..., "--action", help="promote | reject | dismiss"),
-    ids: str = typer.Option("", "--ids", help='comma-separated queue ids, e.g. "1,2,3"'),
-    project: str | None = typer.Option(None, "--project", help="drain this project's open rows"),
-) -> None:
-    """Batch-drain open review rows by ids and/or project (owner tool, WP-1)."""
-    try:
-        queue_ids = [int(x) for x in ids.split(",") if x.strip()] or None
-    except ValueError:
-        _fail(KBError(f"--ids must be comma-separated integers, got {ids!r}"))
-    try:
-        results = review_auto.bulk_resolve(action, queue_ids=queue_ids, project=project)
-    except KBError as e:
-        _fail(e)
-    for qid, outcome in results:
-        typer.echo(f"[{qid}] {outcome}")
-    errs = sum(1 for _, o in results if o.startswith("error"))
-    typer.echo(
-        f"bulk {action}: {len(results) - errs} resolved, {errs} error(s), {len(results)} row(s)"
-    )
 
 
 @review_app.command("triage")

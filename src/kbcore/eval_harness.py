@@ -7,7 +7,11 @@ Golden case schema (all criteria optional, at least one required; additive):
   q:              the query string (required)
   expect_substr:  [..] — pass if ANY substring appears in title+snippet+body of
                   a top-K hit (legacy criterion, unchanged)
-  expect_item_id: N — pass if that item id appears in the top-K
+  expect_item_id: N — pass if that item id appears in the top-K. The pin is
+                  resolved through items.superseded_by to the LIVE chain head
+                  first (cycle-guarded, depth-capped — see _chain_head), so a
+                  doc-refresh supersede is telemetry, not a red night.
+                  forbid_item_id is deliberately NEVER resolved.
   expect_rank_le: R — the positive match's rank must be <= R (catches "still
                   found, but demoted" ranking regressions that hit@K cannot see)
   forbid_item_id: N — FAIL if that id appears in the top-K
@@ -36,6 +40,12 @@ import yaml
 
 from kbcore import search_expand
 from kbcore.db import connect
+
+# THE ESTABLISHED SEAM (mechanical split, review #5 Wave F): usage mining moved
+# to kbcore.eval_mine when chain-head resolution reached this file's 300-line
+# ratchet. Every caller (kb eval mine) keeps reaching it as
+# ``eval_harness.mine_candidates`` — same pattern as kbworker.tail_steps/digest.
+from kbcore.eval_mine import mine_candidates  # noqa: F401
 from kbcore.items import get_item, parse_instant
 from kbcore.search import search
 
@@ -69,6 +79,7 @@ class CaseResult:
     rank: int | None  # positive-criterion match rank (MRR basis); None if unmatched
     passed: bool  # ALL present criteria ok → feeds hit@5
     criteria: list[CriterionResult] = field(default_factory=list)
+    chain_resolved: bool = False  # expect_item_id followed superseded_by to a live head
 
 
 def load_golden(golden_path: Path | None = None) -> list[dict]:
@@ -130,6 +141,36 @@ def _substr_rank(hits, expected: list[str]) -> int | None:
     return None
 
 
+CHAIN_DEPTH_CAP = 50  # supersession hops followed before giving up (cycle backstop)
+
+
+def _chain_head(item_id: int) -> int:
+    """Follow ``items.superseded_by`` (single pointer) to the LIVE chain head.
+
+    Review #5 ret-eval-1: both 08-18/19 red nights were doc-refresh supersedes
+    moving a pinned revision id out from under its golden case — the case's
+    intent ("the CURRENT revision of this knowledge is retrievable") is exactly
+    the chain head, so the harness resolves the pin instead of failing on
+    honest churn. Cycle-guarded and depth-capped (a cycle or a >50-hop chain
+    returns the last sound id rather than looping); a missing id resolves to
+    itself and fails the criterion downstream exactly as before. SCOPE: this
+    covers ONLY the explicit-supersede mode — a re-captured richer twin has no
+    ``superseded_by`` edge to walk and needs a stable-substr case instead
+    (the 858/488 class; see eval/golden.yaml's audit notes).
+    """
+    head = item_id
+    seen = {head}
+    with connect() as conn:
+        for _ in range(CHAIN_DEPTH_CAP):
+            row = conn.execute("SELECT superseded_by FROM items WHERE id = %s", (head,)).fetchone()
+            nxt = row[0] if row else None
+            if nxt is None or nxt in seen:
+                return head
+            seen.add(nxt)
+            head = int(nxt)
+    return head
+
+
 def _content_exists(expected: list[str]) -> bool:
     """Does ANY corpus row (any status) contain one of the expected substrings?
 
@@ -181,10 +222,16 @@ def _evaluate_case(case: dict) -> CaseResult:
             detail = f"no substring of {expected} in top-{K}"
         criteria.append(CriterionResult("expect_substr", rank is not None, detail))
 
+    chain_resolved = False
     if "expect_item_id" in case:
-        want = case["expect_item_id"]
+        pinned = case["expect_item_id"]
+        want = _chain_head(pinned)  # forbid_item_id below stays deliberately UNRESOLVED
+        chain_resolved = want != pinned
+        label = f"item {want}"
+        if chain_resolved:
+            label += f" (chain-resolved {pinned}->{want})"
         item_rank = hit_ids.index(want) + 1 if want in hit_ids else None
-        detail = f"item {want} at rank {item_rank}" if item_rank else f"item {want} not in top-{K}"
+        detail = f"{label} at rank {item_rank}" if item_rank else f"{label} not in top-{K}"
         criteria.append(CriterionResult("expect_item_id", item_rank is not None, detail))
         rank = item_rank  # the id criterion is the precise one — it owns the MRR rank
 
@@ -206,7 +253,7 @@ def _evaluate_case(case: dict) -> CaseResult:
         )
         criteria.append(CriterionResult("forbid_item_id", ok, detail))
 
-    return CaseResult(query, rank, all(c.ok for c in criteria), criteria)
+    return CaseResult(query, rank, all(c.ok for c in criteria), criteria, chain_resolved)
 
 
 def evaluate(
@@ -227,58 +274,3 @@ def evaluate(
     reciprocal = sum(1.0 / r.rank for r in results if r.rank is not None)
     mrr = reciprocal / n_positive if n_positive else 0.0
     return results, hit_at_5, mrr
-
-
-# --- usage mining: real search→get confirmations as candidate golden cases ----
-
-_SEARCH_TOOL_LIKE = "%kb_search%"
-_GET_TOOL_LIKE = "%kb_get%"
-
-
-def mine_candidates(window_minutes: int = 15, limit: int = 50) -> list[dict]:
-    """Mine access_log for golden-case candidates: a kb_search hit that the user
-    then opened via kb_get within ``window_minutes`` is real evidence that
-    (query → item) was a good retrieval. READ-ONLY, parameterized; never writes.
-
-    Returns dicts: {q, expect_item_id, title, confirmations, first_searched,
-    last_confirmed}, most-confirmed first. Un-followed searches (no later
-    kb_get for the same item inside the window) never appear.
-    """
-    with connect() as conn:
-        rows = conn.execute(
-            """
-            SELECT s.query, s.item_id, i.title,
-                   COUNT(DISTINCT g.id) AS confirmations,
-                   MIN(s.ts) AS first_searched,
-                   MAX(g.ts) AS last_confirmed
-            FROM access_log s
-            JOIN access_log g
-              ON g.item_id = s.item_id
-             AND g.tool LIKE %(get_like)s
-             AND g.ts > s.ts
-             AND g.ts <= s.ts + make_interval(mins => %(window)s)
-            JOIN items i ON i.id = s.item_id
-            WHERE s.tool LIKE %(search_like)s
-              AND s.query IS NOT NULL AND s.query <> ''
-            GROUP BY s.query, s.item_id, i.title
-            ORDER BY confirmations DESC, last_confirmed DESC
-            LIMIT %(limit)s
-            """,
-            {
-                "get_like": _GET_TOOL_LIKE,
-                "search_like": _SEARCH_TOOL_LIKE,
-                "window": window_minutes,
-                "limit": limit,
-            },
-        ).fetchall()
-    return [
-        {
-            "q": query,
-            "expect_item_id": item_id,
-            "title": title,
-            "confirmations": confirmations,
-            "first_searched": first_searched,
-            "last_confirmed": last_confirmed,
-        }
-        for query, item_id, title, confirmations, first_searched, last_confirmed in rows
-    ]

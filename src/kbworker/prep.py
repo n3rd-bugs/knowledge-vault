@@ -1,12 +1,10 @@
 """kbworker.prep — extraction INPUT: window budgets, fitting, job assembly, batching.
 
-Split from ``kbworker.consolidate`` (mechanical extraction, 2026-08-04) — the
-ratchet's worst file at 1,276 lines. Everything here is the pure "turn queue
-groups into context-sized extraction jobs" machinery; the drain loop that calls
-it stays in ``consolidate``, which re-exports these names so existing call sites
-and test monkeypatches keep resolving through ``consolidate``'s globals.
-
-Same logger name as the parent on purpose: these lines have always appeared in
+Split from ``kbworker.consolidate`` (2026-08-04) — then the ratchet's worst file
+at 1,276 lines: the pure "turn queue groups into context-sized extraction jobs"
+machinery. The drain loop stays in ``consolidate``, which re-exports these names
+so call sites and test monkeypatches keep resolving through its globals. Same
+logger name as the parent on purpose: these lines have always appeared in
 journald under ``kbworker.consolidate`` and grep recipes depend on that.
 """
 
@@ -224,7 +222,9 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 # it would be an UPDATE per drained note for no benefit.
                 "checkpoint": bool(settings.kb_drain_window_checkpoint and len(windows) > 1),
             }
-            uri = meta.get("source_uri") or f"queue:{row['kind']}:{row['id']}"
+            # group_uri, never raw meta: the SQL guards degenerates and btrims —
+            # 'session:' is truthy, so `or` missed it (review #5 pipe-5).
+            uri = group.get("group_uri") or f"queue:{row['kind']}:{row['id']}"
             for i, window in enumerate(windows):
                 if i in resumed:
                     continue  # extracted on an earlier run; its items are stored

@@ -57,6 +57,17 @@ if [[ ! -s "${OUT}" ]]; then
   exit 1
 fi
 
+# Archive INTEGRITY gate (review #5 ops-6): non-emptiness alone lets a
+# truncated-but-nonempty dump sit undetected until the monthly restore drill,
+# while daily retention is only 14 days. `zstd -t` decodes the whole frame and
+# verifies its checksum in seconds; a failure exits nonzero, which fails the
+# systemd unit and trips the already-wired OnFailure notifier. Catches
+# write-time truncation/corruption only — the monthly drill stays the backstop.
+if ! zstd -t -q "${OUT}"; then
+  echo "backup.sh: FAILED — ${OUT} did not pass the zstd integrity check" >&2
+  exit 1
+fi
+
 # --- prune: keep the 14 newest daily + the 8 newest Monday dumps -------------
 cd "${KB_BACKUPS}"
 declare -A keep=()
@@ -97,6 +108,11 @@ if [[ -d "${KB_RAW}" ]]; then
   tar -C "${KB_RAW}" -cf - . | zstd -9 -q -o "${RAW_OUT}.tmp" -f
   mv -f "${RAW_OUT}.tmp" "${RAW_OUT}"
   chmod 600 "${RAW_OUT}"
+  # Same integrity gate as the dump (ops-6): a bad raw archive fails the unit.
+  if ! zstd -t -q "${RAW_OUT}"; then
+    echo "backup.sh: FAILED — ${RAW_OUT} did not pass the zstd integrity check" >&2
+    exit 1
+  fi
   # prune the kb-raw-* family with the SAME 14-daily + 8-weekly rule as dumps
   declare -A rkeep=()
   rdaily=0

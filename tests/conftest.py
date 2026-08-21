@@ -70,6 +70,7 @@ def _ranking_dials_at_code_defaults(monkeypatch):
     monkeypatch.setattr(_s, "kb_trust_factor", 1.0)
     monkeypatch.setattr(_s, "kb_collapse_alternatives", False)
     monkeypatch.setattr(_s, "kb_tail_triage_share", 0.0)
+    monkeypatch.setattr(_s, "kb_miss_relevance_floor", 0.0)
 
 
 @pytest.fixture(autouse=True)

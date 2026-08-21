@@ -371,13 +371,18 @@ def test_drain_deferral_cap_escalates_a_never_healing_transient(kb, monkeypatch)
     # A payload-deterministic 5xx surfaces as ExtractorUnavailable (transient) and
     # is DEFERRED forever with attempts untouched — until the deferral cap escalates
     # it to a terminal 'failed' row so it can't re-drain every night (finding).
+    # One drain per LOCAL day: the burn is day-bounded (review #5 pipe-2), so the
+    # never-healing nights are simulated by advancing the day boundary per drain.
     ingest_queue.enqueue("qdefer", "User: a\nAssistant: b", kind="session")
 
     def down(*a, **k):
         raise ExtractorUnavailable("deterministic 500 / runner crash")
 
     monkeypatch.setattr(sessions, "extract_and_ingest", down)
-    for _ in range(ingest_queue.DEFERRAL_CAP + 2):
+    for night in range(ingest_queue.DEFERRAL_CAP + 2):
+        monkeypatch.setattr(
+            ingest_queue, "drain_day_start", lambda night=night: datetime(2026, 1, 1 + night)
+        )
         consolidate._drain_ingest_queue()
     assert _one_row("qdefer") == ("failed", ingest_queue.MAX_ATTEMPTS), (
         "a transient that never heals is escalated to terminal after the deferral cap"

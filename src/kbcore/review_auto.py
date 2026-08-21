@@ -117,7 +117,19 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
     * ``eligible_entered_1d`` / ``eligible_left_1d`` / ``eligible_flow_net_1d`` —
       the net daily flow of that pool: rows minted in the last day, versus rows
       that LEFT it by being triaged or having their item recalled. ``net`` > 0
-      means the backlog grows faster than it is examined.
+      means the backlog grows faster than it is examined. SCOPE (review #5
+      val-5): ``left`` is an ACTIVITY gauge, not a pool-membership delta — it
+      counts triage stamps and access events in the last day over ANY
+      unverified_extraction row, open or resolved, in or out of the pool
+      (08-19: left=164 while the untriaged pool sat at 0). Read ``net`` for
+      DIRECTION only; the exact pool delta is the day-over-day change of
+      ``untriaged_pool_size`` (or ``never_triaged_open`` for the never-examined
+      subset).
+    * ``untriaged_pool_size`` — TODAY's untriaged pool, directly: open rows
+      carrying no CURRENT triage verdict. ``triage_prior`` re-queues are
+      INCLUDED (unlike ``never_triaged_open``) — an invalidated verdict puts
+      the row back in ``pending_triage``'s pool awaiting a second look. ADDED
+      key (review #5 val-5); nothing renamed.
     * ``promote_candidates`` — recall-proven unverified items waiting on an
       owner promote, at the default threshold (the PROMOTE PROGRAM, review #3
       P1: the owner sees the queue exists without asking). ADDED key; nothing
@@ -125,11 +137,12 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
     """
     reject = list(REJECT_TRIAGE_ACTIONS)
     with connect() as conn:
-        triaged, rejecting, never_triaged = conn.execute(
+        triaged, rejecting, never_triaged, untriaged_pool = conn.execute(
             f"""
             SELECT count(*) FILTER (WHERE {sql_has_triage()}),
                    count(*) FILTER (WHERE {sql_triage_field("action")} = ANY(%(reject)s)),
-                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{{}}'::jsonb) ?| %(examined)s))
+                   count(*) FILTER (WHERE NOT (COALESCE(rq.detail, '{{}}'::jsonb) ?| %(examined)s)),
+                   count(*) FILTER (WHERE {sql_not_triaged()})
             FROM review_queue rq
             WHERE rq.resolved = false AND rq.reason = 'unverified_extraction'
             """,  # noqa: S608 — constant triage-SQL fragments; values ride parameters
@@ -166,8 +179,9 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
             "  AND jsonb_typeof(detail->'suggested_resolution') = 'object'"
         ).fetchone()
         # Net daily flow of the untriaged-eligible pool. ENTERED = rows minted in
-        # the last day; LEFT = rows that were triaged or whose item was recalled in
-        # the last day (either removes a row from the at-risk-of-silent-expiry set).
+        # the last day; LEFT = an ACTIVITY gauge (see docstring, val-5): triage
+        # stamps / access events in the last day over ANY unverified_extraction
+        # row — deliberately unscoped, so net is directional, not an exact delta.
         (entered,) = conn.execute(
             "SELECT count(*) FROM review_queue "
             "WHERE reason = 'unverified_extraction' "
@@ -202,6 +216,8 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
         "eligible_entered_1d": int(entered),
         "eligible_left_1d": int(left),
         "eligible_flow_net_1d": int(entered) - int(left),
+        # Direct pool gauge (val-5): day-over-day delta of THIS is the exact net.
+        "untriaged_pool_size": int(untriaged_pool),
         # The PROMOTE PROGRAM's queue depth (kbcore.review_promote): same
         # predicate as `kb review promote-candidates`, so digest and table agree.
         "promote_candidates": review_promote.count_promote_candidates(),

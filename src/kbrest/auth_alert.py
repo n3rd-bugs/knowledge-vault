@@ -79,11 +79,15 @@ def push_alert(line: str) -> None:
     or a slow ntfy can never stall or fail the request that triggered it. The
     credential stays inside :mod:`kbcore.notify` — that is where "never log the
     token" lives — and this never logs the request body either.
+
+    Pushed under its own title at high priority (2026-08-23): the first real
+    firing rode the default 'KB nightly' title and the owner read it as the
+    NIGHTLY reporting an auth failure — a security signal must name itself.
     """
     try:
         from kbcore import notify
 
-        notify.push_digest([line])
+        notify.push_digest([line], title="KB ALERT", priority="high")
     except Exception:  # noqa: BLE001 — an alert must never disturb the server
         log.warning("auth-alert push unavailable", exc_info=True)
 
@@ -109,10 +113,28 @@ class AuthAlertMiddleware:
 
         async def _send(message):
             if message["type"] == "http.response.start" and message.get("status") == 401:
-                client = asgi_scope.get("client")
-                line = self.counter.record(client[0] if client else "", time.time())
+                line = self.counter.record(_client_ip(asgi_scope), time.time())
                 if line:
                     threading.Thread(target=push_alert, args=(line,), daemon=True).start()
             await send(message)
 
         await self.app(asgi_scope, receive, _send)
+
+
+def _client_ip(asgi_scope) -> str:
+    """The true client IP for the alert's distinct-IP count.
+
+    The socket peer is useless here: every tunneled request arrives from the
+    cloudflared container's bridge address, so the first real firing (2026-08-23,
+    536-request scan burst) reported '1 IPs' no matter how many sources probed.
+    Cloudflare stamps the real client into CF-Connecting-IP and OVERWRITES any
+    client-supplied value, and kb-rest is reachable only via the tunnel or
+    localhost (KB_BIND, Invariant 6) — so the header is trustworthy when present
+    and the peer address is already correct when it is not. X-Forwarded-For is
+    deliberately NOT consulted: its first hop is client-controlled.
+    """
+    for name, value in asgi_scope.get("headers") or []:
+        if name == b"cf-connecting-ip":
+            return value.decode("latin-1").strip()
+    client = asgi_scope.get("client")
+    return client[0] if client else ""

@@ -168,6 +168,43 @@ def test_non_401_responses_are_never_counted(monkeypatch):
     assert fired == [], "only 401s count toward the burst"
 
 
+def test_alert_push_names_itself_at_high_priority(monkeypatch):
+    """First real firing (2026-08-23) rode the default 'KB nightly' title and the
+    owner read it as the nightly reporting an auth failure — the alert must
+    carry its own identity on the phone."""
+    sent: dict = {}
+
+    def capture(lines, **kw):
+        sent["lines"], sent["kw"] = lines, kw
+        return True
+
+    import kbcore.notify as notify_mod
+
+    monkeypatch.setattr(notify_mod, "push_digest", capture)
+    auth_alert.push_alert("AUTH: 21 failed-auth in 10min from 1 IPs")
+    assert sent["lines"] == ["AUTH: 21 failed-auth in 10min from 1 IPs"]
+    assert sent["kw"] == {"title": "KB ALERT", "priority": "high"}
+
+
+def test_client_ip_prefers_cf_connecting_ip_over_the_tunnel_peer():
+    """Behind cloudflared every request's socket peer is the tunnel container,
+    so the 2026-08-23 scan burst reported '1 IPs' regardless of sources. The
+    Cloudflare-stamped header is the real client; the peer is the fallback;
+    X-Forwarded-For (client-controlled first hop) must be ignored."""
+    scope = {
+        "client": ("172.26.0.4", 40020),
+        "headers": [
+            (b"x-forwarded-for", b"6.6.6.6"),
+            (b"cf-connecting-ip", b"203.0.113.77"),
+        ],
+    }
+    assert auth_alert._client_ip(scope) == "203.0.113.77"
+    assert auth_alert._client_ip({"client": ("172.26.0.4", 1), "headers": []}) == "172.26.0.4"
+    assert (
+        auth_alert._client_ip({"client": None, "headers": [(b"x-forwarded-for", b"6.6.6.6")]}) == ""
+    )
+
+
 # --- end-to-end: the counter is actually installed in build_app --------------
 
 

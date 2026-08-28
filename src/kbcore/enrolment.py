@@ -12,9 +12,10 @@ Authority rules (all enforced here, never in a caller — Invariant 2):
 * A code NEVER carries more than the identity that asked for it. The requester
   is read from :mod:`kbcore.scope`, not from an argument, so a caller cannot ask
   for someone else's authority.
-* An OWNER's code redeems to the master credential. That is not an escalation —
-  the owner already holds it — and it is what makes the hooks work on projects
-  that do not exist yet, which a fixed-grant token cannot do.
+* An OWNER's code redeems to a narrow per-project ``kbg_`` token like any
+  other; the code must NAME the project. (It used to return the master
+  credential so hooks could write not-yet-existing projects — per-project
+  tokens removed that need, and the exception with it; see ``redeem`` below.)
 * A GRANTEE's code mints a fresh per-machine ``kbg_`` principal carrying exactly
   that grantee's grants and role. Every machine is then revocable on its own.
 * An identity with no authority (authenticated but ungranted) cannot get a code

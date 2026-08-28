@@ -12,7 +12,7 @@ OnFailure=kb-notify-fail@%n.service
 Type=oneshot
 WorkingDirectory=%h/kb/repo
 EnvironmentFile=%h/kb/repo/.env
-ExecStart=%h/kb/repo/scripts/restore_test.sh
+ExecStart=%h/kb/repo/scripts/restore_test.sh --auto
 NoNewPrivileges=true
 
 [Install]

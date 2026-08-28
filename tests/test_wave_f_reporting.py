@@ -108,8 +108,10 @@ def test_thin_miss_line_and_feature_detected_stash(monkeypatch):
 
 
 def _lift(monkeypatch, frac, prior=None):
+    """``prior`` is the WoW baseline: (top-5 VERIFIED share, eval_queries) —
+    the lift NUMERATOR, not the composite (review #6 repoint)."""
     monkeypatch.setattr(eval_trust, "_corpus_verified_fraction", lambda: frac)
-    monkeypatch.setattr(eval_trust, "_week_ago_lift", lambda: prior)
+    monkeypatch.setattr(eval_trust, "_week_ago_share", lambda: prior)
 
 
 def test_lift_floor_trips_the_watch(monkeypatch):
@@ -137,14 +139,31 @@ def test_quiet_night_sets_no_status_key(monkeypatch):
     assert "eval_trust_status" not in out and "eval_trust_watch" not in out
 
 
-def test_wow_move_trips_and_a_golden_edit_resets_the_baseline(monkeypatch):
-    _lift(monkeypatch, 0.1, prior=(10.0, 5))
-    out = eval_trust.verified_lift(0.5, golden_count=5)  # lift 5.0 = 50% move
+def test_wow_move_trips_on_the_numerator_share_and_a_golden_edit_resets(monkeypatch):
+    # Baseline verified share 0.5; tonight 0.3 = a 40% numerator move. The
+    # corpus fraction (0.05 -> lift 6.0) keeps the other trips quiet, so the
+    # ONLY reason is the WoW — proving the trip reads the share, not the lift.
+    _lift(monkeypatch, 0.05, prior=(0.5, 5))
+    out = eval_trust.verified_lift(0.7, golden_count=5)
     assert out["eval_trust_status"] == "watch"
-    assert any("WoW" in r for r in out["eval_trust_watch"])
+    assert out["eval_trust_watch"] == ["top5 verified share moved 40% WoW (0.5 -> 0.3)"]
     # Same numbers but the golden set changed size: the WoW baseline is reset.
-    out = eval_trust.verified_lift(0.5, golden_count=7)
+    out = eval_trust.verified_lift(0.7, golden_count=7)
     assert "eval_trust_status" not in out
+
+
+def test_denominator_decay_alone_never_trips_the_wow(monkeypatch):
+    """~90% of the 08-20..08-27 lift climb was corpus-fraction decay (review #6):
+    the WoW watches the NUMERATOR share, so a pure denominator move — the lift
+    doubling with ranking unmoved — stays quiet."""
+    _lift(monkeypatch, 0.05, prior=(0.3, 5))  # share 0.3 -> 0.3, lift 6.0
+    out = eval_trust.verified_lift(0.7, golden_count=5)
+    assert out["eval_top5_verified_lift"] == 6.0
+    assert "eval_trust_status" not in out
+    _lift(monkeypatch, 0.025, prior=(0.3, 5))  # denominator halves: lift 12.0
+    out = eval_trust.verified_lift(0.7, golden_count=5)
+    assert out["eval_top5_verified_lift"] == 12.0
+    assert "eval_trust_status" not in out, "a doubled lift with a flat share is not a move"
 
 
 def test_a_verified_free_corpus_yields_no_lift_key(monkeypatch):

@@ -68,6 +68,42 @@ if ! zstd -t -q "${OUT}"; then
   exit 1
 fi
 
+# --- count sidecar (review #6 Wave G): the restore drill's ground truth -------
+# The 04:30 drill races the 01:00 drain (~190-280 items/h), so comparing the
+# RESTORED counts against the LIVE DB blew the 1% budget on 5 of 8 recent
+# nights — a false "backup broken" page waiting to happen. The truth about a
+# dump is the dump: one decode pass counts the COPY rows the artifact actually
+# carries (items/chunks/relations + chunks with a NULL embedding, which proves
+# the vector column round-trips), and restore_test.sh exact-matches against
+# THIS file. Counting the artifact cannot race anything.
+if ! zstd -dc "${OUT}" | awk '
+  /^COPY public\.(items|chunks|relations) \(/ {
+    tbl = $2; sub(/^public\./, "", tbl); incopy = 1
+    embidx = 0
+    if (tbl == "chunks") {
+      # column list between the parens, e.g. COPY public.chunks (id, item_id, embedding, ...)
+      cols = $0; sub(/^[^(]*\(/, "", cols); sub(/\).*$/, "", cols)
+      n = split(cols, a, /, */)
+      for (i = 1; i <= n; i++) if (a[i] == "embedding") embidx = i
+    }
+    next
+  }
+  incopy && /^\\\.$/ { incopy = 0; next }
+  incopy {
+    rows[tbl]++
+    if (tbl == "chunks" && embidx > 0) { split($0, f, "\t"); if (f[embidx] == "\\N") nullemb++ }
+  }
+  END {
+    printf "items=%d\nchunks=%d\nrelations=%d\nchunks_null_embedding=%d\n", \
+      rows["items"], rows["chunks"], rows["relations"], nullemb
+  }' > "${OUT}.counts.tmp"; then
+  echo "backup.sh: FAILED — could not derive the count sidecar from ${OUT}" >&2
+  exit 1
+fi
+mv -f "${OUT}.counts.tmp" "${OUT}.counts"
+chmod 600 "${OUT}.counts"
+echo "backup.sh: sidecar $(tr '\n' ' ' < "${OUT}.counts")"
+
 # --- prune: keep the 14 newest daily + the 8 newest Monday dumps -------------
 cd "${KB_BACKUPS}"
 declare -A keep=()
@@ -88,7 +124,8 @@ done < <(ls -1 kb-*.sql.zst 2>/dev/null | sort -r)
 
 for f in kb-*.sql.zst; do
   [[ -e "${f}" ]] || continue
-  [[ -n "${keep[${f}]:-}" ]] || rm -f -- "${f}"
+  # the .counts sidecar lives and dies with its dump
+  [[ -n "${keep[${f}]:-}" ]] || rm -f -- "${f}" "${f}.counts"
 done
 
 echo "backup.sh: wrote ${OUT} ($(du -h "${OUT}" | cut -f1)); $(ls -1 kb-*.sql.zst | wc -l) dumps retained"

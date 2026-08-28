@@ -40,13 +40,47 @@ _DOC_BODY_CHARS = 1500  # title + this much body per candidate document
 # Which ranking system did THIS search actually measure? Thread-local so
 # concurrent server threads cannot cross-talk; writer and reader share a thread
 # by construction (kbcore.search reads inline right after the rerank step, and
-# the eval sentinel replays the harness synchronously, reading per case).
+# the eval sentinel replays the harness synchronously on one thread). CORRECTED
+# (review #6): a single read observes only the LAST rerank on its thread — a
+# harness-wide read after N cases reflects case N alone. The per-case picture
+# is the ARMED TALLY below (reset_tally / outcome_tally): _note accumulates
+# the final-when-noted outcomes so the sentinel never has to hook the harness.
 _participation = threading.local()
 
 
 def _note(outcome: str, top_relevance: float | None = None) -> None:
     _participation.outcome = outcome
     _participation.top_relevance = top_relevance
+    # Armed-tally accumulation (review #6): 'active'/'fallback' are each FINAL
+    # when noted — at most one of the two fires per search, and nothing renotes
+    # after it. 'off' is entry/reset noise here; outcome_tally derives it.
+    if outcome in ("active", "fallback"):
+        tally = getattr(_participation, "tally", None)
+        if tally is not None:
+            tally[outcome] += 1
+
+
+def reset_tally() -> None:
+    """Arm/zero this thread's per-search outcome tally (review #6).
+
+    The eval sentinel calls this right before replaying the golden set;
+    ordinary production searches never arm it, so nothing accumulates outside
+    an eval window."""
+    _participation.tally = {"active": 0, "fallback": 0}
+
+
+def outcome_tally(searches: int) -> dict[str, int]:
+    """``{'active', 'fallback', 'off'}`` counts since :func:`reset_tally`.
+
+    'off' is DERIVED as ``searches - active - fallback`` (floored at 0): every
+    search finishes having noted at most one of 'active'/'fallback' (in
+    rerank_fused/_scores), and a search that noted neither ended 'off' —
+    reset_outcome, no URL, or nothing to reorder. ``searches`` is the number of
+    searches the caller ran in the window (one per golden case). Unarmed reads
+    return an all-derived-'off' tally rather than raising."""
+    tally = dict(getattr(_participation, "tally", None) or {"active": 0, "fallback": 0})
+    tally["off"] = max(0, int(searches) - tally["active"] - tally["fallback"])
+    return tally
 
 
 def last_outcome() -> str:
@@ -54,9 +88,10 @@ def last_outcome() -> str:
 
     'active' = the sidecar scored the window; 'fallback' = it was attempted and
     failed, fused order stood; 'off' = it did not participate (no URL configured,
-    or nothing to reorder). Wave-F cross-package contract: the eval sentinel
-    reads this after harness runs so a red night's meta says which ranking
-    system was measured — attribution from a meta field, not journald archaeology.
+    or nothing to reorder). Read per search by kbcore.search_misses.observe;
+    the eval sentinel now reads the ARMED TALLY instead (review #6 — a single
+    read after N harness cases reflects case N alone), still attribution from
+    meta, not journald archaeology.
     """
     return getattr(_participation, "outcome", "off")
 

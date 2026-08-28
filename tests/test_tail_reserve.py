@@ -537,14 +537,17 @@ def test_the_digest_lines_carry_the_facts_the_run_produced():
             "first_expiry_date": (datetime.now().date() + timedelta(days=3)).isoformat(),
         }
     )
-    assert lines[:5] == [
+    assert lines == [
         "drained: 12",
         "saved: 40",
         "triaged: 500",
         "auto-applied: 5",
         "judged pairs: 33",
     ]
-    assert "start expiring" in lines[5]
+    # Review #6 digest hygiene: the 'review rows start expiring <date>' line is
+    # RETIRED — permanently true post-rails, it was wallpaper. 'expired: N' and
+    # the EXPIRY 7d line carry its meaning.
+    assert not any("start expiring" in line for line in lines)
 
 
 def test_the_digest_omits_facts_the_run_did_not_produce():

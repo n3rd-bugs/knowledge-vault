@@ -15,7 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from starlette.middleware.cors import CORSMiddleware
 
-from kbcore import graph, items, render, scope, search_expand
+from kbcore import graph, items, render, save_nudge, scope, search_expand
 from kbcore import ingest as ingest_mod
 from kbcore import search as search_mod
 from kbcore import supersede as supersede_mod
@@ -269,6 +269,7 @@ def kb_save(
         )
         if link_errors:
             msg += " (link failures: " + "; ".join(link_errors) + ")"
+        msg += save_nudge.suffix(project, type, title, item_id, bool(parsed_links))
         return msg
     except (KBError, ValueError, TypeError) as e:
         raise _wrap(e) from e

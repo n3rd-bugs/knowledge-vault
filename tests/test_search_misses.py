@@ -34,8 +34,12 @@ def _hermetic_thin_dial(monkeypatch):
     """Pin the thin-miss dial to its code default and clear the thread-local
     rerank participation marker — it outlives tests (same hermeticity class as
     conftest's _ranking_dials_at_code_defaults; a prior suite's rerank stub
-    could otherwise leak 'active' in and mint calibration rows here)."""
+    could otherwise leak 'active' in and mint calibration rows here). The
+    floor-ON calibration sampler counter is process-global for the same reason:
+    reset it so every test's tick phase starts at zero (Wave G — the sampler is
+    deterministic, so a pinned start makes every assertion exact)."""
     monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.0)
+    monkeypatch.setattr(search_misses, "_calibration_seen", 0)
     rerank.reset_outcome()
     yield
     rerank.reset_outcome()
@@ -234,3 +238,51 @@ def test_search_with_sidecar_records_calibration_row(kb, monkeypatch):
     hits = search("spi timing gotcha", tool="mcp.kb_search")
     assert hits and hits[0].title == "spi timing gotcha"
     assert _full_rows() == [("spi timing gotcha", "calibration", 0.61, "vector+keyword")]
+
+
+# --- Wave G (review #6): the deterministic floor-ON calibration sampler -------
+
+
+def test_floor_on_calibration_sampler_records_every_nth(kb, monkeypatch):
+    """Floor ON + sidecar active: above-floor searches record nothing EXCEPT a
+    deterministic 1-in-CALIBRATION_SAMPLE_EVERY 'calibration' row carrying the
+    score — the histogram stays alive without another floor-off week."""
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.05)
+    legs = ([(7, "x")], [], [])
+    n = search_misses.CALIBRATION_SAMPLE_EVERY
+    for i in range(1, n):
+        rerank._note("active", 0.5)
+        assert not search_misses.observe(f"warm q {i}", None, "t", top_id=7, legs=legs)
+    assert _full_rows() == [], "ticks 1..N-1 record nothing above the floor"
+    rerank._note("active", 0.5)
+    assert search_misses.observe("sampled q", None, "t", top_id=7, legs=legs)
+    assert _full_rows() == [("sampled q", "calibration", 0.5, "vector")]
+    # Excluded from every miss surface, exactly like floor-off calibration rows.
+    assert _REAL_COUNT_SINCE(days=1) == 0
+    assert _REAL_COUNT_SINCE(days=1, subtype="thin") == 0
+    assert search_misses.stats(days=1)["total"] == 0
+    assert search_misses.top_misses(days=1) == []
+
+
+def test_floor_on_sampler_thin_wins_a_due_tick(kb, monkeypatch):
+    """A due tick that is ALSO a thin miss records only the thin row (which
+    already carries the score) — never a double write."""
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.05)
+    monkeypatch.setattr(
+        search_misses, "_calibration_seen", search_misses.CALIBRATION_SAMPLE_EVERY - 1
+    )
+    rerank._note("active", 3e-05)
+    assert search_misses.observe("thin on the tick", None, "t", top_id=7, legs=([(7, "x")], [], []))
+    assert _full_rows() == [("thin on the tick", "thin", 3e-05, "vector")]
+
+
+def test_sampler_ticks_only_for_sidecar_scored_floor_on_searches(kb, monkeypatch):
+    """Neither floor-OFF calibration writes nor sidecar-absent thins advance the
+    sampler — its denominator is exactly 'sidecar-scored under floor ON'."""
+    legs = ([(7, "x")], [], [])
+    rerank._note("active", 0.9)
+    assert search_misses.observe("floor off cal", None, "t", top_id=7, legs=legs)  # floor OFF
+    monkeypatch.setattr(settings, "kb_miss_relevance_floor", 0.05)
+    rerank.reset_outcome()  # sidecar absent ('off') + floor ON -> heuristic thin path
+    assert search_misses.observe("no sidecar", None, "t", top_id=7, legs=legs)
+    assert search_misses._calibration_seen == 0, "neither path may tick the sampler"

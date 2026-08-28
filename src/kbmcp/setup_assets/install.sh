@@ -371,15 +371,18 @@ if [ -n "${KB_ENROL_CODE:-}" ] && [ ! -f "$CFG" ]; then
     # The WHOLE manifest is kept, not just its version: the stamp at the end is
     # written only after the per-file sha256 digests in it have been checked
     # against what actually landed in ~/.claude/hooks.
-    PRE_MANIFEST=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+    PRE_MANIFEST=$(printf 'ipv4\nheader = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
       | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null || true)
-    PRE_NOTIFY=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+    PRE_NOTIFY=$(printf 'ipv4\nheader = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
       | curl -fsS -K - --max-time 8 "${KB_REST_URL%/}/api/setup/notify.env" 2>/dev/null || true)
     # The code travels as a BEARER on STDIN (curl -K -), never in argv: an
     # enrolment code is a credential, and argv is visible to every process on the
     # box via /proc/<pid>/cmdline. Never in the URL or the body either, so it
-    # cannot land in a proxy access log.
-    ENROL_OUT=$(printf 'header = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
+    # cannot land in a proxy access log. `ipv4` rides the same config so the
+    # redeem POST takes the same pinned path as every other KB curl — during
+    # the AAAA-only transient an unpinned enrol died on a doomed IPv6 connect
+    # and the box came up with no credential at all (see setup_auth_config).
+    ENROL_OUT=$(printf 'ipv4\nheader = "Authorization: Bearer %s"\n' "$KB_ENROL_CODE" \
       | kb_timeout 30 curl -sS -K - --max-time 25 -X POST "${KB_REST_URL%/}/api/enrol" \
         -H "Content-Type: application/json" \
         -d "$(kb_json_build - machine s "$(hostname 2>/dev/null || echo machine)")" 2>&1)
@@ -693,7 +696,13 @@ fi
 # operator already had, and only then the raw enrolment code as a last resort for
 # a server that does not hand back a token. Emitted as a curl config on STDIN, so
 # no credential ever appears in argv (/proc/<pid>/cmdline, `ps`).
-setup_auth_config() { # -> curl config on stdout; empty when we have nothing
+# `ipv4` pins these fetches to the A record like every other KB curl config
+# (see kb_curl_auth_config in the hooks): the AAAA record resolves first on
+# this network and IPv6 egress fails, so an unpinned install curl dies on a
+# doomed IPv6 connect during an AAAA-only transient. Emitted BEFORE the bearer
+# guard, so a bearer-less config still carries the pin.
+setup_auth_config() { # -> curl config on stdout; bearer-less when we have nothing
+  printf 'ipv4\n'
   _sab="${KB_SETUP_BEARER:-${KB_TOKEN:-${KB_ENROL_CODE:-}}}"
   [ -n "$_sab" ] || return 0
   printf 'header = "Authorization: Bearer %s"\n' "$_sab"

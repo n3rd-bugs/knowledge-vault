@@ -210,26 +210,43 @@ def item_ranks(item_ids: list[int]) -> dict[int, tuple[int, datetime, int]]:
 
 
 def tags_needing_summary(since: datetime | None, min_new: int = 3) -> list[tuple[str, str, int]]:
-    """(project, tag, new_count) for tags with >= ``min_new`` active items since ``since``.
+    """(project, tag, new_count) for tags with >= ``min_new`` active items NEWER
+    than the tag's own newest summary — need derived from DATA, not a run mark.
 
-    Summary/report items are excluded so a summary never feeds its own topic.
-    ``since=None`` (no prior run) floors to the epoch so every item counts.
+    REVIEW #6 (the lossy-deferral bug): the old predicate counted items created
+    after ``since`` (the previous consolidation report), but ``_write_report``
+    runs unconditionally, so a stood-down summaries step still advanced the mark
+    and its unreached tags were silently dropped. The per-tag high-water is now
+    the newest ``type='summary'`` item for that (project, topic) — ANY status; a
+    superseded summary still proves the pass ran — which no unrelated report can
+    advance. A tag with no summary yet counts every active item (the old epoch
+    floor, per tag); summary/report items stay excluded from the counted side so
+    a summary never feeds its own topic. ``since`` is retained for the
+    call/patch surface only and no longer participates in the selection.
     """
-    floor = since or datetime(1970, 1, 1, tzinfo=UTC)
+    del since  # review #6: the run mark is no longer the source of truth
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT project, tag, count(*) FILTER (WHERE created_at > %(since)s) AS new_count
-            FROM (
-                SELECT i.project, unnest(i.tags) AS tag, i.created_at
-                FROM items i
-                WHERE i.status = 'active' AND i.type NOT IN ('summary', 'report')
-            ) t
-            GROUP BY project, tag
-            HAVING count(*) FILTER (WHERE created_at > %(since)s) >= %(min)s
-            ORDER BY project, tag
+            WITH hw AS (
+                SELECT project, meta->>'topic' AS tag, max(created_at) AS mark
+                  FROM items
+                 WHERE type = 'summary' AND meta->>'topic' IS NOT NULL
+                 GROUP BY project, meta->>'topic'
+            )
+            SELECT t.project, t.tag, count(*) AS new_count
+              FROM (
+                  SELECT i.project, unnest(i.tags) AS tag, i.created_at
+                    FROM items i
+                   WHERE i.status = 'active' AND i.type NOT IN ('summary', 'report')
+              ) t
+              LEFT JOIN hw ON hw.project = t.project AND hw.tag = t.tag
+             WHERE hw.mark IS NULL OR t.created_at > hw.mark
+             GROUP BY t.project, t.tag
+            HAVING count(*) >= %(min)s
+             ORDER BY t.project, t.tag
             """,
-            {"since": floor, "min": min_new},
+            {"min": min_new},
         ).fetchall()
     return [(p, tag, int(n)) for p, tag, n in rows]
 

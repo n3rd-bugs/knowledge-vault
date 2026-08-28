@@ -14,6 +14,7 @@ the drain on Saturdays too. Only the clock is day-aware.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 
 from kbcore.config import settings
@@ -65,3 +66,52 @@ def is_unbounded_day(now: datetime | None = None) -> bool:
     (see the module docstring), so an unbounded day still stands down on a sag.
     """
     return not effective_deadline(now)
+
+
+def triage_batch(now: datetime | None = None) -> int:
+    """Tonight's review-triage batch — day-aware (review #6, 300 weekday / 500 unbounded).
+
+    Unbounded days keep the full ``kb_review_triage_batch`` (backlog catch-up);
+    deadline days bind at ``min(batch, kb_review_triage_batch_weekday)``. Honest
+    justification: verdict consumption runs ~1.4x SLOWER than production once
+    owner bulk-applies are counted, and against the ~16k awaiting-apply backlog a
+    marginal weekday verdict carries months of latency — the last ~200 weekday
+    rows are ~35 minutes of GPU with near-zero realized value, and dropping them
+    removes the tension between the ~87.5-min batch and the 90-min triage share.
+    ``min`` keeps BOTH kill switches: the batch knob stays the master (0 disables
+    the step everywhere) and 0 in the weekday knob is a weekday-only kill.
+    ``now`` exists so tests can day-pin the calendar-sensitive branch.
+    """
+    batch = int(settings.kb_review_triage_batch)
+    if is_unbounded_day(now):
+        return batch
+    return min(batch, int(settings.kb_review_triage_batch_weekday))
+
+
+# The drain-budget stand-down verdict — distinct from 'deadline'/'battery' and
+# the allocator's 'tail-reserve', so a report can tell "the weekday budget was
+# spent" apart from "the window ran out".
+DRAIN_BUDGET_REASON = "drain-budget"
+
+
+def drain_budget_reason(started_monotonic: float, now: datetime | None = None) -> str | None:
+    """:data:`DRAIN_BUDGET_REASON` once a deadline day's drain spent its budget, else None.
+
+    The tail reserve protects the LAST ``kb_tail_reserve_minutes`` of the window,
+    but nothing bounded the drain's TOTAL appetite — a weekend-sized backlog
+    landing on a weekday could still consume the whole night (review #6; legal
+    now that the queue_groups split landed in Wave F).
+    ``kb_drain_weekday_budget_minutes`` caps the drain's wall clock on days the
+    deadline applies; unbounded days stay unbounded (the weekend IS the
+    catch-up), and 0 disables the budget. Asked between cohorts by
+    ``kbworker.consolidate._drain_ingest_queue`` against the drain's start on the
+    monotonic clock; a budget stop defers rows exactly like the deadline does —
+    still 'pending', resumed next run — and the shed volume rides the report as
+    ``counts['drained_deferred']``. ``now`` is for day-pinned tests.
+    """
+    minutes = int(settings.kb_drain_weekday_budget_minutes)
+    if minutes <= 0 or is_unbounded_day(now):
+        return None
+    if time.monotonic() - started_monotonic < minutes * 60.0:
+        return None
+    return DRAIN_BUDGET_REASON

@@ -54,6 +54,10 @@ services:
   kb-mcp-public:
     image: kb-app:latest
     container_name: kb-mcp-public
+    # 401/burst forensics must survive container recreation (review #6 Wave G):
+    # json-file logs die with the container, which is how the 08-22 scan burst
+    # vanished from its own 7-day window. journald persists on the host.
+    logging: {driver: journald}
     # Run as the HOST user. The raw archive is a shared filesystem between
     # these containers and the host worker; as root they created project
     # dirs root:root that the worker (uid 1000) then could not write into,
@@ -138,6 +142,10 @@ services:
   kb-rest:
     image: kb-app:latest
     container_name: kb-rest
+    # 401/burst forensics must survive container recreation (review #6 Wave G):
+    # json-file logs die with the container, which is how the 08-22 scan burst
+    # vanished from its own 7-day window. journald persists on the host.
+    logging: {driver: journald}
     # Run as the HOST user. The raw archive is a shared filesystem between
     # these containers and the host worker; as root they created project
     # dirs root:root that the worker (uid 1000) then could not write into,
@@ -170,6 +178,10 @@ services:
   kb-web:
     image: kb-app:latest
     container_name: kb-web
+    # 401/burst forensics must survive container recreation (review #6 Wave G):
+    # json-file logs die with the container, which is how the 08-22 scan burst
+    # vanished from its own 7-day window. journald persists on the host.
+    logging: {driver: journald}
     command: ["python", "-m", "kbweb.server"]
     env_file: [.env, oauth.env]   # oauth.env: GOOGLE_CLIENT_ID/SECRET for web "Sign in with Google"
     environment:

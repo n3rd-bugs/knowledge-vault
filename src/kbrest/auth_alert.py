@@ -115,6 +115,11 @@ class AuthAlertMiddleware:
             if message["type"] == "http.response.start" and message.get("status") == 401:
                 line = self.counter.record(_client_ip(asgi_scope), time.time())
                 if line:
+                    # Journald is the DURABLE firing record (review #6): the ntfy
+                    # push below is best-effort and its history is lossy. The line
+                    # holds only window/IP COUNTS — no token, no body, no client
+                    # payload — so logging it leaks nothing the alert would not.
+                    log.info("auth alert fired: %s", line)
                     threading.Thread(target=push_alert, args=(line,), daemon=True).start()
             await send(message)
 

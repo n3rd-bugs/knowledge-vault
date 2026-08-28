@@ -254,16 +254,25 @@ def _drain_job(
             rid for rid in ids if ingest_queue.mark_deferred(rid, f"{type(e).__name__}: {e}")
         ]
         if escalated:
+            # GROUP-ATOMIC (review #6): per-row deferral counters diverge (rows
+            # join a session on different nights), so a partial escalation would
+            # leave siblings 'pending' and the next run would extract the
+            # session in pieces. Retire the remainder with the same error
+            # (attempts pinned); requeue_failed still reverses group-wide.
+            rest = [rid for rid in ids if rid not in escalated]
+            ingest_queue.escalate_rows(rest, f"{type(e).__name__}: {e}")
             # Into the run report (and the digest, when positive): a terminal
             # escalation was journald-only, and retention (<36h) destroyed the
             # evidence before the owner ever looked (review #3 P1 rider).
             _COHORT_STATS["deferral_escalations"] = _COHORT_STATS.get(
                 "deferral_escalations", 0
-            ) + len(escalated)
+            ) + len(ids)
             logger.error(
-                "rows %s escalated to failed after %d deferrals (transient never healed): %s",
-                escalated,
+                "group %s escalated to failed after %d deferrals (transient never "
+                "healed; %d sibling row(s) retired with it, group-atomic): %s",
+                ids,
                 ingest_queue.DEFERRAL_CAP,
+                len(rest),
                 e,
             )
         else:

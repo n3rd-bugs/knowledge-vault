@@ -248,7 +248,7 @@ export KB_ENROL_CODE=kbe_…            # from kb_setup; single use, ~15 min
 export KB_REST_URL=https://api.<host>
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
-  curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
+  curl -4 -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh
 ```

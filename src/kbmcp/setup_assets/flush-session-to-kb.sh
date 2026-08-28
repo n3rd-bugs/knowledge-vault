@@ -307,6 +307,18 @@ REPO=${REPO##*:}
 BRANCH=$(git -C "${CWD:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null)
 [ "$BRANCH" = "HEAD" ] && BRANCH="" # detached HEAD names no branch
 COMMIT=$(git -C "${CWD:-.}" rev-parse --short HEAD 2>/dev/null)
+# Hook provenance for the fleet: the manifest version install.sh stamped into
+# ~/.claude/hooks/.setup-version rides the REST payload as hook_version, so the
+# queue row's meta can say WHICH shipped assets produced a submission (the same
+# additive-meta pattern as submitted_by; the server ignores the field until it
+# learns it). SHAPE-CHECKED like every other value we put on the wire: the stamp
+# is a 12-hex content digest, and anything else is treated as absent. Absence is
+# itself the signal -- old hook code and unverified installs simply never stamp.
+HOOKVER=$(head -n1 "$HOME/.claude/hooks/.setup-version" 2>/dev/null | tr -d ' \r')
+case "$HOOKVER" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+  *) HOOKVER="" ;;
+esac
 LOG="$HOME/.claude/hooks/flush-session.log"
 # EVERY variable the detached children read must be EXPORTED. The children are
 # `setsid/nohup bash -c '<single-quoted>'` — a FRESH shell that inherits only the
@@ -320,7 +332,7 @@ LOG="$HOME/.claude/hooks/flush-session.log"
 # printing a bare "in " with no path. tests/test_capture_funnel.py now derives
 # the reference set mechanically from the script, so the whole CLASS is guarded,
 # not the one instance.
-export T CWD SID PROJECT LOG REPO BRANCH COMMIT CFG
+export T CWD SID PROJECT LOG REPO BRANCH COMMIT CFG HOOKVER
 # The detached child is a FRESH bash: hand it the JSON backend (which may be
 # python3, with no jq anywhere on the box) as exported vars + functions.
 export KB_JQ_BIN KB_PY_BIN KB_JSON_PROBED
@@ -368,9 +380,15 @@ export -f kb_take_lock
 # the detached child -- the transcript-capture path carries the highest-value
 # bearer on the box (the owner's master token where no project token exists),
 # and this curl was the last one still holding it in argv. An empty bearer
-# yields an empty config, i.e. an unauthenticated request the server refuses
-# loudly -- never a silent skip.
+# yields a config holding only the address-family pin, i.e. an unauthenticated
+# request the server refuses loudly -- never a silent skip.
+# `ipv4` pins every `curl -K -` consumer to the A record at this one layer: on
+# this network the AAAA record resolves first and IPv6 egress fails, which took
+# out flush/brief/enrol together during an AAAA-only transient while the ntfy
+# push (long pinned -4) kept working. Emitted BEFORE the bearer guard so even a
+# bearer-less request fails as a loud 401, never as a doomed IPv6 connect.
 kb_curl_auth_config() { # -> curl config on stdout
+  printf 'ipv4\n'
   [ -n "${KB_TOKEN:-}" ] || return 0
   printf 'header = "Authorization: Bearer %s"\n' "$KB_TOKEN"
 }
@@ -561,6 +579,14 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     [ -n "$REPO" ] && set -- "$@" repo s "$REPO"
     [ -n "$BRANCH" ] && set -- "$@" branch s "$BRANCH"
     [ -n "$COMMIT" ] && set -- "$@" commit s "$COMMIT"
+    # hook_version rides ONLY the REST body: the REST request model ignores
+    # fields it does not know (harmless today, fleet data the day the server
+    # learns the field), while the MCP tool signature is CLOSED -- an unknown
+    # argument there errors the call and would break every MCP-mode flush
+    # against a current server. The transport is fixed for the whole loop
+    # (KB_MCP_URL wins when set), so appending once here cannot leak into the
+    # MCP arm.
+    [ -z "$KB_MCP_URL" ] && [ -n "${HOOKVER:-}" ] && set -- "$@" hook_version s "$HOOKVER"
     while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$MAX_PER_FIRING" ]; do
       TMPC=$(mktemp) || { echo "$(date -Is) flush $PROJECT BUG: mktemp failed"; break; }
       tail -c +$((OFFSET+1)) "$T" | head -c "$CHUNK" >"$TMPC"

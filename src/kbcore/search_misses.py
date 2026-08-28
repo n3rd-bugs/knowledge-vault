@@ -16,9 +16,18 @@ capturing next. Three row subtypes (review #5 val-1):
   Recorded only while the floor dial is ON. NEVER a fused-score floor — a
   vector-only top-1 always scores >= 1/(RRF_K+1), so that condition is
   unreachable by construction (review #5 guard).
-* ``calibration`` — floor dial OFF (the calibration-week default): the
-  would-be top relevance score is recorded per sidecar-scored search so a week
-  of real data sizes the floor. NOT a miss; excluded from every default count.
+* ``calibration`` — NOT a miss; excluded from every default count. Two ways a
+  row is minted: floor dial OFF (the calibration-week posture) records the
+  would-be top relevance score on EVERY sidecar-scored search so a week of real
+  data sizes the floor; floor dial ON (Wave G, review #6) keeps the score
+  histogram alive with a DETERMINISTIC 1-in-:data:`CALIBRATION_SAMPLE_EVERY`
+  sample of sidecar-scored searches — the 183-row floor-off distribution is
+  frozen and ages out under the 90d retention, and without a live sample every
+  future floor re-tune would cost another floor-off week. Sub-floor scores are
+  all captured anyway (every 'thin' row carries its score), so thin rows plus
+  the sample reconstruct the distribution. Consumers of THIN rows should
+  require ``top_score IS NOT NULL`` — fallback-mode thins (sidecar absent) are
+  provenance-heuristic only and carry no score.
 
 Rules of the road:
 
@@ -60,6 +69,21 @@ RETENTION_DAYS = 90
 Rows = list[tuple[int, str]]
 # The subtypes that ARE misses; 'calibration' is deliberately outside this set.
 _MISS_SUBTYPES = ("empty", "thin")
+
+# Deterministic floor-ON calibration sampler (Wave G): a plain modulo on a
+# monotonically increasing per-process counter — NEVER random.random(), so tests
+# pin it exactly (reset ``_calibration_seen``). The counter ticks once per
+# sidecar-scored search while the floor dial is ON; restarts only re-phase the
+# sample, which is all a histogram needs.
+CALIBRATION_SAMPLE_EVERY = 20
+_calibration_seen = 0
+
+
+def _calibration_due() -> bool:
+    """Tick the sampler; True exactly once per :data:`CALIBRATION_SAMPLE_EVERY` ticks."""
+    global _calibration_seen
+    _calibration_seen += 1
+    return _calibration_seen % CALIBRATION_SAMPLE_EVERY == 0
 
 
 def record(
@@ -113,11 +137,15 @@ def observe(
     candidate rows for leg provenance. With hits present:
 
     * rerank sidecar 'active' + floor ON → 'thin' when its top-1 relevance is
-      below the floor;
+      below the floor; otherwise a deterministic 1-in-CALIBRATION_SAMPLE_EVERY
+      sample records a 'calibration' row with the score (the sampler ticks on
+      EVERY sidecar-scored search here; a due tick that is also a thin miss
+      records only the thin row, which carries the same score);
     * sidecar 'active' + floor OFF → a 'calibration' row carrying the would-be
       score (cheap: one small best-effort insert per sidecar-scored search);
     * sidecar absent ('off'/'fallback') + floor ON → 'thin' when the top
-      candidate has no keyword/identifier-leg contribution.
+      candidate has no keyword/identifier-leg contribution (no sidecar score:
+      ``top_score`` stays NULL — provenance-heuristic only).
 
     ``query`` arrives already scrubbed (search scrubs ONCE for both sinks);
     :func:`record` re-scrubs defensively. Returns whether a row was written.
@@ -137,8 +165,11 @@ def observe(
     if rerank.last_outcome() == "active":
         score = rerank.last_top_relevance()
         if floor > 0:
+            due = _calibration_due()
             if score is not None and score < floor:
                 return record(query, project, tool, "thin", score, top_legs)
+            if due:
+                return record(query, project, tool, "calibration", score, top_legs)
             return False
         return record(query, project, tool, "calibration", score, top_legs)
     if floor > 0 and "keyword" not in hit and "identifier" not in hit:

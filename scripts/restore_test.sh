@@ -32,8 +32,22 @@ DBPASS="${KB_DB_PASSWORD:-restore-test}"
 MODE="local"
 case "${1:-}" in
   --offsite) MODE="offsite" ;;
+  --auto)
+    # Timer mode (review #6 Wave G): even months drill the offsite path so
+    # age-decrypt + rclone stay machine-proven — but ONLY when the off-box age
+    # identity has been supplied for the drill; otherwise fall back to local
+    # rather than page a false FAIL from an unattended timer.
+    if (( 10#$(date -u +%m) % 2 == 0 )) && [[ -n "${KB_AGE_IDENTITY:-}" && -r "${KB_AGE_IDENTITY/#\~/${HOME}}" ]]; then
+      MODE="offsite"
+    else
+      MODE="local"
+      if (( 10#$(date -u +%m) % 2 == 0 )); then
+        echo "restore_test: even month wanted --offsite but KB_AGE_IDENTITY is absent — local drill (supply the identity to prove the offsite path)"
+      fi
+    fi
+    ;;
   "") ;;
-  *) echo "restore_test: unknown argument '$1' (usage: restore_test.sh [--offsite])" >&2; exit 2 ;;
+  *) echo "restore_test: unknown argument '$1' (usage: restore_test.sh [--offsite|--auto])" >&2; exit 2 ;;
 esac
 
 TMP_FETCH=""
@@ -88,19 +102,51 @@ fi
 
 count() { docker exec "$1" psql -U kb -d kb -tAc "SELECT count(*) FROM $2" 2>/dev/null | tr -d '[:space:]'; }
 R_ITEMS="$(count "${CONT}" items)";  R_CHUNKS="$(count "${CONT}" chunks)"
-L_ITEMS="$(count kb-db items)";      L_CHUNKS="$(count kb-db chunks)"
-[[ "${R_ITEMS}" =~ ^[0-9]+$ && "${L_ITEMS}" =~ ^[0-9]+$ ]] || fail "could not read row counts"
+R_RELS="$(count "${CONT}" relations)"
+R_NULLEMB="$(docker exec "${CONT}" psql -U kb -d kb -tAc \
+  "SELECT count(*) FROM chunks WHERE embedding IS NULL" 2>/dev/null | tr -d '[:space:]')"
+[[ "${R_ITEMS}" =~ ^[0-9]+$ && "${R_CHUNKS}" =~ ^[0-9]+$ ]] || fail "could not read restored row counts"
 
-within_1pct() {  # restored live  ->  |restored-live|*100 <= live  (0 vs 0 passes)
-  local r="$1" l="$2" d
-  if (( l == 0 )); then (( r == 0 )); return; fi
-  d=$(( r > l ? r - l : l - r ))
-  (( d * 100 <= l ))
-}
-
-echo "restore_test: items restored=${R_ITEMS} live=${L_ITEMS} | chunks restored=${R_CHUNKS} live=${L_CHUNKS}"
-within_1pct "${R_ITEMS}"  "${L_ITEMS}"  || fail "items count ${R_ITEMS} not within 1% of live ${L_ITEMS}"
-within_1pct "${R_CHUNKS}" "${L_CHUNKS}" || fail "chunks count ${R_CHUNKS} not within 1% of live ${L_CHUNKS}"
-
-echo "restore_test: PASS (items & chunks within 1% of live)"
+# --- sidecar exact-match (review #6 Wave G): the drill's ground truth ---------
+# backup.sh derives ${dump}.counts from the ARTIFACT (one decode pass over the
+# COPY blocks), so restored-vs-sidecar is exact by construction. The old
+# restored-vs-LIVE 1% check raced the 01:00 drain (~190-280 items/h) and would
+# have false-FAILED 5 of 8 recent nights at 04:30 — it is now ADVISORY only.
+SIDECAR="${KB_BACKUPS}/$(basename "${NEWEST}").counts"
+[[ "${MODE}" == "local" ]] && SIDECAR="${NEWEST}.counts"
+if [[ -r "${SIDECAR}" ]]; then
+  S_ITEMS="$(sed -n 's/^items=//p' "${SIDECAR}")"
+  S_CHUNKS="$(sed -n 's/^chunks=//p' "${SIDECAR}")"
+  S_RELS="$(sed -n 's/^relations=//p' "${SIDECAR}")"
+  S_NULLEMB="$(sed -n 's/^chunks_null_embedding=//p' "${SIDECAR}")"
+  [[ "${S_ITEMS}" =~ ^[0-9]+$ && "${S_CHUNKS}" =~ ^[0-9]+$ ]] || fail "sidecar ${SIDECAR} is malformed"
+  echo "restore_test: sidecar items=${S_ITEMS} chunks=${S_CHUNKS} relations=${S_RELS} null_emb=${S_NULLEMB}"
+  echo "restore_test: restored items=${R_ITEMS} chunks=${R_CHUNKS} relations=${R_RELS} null_emb=${R_NULLEMB}"
+  [[ "${R_ITEMS}"  == "${S_ITEMS}"  ]] || fail "items restored=${R_ITEMS} != sidecar=${S_ITEMS}"
+  [[ "${R_CHUNKS}" == "${S_CHUNKS}" ]] || fail "chunks restored=${R_CHUNKS} != sidecar=${S_CHUNKS}"
+  [[ -z "${S_RELS}" || "${R_RELS}" == "${S_RELS}" ]] || fail "relations restored=${R_RELS} != sidecar=${S_RELS}"
+  # NULL-embedding equality proves the vector column round-tripped: a dump or
+  # restore that silently dropped embeddings would inflate the restored side.
+  [[ -z "${S_NULLEMB}" || "${R_NULLEMB}" == "${S_NULLEMB}" ]] \
+    || fail "chunks with NULL embedding restored=${R_NULLEMB} != sidecar=${S_NULLEMB}"
+  L_ITEMS="$(count kb-db items)"; L_CHUNKS="$(count kb-db chunks)"
+  echo "restore_test: advisory vs live: items ${R_ITEMS}/${L_ITEMS:-?}, chunks ${R_CHUNKS}/${L_CHUNKS:-?} (drift = writes since dump)"
+  echo "restore_test: PASS (exact match against the dump's count sidecar)"
+else
+  # Pre-sidecar dump (or offsite object without a local sidecar): the old
+  # advisory-grade 1% live comparison is the only available check.
+  L_ITEMS="$(count kb-db items)"; L_CHUNKS="$(count kb-db chunks)"
+  [[ "${L_ITEMS}" =~ ^[0-9]+$ ]] || fail "could not read live row counts"
+  within_1pct() {
+    local r="$1" l="$2" d
+    if (( l == 0 )); then (( r == 0 )); return; fi
+    d=$(( r > l ? r - l : l - r ))
+    (( d * 100 <= l ))
+  }
+  echo "restore_test: no sidecar at ${SIDECAR} — falling back to the 1% live comparison"
+  echo "restore_test: items restored=${R_ITEMS} live=${L_ITEMS} | chunks restored=${R_CHUNKS} live=${L_CHUNKS}"
+  within_1pct "${R_ITEMS}"  "${L_ITEMS}"  || fail "items count ${R_ITEMS} not within 1% of live ${L_ITEMS}"
+  within_1pct "${R_CHUNKS}" "${L_CHUNKS}" || fail "chunks count ${R_CHUNKS} not within 1% of live ${L_CHUNKS}"
+  echo "restore_test: PASS (items & chunks within 1% of live; sidecar unavailable)"
+fi
 # cleanup runs via the EXIT trap

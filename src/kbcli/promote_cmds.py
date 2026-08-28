@@ -1,4 +1,4 @@
-"""kbcli.promote_cmds — the two owner-facing PROMOTE PROGRAM commands.
+"""kbcli.promote_cmds — the owner-facing PROMOTE PROGRAM commands.
 
 They belong to the ``kb review`` sub-app (registered by
 :mod:`kbcli.review_cmds`) and live in their own module because that file sits
@@ -122,3 +122,45 @@ def review_promote_batch(
     promoted = sum(1 for _, o in results if o.startswith("promoted"))
     errs = sum(1 for _, o in results if o.startswith("error"))
     typer.echo(f"promote-batch: {promoted} promoted, {errs} error(s), {len(results)} item(s)")
+
+
+def review_promote_run(
+    run_key: str = typer.Argument(..., help="the run's sources.uri (kind='session')"),
+    apply: bool = typer.Option(
+        False, "--apply", help="promote after confirming (default: dry run)"
+    ),
+) -> None:
+    """Promote every unverified item of ONE session run - DRY RUN unless --apply.
+
+    The run key is the ``sources.uri`` all of a session run's extraction items
+    share (e.g. ``session:<id>`` from the flush hook). The dry run prints each
+    item's id, TYPE and TITLE so the owner vets content, not a count; every
+    promotion then goes through the singular owner chokepoint (V4), exactly as
+    ``kb review promote-batch`` does.
+    """
+    try:
+        preview = review_promote.promote_run(run_key)
+    except KBError as e:
+        _fail(e)
+    if not preview:
+        typer.echo(f"no active unverified items for run {run_key!r}")
+        return
+    for r in preview:
+        typer.echo(f"[{r['item_id']}] {r['type']:<8.8}  {r['title']} -- {r['outcome']}")
+    would = sum(1 for r in preview if r["outcome"].startswith("would promote"))
+    if not apply:
+        typer.echo(f"dry run: {would} item(s) would promote - re-run with --apply to write")
+        return
+    if not would:
+        typer.echo("nothing to promote")
+        return
+    typer.confirm(f"promote {would} item(s) from this run to verified?", abort=True)
+    try:
+        results = review_promote.promote_run(run_key, dry_run=False)
+    except KBError as e:
+        _fail(e)
+    for r in results:
+        typer.echo(f"[{r['item_id']}] {r['outcome']}")
+    promoted = sum(1 for r in results if r["outcome"].startswith("promoted"))
+    errs = sum(1 for r in results if r["outcome"].startswith("error"))
+    typer.echo(f"promote-run: {promoted} promoted, {errs} error(s), {len(results)} item(s)")

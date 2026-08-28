@@ -58,6 +58,9 @@ from kbworker.weekly_render import (  # noqa: F401
     _series,
     _sum,
     _trend,
+    _trend_int,
+    _verified_series,
+    _verified_top5,
 )
 
 logger = logging.getLogger("kbworker.weekly")

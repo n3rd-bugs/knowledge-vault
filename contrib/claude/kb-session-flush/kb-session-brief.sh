@@ -427,10 +427,17 @@ PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || tr
 # Feed a bearer to curl on STDIN, never on the command line: argv is world-visible
 # through /proc/<pid>/cmdline and `ps`, and a credential has already leaked that
 # way once on this system. `curl -K -` reads the same options from a config file,
-# so the token never becomes a process argument. Empty bearer => an empty config,
-# i.e. an unauthenticated request that the server refuses — which is what we want
-# it to do, rather than the caller silently skipping the request.
+# so the token never becomes a process argument. Empty bearer => a config holding
+# only the address-family pin, i.e. an unauthenticated request that the server
+# refuses — which is what we want it to do, rather than the caller silently
+# skipping the request.
+# `ipv4` pins every `curl -K -` consumer to the A record at this one layer: on
+# this network the AAAA record resolves first and IPv6 egress fails, which took
+# out flush/brief/enrol together during an AAAA-only transient while the ntfy
+# push (long pinned -4) kept working. Emitted BEFORE the bearer guard so even a
+# bearer-less request fails as a loud 401, never as a doomed IPv6 connect.
 kb_curl_auth_config() { # -> curl config on stdout
+  printf 'ipv4\n'
   [ -n "${KB_TOKEN:-}" ] || return 0
   printf 'header = "Authorization: Bearer %s"\n' "$KB_TOKEN"
 }
@@ -544,7 +551,7 @@ else
         printf '  for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \\\n'
         printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh \\\n'
         printf '           kb-hook-dispatch.sh kb-flush-backfill.sh; do\n'
-        printf '    curl -fsS -H "Authorization: Bearer $KB_TOKEN" "%s/api/setup/$f" -o "$f"\n' "${KB_REST_URL%/}"
+        printf '    curl -fsS -4 -H "Authorization: Bearer $KB_TOKEN" "%s/api/setup/$f" -o "$f"\n' "${KB_REST_URL%/}"
         printf '  done && bash install.sh\n'
         printf 'This is FYI — nothing is broken, but newer scripts may capture more.\n\n'
       fi
@@ -587,7 +594,10 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # MCP: call kb_search over the connector endpoint (reuses the registration).
   # REACHABILITY PROBE first — a blackholed KB host must not stall the prompt for
   # the whole hook budget; bail in ~2s if we can't even open a connection.
-  if curl -sS -o /dev/null --connect-timeout 2 --max-time 3 "$KB_MCP_URL" >/dev/null 2>&1; then
+  # -4 matches the pinned real call (kb_curl_auth_config emits `ipv4`): a probe
+  # testing a different address family than the call it gates is a false gate —
+  # exactly the "briefs skip silently" failure of the AAAA-only transient.
+  if curl -sS -4 -o /dev/null --connect-timeout 2 --max-time 3 "$KB_MCP_URL" >/dev/null 2>&1; then
     HELPER="$HOOKDIR/kb-mcp-call.sh"
     # boost_project mirrors LOCAL mode's --boost-project so recall ranking does
     # not silently differ by transport; omitted entirely if PROJECT is empty.
@@ -623,8 +633,10 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
 # halves of the same install to different transports.
 elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # REACHABILITY PROBE: cheap connect check so a dead KB skips recall in ~2s
-  # instead of consuming the full hook budget on the search request.
-  if curl -sS -o /dev/null --connect-timeout 2 --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
+  # instead of consuming the full hook budget on the search request. -4 matches
+  # the pinned real call below — a probe on the wrong address family is a false
+  # gate (see the MCP probe above).
+  if curl -sS -4 -o /dev/null --connect-timeout 2 --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
     ENC=$(printf '%s' "$QUERY" | kb_urlencode)
     # Bearer on STDIN (curl -K -), never on argv — see kb_curl_auth_config.
     # -w puts the status on its own LAST line, because `curl -sS` (no -f, which

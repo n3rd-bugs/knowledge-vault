@@ -352,6 +352,9 @@ class Settings(SettingsViews, BaseSettings):
     # unread. 500 covers a normal night and lets the backlog drain instead of grow. Cost is ~500
     # LLM calls, which is minutes now that model-major cohorting landed. Kill switch: 0.
     kb_review_triage_batch: int = 500
+    # Day-aware weekday batch (review #6): deadline days triage min(batch, this) — see
+    # kbcore.drainsched.triage_batch for the reasoning and the kill-switch semantics.
+    kb_review_triage_batch_weekday: int = 300
     # WEEKEND TRIAGE TOP-UP (owner request 2026-08-08): "at weekend triage as many items as we
     # can". On a day with NO drain deadline (kbcore.drainsched) the nightly can finish at 19:45 and
     # leave the GPU idle until the next 01:00 firing, so the tail keeps triaging in SLICES until
@@ -451,6 +454,14 @@ class Settings(SettingsViews, BaseSettings):
     kb_contradiction_pair_cap: int = 500
     # 500 (was 200, 2026-08-03): measured 9.2 s/pair (not the 41 inferred) => ~77
     # min; safe to widen because judged pairs PERSIST across a deadline cut.
+    # Day-aware weekday cap (review #6): deadline days judge min(cap, this) — kbworker.tail_ops.
+    kb_contradiction_pair_cap_weekday: int = 40
+    # WEEKDAY DRAIN BUDGET, minutes (review #6, kbcore.drainsched.drain_budget_reason): deadline
+    # days admit no NEW cohort past this; leftovers stay pending, ride counts['drained_deferred'].
+    kb_drain_weekday_budget_minutes: int = 360
+    # Chunks one reembed pass may update (review #6, kbcore.reembed): bounds the whole-store
+    # re-embed an embedder swap triggers (the nightly step is also weekend-gated). 0 = uncapped.
+    kb_reembed_night_cap: int = 20_000
 
     @model_validator(mode="after")
     def _check_embed_pairing(self) -> Settings:

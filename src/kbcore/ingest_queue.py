@@ -281,6 +281,29 @@ def mark_deferred(queue_id: int, error: str) -> bool:
     return False
 
 
+def escalate_rows(ids: list[int], error: str) -> None:
+    """Terminally fail ``ids`` with attempts PINNED at the cap — the group-atomic
+    half of a deferral-cap escalation (review #6).
+
+    Per-row deferral counters can diverge inside one coalesced group (rows join a
+    session on different nights), so :func:`mark_deferred` may escalate SOME rows
+    of a group while leaving siblings 'pending' — and a split group is extracted
+    in pieces on the next run, the exact thing coalescing exists to prevent. The
+    drain calls this on the REMAINING rows so the group retires as a unit: the
+    same status flip mark_deferred's escalation performs (Invariant 5 — never a
+    delete), attempts pinned to :data:`MAX_ATTEMPTS` so the attempts logic keeps
+    it retired, and the owner's ``requeue_failed`` reverses it group-wide.
+    """
+    if not ids:
+        return
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE ingest_queue SET status = 'failed', attempts = %s, error = %s, "
+            "processed_at = now() WHERE id = ANY(%s)",
+            (MAX_ATTEMPTS, error[:2000], list(ids)),
+        )
+
+
 def queue_depth() -> int:
     """Count of pending submissions. Resilient to migration 002 not yet applied."""
     with connect() as conn:

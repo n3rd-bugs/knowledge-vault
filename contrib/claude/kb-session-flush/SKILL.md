@@ -173,6 +173,13 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   for the whole budget. All inner search timeouts are kept strictly under the hook
   budget (recall ≤ ~8 s, connector recall ≤ 12 s), and `kb-mcp-call.sh` curls carry
   `--connect-timeout 3`.
+- **IPv4 pinned** — every KB curl runs over IPv4: the shared config emitters
+  (`kb_curl_auth_config` in the hooks, `setup_auth_config` and the enrolment
+  configs in `install.sh`) put `ipv4` in the config they feed `curl -K -`, the
+  reachability probes carry `-4`, and the ntfy push has pinned `-4` all along.
+  On networks where the AAAA record resolves first but IPv6 egress fails,
+  unpinned curls died silently (flush/brief/enrol) while notifications kept
+  working — the pin lives in the config layer so every consumer inherits it.
 - **Partial-line safety** — a flush window that ends in an unterminated JSONL line
   is trimmed to the last complete line and the remainder is held for the next
   firing (never advanced past mid-line, so no straddled message is lost); the

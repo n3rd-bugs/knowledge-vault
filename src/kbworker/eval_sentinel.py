@@ -24,6 +24,7 @@ never invoked. Kill switches: ``kb_eval_in_consolidation`` (whole eval),
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -63,15 +64,28 @@ def run_sentinel(counts: dict[str, Any]) -> None:
     Records ``eval_status`` (ok / skipped / disabled / error) plus, when ok,
     ``eval_hit_at_5`` / ``eval_mrr`` / ``eval_queries`` / ``eval_regression``.
     Wrapped so a broken eval (missing golden, embed down, …) never breaks the run.
+
+    SELF-TIMED into ``counts['step_secs']['eval_sentinel']`` (review #6): the
+    consolidate call site cannot run this step through ``_run_step`` (it fills
+    ``counts`` itself instead of returning one number), so it reports into the
+    same cost ledger itself — an ADDED step_secs key, nothing renamed — and
+    mirrors ``_run_step``'s >=60s WARNING so a slow eval is visible in journald.
     """
-    if not settings.kb_eval_in_consolidation:
-        counts["eval_status"] = "disabled"  # kill switch: skip the eval entirely
-        return
+    t0 = time.monotonic()
     try:
-        _run(counts)
-    except Exception:  # noqa: BLE001 — the sentinel must never break consolidation
-        logger.exception("search-quality sentinel errored; consolidation unaffected")
-        counts["eval_status"] = "error"
+        if not settings.kb_eval_in_consolidation:
+            counts["eval_status"] = "disabled"  # kill switch: skip the eval entirely
+            return
+        try:
+            _run(counts)
+        except Exception:  # noqa: BLE001 — the sentinel must never break consolidation
+            logger.exception("search-quality sentinel errored; consolidation unaffected")
+            counts["eval_status"] = "error"
+    finally:
+        secs = round(time.monotonic() - t0, 1)
+        counts.setdefault("step_secs", {})["eval_sentinel"] = secs
+        if secs >= 60:
+            logger.warning("consolidation step 'eval_sentinel' took %.0fs", secs)
 
 
 def _run(counts: dict[str, Any]) -> None:
@@ -80,6 +94,12 @@ def _run(counts: dict[str, Any]) -> None:
         counts["eval_status"] = "skipped"  # golden set missing/empty
         logger.info("search-quality sentinel: golden set missing/empty — eval skipped")
         return
+    try:  # arm the per-case rerank tally for the replay below (review #6)
+        from kbcore import rerank as _rerank_arm
+
+        _rerank_arm.reset_tally()
+    except Exception:  # noqa: BLE001 — observability may never fail the eval
+        pass
     _results, hit_at_5, mrr = eval_harness.evaluate(golden=golden)
     counts["eval_status"] = "ok"
     counts["eval_hit_at_5"] = round(hit_at_5, 4)
@@ -91,13 +111,21 @@ def _run(counts: dict[str, Any]) -> None:
     # a meta number instead of a red night. getattr, so a stubbed evaluate()
     # returning bare tuples (the sentinel test rig) still counts 0.
     counts["eval_chain_resolved"] = sum(1 for r in _results if getattr(r, "chain_resolved", False))
-    # Review #5 ops-4: which rerank path scored tonight's replay — 'active'
-    # (sidecar scored), 'fallback' (sidecar failed, fused order stood), 'off'.
-    # A red night reads differently if the reranker silently sat out.
+    # Review #5 ops-4 / review #6 instrument fix: which rerank path scored
+    # tonight's replay, PER CASE — kbcore.rerank accumulates a thread-local
+    # {active, fallback} tally across the harness's searches, 'off' is derived
+    # (see rerank.outcome_tally). ``eval_rerank_outcome`` keeps its key and
+    # value domain but is now the WORST observed outcome across cases
+    # (fallback > off > active), never just the final case's; the tally is an
+    # ADDED key. Snapshot here, before the instruments replay more searches.
     try:
         from kbcore import rerank as _rerank
 
-        counts["eval_rerank_outcome"] = _rerank.last_outcome()
+        tally = _rerank.outcome_tally(len(golden))
+        counts["eval_rerank_tally"] = tally
+        counts["eval_rerank_outcome"] = next(
+            (o for o in ("fallback", "off", "active") if tally.get(o)), "off"
+        )
     except Exception:  # noqa: BLE001 — observability may never fail the eval
         pass
     logger.info(
@@ -257,6 +285,10 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
     result = {
         "eval_top5_unverified_share": unverified_share,
         "eval_top5_unverified": unverified,
+        # The lift NUMERATOR, persisted explicitly (review #6): every surface
+        # rendering the lift renders this count and the corpus fraction beside
+        # it, so denominator decay can never masquerade as a ranking move.
+        "eval_top5_verified": total - unverified,
         "eval_top5_summary_share": summary_share,
         "eval_top5_summary": summary,
         "eval_top5_results": total,

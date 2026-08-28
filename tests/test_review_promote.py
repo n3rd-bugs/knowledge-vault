@@ -410,6 +410,113 @@ def test_cli_promote_batch_with_nothing_eligible_never_prompts(kb):
     assert "nothing to promote" in res.stdout
 
 
+# --- 4b. Wave G (review #6): promote-by-source-run ----------------------------
+
+
+def _run_item(
+    run: str, tag: str, *, project: str = "pp", type_: str = "gotcha", trust: str = "unverified"
+) -> tuple[int, int | None]:
+    """One extraction-shaped item of a session run: kind='session', uri=<run key>."""
+    item_id = ingest(project, type_, f"t {tag}", f"b {tag}", kind="session", uri=run, trust=trust)
+    if trust != "unverified":
+        return item_id, None
+    return item_id, queue_review(item_id, "unverified_extraction", {"rejected_count": 0})
+
+
+def test_promote_run_selects_exactly_the_run_and_dry_runs_by_default(kb):
+    a1, _q1 = _run_item("session:runA", "a1")
+    a2, _q2 = _run_item("session:runA", "a2", type_="bug")
+    _run_item("session:runA", "a-verified", trust="verified")  # not unverified
+    archived, _qx = _run_item("session:runA", "a-archived")
+    with db.transaction() as conn:  # kb_test fixture data: park it out of 'active'
+        conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (archived,))
+    b1, _qb = _run_item("session:runB", "b1")  # a DIFFERENT run
+    manual = ingest(
+        "pp", "note", "t manual", "b manual", kind="manual", uri="session:runA", trust="unverified"
+    )  # same uri string, wrong KIND — never run membership
+    before = _snapshot()
+
+    rows = review_promote.promote_run("session:runA")
+
+    assert [r["item_id"] for r in rows] == [a1, a2], "exactly the run's active+unverified items"
+    assert rows[0]["type"] == "gotcha" and rows[0]["title"] == "t a1", "content, not a count"
+    assert all(r["outcome"].startswith("would promote") for r in rows)
+    assert _snapshot() == before, "the default is a DRY RUN — zero writes"
+    assert manual not in {r["item_id"] for r in rows}
+    assert b1 not in {r["item_id"] for r in rows}
+
+
+def test_promote_run_apply_delegates_to_the_singular_chokepoint(kb):
+    a1, q1 = _run_item("session:runC", "c1")
+    a2, q2 = _run_item("session:runC", "c2")
+    b1, _qb = _run_item("session:runD", "d1")
+
+    rows = review_promote.promote_run("session:runC", dry_run=False)
+
+    assert [r["item_id"] for r in rows] == [a1, a2]
+    assert rows[0]["outcome"] == f"promoted (queue {q1} resolved)"
+    assert rows[1]["outcome"] == f"promoted (queue {q2} resolved)"
+    for iid in (a1, a2):
+        assert _item_state(iid) == ("active", "verified")
+    assert _row(q1)[0] and _row(q2)[0], "each item's review row resolved, batch-style"
+    assert _item_state(b1) == ("active", "unverified"), "the OTHER run is untouched"
+
+
+def test_promote_run_refuses_an_empty_key_and_reports_an_unknown_one(kb):
+    from kbcore.errors import InvalidOperation
+
+    with pytest.raises(InvalidOperation):
+        review_promote.promote_run("   ")
+    assert review_promote.promote_run("session:never-flushed") == []
+
+
+def test_cli_promote_run_defaults_to_a_dry_run_showing_content(kb):
+    from kbcli.main import app
+
+    item, _q = _run_item("session:cliA", "cli-run", type_="bug")
+    before = _snapshot()
+
+    res = runner.invoke(app, ["review", "promote-run", "session:cliA"])
+
+    assert res.exit_code == 0, res.output
+    assert f"[{item}]" in res.stdout and "bug" in res.stdout and "t cli-run" in res.stdout
+    assert "dry run: 1 item(s) would promote" in res.stdout
+    assert _snapshot() == before, "the default path must not write"
+
+    res = runner.invoke(app, ["review", "promote-run", "session:no-such-run"])
+    assert res.exit_code == 0
+    assert "no active unverified items" in res.stdout
+
+
+def test_cli_promote_run_confirm_declined_writes_nothing(kb):
+    from kbcli.main import app
+
+    item, _q = _run_item("session:cliB", "cli-decline")
+    before = _snapshot()
+
+    res = runner.invoke(app, ["review", "promote-run", "session:cliB", "--apply"], input="n\n")
+
+    assert res.exit_code == 1, "abort=True exits nonzero on a declined confirm"
+    assert _snapshot() == before, "declining the prompt must write ZERO rows"
+    assert _item_state(item) == ("active", "unverified")
+
+
+def test_cli_promote_run_apply_confirmed_promotes_the_run(kb):
+    from kbcli.main import app
+
+    a, qa = _run_item("session:cliC", "cli-x")
+    b, qb = _run_item("session:cliC", "cli-y")
+
+    res = runner.invoke(app, ["review", "promote-run", "session:cliC", "--apply"], input="y\n")
+
+    assert res.exit_code == 0, res.output
+    assert f"[{a}] promoted (queue {qa} resolved)" in res.stdout
+    assert f"[{b}] promoted (queue {qb} resolved)" in res.stdout
+    assert "promote-run: 2 promoted, 0 error(s), 2 item(s)" in res.stdout
+    assert _item_state(a) == ("active", "verified")
+    assert _item_state(b) == ("active", "verified")
+
+
 # --- 5. the nightly only COUNTS (curation_counts.promote_candidates) ----------
 
 

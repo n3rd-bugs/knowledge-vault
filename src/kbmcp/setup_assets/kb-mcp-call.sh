@@ -256,9 +256,16 @@ kb_json_probe || {
 # client runs once per chunk -- a chunked flush used to parade the transcript
 # path's credential (on the owner box, the MASTER token) through the process
 # table on every call. Same name and shape as kb-session-brief.sh's copy; the
-# non-secret headers stay on argv. An empty bearer yields an empty config, i.e.
-# an unauthenticated request the server refuses loudly -- never a silent skip.
+# non-secret headers stay on argv. An empty bearer yields a config holding only
+# the address-family pin, i.e. an unauthenticated request the server refuses
+# loudly -- never a silent skip.
+# `ipv4` pins every `curl -K -` consumer to the A record at this one layer: on
+# this network the AAAA record resolves first and IPv6 egress fails, which took
+# out flush/brief/enrol together during an AAAA-only transient while the ntfy
+# push (long pinned -4) kept working. Emitted BEFORE the bearer guard so even a
+# bearer-less request fails as a loud 401, never as a doomed IPv6 connect.
 kb_curl_auth_config() { # -> curl config on stdout
+  printf 'ipv4\n'
   [ -n "${KB_TOKEN:-}" ] || return 0
   printf 'header = "Authorization: Bearer %s"\n' "$KB_TOKEN"
 }

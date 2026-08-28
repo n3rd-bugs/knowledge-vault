@@ -52,6 +52,36 @@ def _trend(vals: list[float]) -> str:
     return f"{vals[0]:.3f} -> {vals[-1]:.3f}"
 
 
+def _trend_int(vals: list[float]) -> str:
+    """:func:`_trend` for stock counts: comma-grouped ints (``14,981 -> 17,330``)."""
+    if not vals:
+        return "n/a"
+    if len(vals) == 1:
+        return f"{int(vals[0]):,}"
+    return f"{int(vals[0]):,} -> {int(vals[-1]):,}"
+
+
+def _verified_top5(meta: dict[str, Any]) -> int | None:
+    """The night's verified top-5 hit COUNT — the lift NUMERATOR (review #6).
+
+    Wave-G sentinels persist it as ``eval_top5_verified``; older reports carry
+    only the parts (``eval_top5_results`` − ``eval_top5_unverified``), so the
+    trend does not start blind. None when the instrument never ran that night.
+    """
+    v = meta.get("eval_top5_verified")
+    if isinstance(v, int) and not isinstance(v, bool):
+        return v
+    total, unv = meta.get("eval_top5_results"), meta.get("eval_top5_unverified")
+    if all(isinstance(x, int) and not isinstance(x, bool) for x in (total, unv)):
+        return int(total) - int(unv)
+    return None
+
+
+def _verified_series(reports: list[tuple[datetime, dict[str, Any]]]) -> list[float]:
+    """The verified-top-5-count series across the window's reports."""
+    return [float(v) for _at, meta in reports if (v := _verified_top5(meta)) is not None]
+
+
 def _sum(reports: list[tuple[datetime, dict[str, Any]]], key: str) -> int:
     total = 0
     for _at, meta in reports:
@@ -93,8 +123,15 @@ def _push_lines(
         f"eval hit@5: {_trend(_series(reports, 'eval_hit_at_5'))}",
         f"eval mrr: {_trend(_series(reports, 'eval_mrr'))}",
         f"top5 unverified: {_trend(_series(reports, 'eval_top5_unverified_share'))}",
-        f"verified lift: {_trend(_series(reports, 'eval_top5_verified_lift'))}",
+        # The lift never renders alone (review #6): ~90% of one week's climb was
+        # corpus-denominator decay, so its components ride the same line.
+        f"verified lift: {_trend(_series(reports, 'eval_top5_verified_lift'))} "
+        f"(v-top5 {_trend_int(_verified_series(reports))}, "
+        f"corpus {_trend(_series(reports, 'eval_corpus_verified_fraction'))})",
         f"search misses: {miss_stats['total']} ({miss_stats['distinct']} distinct)",
+        # The ONE stocks line the push budget affords (review #6): the flows-only
+        # view hid +2,349 queue growth in 8 days. Full block in the report body.
+        f"queue open: {_trend_int(_series(reports, 'review_queue_open'))}",
     ]
     # Review #5 val-3/strat-8: the reject backlog only shrinks through the owner
     # bulk path, so the weekly names the command. Latest nightly's gauge.
@@ -135,7 +172,11 @@ def _report_body(
         "",
         f"window: {WINDOW_DAYS}d ending {now.date().isoformat()}; nightly reports: {len(reports)}",
         "",
-        "night       drained  saved  triaged  hit@5   mrr     unv-top5   v-lift",
+        # v-top5/corp-v are the lift's numerator count and denominator fraction
+        # (review #6 — a lift with no components invites the denominator-decay
+        # misread); 'expired' makes the 2 -> 55 -> 500 cap ramp read as a trend.
+        "night       drained  saved  triaged  expired  hit@5   mrr     "
+        "unv-top5   v-lift  v-top5  corp-v",
     ]
     for at, meta in reports:
         lines.append(
@@ -143,11 +184,24 @@ def _report_body(
             f"{_cell(meta.get('queued_drained')):>7}  "
             f"{_cell(meta.get('queued_items_saved')):>5}  "
             f"{_cell(meta.get('review_triaged')):>7}  "
+            f"{_cell(meta.get('review_expired')):>7}  "
             f"{_cell(meta.get('eval_hit_at_5'), floats=True):>6}  "
             f"{_cell(meta.get('eval_mrr'), floats=True):>6}  "
             f"{_cell(meta.get('eval_top5_unverified_share'), floats=True):>8}  "
-            f"{_cell(meta.get('eval_top5_verified_lift'), floats=True):>7}"
+            f"{_cell(meta.get('eval_top5_verified_lift'), floats=True):>7}  "
+            f"{_cell(_verified_top5(meta)):>6}  "
+            f"{_cell(meta.get('eval_corpus_verified_fraction'), floats=True):>6}"
         )
+    # STOCKS (review #6): first -> last levels beside the flow table above —
+    # flows alone hid +2,349 queue growth, the expiry ramp and the swap creep.
+    lines += [
+        "",
+        "stocks (first -> last over the window):",
+        f"  review queue open:       {_trend_int(_series(reports, 'review_queue_open'))}",
+        f"  never-triaged open:      {_trend_int(_series(reports, 'never_triaged_open'))}",
+        f"  expired/night:           {_trend_int(_series(reports, 'review_expired'))}",
+        f"  reject suggestions open: {_trend_int(_series(reports, 'reject_suggestions_pending'))}",
+    ]
     lines += [
         "",
         f"search misses ({WINDOW_DAYS}d): {miss_stats['total']} total "

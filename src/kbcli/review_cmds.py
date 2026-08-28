@@ -29,6 +29,7 @@ review_app.command("undo-expiry")(expire_cmds.review_undo_expiry)
 # for the same ratchet reason: `kb review promote-candidates` / `promote-batch`.
 review_app.command("promote-candidates")(promote_cmds.review_promote_candidates)
 review_app.command("promote-batch")(promote_cmds.review_promote_batch)
+review_app.command("promote-run")(promote_cmds.review_promote_run)
 # `kb review bulk` moved to kbcli.bulk_cmds (review #5 strat-8) when it grew the
 # --suggested-rejects dry-run/confirm mode; same ratchet seam as the two above.
 review_app.command("bulk")(bulk_cmds.review_bulk)

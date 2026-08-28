@@ -99,6 +99,28 @@ def quiet_expire_step(counts: dict[str, Any], stop: StopCheck | None = None) -> 
     return expired
 
 
+def reembed_step(stop: StopCheck | None = None) -> int:
+    """Tail step ``reembedded``: embedder-swap catch-up — UNBOUNDED DAYS ONLY.
+
+    Review #6: the step was a stop-less while-True at the tail of every night.
+    Inert while no swap is pending (the stale-chunk SELECT finds nothing), but a
+    weekday ``kb_embed_model`` change would send it re-embedding the whole store
+    through noon — the same night the swap invalidates the contradiction
+    pair-judgement memory. Gating on
+    :func:`kbcore.drainsched.is_unbounded_day` (the ONE "box is free tonight"
+    definition), plus the stop-check and per-night cap inside
+    :func:`kbcore.reembed.reembed`, makes the swap a schedulable weekend
+    project. A deadline-day run returns 0 and the stale chunks simply wait; an
+    owner finishing a swap by hand uses ``kb reembed``.
+    """
+    from kbcore import reembed as reembed_mod
+    from kbcore.drainsched import is_unbounded_day
+
+    if not is_unbounded_day():
+        return 0
+    return reembed_mod.reembed(stop=stop)
+
+
 def _topup_cutoff(now: datetime | None = None) -> datetime | None:
     """Today's top-up cutoff as a LOCAL datetime, or ``None`` when disabled.
 

@@ -43,6 +43,7 @@ from typing import Any
 from kbcore import review, scope, search_rank
 from kbcore.config import settings
 from kbcore.db import connect
+from kbcore.errors import InvalidOperation
 
 #: Item types the candidate surface never proposes (consolidation output).
 CANDIDATE_EXCLUDED_TYPES = ("summary", "report")
@@ -248,3 +249,45 @@ def promote_batch(item_ids: list[int], *, dry_run: bool = False) -> list[tuple[i
         except Exception as e:  # noqa: BLE001 — per-item isolation: one bad row must not abort the batch
             outcomes[item_id] = f"error: {e}"
     return sorted(outcomes.items())
+
+
+def promote_run(run_key: str, *, dry_run: bool = True) -> list[dict[str, Any]]:
+    """Resolve one SESSION RUN to its promotable items; DELEGATE to :func:`promote_batch`.
+
+    ``run_key`` is the run's grouping identity — the STORED ``sources.uri`` of a
+    ``kind='session'`` source, matched exactly. Every extraction item is minted
+    with that pair (``kbworker.sessions._ingest_and_queue``), one source row per
+    item (UNIQUE(kind,uri,content_hash)), so uri equality IS run membership and
+    there is no cascade. Key shapes: the hook's ``session:<id>``, the local
+    flush's ``<path>:<start>-<end>`` (``#pN`` per queued window), the degenerate
+    fallback ``queue:<kind>:<row id>``, a mined document's uri.
+
+    Selected: the run's ``active`` + ``trust='unverified'`` items, excluding
+    consolidation output. Everything that MUTATES — owner gate, per-item
+    isolation, audit rows, the trust flip through ``kbcore.review.promote`` —
+    is :func:`promote_batch` (V4: this adds a selector, never an escalation
+    surface). DRY-RUN BY DEFAULT. Returns ``[{item_id, type, title, outcome}]``
+    sorted by item id — titles and types so the CLI shows the owner CONTENT to
+    vet, never just a count.
+    """
+    scope.require_owner("promote-run")
+    key = (run_key or "").strip()
+    if not key:
+        raise InvalidOperation("promote-run needs a non-empty run key (a session sources.uri)")
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.type, i.title FROM items i
+            JOIN sources s ON s.id = i.source_id
+            WHERE s.kind = 'session' AND s.uri = %(key)s
+              AND i.status = 'active' AND s.trust = 'unverified'
+              AND i.type <> ALL(%(excluded)s)
+            ORDER BY i.id
+            """,
+            {"key": key, "excluded": list(CANDIDATE_EXCLUDED_TYPES)},
+        ).fetchall()
+    info = {int(r[0]): (r[1], r[2]) for r in rows}
+    return [
+        {"item_id": iid, "type": info[iid][0], "title": info[iid][1], "outcome": outcome}
+        for iid, outcome in promote_batch(list(info), dry_run=dry_run)
+    ]

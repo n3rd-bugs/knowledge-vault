@@ -157,7 +157,7 @@ mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
          kb-mcp-call.sh notify-complete.sh turn-start.sh \
          kb-hook-dispatch.sh kb-flush-backfill.sh; do
-  curl -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
+  curl -4 -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh
 ~/.claude/hooks/kb-flush-backfill.sh          # what this box never captured

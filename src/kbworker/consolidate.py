@@ -19,6 +19,7 @@ from typing import Any
 from kbcore import (
     consolidation,
     documents,
+    drainsched,
     enrolment,
     evidence,
     fleet_health,
@@ -28,7 +29,6 @@ from kbcore import (
     review_rejects,
     review_triage,
 )
-from kbcore import reembed as reembed_mod
 from kbcore.config import settings
 from kbcore.db import advisory_lock
 from kbcore.ingest import ingest
@@ -258,6 +258,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
     drained = 0
     saved_total = 0
     reserve = allocator.TailReserve.for_run()  # window left for the LLM tail
+    run_t0 = time.monotonic()  # the weekday drain budget's clock (drainsched)
     batches_done = 0  # across ALL refills: only the run's FIRST cohort is exempt
     processed: set[tuple[str, str]] = set()
     stopped = False
@@ -283,7 +284,13 @@ def _drain_ingest_queue() -> tuple[int, int]:
         for n, batch in enumerate(batches):
             # Same exemption as the guard, for the same reason: the run's first
             # cohort is _drain_step's call, not a batch's.
-            reason = (should_stop() or reserve.deny_reason(batches[n:])) if batches_done else None
+            reason = (
+                should_stop()
+                or drainsched.drain_budget_reason(run_t0)
+                or reserve.deny_reason(batches[n:])
+                if batches_done
+                else None
+            )
             if reason:
                 left = sum(len(b) for b in batches[n:])
                 logger.warning(
@@ -295,6 +302,9 @@ def _drain_ingest_queue() -> tuple[int, int]:
                     left,
                 )
                 _COHORT_STATS["deadline_deferred_jobs"] = left  # never renamed (telemetry)
+                if reason == drainsched.DRAIN_BUDGET_REASON:
+                    # Review #6 contract: still-pending ROWS the weekday budget shed.
+                    _COHORT_STATS["drained_deferred"] = ingest_queue.queue_depth()
                 _note_stop("queued_drained", reason, left)
                 stopped = True
                 break
@@ -593,6 +603,8 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         counts: dict[str, Any] = {
             "queued_drained": 0,
             "queued_items_saved": 0,
+            # Review #6: rows the WEEKDAY drain budget shed (weekend catches up).
+            "drained_deferred": 0,
             # WP-B2 ensemble observability: pipeline mode this run ran under and
             # the would-be survivors the shadow ensemble reported during the
             # drain (0 unless mode == "shadow" and rows were drained).
@@ -660,9 +672,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         _run_step(
             counts,
             "review_triaged",
-            lambda: review_triage.run_triage(
-                settings.kb_review_triage_batch, should_stop=triage_stop
-            ),
+            lambda: review_triage.run_triage(drainsched.triage_batch(), should_stop=triage_stop),
         )
         # P0-2: apply the triage verdicts that have COOLED (kbcore.review_apply),
         # right after the step that writes them — status flips only, never a
@@ -712,7 +722,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
                 datetime.now(UTC) - timedelta(days=settings.kb_archive_after_days)
             ),
         )
-        _run_step(counts, "reembedded", reembed_mod.reembed)
+        _run_step(counts, "reembedded", lambda: tail_steps.reembed_step(stop))
 
         # AFTER quiet-expiry (which now runs early, before the LLM tail), so the
         # four curation counts describe the queue the owner will actually wake up

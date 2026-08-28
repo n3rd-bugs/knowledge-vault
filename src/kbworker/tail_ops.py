@@ -49,12 +49,20 @@ _STOP_LOG: dict[str, dict[str, Any]] = {}
 
 
 def _note_stop(step: str, reason: str, deferred: int) -> None:
-    """Record + log that ``step`` stood down, and how much it deferred."""
+    """Record + log that ``step`` stood down, and how much it deferred.
+
+    The wording is deliberate (review #6): the old "nothing is lost" was FALSE
+    for the summaries step while its need was judged against a run mark that
+    ``_write_report`` advanced unconditionally — a stood-down step's unreached
+    tags were silently dropped. Every step's remaining work is now re-derived
+    from the queue/data on the next eligible run, and the log claims exactly
+    that, no more.
+    """
     prior = _STOP_LOG.get(step, {}).get("deferred", 0)
     _STOP_LOG[step] = {"reason": reason, "deferred": prior + deferred}
     logger.warning(
-        "step %r standing down (%s): %d item(s) deferred — nothing is lost, the "
-        "next run resumes here",
+        "step %r standing down (%s): %d item(s) deferred — the next eligible run "
+        "re-derives its remaining work and resumes here",
         step,
         reason,
         deferred,
@@ -97,12 +105,15 @@ def _dedupe(project: str) -> int:
 
 
 def _summaries(since: datetime | None, stop: StopCheck | None = None) -> int:
-    """Step 2: (re)write topic summaries for tags with >=3 new items since last run.
+    """Step 2: (re)write topic summaries for tags with >=3 items past their own summary.
 
     ``stop`` is the run's stand-down guard (``consolidate.should_stop``), asked
     every :data:`STOP_CHECK_EVERY` tags because each tag is a summarizer call.
-    Tags not reached are simply re-selected next run — the "since" mark only
-    advances when a consolidation report is written.
+    Tags not reached are simply re-selected next run — LOSSLESSLY, since review
+    #6: need is derived per tag from the DATA (items newer than the tag's own
+    newest summary, :func:`kbcore.consolidation.tags_needing_summary`), not from
+    the run mark ``_write_report`` used to advance even over a stood-down step.
+    ``since`` rides along for the call/patch surface only.
     """
     written = 0
     todo = consolidation.tags_needing_summary(since)
@@ -159,6 +170,30 @@ def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None
     return queued
 
 
+def _contradiction_pair_cap(now: datetime | None = None) -> int:
+    """Tonight's contradiction-pair budget — day-aware (review #6), the sibling of
+    ``consolidate._evidence_pair_cap`` for the step before it.
+
+    Unbounded days (``kbcore.drainsched.is_unbounded_day`` — the single "box is
+    free tonight" definition) keep the full ``kb_contradiction_pair_cap`` (500,
+    the catch-up bound); deadline days bind at ``min(cap,
+    kb_contradiction_pair_cap_weekday)`` — measured 129-153 s/pair, so the
+    154-pair nights spent ~21 binding minutes past what 40 covers, growing with
+    ingest. Convergence-safe: judged-pair memory persists across nights
+    (migration 017) and the candidate query is sim-DESC, so a capped night
+    spends its budget on the closest pairs and never re-pays judged ones. This
+    cap is also what bounds the re-judging wave after any embedder swap. ``min``
+    keeps BOTH kill switches (0 in the main knob kills everywhere; 0 in the
+    weekday knob is weekday-only). ``now`` is for day-pinned tests.
+    """
+    from kbcore.drainsched import is_unbounded_day
+
+    cap = int(settings.kb_contradiction_pair_cap)
+    if is_unbounded_day(now):
+        return cap
+    return min(cap, int(settings.kb_contradiction_pair_cap_weekday))
+
+
 def _contradictions_all(
     projects: list[str], stop: StopCheck | None = None, cap: int | None = None
 ) -> int:
@@ -167,10 +202,12 @@ def _contradictions_all(
     The budget is per NIGHT, not per project, so a single large project cannot
     consume the whole GPU window; projects are taken in order and whatever is not
     reached is offered again next run (nothing is written, nothing is lost).
-    ``cap`` of 0 is the kill switch — no pair is judged at all.
+    The default budget is day-aware (:func:`_contradiction_pair_cap`); an
+    explicit ``cap`` overrides it, and ``cap`` of 0 is the kill switch — no pair
+    is judged at all.
     """
     _CONTRA_STATS["judged"] = 0
-    budget = int(settings.kb_contradiction_pair_cap) if cap is None else int(cap)
+    budget = _contradiction_pair_cap() if cap is None else int(cap)
     queued = 0
     for project in projects:
         remaining = budget - _CONTRA_STATS["judged"]

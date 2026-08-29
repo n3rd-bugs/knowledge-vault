@@ -50,6 +50,19 @@ if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
 fi
 
+# A live run owns both the GPU and the marker's fate (its clean finish clears
+# it; a fresh pause rewrites it). Starting an active unit is a systemd no-op,
+# but the first night in production (2026-08-30 00:05-00:45) showed this script
+# logging a bogus "resuming" every ten minutes against a running consolidation
+# — stand down until the unit is idle so the log tells the truth.
+UNIT_STATE="$(systemctl --user is-active kb-consolidate.service 2>/dev/null || true)"
+if [[ "${UNIT_STATE}" == "active" || "${UNIT_STATE}" == "activating" ]]; then
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "ac_restore: dry-run: kb-consolidate is ${UNIT_STATE} — standing down"
+  fi
+  exit 0
+fi
+
 if [[ ! -f "${MARKER}" ]]; then
   # Nothing is paused — the every-5-minutes common case stays silent. A leftover
   # debounce stamp is swept here (verifier wfcd8e1248: a clean nightly clears

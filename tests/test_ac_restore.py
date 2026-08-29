@@ -259,7 +259,12 @@ def _rig(tmp_path, state_word: str = "grid", debounce: int = 60):
     pystub.write_text(f"#!/usr/bin/env bash\necho {state_word}\n")
     pystub.chmod(0o755)
     sysctl = bindir / "systemctl"
-    sysctl.write_text(f'#!/usr/bin/env bash\necho "$@" >> "{calls}"\n')
+    # Record only MUTATING verbs: the already-running guard issues a read-only
+    # `is-active` query on every pass (answered silently as inactive here), and
+    # the tests' "no service was touched" assertions mean starts, not queries.
+    sysctl.write_text(
+        f'#!/usr/bin/env bash\ncase "$*" in *start*|*stop*) echo "$@" >> "{calls}";; esac\n'
+    )
     sysctl.chmod(0o755)
     envfile = tmp_path / "test.env"
     envfile.write_text(
@@ -337,7 +342,7 @@ def test_script_dry_run_prints_the_decision_and_changes_nothing(tmp_path):
     proc = _run(env, "--dry-run")
     assert proc.returncode == 0
     assert "would start kb-consolidate.service" in proc.stdout
-    assert not calls.exists(), "--dry-run must never start the service"
+    assert not calls.exists(), "--dry-run must never start the service (starts are recorded)"
     assert stamp.exists(), "--dry-run must change nothing"
     # And with no marker, dry-run still says what it decided.
     (state / "battery-pause.json").unlink()

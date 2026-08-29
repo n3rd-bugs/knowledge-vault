@@ -394,6 +394,7 @@ class Settings(SettingsViews, BaseSettings):
     kb_inbox: Path = Path("~/kb/inbox")
     kb_raw: Path = Path("~/kb/raw")
     kb_backups: Path = Path("~/kb/backups")
+    kb_state_dir: Path = Path("~/kb/state")  # AC-restore marker/stamp dir (see .env.example)
     # Encrypted offsite backups (PLAN.md §6d). Consumed by scripts/backup.sh / scripts/offsite.sh
     # straight from .env; typed here so Python surfaces share the single documented config view.
     # Off by default — backup.sh stays purely local until the owner flips the switch.

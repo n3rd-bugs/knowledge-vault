@@ -61,7 +61,7 @@ def _note_stop(step: str, reason: str, deferred: int) -> None:
     prior = _STOP_LOG.get(step, {}).get("deferred", 0)
     _STOP_LOG[step] = {"reason": reason, "deferred": prior + deferred}
     logger.warning(
-        "step %r standing down (%s): %d item(s) deferred — the next eligible run "
+        "step %r pausing (%s): %d item(s) deferred — the next eligible run "
         "re-derives its remaining work and resumes here",
         step,
         reason,

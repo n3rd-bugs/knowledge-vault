@@ -266,6 +266,20 @@ def _isolated_raw_store(tmp_path_factory, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _isolated_state_dir(tmp_path, monkeypatch):
+    """Point KB_STATE_DIR at a per-test temp dir instead of the real ~/kb/state.
+
+    consolidate.main()'s tail now arms/disarms the AC-restore trigger
+    (kbworker.powerguard.record_battery_pause), so any test driving main() with
+    a battery stop would otherwise write a real battery-pause.json that the live
+    kb-ac-restore.timer acts on — a test could literally restart the owner's
+    nightly. Same hermeticity class as _isolated_raw_store.
+    """
+    monkeypatch.setattr(settings, "kb_state_dir", tmp_path / "kb_state")
+    yield
+
+
 @pytest.fixture()
 def kb(kb_schema):
     """Function-scoped clean slate inside kb_test (truncate, keep layout).

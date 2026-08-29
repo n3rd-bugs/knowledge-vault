@@ -1,0 +1,28 @@
+# kb-ac-restore.service — AC-restore trigger: resume a battery-PAUSED nightly
+# (owner request 2026-08-29, after the 02:02 battery pause left 41 pending rows
+# and the tail's deferred work waiting a full day for the next nightly).
+#
+# The nightly pauses between items when the house is on battery (kbworker.
+# powerguard); its tail writes $KB_STATE_DIR/battery-pause.json when any step
+# paused with reason 'battery'. While that marker exists, kb-ac-restore.timer
+# runs this probe every 5 minutes: scripts/ac_restore.sh asks the sungrow DB
+# via `python -m kbworker.powerguard` (grid|battery|unknown — unknown never
+# resumes), debounces the first healthy reading with a grid-ok stamp, and once
+# the grid has held GRID_DEBOUNCE_SECONDS starts kb-consolidate.service
+# (--no-block; the drain's advisory lock makes a redundant start a cheap no-op).
+# The marker is cleared only by a run that finishes with NO battery pause
+# (powerguard.record_battery_pause), so a flapped resume re-arms the trigger.
+#
+# Install: bash scripts/install_systemd.sh (the directory glob covers this
+# file); then enable kb-ac-restore.timer. Like kb-consolidate-boot.service,
+# this unit has no [Install] — only its timer starts it.
+[Unit]
+Description=Knowledge Vault AC-restore trigger (resume a battery-paused nightly)
+OnFailure=kb-notify-fail@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+ExecStart=%h/kb/repo/scripts/ac_restore.sh
+NoNewPrivileges=true

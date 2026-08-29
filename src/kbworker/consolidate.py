@@ -65,6 +65,7 @@ from kbworker.cohort import (  # noqa: F401
 from kbworker.powerguard import (  # noqa: F401
     _on_battery,
     _reading_age_seconds,
+    record_battery_pause,
 )
 from kbworker.prep import (  # noqa: F401
     EXTRACT_BYTES_PER_TOKEN,
@@ -294,8 +295,8 @@ def _drain_ingest_queue() -> tuple[int, int]:
             if reason:
                 left = sum(len(b) for b in batches[n:])
                 logger.warning(
-                    "drain stopping (%s) after %d refill(s): %d cohort(s) / %d job(s) "
-                    "deferred — rows stay 'pending' and the next run resumes here",
+                    "drain pausing (%s) after %d refill(s): %d cohort(s) / %d job(s) "
+                    "deferred — rows stay 'pending' and the next eligible run resumes here",
                     reason,
                     _COHORT_STATS["cohort_refills"],
                     len(batches) - n,
@@ -755,6 +756,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # WHY the run is as short as it is, and how much it left behind. Rides
         # into consolidation_requests.result with the rest of the report.
         counts["stopped"] = {k: dict(v) for k, v in _STOP_LOG.items()}
+        record_battery_pause(counts)  # arm/disarm the AC-restore trigger (powerguard)
         counts["review_queue_open"] = consolidation.open_review_count()
         counts["ingest_queue_pending"] = ingest_queue.queue_depth()
         _run_step(counts, "fleet_degenerate_by_project", fleet_health.degenerate_by_project)

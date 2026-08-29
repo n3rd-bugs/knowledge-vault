@@ -1,0 +1,23 @@
+# kb-ac-restore.timer — probe for grid restore every 5 minutes.
+#
+# Cheap when idle: with no battery-pause marker the service is one file stat
+# and a silent exit 0. With a marker it reads the sungrow DB read-only and, at
+# most, starts kb-consolidate.service after the debounce — so an outage night's
+# 41 pending rows resume minutes after mains returns instead of waiting for the
+# next 01:00 window. Effective resume lag: GRID_DEBOUNCE_SECONDS (default 240s)
+# up to +5 min of timer granularity.
+#
+# Persistent=false on purpose: a missed window means the BOX was off, and the
+# boot path already has its own catch-up (kb-consolidate-boot.timer). Replaying
+# stale five-minute probes at boot would add nothing — the next tick probes the
+# grid as it is NOW, which is the only reading that matters.
+[Unit]
+Description=Knowledge Vault AC-restore probe (every 5 min; acts only while battery-paused)
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=false
+Unit=kb-ac-restore.service
+
+[Install]
+WantedBy=timers.target

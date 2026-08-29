@@ -1,4 +1,4 @@
-"""kbworker.powerguard — the house-power stand-down signal for the drain.
+"""kbworker.powerguard — the house-power pause signal for the drain.
 
 Split from ``kbworker.consolidate`` (mechanical move, 2026-08-21, review #5):
 that file sat 3 lines under its ratchet ceiling and the nightly needed room for
@@ -8,19 +8,34 @@ suite's monkeypatches keep resolving through ``consolidate``'s globals —
 ``should_stop`` reads the global ``_on_battery``, so patching
 ``consolidate._on_battery`` still works exactly as before.
 
+AC-RESTORE TRIGGER (owner request 2026-08-29, after the 02:02 battery pause
+left 41 pending rows waiting a full day for the next nightly): this module now
+also owns the pause MARKER (:func:`record_battery_pause`, called once from
+``consolidate.main()``'s tail) and the three-way grid probe
+(:func:`grid_state` / ``python -m kbworker.powerguard``) that
+``scripts/ac_restore.sh`` — fired by ``kb-ac-restore.timer`` every 5 minutes —
+uses to restart ``kb-consolidate.service`` once the grid has held steady.
+
 Same logger name as the parent on purpose: these lines have always appeared in
 journald under ``kbworker.consolidate`` and grep recipes depend on that.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from kbcore.config import settings
 
 logger = logging.getLogger("kbworker.consolidate")
+
+# Basename of the pause marker under KB_STATE_DIR. scripts/ac_restore.sh derives
+# the same path from the same knob — the filename is part of that contract.
+BATTERY_PAUSE_MARKER = "battery-pause.json"
 
 
 def _reading_age_seconds(ts: Any) -> float | None:
@@ -49,6 +64,27 @@ def _reading_age_seconds(ts: Any) -> float | None:
     return (datetime.now(UTC) - seen).total_seconds()
 
 
+def _grid_rows() -> list[Any]:
+    """The newest ``kb_power_window`` (grid_voltage, timestamp) rows, newest first.
+
+    The single sungrow read, shared by :func:`_on_battery` and
+    :func:`grid_state` so the two can never drift apart. Policy stays with the
+    callers: this raises on an unreadable DB and does not check that
+    ``kb_power_db`` is configured at all — what ignorance MEANS (fail-open,
+    fail-safe, or 'unknown') is the one thing the two callers decide
+    differently, on purpose.
+    """
+    import sqlite3
+
+    path = (settings.kb_power_db or "").strip()
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
+        return conn.execute(
+            "SELECT grid_voltage, timestamp FROM monitor_inverterreading "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (max(1, int(settings.kb_power_window)),),
+        ).fetchall()
+
+
 def _on_battery() -> bool:
     """True when the house is running on battery, so the drain should stand down.
 
@@ -74,19 +110,11 @@ def _on_battery() -> bool:
     cannot ride out a fluctuation, pausing the GPU when house-power state is
     unknown-but-configured is the safe default. Both branches warn loudly.
     """
-    path = (settings.kb_power_db or "").strip()
-    if not path:
+    if not (settings.kb_power_db or "").strip():
         return False
     try:
-        import sqlite3
-
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
-            rows = conn.execute(
-                "SELECT grid_voltage, timestamp FROM monitor_inverterreading "
-                "ORDER BY timestamp DESC LIMIT ?",
-                (max(1, int(settings.kb_power_window)),),
-            ).fetchall()
-            row = rows[0] if rows else None
+        rows = _grid_rows()
+        row = rows[0] if rows else None
     except Exception as e:  # noqa: BLE001 — another project's DB; never fatal here
         logger.warning(
             "power check unavailable (%s: %s) — proceeding on mains assumption", type(e).__name__, e
@@ -103,8 +131,8 @@ def _on_battery() -> bool:
 
     if age is not None and age > settings.kb_power_max_age_seconds:
         logger.warning(
-            "power check STALE (%.0fs old, grid=%.1fV) — treating as ON BATTERY and standing "
-            "down; the sungrow poller may be down, and a last-known-good value is not evidence "
+            "power check STALE (%.0fs old, grid=%.1fV) — treating as ON BATTERY and pausing; "
+            "the sungrow poller may be down, and a last-known-good value is not evidence "
             "the grid is up. Pausing the GPU is the safe default on a UPS that cannot ride out a "
             "fluctuation; rows stay 'pending' and the next run resumes here",
             age,
@@ -119,10 +147,113 @@ def _on_battery() -> bool:
     if floor < settings.kb_power_min_grid_volts:
         volts = floor
         logger.warning(
-            "ON BATTERY (grid=%.1fV < %.1fV) — drain standing down; rows stay 'pending' "
-            "and the next run resumes here",
+            "ON BATTERY (grid=%.1fV < %.1fV) — drain pausing; rows stay 'pending' and the run "
+            "resumes on grid restore (kb-ac-restore.timer) or the next scheduled run",
             volts,
             settings.kb_power_min_grid_volts,
         )
         return True
     return False
+
+
+def grid_state() -> str:
+    """``'grid'`` / ``'battery'`` / ``'unknown'`` — the AC-restore trigger's probe.
+
+    Where :func:`_on_battery` must fold ignorance into a drain verdict (fail
+    OPEN when unconfigured, fail SAFE when stale), a trigger that RESTARTS the
+    GPU must never act on ignorance at all: an unconfigured/unreadable power DB,
+    no readings, or a reading older than ``kb_power_max_age_seconds`` (checked
+    via :func:`_reading_age_seconds`, so the naive-local carve-out applies) all
+    come back ``'unknown'``, and ``scripts/ac_restore.sh`` simply keeps waiting.
+    ``'grid'`` requires the WHOLE window healthy — the same any-dip floor as the
+    guard — so the trigger will not resume into a flickering supply either.
+    """
+    if not (settings.kb_power_db or "").strip():
+        return "unknown"
+    try:
+        rows = [r for r in _grid_rows() if r[0] is not None]
+    except Exception as e:  # noqa: BLE001 — another project's DB; never fatal here
+        logger.warning("power probe unreadable (%s: %s) — reporting unknown", type(e).__name__, e)
+        return "unknown"
+    if not rows:
+        return "unknown"
+    age = _reading_age_seconds(rows[0][1])
+    if age is None or age > settings.kb_power_max_age_seconds:
+        return "unknown"
+    floor = min(float(r[0]) for r in rows)
+    return "battery" if floor < settings.kb_power_min_grid_volts else "grid"
+
+
+def battery_pause_marker_path() -> Path:
+    """Where the battery-pause marker lives: ``$KB_STATE_DIR/battery-pause.json``.
+
+    ``scripts/ac_restore.sh`` derives the SAME path from ``KB_STATE_DIR`` in
+    ``.env`` (default ``~/kb/state``) — the knob and the basename are the
+    contract between the Python side that arms the trigger and the shell side
+    that fires it.
+    """
+    return Path(settings.kb_state_dir).expanduser() / BATTERY_PAUSE_MARKER
+
+
+def record_battery_pause(counts: Mapping[str, Any], marker: Path | None = None) -> None:
+    """Arm (or disarm) the AC-restore trigger from a finished run's counts.
+
+    Called ONCE from the tail of ``consolidate.main()``, right after
+    ``counts['stopped']`` is recorded. If any step paused with reason
+    ``'battery'``, a JSON marker ``{'at': <UTC iso>, 'deferred': <total>}`` is
+    written ATOMICALLY (tmp + rename — kb-ac-restore.timer polls this path
+    every 5 minutes and must never read a half-written file). Otherwise the run
+    completed with no battery pause, so the marker is removed if present: a
+    clean finish means nothing is waiting, and it is the ONLY thing that
+    disarms the trigger — ``ac_restore.sh`` deliberately never removes the
+    marker itself, so a resume cut short by another outage stays armed.
+
+    ``marker`` is an injectable seam for tests; reason strings are data
+    (``'battery'`` verbatim, from the stop log) and never renamed. Fail-open
+    both ways: a marker that cannot be written or removed logs and never fails
+    the run whose report is about to be pushed.
+    """
+    marker = battery_pause_marker_path() if marker is None else marker
+    stopped = counts.get("stopped") or {}
+    battery = [
+        v for v in stopped.values() if isinstance(v, Mapping) and v.get("reason") == "battery"
+    ]
+    try:
+        if not battery:
+            marker.unlink(missing_ok=True)
+            return
+        total = 0
+        for entry in battery:
+            try:
+                total += int(entry.get("deferred") or 0)
+            except (TypeError, ValueError):
+                pass  # a malformed count must not cost the marker
+        payload = {"at": datetime.now(UTC).isoformat(), "deferred": total}
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tmp = marker.with_name(marker.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(marker)  # atomic on POSIX — the poller never sees half a file
+        logger.warning(
+            "battery pause recorded (%d item(s) deferred) — kb-ac-restore.timer resumes the "
+            "run once the grid holds, else the next scheduled run picks it up",
+            total,
+        )
+    except Exception:  # noqa: BLE001 — the trigger may never fail the run's report
+        logger.exception("battery-pause marker update failed (%s)", marker)
+
+
+def _cli() -> int:
+    """``python -m kbworker.powerguard``: print the state word, exit by state.
+
+    Exit codes 0 = grid, 1 = battery, 2 = unknown — but ``ac_restore.sh``
+    parses the WORD on stdout (a crashed interpreter and 'battery' must not
+    look alike), so both surfaces carry the same answer. Deliberately
+    dependency-light: stdlib + kbcore.config only, no DB pool, no Ollama.
+    """
+    state = grid_state()
+    print(state)
+    return {"grid": 0, "battery": 1}.get(state, 2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

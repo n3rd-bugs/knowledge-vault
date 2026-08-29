@@ -153,10 +153,11 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
 def _stopped_line(stopped: Any) -> str | None:
     """One positive-only line for the steps the run cut short, or None.
 
-    ``counts['stopped']`` is ``{step: {'reason', 'deferred'}}`` (consolidate's
-    stop log): ``stopped early (battery): evidence_refreshed(20), ...``;
-    distinct reasons join with ``/``. Shape-tolerant like every digest input.
-    """
+    ``counts['stopped']`` is ``{step: {'reason', 'deferred'}}``. A cut involving
+    'battery' is a PAUSE — grid restore (kb-ac-restore.timer) or the next run
+    resumes it — rendered ``paused (battery): evidence_refreshed(20), ...``;
+    other reasons keep ``stopped early``. Reasons join with ``/`` and stay
+    verbatim (they are DATA). Shape-tolerant as ever."""
     if not isinstance(stopped, Mapping) or not stopped:
         return None
     reasons: list[str] = []
@@ -167,7 +168,8 @@ def _stopped_line(stopped: Any) -> str | None:
         if reason not in reasons:
             reasons.append(reason)
         parts.append(f"{step}({detail.get('deferred', '?')})")
-    return f"stopped early ({'/'.join(reasons)}): {', '.join(parts)}"
+    label = "paused" if "battery" in reasons else "stopped early"
+    return f"{label} ({'/'.join(reasons)}): {', '.join(parts)}"
 
 
 def _eval_red_line(counts: Mapping[str, Any]) -> str:

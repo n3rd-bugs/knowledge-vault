@@ -135,7 +135,10 @@ def test_drained_deferred_renders_the_contract_line_positive_only():
         assert not any("weekend budget" in ln for ln in digest_mod.digest_lines(counts))
 
 
-# --- battery-stop line --------------------------------------------------------
+# --- battery-pause line -------------------------------------------------------
+# Wording change 2026-08-29 (pause-not-stopped): a battery cut renders 'paused',
+# because grid restore (kb-ac-restore.timer) or the next nightly resumes it.
+# The 'stopped' counts key and the reason STRINGS are data and stay verbatim.
 
 
 def test_stopped_steps_render_one_line_with_reason_and_deferred_counts():
@@ -148,7 +151,7 @@ def test_stopped_steps_render_one_line_with_reason_and_deferred_counts():
             },
         }
     )
-    assert "stopped early (battery): evidence_refreshed(20), contradictions_queued(2)" in lines
+    assert "paused (battery): evidence_refreshed(20), contradictions_queued(2)" in lines
     assert all(line.isascii() for line in lines)
 
 
@@ -161,9 +164,19 @@ def test_stopped_line_joins_distinct_reasons_and_is_positive_only():
             }
         }
     )
-    assert "stopped early (deadline/battery): summaries_written(4), evidence_refreshed(1)" in lines
+    assert "paused (deadline/battery): summaries_written(4), evidence_refreshed(1)" in lines
     for counts in ({"queued_drained": 1, "stopped": {}}, {"queued_drained": 1}):
-        assert not any(ln.startswith("stopped early") for ln in digest_mod.digest_lines(counts))
+        rendered = digest_mod.digest_lines(counts)
+        assert not any(ln.startswith(("stopped early", "paused")) for ln in rendered)
+
+
+def test_a_pure_deadline_stop_still_renders_stopped_early():
+    """Only a battery cut is a 'pause' — the AC-restore timer will not resume a
+    deadline stop, so its line must not promise what nothing delivers."""
+    lines = digest_mod.digest_lines(
+        {"stopped": {"summaries_written": {"reason": "deadline", "deferred": 4}}}
+    )
+    assert "stopped early (deadline): summaries_written(4)" in lines
 
 
 # --- TRUST WATCH renders the lift components ----------------------------------

@@ -121,3 +121,90 @@
   # and it is the tightest bound this case can safely carry today.
   expect_substr: ["journalctl"]
   expect_rank_le: 5
+
+# =============================================================================
+# E1 STAGING (review #8 H5, 2026-09-03; KB 31857 review record, KB 31855 the
+# 297<->294 decision) — NOT loaded. E1 is the dedicated eval-epoch commit
+# (gate: Wave H shipped AND >=5 nights of satisfier-type telemetry AND the H3f
+# probe pasted; ~Sep 16-18). Nothing below moves into golden.yaml before then —
+# the eval-epoch rule: golden and ranking changes land BATCHED, never dribbled.
+# Harness support landed with Wave H: `kwargs.include_superseded` (transaction
+# time) joins `kwargs.as_of` (valid time), so every case here parses today
+# (tests/test_wave_h_eval.py proves the flag reaches search()).
+#
+# MRR QUANTUM — read before judging any of these at E1: one case slipping rank
+# 1 -> 2 moves MRR by exactly (1 - 1/2) / n_positive = 0.5/52 = 0.0096 on the
+# current 52-case set (equivalent decompositions exist: two cases 2 -> 3 and
+# 3 -> 4 read the same). Adding N positive cases changes the quantum to
+# 0.5/(52+N) — re-anchor the floor and reset the WoW baseline in the same
+# commit, and read the 08-29 step 0.9365 -> 0.9269 (exactly one quantum,
+# coincident with 661 new summaries + doc-refresh churn) as corpus composition,
+# never as drift. Per-case diffs name the slipped case; a scalar never does.
+# =============================================================================
+
+# --- BITEMPORAL 1: transaction time (include_superseded) ----------------------
+# The harness resolves expect_item_id to the LIVE chain head, so a superseded
+# revision can be asserted ABSENT (forbid_item_id is never resolved) but not
+# PRESENT by id. Live probe 2026-09-03 (kb_search, k=5, expand=false):
+#   default:            473 (head), 24709, 30811, 24729, 1576 -- 101 absent
+#   include_superseded: 101 (superseded -> 473) rank 1, 473 rank 3,
+#                       21589 (superseded -> 24709) rank 4
+- q: "mTLS fleet agent deferred config-sync"
+  # Default search hides superseded revisions: the rm3 fleet-agent README
+  # revision 101 (superseded by 473 on 2026-07-07) must never surface unasked.
+  # forbid-only, so it never inflates hit@5 or MRR.
+  forbid_item_id: 101
+- q: "mTLS fleet agent deferred config-sync"
+  # Transaction time: asked for, the superseded revision IS retrievable
+  # (Invariant 5 -- everything stays retrievable WITH a flag). Today this can
+  # only be asserted through the head (expect_item_id 101 resolves to 473, rank
+  # 3 with the flag); E1 picks (a) an `expect_item_id_raw` criterion that skips
+  # _chain_head (~4 harness lines) asserting 101 itself at rank <= 3, or (b) an
+  # expect_substr unique to the old revision's body. Staged as (a).
+  expect_item_id: 101            # E1: expect_item_id_raw: 101, expect_rank_le: 3
+  kwargs: {include_superseded: true}
+
+# --- BITEMPORAL 2: valid time (as_of) exclusion pair ---------------------------
+# golden.yaml's only as_of case proves NULL-bounded facts stay visible; the
+# missing half is that a fact with valid_to in the PAST is FOUND as-of before
+# it and HIDDEN as-of after it -- exactly the pair
+# tests/test_eval_harness_schema.py::test_as_of_kwarg_filters_valid_time_end_to_end
+# proves in kb_test. Needs a live item with valid_to set: the owner resolves it
+# on the owner box (a read, never automation) --
+#   SELECT id, title, valid_to FROM items
+#   WHERE valid_to IS NOT NULL AND status = 'active' ORDER BY valid_to DESC LIMIT 10;
+# -- the 2026-08-02 supersede auto-close (item 8163) stamps valid_to on every
+# replaced revision whose replacement introduced a new start, so candidates exist.
+# - q: "<query that names the time-bounded fact>"
+#   expect_item_id: 0            # FIXME: the valid_to-bounded item
+#   kwargs: {as_of: "<instant inside its interval>"}
+# - q: "<same query>"
+#   forbid_item_id: 0            # FIXME: same id
+#   kwargs: {as_of: "<instant after its valid_to>"}
+
+# --- 297 <-> 294: both ADR alternatives survive an un-folded query -------------
+# KB 31855: the manual 2026-07-03 alternative_to edge 297 -> 294 is CORRECT
+# ADR-alternatives knowledge (lanyard's BLE_ONLY_ALERT build option vs
+# punchrescue's SF9/BW500 certification path); the defect is
+# search_rank.collapse_alternatives folding EVERY cross-project alternative_to
+# pair as if it were a cross-twin-linker twin. E1 lands the twin_of
+# discriminator and THIS pair as its regression guard: with the fold armed
+# (kb_collapse_alternatives on), both must still hold a top-5 slot for ONE
+# query that surfaces both. Two cases, because a case carries one positive id.
+# Never unlink, never hand-DELETE the row, never flip the dial globally.
+# Live probes 2026-09-03 (k=8, expand=false) -- neither phrasing co-surfaces
+# them yet, so the query is E1's to find (do not repeat these two):
+#   "lanyard alert over BLE only never key the LoRa radio vs SF9 BW=500 FCC
+#    certification path" -> 14757, 3444 (re-captured twins of 294's title),
+#    3400, 15184, then summaries 30672 / 12965 / 6022 / 14955; neither 297 nor 294.
+#   "lanyard-firmware lora.c lora_send_alert lora_init LR1110 BLE_ONLY_ALERT SF9"
+#    -> 16097, 16098, 297 (rank 3), 6366, 16108, 16505, 16135, 6384; no 294.
+# The 294 side is dominated by its unverified re-captures (14757 repeater,
+# 3444 punchrescue) -- `kwargs: {type: decision}` or `boost_project` may be the
+# honest way to make one query carry both VERIFIED ADRs; verify live at E1.
+# - q: "<E1: one query surfacing both 297 and 294>"
+#   expect_item_id: 297
+#   expect_rank_le: 5
+# - q: "<same query>"
+#   expect_item_id: 294
+#   expect_rank_le: 5

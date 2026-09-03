@@ -5,7 +5,9 @@ promote-candidate table, the verified-lift column and the injection fence
 pushed that file to the 300-line ratchet, and rendering is its own concern —
 pure functions from the week's numbers to ASCII lines, no DB, no push.
 ``weekly`` re-imports every name (the established seam — kbworker.tail_steps /
-kbworker.digest), so tests keep reaching e.g. ``weekly.PUSH_MAX_LINES``.
+kbworker.digest), so tests keep reaching e.g. ``weekly.PUSH_MAX_LINES``. The
+Wave I trigger instruments and the LOCAL-night row grouping live in
+:mod:`kbworker.weekly_instruments` (review #8 H9) and are re-imported here.
 
 INJECTION POSTURE (review #5 sec-2): the misses table renders VERBATIM query
 text written by any CAP_SEARCH principal, and the weekly item is ingested
@@ -18,10 +20,20 @@ inspection), and the phone push previews are bounded harder still.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, tzinfo
 from typing import Any
 
 from kbcore import search_misses
+from kbworker.weekly_instruments import (  # noqa: F401
+    _calibration_line,
+    _cell,
+    _contradiction_lines,
+    _nested_series,
+    _typed_edge_line,
+    _verified_top5,
+    night_rows,
+    nights_line,
+)
 
 WINDOW_DAYS = 7
 TOP_MISSES = 10  # rows tabled in the report item; PUSH_TOP_MISSES of them pushed
@@ -61,22 +73,6 @@ def _trend_int(vals: list[float]) -> str:
     return f"{int(vals[0]):,} -> {int(vals[-1]):,}"
 
 
-def _verified_top5(meta: dict[str, Any]) -> int | None:
-    """The night's verified top-5 hit COUNT — the lift NUMERATOR (review #6).
-
-    Wave-G sentinels persist it as ``eval_top5_verified``; older reports carry
-    only the parts (``eval_top5_results`` − ``eval_top5_unverified``), so the
-    trend does not start blind. None when the instrument never ran that night.
-    """
-    v = meta.get("eval_top5_verified")
-    if isinstance(v, int) and not isinstance(v, bool):
-        return v
-    total, unv = meta.get("eval_top5_results"), meta.get("eval_top5_unverified")
-    if all(isinstance(x, int) and not isinstance(x, bool) for x in (total, unv)):
-        return int(total) - int(unv)
-    return None
-
-
 def _verified_series(reports: list[tuple[datetime, dict[str, Any]]]) -> list[float]:
     """The verified-top-5-count series across the window's reports."""
     return [float(v) for _at, meta in reports if (v := _verified_top5(meta)) is not None]
@@ -97,11 +93,6 @@ def _ascii(text: str, limit: int) -> str:
     return flat.encode("ascii", "replace").decode("ascii")[:limit]
 
 
-def _cell(v: Any, floats: bool = False) -> str:
-    ok = not isinstance(v, bool) and isinstance(v, int | float)
-    return (f"{float(v):.3f}" if floats else str(int(v))) if ok else "-"
-
-
 def _push_lines(
     now: datetime,
     reports: list[tuple[datetime, dict[str, Any]]],
@@ -110,11 +101,20 @@ def _push_lines(
     candidates: int,
     promoted_7d: int | None,
     item_id: int | None,
+    *,
+    typed_totals: dict[str, int] | None = None,
+    typed_diff: dict[str, int] | None = None,
+    tz: tzinfo | None = None,
 ) -> list[str]:
-    """The <20-line, pure-ASCII 'KB weekly' push body."""
+    """The <20-line, pure-ASCII 'KB weekly' push body.
+
+    ``now`` is the LOCAL display instant (review #8 H9f — the header date used
+    to be the UTC date, one day early for a 01:30 Sunday run on a UTC+5 box);
+    ``tz`` pins the night grouping for hermetic tests (None = the box's zone).
+    """
     lines = [
         f"KB weekly {now.date().isoformat()}",
-        f"nights reported: {len(reports)}",
+        nights_line(reports, tz),
         (
             f"7d: drained {_sum(reports, 'queued_drained')}, "
             f"saved {_sum(reports, 'queued_items_saved')}, "
@@ -151,6 +151,8 @@ def _push_lines(
         lines.append(f"promotes: checkpoint minted; {candidates} candidates open")
     else:
         lines.append(f"promotes: {promoted_7d} in 7d, {candidates} candidates open")
+    if typed_totals is not None:  # the nudge's exposure trigger (H9b), positive-only
+        lines.append(_typed_edge_line(typed_totals, typed_diff))
     lines.append(f"full table: kb-system item {item_id}")
     return lines[:PUSH_MAX_LINES]
 
@@ -165,43 +167,51 @@ def _report_body(
     promoted_7d: int | None,
     swept: int,
     promote_rows: list[dict[str, Any]] | None = None,
+    *,
+    typed_totals: dict[str, int] | None = None,
+    typed_diff: dict[str, int] | None = None,
+    calibration: dict[str, Any] | None = None,
+    floor: float = 0.0,
+    tz: tzinfo | None = None,
 ) -> str:
-    """The full weekly table persisted as the kb-system report item's body."""
+    """The full weekly table persisted as the kb-system report item's body.
+
+    Rows are ONE PER LOCAL NIGHT (review #8 H9f): flows summed over the night's
+    runs with the run count beside the date, eval/stock columns from the last
+    run. The instruments block carries the Wave I trigger series.
+    """
     lines = [
         "KB weekly trend report",
         "",
-        f"window: {WINDOW_DAYS}d ending {now.date().isoformat()}; nightly reports: {len(reports)}",
+        f"window: {WINDOW_DAYS}d ending {now.date().isoformat()}; {nights_line(reports, tz)}",
         "",
         # v-top5/corp-v are the lift's numerator count and denominator fraction
         # (review #6 — a lift with no components invites the denominator-decay
         # misread); 'expired' makes the 2 -> 55 -> 500 cap ramp read as a trend.
-        "night       drained  saved  triaged  expired  hit@5   mrr     "
+        "night       runs  drained  saved  triaged  expired  hit@5   mrr     "
         "unv-top5   v-lift  v-top5  corp-v",
     ]
-    for at, meta in reports:
-        lines.append(
-            f"{at.date().isoformat():<11} "
-            f"{_cell(meta.get('queued_drained')):>7}  "
-            f"{_cell(meta.get('queued_items_saved')):>5}  "
-            f"{_cell(meta.get('review_triaged')):>7}  "
-            f"{_cell(meta.get('review_expired')):>7}  "
-            f"{_cell(meta.get('eval_hit_at_5'), floats=True):>6}  "
-            f"{_cell(meta.get('eval_mrr'), floats=True):>6}  "
-            f"{_cell(meta.get('eval_top5_unverified_share'), floats=True):>8}  "
-            f"{_cell(meta.get('eval_top5_verified_lift'), floats=True):>7}  "
-            f"{_cell(_verified_top5(meta)):>6}  "
-            f"{_cell(meta.get('eval_corpus_verified_fraction'), floats=True):>6}"
-        )
+    lines += night_rows(reports, tz)
     # STOCKS (review #6): first -> last levels beside the flow table above —
     # flows alone hid +2,349 queue growth, the expiry ramp and the swap creep.
+    # 'expiry eligible left' (H9a) is the cap-raise trigger's series: a NESTED
+    # key, and a different predicate from db_snapshot's 'eligible now'.
     lines += [
         "",
         "stocks (first -> last over the window):",
         f"  review queue open:       {_trend_int(_series(reports, 'review_queue_open'))}",
         f"  never-triaged open:      {_trend_int(_series(reports, 'never_triaged_open'))}",
         f"  expired/night:           {_trend_int(_series(reports, 'review_expired'))}",
+        "  expiry eligible left:    "
+        f"{_trend_int(_nested_series(reports, 'quiet_expiry_counts', 'eligible_remaining'))}",
         f"  reject suggestions open: {_trend_int(_series(reports, 'reject_suggestions_pending'))}",
+        "",
+        "instruments (Wave I triggers, review #8 H9):",
+        f"  {_typed_edge_line(typed_totals, typed_diff)}",
+        f"  {_calibration_line(calibration, floor)}",
     ]
+    lines += [f"  {ln}" for ln in _contradiction_lines(reports, typed_diff)]
+    lines += [f"  {ln}" for ln in _satisfier_lines(reports)]
     lines += [
         "",
         f"search misses ({WINDOW_DAYS}d): {miss_stats['total']} total "
@@ -225,6 +235,25 @@ def _report_body(
         f"search-miss retention: {swept} row(s) older than {search_misses.RETENTION_DAYS}d pruned"
     )
     return "\n".join(lines)
+
+
+def _satisfier_lines(reports: list[tuple[datetime, dict[str, Any]]]) -> list[str]:
+    """H5's satisfier telemetry from the LAST report of the window (review #8).
+
+    The ~Sep 20 summaries verdict must be read on WHICH kind of item satisfies
+    each golden case (summary / verified / unverified / unsatisfied) and on how
+    many cases are satisfied ONLY by machine summaries — not on the raw
+    summary top-5 share, which ANY-of expect_substr lets one summary inflate.
+    Empty when the producer has not run (pre-H5 reports, eval disabled).
+    """
+    for _at, meta in reversed(reports):
+        types = meta.get("eval_satisfier_types")
+        if isinstance(types, dict) and types:
+            parts = " / ".join(f"{k} {int(v)}" for k, v in types.items() if isinstance(v, int))
+            only = meta.get("eval_summary_only_cases")
+            only_txt = f"; summary-only cases: {int(only)}" if isinstance(only, int) else ""
+            return [f"eval satisfiers: {parts}{only_txt}"]
+    return []
 
 
 def _promote_table(rows: list[dict[str, Any]]) -> list[str]:

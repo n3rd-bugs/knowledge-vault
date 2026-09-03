@@ -27,7 +27,7 @@ note "enrolment code: ${CODE:0:8}… (single use)"
 step "the four scripts download through Git Bash's curl.exe"
 cd "$HOME/.claude/kb-setup" || exit 1
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh \
-  kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do
+  kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh update.sh; do
   if "$RIG_CURL" -fsS -H "Authorization: Bearer $CODE" "$STUB/api/setup/$f" -o "$f"; then
     pass "fetched $f ($(wc -c <"$f") bytes)"
   else
@@ -39,7 +39,7 @@ step "the downloads are byte-identical and LF-clean"
 # A CRLF-mangled install.sh is not a subtly wrong script, it is an unrunnable
 # one: Git Bash reports $'\r': command not found and nothing installs.
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh \
-  kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do
+  kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh update.sh; do
   cmp -s "$f" "$SKILL/$f" && pass "$f matches the shipped copy" || fail "$f differs"
   if grep -qU $'\r' "$f" 2>/dev/null; then
     fail "$f arrived with CRLF endings — Git Bash cannot run it"

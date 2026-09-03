@@ -1,6 +1,6 @@
 {
   "src/kbcli/main.py": 431,
-  "src/kbcore/config.py": 467,
+  "src/kbcore/config.py": 433,
   "src/kbcore/consolidation.py": 472,
   "src/kbcore/documents.py": 371,
   "src/kbcore/enrolment.py": 358,
@@ -17,13 +17,13 @@
   "src/kbcore/scope.py": 378,
   "src/kbcore/search.py": 368,
   "src/kbcore/search_legs.py": 381,
-  "src/kbmcp/server.py": 585,
+  "src/kbmcp/server.py": 336,
   "src/kbmcp/tools_setup.py": 448,
   "src/kbrest/server.py": 447,
   "src/kbweb/auth.py": 328,
   "src/kbweb/server.py": 387,
   "src/kbweb/views_write.py": 313,
-  "src/kbworker/consolidate.py": 758,
+  "src/kbworker/consolidate.py": 529,
   "src/kbworker/ensemble.py": 443,
   "src/kbworker/sessions.py": 666
 }

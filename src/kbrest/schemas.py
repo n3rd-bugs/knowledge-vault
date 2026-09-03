@@ -62,6 +62,14 @@ class IngestSessionRequest(BaseModel):
     repo: str | None = None
     branch: str | None = None
     commit: str | None = None
+    # The installed hook version (~/.claude/hooks/.setup-version, a manifest
+    # digest), sent ONLY over REST by flush-session-to-kb.sh (review #8 H15).
+    # Threaded into ingest_queue.meta['hook_version'] so fleet_by_box can say
+    # WHICH boxes carry a given fix (the IPv4 pin, the H11 envelope gate) — the
+    # only server-side way to know. Optional: pre-stamp hooks and MCP-transport
+    # boxes send nothing, and that absence is itself the signal (fleet_health).
+    # Closed shape (a digest is 12 hex); never trusted as anything but a label.
+    hook_version: str | None = Field(default=None, max_length=64)
 
 
 class EnrolRequest(BaseModel):

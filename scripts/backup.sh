@@ -7,11 +7,23 @@
 # Offsite (PLAN.md §6d, opt-in): when KB_OFFSITE_ENABLED=true the finished dump
 # is age-ENCRYPTED locally and only the ciphertext is pushed via rclone — see
 # scripts/offsite.sh. Unset/false keeps this script purely local (no new deps).
+#
+# --local-only (review #8 H10a): do everything above EXCEPT the offsite push.
+# This is the boot path's switch (systemd/kb-backup-local.service): on
+# 2026-09-01 the boot catch-up drain waited 2h59m behind the offsite push on
+# modem WAN. It is a FLAG, not an env override, on purpose — a unit's
+# Environment= is overridden by EnvironmentFile=, and this script re-sources
+# .env under `set -a` below, so KB_OFFSITE_ENABLED=false from a unit would be
+# silently undone. The flag is parsed AFTER that sourcing.
+#
+# Test seams: KB_ENV_FILE overrides the env file sourced (default: the repo
+# .env, as in offsite.sh/ac_restore.sh); KB_BACKUP_LOCK_WAIT bounds the lock
+# wait below (default 1800 s).
 set -euo pipefail
 umask 077
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="${REPO_DIR}/.env"
+ENV_FILE="${KB_ENV_FILE:-${REPO_DIR}/.env}"
 
 # Pull config from .env without echoing it (secrets live here too).
 if [[ -f "${ENV_FILE}" ]]; then
@@ -40,9 +52,34 @@ if [[ -f "${KB_OFFSITE_CONF}" ]]; then
   done < "${KB_OFFSITE_CONF}"
 fi
 
+# Flags are parsed HERE, after both config sources, so nothing sourced above can
+# clobber the decision (see the --local-only header note).
+LOCAL_ONLY=0
+for arg in "$@"; do
+  case "${arg}" in
+    --local-only) LOCAL_ONLY=1 ;;
+    *) echo "backup.sh: unknown argument '${arg}' (usage: backup.sh [--local-only])" >&2; exit 2 ;;
+  esac
+done
+
 KB_BACKUPS="${KB_BACKUPS:-${HOME}/kb/backups}"
 KB_BACKUPS="${KB_BACKUPS/#\~/${HOME}}"   # expand a leading ~
 mkdir -p "${KB_BACKUPS}"
+
+# --- single-writer lock for the LOCAL leg (review #8 H10a) --------------------
+# Two instances can overlap at boot: kb-backup-local.service (pulled in by the
+# boot guard) and kb-backup.service's Persistent catch-up. Both write
+# kb-<date>.sql.zst through the same .tmp, so they must take turns. The lock
+# covers ONLY the local leg and is released before the offsite push (below), so
+# a boot dump never waits behind a multi-hour WAN push. Bounded: a lock held
+# longer than KB_BACKUP_LOCK_WAIT seconds fails the unit (OnFailure= pages)
+# instead of piling up silent waiters.
+LOCK_FILE="${KB_BACKUPS}/.backup.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -w "${KB_BACKUP_LOCK_WAIT:-1800}" 9; then
+  echo "backup.sh: FAILED — another backup.sh has held the lock ${LOCK_FILE} for ${KB_BACKUP_LOCK_WAIT:-1800}s" >&2
+  exit 1
+fi
 
 STAMP="$(date -u +%F)"
 OUT="${KB_BACKUPS}/kb-${STAMP}.sql.zst"
@@ -175,28 +212,44 @@ else
   RAW_OUT=""
 fi
 
+# The local leg is complete: release the lock BEFORE the offsite push so a
+# concurrent boot-path dump never waits behind the WAN (see the lock note).
+flock -u 9
+exec 9>&-
+
+if (( LOCAL_ONLY == 1 )); then
+  echo "backup.sh: --local-only: offsite push skipped (boot-path dump; kb-backup.timer's nightly run pushes offsite)"
+  exit 0
+fi
+
 # --- offsite push (PLAN.md §6d) ----------------------------------------------
 # Additive: with KB_OFFSITE_ENABLED unset/false nothing below runs and this
 # script behaves exactly as before. The local backup above is already complete;
 # an offsite failure logs + exits nonzero but never touches the local dumps.
 # offsite.sh encrypts LOCALLY with age (recipient KB_AGE_RECIPIENT) and pushes
 # ONLY the .age ciphertext to KB_RCLONE_REMOTE — plaintext never leaves the box.
+# Each leg logs its wall time (review #8 H10a/H12): the push has no timeout and
+# took 2h57m on modem WAN on 2026-09-01, invisible until someone did the sums.
 KB_OFFSITE_ENABLED="${KB_OFFSITE_ENABLED:-false}"
 if [[ "${KB_OFFSITE_ENABLED,,}" =~ ^(true|1|yes)$ ]]; then
   offsite_fail=0
+  offsite_start=${SECONDS}
+  leg_start=${SECONDS}
   if bash "${REPO_DIR}/scripts/offsite.sh" push "${OUT}"; then
-    echo "backup.sh: offsite push OK (dump)"
+    echo "backup.sh: offsite push OK (dump) in $((SECONDS - leg_start))s"
   else
-    echo "backup.sh: local backup OK but OFFSITE PUSH FAILED for the dump" >&2
+    echo "backup.sh: local backup OK but OFFSITE PUSH FAILED for the dump after $((SECONDS - leg_start))s" >&2
     offsite_fail=1
   fi
   if [[ -n "${RAW_OUT}" ]]; then
+    leg_start=${SECONDS}
     if bash "${REPO_DIR}/scripts/offsite.sh" push "${RAW_OUT}"; then
-      echo "backup.sh: offsite push OK (raw)"
+      echo "backup.sh: offsite push OK (raw) in $((SECONDS - leg_start))s"
     else
-      echo "backup.sh: local backup OK but OFFSITE PUSH FAILED for the raw archive" >&2
+      echo "backup.sh: local backup OK but OFFSITE PUSH FAILED for the raw archive after $((SECONDS - leg_start))s" >&2
       offsite_fail=1
     fi
   fi
+  echo "backup.sh: offsite leg took $((SECONDS - offsite_start))s in total"
   (( offsite_fail == 0 )) || exit 1
 fi

@@ -90,13 +90,21 @@ def test_the_boot_timer_triggers_the_guard_not_the_drain_directly():
 
 def test_the_guard_orders_the_backup_before_the_catch_up_drain():
     """backup -> guard -> drain. Wants pulls the backup into the transaction (a
-    bare After= would order against nothing at OnBootSec); After/Before place it."""
+    bare After= would order against nothing at OnBootSec); After/Before place it.
+
+    The backup it pulls is the LOCAL unit (review #8 H10a): kb-backup.service
+    also pushes offsite, and on 2026-09-01 the boot catch-up waited 2h59m behind
+    that push on modem WAN. The guard must neither Want nor order After the
+    pushing unit (tests/test_backup_local.py has the mechanical check)."""
     unit = parse_unit(GUARD)["Unit"]
-    assert "kb-backup.service" in unit.get("Wants", []), (
-        "the guard must PULL the backup in — at boot it is not otherwise in the "
+    assert "kb-backup-local.service" in unit.get("Wants", []), (
+        "the guard must PULL the local backup in — at boot it is not otherwise in the "
         "transaction, so a bare After= would order against nothing"
     )
-    assert "kb-backup.service" in unit.get("After", []), "guard must run after the backup"
+    assert "kb-backup-local.service" in unit.get("After", []), "guard must run after the backup"
+    assert "kb-backup.service" not in unit.get("Wants", []) + unit.get("After", []), (
+        "kb-backup.service pushes offsite; the boot path must not wait behind it"
+    )
     assert "kb-consolidate.service" in unit.get("Wants", []), "guard must pull the drain in"
     assert "kb-consolidate.service" in unit.get("Before", []), (
         "the drain must run AFTER the guard (and therefore after the backup)"

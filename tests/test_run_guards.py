@@ -103,7 +103,7 @@ def test_the_guard_is_asked_BEFORE_the_first_cohort(monkeypatch):
         lambda: pytest.fail("the drain started past its deadline"),
     )
     monkeypatch.setattr(consolidate.ensemble, "reset_shadow_counter", lambda: None)
-    monkeypatch.setattr(consolidate.ingest_queue, "queue_depth", lambda: 7)
+    monkeypatch.setattr(consolidate.ingest_queue, "queue_depth", lambda **kw: 7)
     consolidate._STOP_LOG.clear()
 
     assert consolidate._drain_step({}, lambda: "deadline") == 0
@@ -248,7 +248,7 @@ def test_a_deferral_is_accumulated_across_projects():
 
 def test_the_run_report_records_why_it_stopped(kb, monkeypatch):
     """A run that did a third of its work must not look like a broken one."""
-    monkeypatch.setattr(consolidate.ingest_queue, "queue_depth", lambda: 11)
+    monkeypatch.setattr(consolidate.ingest_queue, "queue_depth", lambda **kw: 11)
     monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)
 
     result = consolidate.main(stop=lambda: "battery")
@@ -287,8 +287,16 @@ def _naive_local_power_db(tmp_path, zone, volts: float, age_seconds: int) -> str
     assert "+" not in stamp.isoformat(), "the fixture leaked an offset"
     path = tmp_path / "sungrow.sqlite3"
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT)")
-    conn.execute("INSERT INTO monitor_inverterreading VALUES (?,?)", (volts, stamp.isoformat()))
+    # Battery-inverter-only read (monitor_inverter.has_battery = 1, review #8 H2).
+    conn.execute("CREATE TABLE monitor_inverter (id INTEGER PRIMARY KEY, has_battery BOOL)")
+    conn.execute("INSERT INTO monitor_inverter VALUES (1, 1)")
+    conn.execute(
+        "CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT, "
+        "inverter_id INTEGER, raw_data TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO monitor_inverterreading VALUES (?,?,1,NULL)", (volts, stamp.isoformat())
+    )
     conn.commit()
     conn.close()
     return str(path)

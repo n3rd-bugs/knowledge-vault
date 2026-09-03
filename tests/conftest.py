@@ -9,6 +9,7 @@ import hashlib
 import math
 import os
 import random
+import sys
 
 import pytest
 
@@ -208,9 +209,39 @@ def _admin_ddl(sql: str) -> None:
         conn.close()
 
 
+# ONE pytest process on kb_test at a time (review #8 H1). The schema is shared by
+# every suite run on this box, and a concurrent process's session teardown (DROP
+# SCHEMA kb_test CASCADE) mid-run produced ~27 spurious failures on ship day. A
+# session-level advisory lock on a dedicated admin connection — BLOCKING, so the
+# second run waits instead of failing — serialises them. Fixed bigint key, far
+# above kbcore.db.advisory_lock's schema-scoped keys (< 2**32), so it can never
+# collide with a nightly; it touches no table (schema-per-process stays Wave I).
+KB_TEST_SESSION_LOCK_KEY = 0x6B62_7465_7374  # 'kbtest'
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _kb_test_session_lock():
+    """Hold the kb_test session lock for the whole run; released at teardown."""
+    if not DB_UP:
+        yield
+        return
+    conn = db.connect(schema="public", allow_public=True)  # sanctioned admin path; no data access
+    conn.autocommit = True
+    try:
+        key = (KB_TEST_SESSION_LOCK_KEY,)
+        if not conn.execute("SELECT pg_try_advisory_lock(%s)", key).fetchone()[0]:
+            print("\n[conftest] another test session holds kb_test; waiting", file=sys.stderr)
+            conn.execute("SELECT pg_advisory_lock(%s)", key)
+        yield
+    finally:
+        conn.execute("SELECT pg_advisory_unlock(%s)", (KB_TEST_SESSION_LOCK_KEY,))
+        conn.close()
+
+
 @pytest.fixture(scope="session")
-def kb_schema():
-    """Session-scoped isolated schema kb_test with the full migrated layout."""
+def kb_schema(_kb_test_session_lock):
+    """Session-scoped isolated schema kb_test with the full migrated layout —
+    always created and dropped UNDER the session lock above."""
     if not DB_UP:
         pytest.skip("compose Postgres not reachable")
     # kb_test must exist before any kb_test-targeted connect (db.connect refuses a

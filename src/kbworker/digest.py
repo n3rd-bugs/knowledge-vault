@@ -12,32 +12,50 @@ DIGEST HYGIENE (review #6): ALERT-class lines render FIRST (phone previews
 truncate; the 08-18/19 red nights rendered EVAL RED dead last) and the digest
 is hard-capped at :data:`DIGEST_MAX_LINES` — kbcore.notify bounds bytes, not
 lines, and 25+ lines are now reachable.
+
+TRUTH-TELLING BUNDLE (review #8 H7, KB 31857): the alert tier gained the lines
+the cap must never truncate — a rerank FALLBACK tally, a battery PAUSE, swap
+past :data:`SWAP_ALERT_PCT`, the miss counters — so the 20-line cap trims only
+routine facts; a resumed run says so in its FIRST fact line; the drain's
+deferred count renders the honest H6 number; a run-duration line closes the
+facts. Rendering only — every number comes from the run's counts, and a key the
+run does not carry still contributes NO line.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from datetime import date, timedelta
 from typing import Any
+
+# MECHANICAL SPLIT (2026-09-03, review #8 H0): the composed one-line renderers
+# moved to kbworker.digest_lines when this file reached the 300-line cap. They
+# are re-imported HERE because this module is the seam every caller and test
+# resolves through (tail_steps re-imports from digest in turn) — _alert_lines /
+# _fact_lines below keep calling them by their bare names. The RETIRED expiry
+# helper (DIGEST_EXPIRY_HORIZON_DAYS / _expiring_soon, review #6) moved with
+# them in H7 to keep this file under its cap; both names still resolve here.
+from kbworker.digest_lines import (  # noqa: F401
+    DIGEST_EXPIRY_HORIZON_DAYS,
+    NIGHT_ROLLOVER_HOUR,
+    _drain_deferred_line,
+    _eval_red_line,
+    _expiring_soon,
+    _promote_runs_line,
+    _rerank_fell_back,
+    _rerank_tally_line,
+    _resume_line,
+    _run_duration_line,
+    _stale_hook_projects,
+    _stopped_line,
+    _trust_watch_line,
+    night_of,
+)
 
 logger = logging.getLogger("kbworker.tail_steps")
 
 DIGEST_MAX_LINES = 20  # hard line cap on the nightly push (review #6)
-
-# RETIRED LINE (review #6): 'review rows start expiring <date>' was permanently
-# true post-rails — wallpaper; 'expired: N' + the EXPIRY 7d line do its job. The
-# constant and helper stay importable (kbworker.tail_steps re-imports them).
-DIGEST_EXPIRY_HORIZON_DAYS = 7
-
-
-def _expiring_soon(value: Any, today: date | None = None) -> bool:
-    """True when an ISO expiry date is already due or due within the horizon."""
-    try:
-        when = date.fromisoformat(str(value))
-    except (ValueError, TypeError):
-        return False
-    return when <= (today or date.today()) + timedelta(days=DIGEST_EXPIRY_HORIZON_DAYS)
+SWAP_ALERT_PCT = 70  # host swap past this is alert-class (review #8 H7b; was a fact past 80)
 
 
 def digest_lines(counts: Mapping[str, Any]) -> list[str]:
@@ -71,12 +89,37 @@ def _alert_lines(counts: Mapping[str, Any]) -> list[str]:
     # it is the drain's most consequential outcome, so it rides with the alerts.
     if escalations := counts.get("deferral_escalations"):
         lines.append(f"drain: {escalations} row(s) escalated to failed at the deferral cap")
+    # Review #8 H7a/b: a rerank FALLBACK night was measured on the fused order —
+    # the tally rides the alert tier VERBATIM so the scalar can never hide it.
+    tally = counts.get("eval_rerank_tally")
+    if _rerank_fell_back(tally) and (tally_line := _rerank_tally_line(tally)):
+        lines.append(tally_line)
+    # A battery PAUSE is alert-class (H7b/d): the run is waiting on the grid and
+    # the AC-restore trigger; a pure deadline cut stays a routine fact below.
+    stopped_line = _stopped_line(counts.get("stopped"))
+    if stopped_line and stopped_line.startswith("paused"):
+        lines.append(stopped_line)
+    # Host swap telemetry (review #5 strat-7/ops-3), alert tier past 70% (H7b).
+    swap = counts.get("swap_used_pct")
+    if isinstance(swap, int | float) and not isinstance(swap, bool) and swap > SWAP_ALERT_PCT:
+        lines.append(f"swap: {swap:.0f}% used")
+    # Demand-side gap counters (review #4 Wave E, KB 21332; thin split Wave F) —
+    # alert tier since H7b: a truncated preview must still show what agents
+    # asked for and never got.
+    if misses := counts.get("search_misses_24h"):
+        lines.append(f"empty-result searches: {misses}")
+    if thin := counts.get("search_misses_thin_24h"):
+        lines.append(f"thin-result searches: {thin}")
     return lines
 
 
 def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
     """The positive-only fact lines, in their long-standing order. Pure ASCII —
     every one of these goes out over ntfy to a phone."""
+    lines: list[str] = []
+    # Review #8 H7d: a run that resumed a battery pause says so FIRST.
+    if resume := _resume_line(counts):
+        lines.append(resume)
     spec = (
         ("drained", "queued_drained"),
         ("saved", "queued_items_saved"),
@@ -84,15 +127,15 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
         ("auto-applied", "auto_applied"),
         ("judged pairs", "contradiction_pairs_judged"),
     )
-    lines = [f"{label}: {counts[key]}" for label, key in spec if counts.get(key) is not None]
+    lines += [f"{label}: {counts[key]}" for label, key in spec if counts.get(key) is not None]
     # Deferral-cap pressure (review #3 P1 rider): fires ~2 nights of deferrals
     # BEFORE the escalation it warns about (the escalation line is ALERT-class).
     if near_cap := counts.get("groups_near_deferral_cap"):
         lines.append(f"drain: {near_cap} group(s) near deferral cap")
-    # Weekday drain budget (review #6 cross-package contract): items the drain
-    # SHED to the weekend tonight — previously inferable only from finish times.
-    if deferred := counts.get("drained_deferred"):
-        lines.append(f"drain: {deferred} item(s) deferred to the weekend budget")
+    # The honest drained_deferred count (review #6 contract, re-cut by H6 to
+    # every stop path) — rows older than the run start still pending.
+    if deferred_line := _drain_deferred_line(counts):
+        lines.append(deferred_line)
     # Attempts-cap retirement (review #4 P0 rider): a content-failing group's
     # LAST act — the owner hears it here or from nobody.
     if retired := counts.get("attempts_cap_retirements"):
@@ -131,99 +174,25 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
     # recall-proven unverified queue exists without asking.
     if promotable := counts.get("promote_candidates"):
         lines.append(f"promote-worthy: {promotable}")
-    # Demand-side gap counters (review #4 Wave E, KB 21332; thin split Wave F).
-    if misses := counts.get("search_misses_24h"):
-        lines.append(f"empty-result searches: {misses}")
-    if thin := counts.get("search_misses_thin_24h"):
-        lines.append(f"thin-result searches: {thin}")
-    # Host swap telemetry (review #5 strat-7/ops-3): rendered only past 80%.
-    swap = counts.get("swap_used_pct")
-    if isinstance(swap, int | float) and not isinstance(swap, bool) and swap > 80:
-        lines.append(f"swap: {swap:.0f}% used")
+    if promote_runs := _promote_runs_line(counts):  # H13c: uptake costs one paste
+        lines.append(promote_runs)
+    # The rerank tally on a clean night is a routine fact (H7a: rendered
+    # verbatim either way; a fallback night carried it in the alert tier).
+    tally = counts.get("eval_rerank_tally")
+    if not _rerank_fell_back(tally) and (tally_line := _rerank_tally_line(tally)):
+        lines.append(tally_line)
     # Rerank sidecar probe (review #5 ops-4): only a failure is news.
     if counts.get("rerank_probe") == "failed":
         lines.append("rerank probe: failed")
     # Review #6: a step cut short by the stand-down guard was indistinguishable
     # from an idle one on every rendered surface — one line names the cut steps.
-    if stopped_line := _stopped_line(counts.get("stopped")):
+    # A battery pause rendered in the alert tier; a deadline-only cut lands here.
+    stopped_line = _stopped_line(counts.get("stopped"))
+    if stopped_line and not stopped_line.startswith("paused"):
         lines.append(stopped_line)
+    if duration := _run_duration_line(counts):
+        lines.append(duration)
     return lines
-
-
-def _stopped_line(stopped: Any) -> str | None:
-    """One positive-only line for the steps the run cut short, or None.
-
-    ``counts['stopped']`` is ``{step: {'reason', 'deferred'}}``. A cut involving
-    'battery' is a PAUSE — grid restore (kb-ac-restore.timer) or the next run
-    resumes it — rendered ``paused (battery): evidence_refreshed(20), ...``;
-    other reasons keep ``stopped early``. Reasons join with ``/`` and stay
-    verbatim (they are DATA). Shape-tolerant as ever."""
-    if not isinstance(stopped, Mapping) or not stopped:
-        return None
-    reasons: list[str] = []
-    parts: list[str] = []
-    for step, info in stopped.items():
-        detail = info if isinstance(info, Mapping) else {}
-        reason = str(detail.get("reason", "?"))
-        if reason not in reasons:
-            reasons.append(reason)
-        parts.append(f"{step}({detail.get('deferred', '?')})")
-    label = "paused" if "battery" in reasons else "stopped early"
-    return f"{label} ({'/'.join(reasons)}): {', '.join(parts)}"
-
-
-def _eval_red_line(counts: Mapping[str, Any]) -> str:
-    """The red-eval digest line: observed hit@5 against the anchored floor.
-
-    The floor is read lazily (the digest's convention — a broken import costs
-    ONE line, never the digest) at RENDER time, so the line always names the
-    floor the sentinel actually compared against tonight.
-    """
-    try:
-        from kbcore.config import settings
-
-        floor: str = f"{settings.kb_eval_min_hit5:g}"
-    except Exception:  # noqa: BLE001 — a digest line may never cost the digest
-        floor = "?"
-    hit = counts.get("eval_hit_at_5")
-    return f"EVAL RED: hit@5 {hit if hit is not None else '?'} (floor {floor})"
-
-
-def _trust_watch_line(counts: Mapping[str, Any]) -> str:
-    """TRUST WATCH with the lift's COMPONENTS beside it (review #6): ~90% of the
-    08-20..08-27 lift climb was corpus-denominator decay, so a bare ratio reads
-    as a ranking move it is not. Numerator (verified top-5 count) and
-    denominator (corpus verified fraction) render with the composite whenever
-    the run carries them; an older report renders the bare line as before."""
-    share = counts.get("eval_top5_unverified_share")
-    lift = counts.get("eval_top5_verified_lift")
-    line = (
-        f"TRUST WATCH: top5 unverified {share if share is not None else '?'}, "
-        f"verified lift {f'{lift}x' if lift is not None else 'n/a'}"
-    )
-    verified = counts.get("eval_top5_verified")
-    total = counts.get("eval_top5_results")
-    unverified = counts.get("eval_top5_unverified")
-    if verified is None and total is not None and unverified is not None:
-        verified = total - unverified  # pre-Wave-G reports carry only the parts
-    frac = counts.get("eval_corpus_verified_fraction")
-    if verified is not None and total and frac is not None:
-        line += f" (v-top5 {verified}/{total}, corpus {frac})"
-    return line
-
-
-def _stale_hook_projects(report: Any) -> list[str]:
-    """Projects whose queue rows show a machine still on pre-fix hooks.
-
-    ONE definition of "nonzero", which lives in :mod:`kbcore.fleet_health`
-    beside the query that produced the report. Lazily imported like the other
-    tail steps, so a missing module costs this ONE line and not the digest.
-    """
-    try:
-        from kbcore import fleet_health
-    except ImportError:
-        return []
-    return fleet_health.stale_hook_projects(report)
 
 
 def push_run_digest(counts: Mapping[str, Any]) -> bool:
@@ -237,6 +206,7 @@ def push_run_digest(counts: Mapping[str, Any]) -> bool:
     inside kbworker.weekly — no new timer; review #4, KB 21332).
     """
     _note_search_misses(counts)
+    _note_promote_runs(counts)
     lines = digest_lines(counts)
     pushed = False
     if lines:
@@ -281,6 +251,24 @@ def _note_search_misses(counts: Mapping[str, Any]) -> None:
             pass
     except Exception:  # noqa: BLE001 — telemetry may never cost the digest
         logger.warning("search-miss count unavailable for the digest", exc_info=True)
+
+
+def _note_promote_runs(counts: Mapping[str, Any]) -> None:
+    """Stash last night's promote-run summary into ``counts`` (ADDED key, H13c).
+
+    :func:`kbcore.review_promote_runs.promote_runs_summary` is READ-ONLY and
+    owner-gated (the nightly runs as the owner; a grantee context simply gets
+    no line). Same posture as :func:`_note_search_misses`: lazily imported,
+    fail-open — a missing module or query costs this ONE line, never the digest.
+    """
+    if not isinstance(counts, dict):
+        return
+    try:
+        from kbcore import review_promote_runs
+
+        counts["promote_runs_ready"] = review_promote_runs.promote_runs_summary(days=1)
+    except Exception:  # noqa: BLE001 — telemetry may never cost the digest
+        logger.warning("promote-run summary unavailable for the digest", exc_info=True)
 
 
 def _maybe_weekly(counts: Mapping[str, Any]) -> None:

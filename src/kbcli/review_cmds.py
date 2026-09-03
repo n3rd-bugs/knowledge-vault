@@ -30,6 +30,9 @@ review_app.command("undo-expiry")(expire_cmds.review_undo_expiry)
 review_app.command("promote-candidates")(promote_cmds.review_promote_candidates)
 review_app.command("promote-batch")(promote_cmds.review_promote_batch)
 review_app.command("promote-run")(promote_cmds.review_promote_run)
+# `kb review promote-runs` (review #8 H13c): the read-only listing that tells the
+# owner WHICH run key to paste into promote-run — same module, same seam.
+review_app.command("promote-runs")(promote_cmds.review_promote_runs)
 # `kb review bulk` moved to kbcli.bulk_cmds (review #5 strat-8) when it grew the
 # --suggested-rejects dry-run/confirm mode; same ratchet seam as the two above.
 review_app.command("bulk")(bulk_cmds.review_bulk)

@@ -1,0 +1,35 @@
+# kb-backup-local.service — the BOOT-PATH backup: local dump only, no offsite push
+# (review #8 H10a, 2026-09-03).
+#
+# kb-consolidate-boot.service (the boot guard) used to pull kb-backup.service in
+# ahead of the catch-up drain. That unit's run includes the encrypted offsite
+# push when KB_OFFSITE_ENABLED=true, and on 2026-09-01 the boot catch-up waited
+# 2h59m behind that push on modem WAN. This unit runs `backup.sh --local-only`:
+# the same dump + raw archive + zstd integrity gate + count sidecar + prune, and
+# then STOPS. The nightly kb-backup.timer -> kb-backup.service keeps the offsite
+# leg; nothing here changes the offsite schedule or retention.
+#
+# WHY A FLAG AND NOT Environment=KB_OFFSITE_ENABLED=false: EnvironmentFile=
+# overrides Environment=, and backup.sh re-sources .env under `set -a` anyway,
+# so an env override would be silently undone. The flag is parsed AFTER that
+# sourcing (tests/test_backup_local.py proves the push is skipped with
+# KB_OFFSITE_ENABLED=true in the env file).
+#
+# No [Install] and no timer: only the guard's Wants= starts it. Deliberately NOT
+# ordered After=kb-backup.service — that would re-create the wait behind the WAN
+# push whenever the nightly unit's Persistent catch-up fires at the same boot.
+# backup.sh serialises concurrent local legs under a lock instead (released
+# before the push), so the two dumps never race on the same file.
+[Unit]
+Description=Knowledge Vault boot-path backup (local dump only, no offsite push)
+OnFailure=kb-notify-fail@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/kb/repo
+EnvironmentFile=%h/kb/repo/.env
+# Same bounded readiness wait as kb-backup.service: at boot the dockerized
+# Postgres may not be up yet; a timeout FAILS the unit so OnFailure= says so.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker exec kb-db pg_isready -q -U kb 2>/dev/null && exit 0; sleep 5; done; echo "kb-db not ready after 5m" >&2; exit 1'
+ExecStart=%h/kb/repo/scripts/backup.sh --local-only
+NoNewPrivileges=true

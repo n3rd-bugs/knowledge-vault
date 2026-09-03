@@ -221,8 +221,9 @@ def tags_needing_summary(since: datetime | None, min_new: int = 3) -> list[tuple
     superseded summary still proves the pass ran — which no unrelated report can
     advance. A tag with no summary yet counts every active item (the old epoch
     floor, per tag); summary/report items stay excluded from the counted side so
-    a summary never feeds its own topic. ``since`` is retained for the
-    call/patch surface only and no longer participates in the selection.
+    a summary never feeds its own topic. H8a (review #8): the counted side applies the
+    SAME :data:`SUMMARY_EXCLUDING_META` exclusion as :func:`active_items_with_tag`, so an
+    all-flagged tag (the ~113 'deferred' residue) is never selected — todo == writable work.
     """
     del since  # review #6: the run mark is no longer the source of truth
     with connect() as conn:
@@ -239,6 +240,7 @@ def tags_needing_summary(since: datetime | None, min_new: int = 3) -> list[tuple
                   SELECT i.project, unnest(i.tags) AS tag, i.created_at
                     FROM items i
                    WHERE i.status = 'active' AND i.type NOT IN ('summary', 'report')
+                     AND NOT jsonb_exists_any(COALESCE(i.meta, '{}'::jsonb), %(excl)s)
               ) t
               LEFT JOIN hw ON hw.project = t.project AND hw.tag = t.tag
              WHERE hw.mark IS NULL OR t.created_at > hw.mark
@@ -246,7 +248,7 @@ def tags_needing_summary(since: datetime | None, min_new: int = 3) -> list[tuple
             HAVING count(*) >= %(min)s
              ORDER BY t.project, t.tag
             """,
-            {"min": min_new},
+            {"min": min_new, "excl": list(SUMMARY_EXCLUDING_META)},
         ).fetchall()
     return [(p, tag, int(n)) for p, tag, n in rows]
 

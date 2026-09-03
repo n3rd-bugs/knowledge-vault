@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # kb-boot-check.sh — push ONE ntfy line when the box came back from an unclean
-# shutdown (power loss / crash), and nothing otherwise.
+# shutdown (power loss / crash), nothing otherwise — and log ONE line saying how
+# the PREVIOUS boot ended, so the next event is self-explaining (review #8 H10j).
 #
 # WHY: after a power cut the machine restarts with no signal that it went down
 # hard — four reboots on 2026-08-01 were completely silent. This turns each
@@ -14,6 +15,21 @@
 # never on a clean reboot. The idempotency lives in kbcore.boot, not here (see
 # src/kbcore/boot.py); this file is only the ntfy transport.
 #
+# BOOT CLASSIFICATION (review #8 H10j): the marker says clean/unclean; the
+# previous boot's journal says HOW it ended — PID 1 logs 'Reached target
+# reboot.target' / 'poweroff.target' on an orderly stop and nothing at all on a
+# power loss. One line 'boot-check: previous boot ended <class>' goes to stdout
+# (journald under this unit) and to $LOG on EVERY boot:
+#   orderly-reboot | orderly-poweroff | orderly-halt | orderly-kexec
+#   orderly (journal end: none)   marker clean, no target seen (first boot, rotated
+#                                 journal, or no adm/systemd-journal group)
+#   unclean (journal end: <x>)    marker survived; 'none' = power loss, a target =
+#                                 an orderly stop where this unit's ExecStop never ran
+# The 2026-09-01 20:58 event (an owner-requested GNOME reboot 12 min into a real
+# outage) read as a mystery for a day; this line would have said orderly-reboot.
+# The unclean push carries the class too. Reading is best-effort: any journal
+# failure degrades to 'none', never to a failed unit.
+#
 # CREDENTIAL HANDLING mirrors kb-notify-fail.sh EXACTLY: the ntfy auth NEVER
 # reaches argv (world-readable in /proc, and it leaked once via a `bash -x`
 # trace). curl reads it from a config on STDIN (`-K -`). Absent config = silently
@@ -21,10 +37,15 @@
 #
 # ALWAYS exits 0: a boot-time unit that can fail is a boot loop waiting to happen.
 # curl's exit code is not swallowed — it goes to the same log kb-notify-fail.sh uses.
+#
+# Test seams (tests/test_boot_check_classify.py): KB_PYTHON (the marker helper's
+# interpreter), KB_JOURNALCTL (a stub printing canned PID-1 lines), KB_NOTIFY_ENV,
+# KB_NOTIFY_LOG.
 set -u
 
 PYTHON="${KB_PYTHON:-$HOME/kb/repo/.venv/bin/python}"
 CFG="${KB_NOTIFY_ENV:-$HOME/.claude/notify.env}"
+JOURNALCTL="${KB_JOURNALCTL:-journalctl}"
 
 LOG="${KB_NOTIFY_LOG:-$HOME/.claude/hooks/notify-fail.log}"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
@@ -38,6 +59,24 @@ fi
 # on a box with no ntfy channel — it just will not push. A python fault here must
 # not fail the unit (no boot loop): fall through to a clean exit.
 MSG="$("$PYTHON" -m kbcore.boot check 2>>"$LOG" || true)"
+
+# How did the PREVIOUS boot end, per PID 1's last shutdown target? Only PID 1's
+# lines are read (a few hundred, not the whole boot). Empty when there is no
+# previous boot, the journal is unreadable, or the box simply lost power.
+JOURNAL_END="$("$JOURNALCTL" -b -1 -q -o cat --no-pager _PID=1 2>/dev/null \
+  | grep -oE 'Reached target (reboot|poweroff|halt|kexec)\.target' | tail -1 \
+  | sed -E 's/Reached target ([a-z]+)\.target/\1/')"
+JOURNAL_END="${JOURNAL_END:-none}"
+if [ -n "$MSG" ]; then
+  CLASS="unclean (journal end: ${JOURNAL_END})"
+elif [ "$JOURNAL_END" != "none" ]; then
+  CLASS="orderly-${JOURNAL_END}"
+else
+  CLASS="orderly (journal end: none)"
+fi
+echo "boot-check: previous boot ended ${CLASS}"
+log_line "boot-check: previous boot ended ${CLASS}"
+
 [ -n "$MSG" ] || exit 0   # clean boot: nothing to report
 
 [ -r "$CFG" ] || log_line "boot-check skipped: no config at $CFG"
@@ -49,7 +88,7 @@ MSG="$("$PYTHON" -m kbcore.boot check 2>>"$LOG" || true)"
 
 BASE="${NTFY_URL:-https://ntfy.sh}"
 MACHINE="${NTFY_MACHINE:-$(hostname 2>/dev/null || echo unknown)}"
-BODY="${MSG} @ ${MACHINE}"
+BODY="${MSG} [${CLASS}] @ ${MACHINE}"
 
 # BOUNDED RETRY WITH BACKOFF, same shape and budget as kb-notify-fail.sh: this
 # push races cloudflared and ntfy coming up right after a boot, so the first

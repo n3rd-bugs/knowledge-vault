@@ -75,11 +75,11 @@ _SETUP_SCRIPTS = frozenset(
         # up with five registered hooks pointing at a file it does not have.
         "kb-hook-dispatch.sh",
         # The backfill sweep (2026-08-03). Not a hook, but it is exactly what a
-        # re-onboarded box runs right after install.sh — so it has to be
-        # SERVABLE, or that box can only ever capture sessions started after the
-        # install and everything already on its disk stays invisible. Same gap
-        # class as the notify pair above.
+        # re-onboarded box runs right after install.sh — so it has to be SERVABLE,
+        # or that box can only ever capture sessions started after the install and
+        # everything already on disk stays invisible. Same gap class as notify.
         "kb-flush-backfill.sh",
+        "update.sh",  # self-update (review #8 H15): manifest-driven fetch + install
     }
 )
 
@@ -197,6 +197,7 @@ def _register_write(app: FastAPI) -> None:
             repo=payload.repo,
             branch=payload.branch,
             commit=payload.commit,
+            hook_version=payload.hook_version,  # review #8 H15: fleet version column
         )
         return {
             "queue_id": res.id,

@@ -68,7 +68,7 @@ done
 step "the skill under test is complete"
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
          kb-mcp-call.sh notify-complete.sh turn-start.sh \
-         kb-hook-dispatch.sh kb-flush-backfill.sh; do
+         kb-hook-dispatch.sh kb-flush-backfill.sh update.sh; do
   if [ -f "$SKILL/$f" ]; then pass "skill has $f"; else fail "skill missing $f"; fi
 done
 

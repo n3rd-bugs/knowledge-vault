@@ -16,6 +16,13 @@ also owns the pause MARKER (:func:`record_battery_pause`, called once from
 ``scripts/ac_restore.sh`` — fired by ``kb-ac-restore.timer`` every 5 minutes —
 uses to restart ``kb-consolidate.service`` once the grid has held steady.
 
+SIGNAL FIX (review #8 H2, 2026-09-03): readings come from the BATTERY inverter
+only (``monitor_inverter.has_battery = 1``, filtered BEFORE the window is cut)
+and the verdict is :func:`kbworker.power_rules.window_verdict` — the any-row
+voltage floor plus a >= 3 CONSECUTIVE-row off-grid rule (never any-row). Every
+Wave G pause was inverter #2's 0 V night standby; the real ~237 V outages were
+never seen. The measured populations and the rationale live in power_rules.
+
 Same logger name as the parent on purpose: these lines have always appeared in
 journald under ``kbworker.consolidate`` and grep recipes depend on that.
 """
@@ -30,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from kbcore.config import settings
+from kbworker.power_rules import window_verdict
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -65,22 +73,31 @@ def _reading_age_seconds(ts: Any) -> float | None:
 
 
 def _grid_rows() -> list[Any]:
-    """The newest ``kb_power_window`` (grid_voltage, timestamp) rows, newest first.
+    """The newest ``kb_power_window`` rows of the BATTERY inverter, newest first.
 
-    The single sungrow read, shared by :func:`_on_battery` and
-    :func:`grid_state` so the two can never drift apart. Policy stays with the
-    callers: this raises on an unreadable DB and does not check that
-    ``kb_power_db`` is configured at all — what ignorance MEANS (fail-open,
-    fail-safe, or 'unknown') is the one thing the two callers decide
-    differently, on purpose.
+    Rows are ``(grid_voltage, timestamp, inverter_id, raw_data)``. The
+    ``has_battery = 1`` filter (the same self-describing key sungrow's own
+    ``_check_grid_state`` uses) is applied BEFORE the window is cut, so 5 rows
+    are ~5 minutes of ONE poller (~60 s cadence) and never a blend; if that
+    poller dies its newest row is simply stale, which both callers already
+    treat as fail-safe. The single sungrow read, shared by :func:`_on_battery`
+    and :func:`grid_state` so the two can never drift apart. Policy stays with
+    the callers: this raises on an unreadable DB (a schema without the inverter
+    table included — there is deliberately NO blend-everything fallback) and
+    does not check that ``kb_power_db`` is configured at all — what ignorance
+    MEANS (fail-open, fail-safe, or 'unknown') is the one thing the two callers
+    decide differently, on purpose.
     """
     import sqlite3
 
     path = (settings.kb_power_db or "").strip()
     with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
         return conn.execute(
-            "SELECT grid_voltage, timestamp FROM monitor_inverterreading "
-            "ORDER BY timestamp DESC LIMIT ?",
+            "SELECT r.grid_voltage, r.timestamp, r.inverter_id, r.raw_data "
+            "FROM monitor_inverterreading AS r "
+            "JOIN monitor_inverter AS i ON i.id = r.inverter_id "
+            "WHERE i.has_battery = 1 "
+            "ORDER BY r.timestamp DESC LIMIT ?",
             (max(1, int(settings.kb_power_window)),),
         ).fetchall()
 
@@ -94,10 +111,15 @@ def _on_battery() -> bool:
     resumes when mains returns — the same stop-and-resume path as the deadline,
     which needs no state of its own because unreached rows stay 'pending'.
 
-    Signal is grid_voltage from the sungrow monitor DB, read-only. Measured over
-    219,304 readings: normal 213-256V, outages cluster below 50V, and the 50-150V
-    band holds only ~170 readings — so the threshold sits in a sparse gap rather
-    than near either mode.
+    Signal is the sungrow monitor DB, read-only, BATTERY inverter only (the
+    219,304-reading threshold table blended both inverters, and every Wave G
+    pause was the battery-less #2's night standby). Two rules, shared with
+    :func:`grid_state` via ``power_rules.window_verdict``: any row under
+    ``kb_power_min_grid_volts`` (normal 213-256V, outages cluster below 50V, the
+    50-150V band holds ~170 readings, so 200 sits in a sparse gap), or >= 3
+    CONSECUTIVE off-grid rows (importing=0 exporting=0 discharging=1 at 50.0 Hz
+    — the real ~237 V outages the floor never saw). The log line names the
+    inverter and the rule that fired.
 
     FAIL-SAFE ON UNKNOWN-BUT-CONFIGURED STATE. A MISSING or unreadable power DB
     fails OPEN (returns False, warns): the feature is simply not configured on
@@ -124,36 +146,37 @@ def _on_battery() -> bool:
         logger.warning("power check found no readings — proceeding on mains assumption")
         return False
 
-    volts, ts = float(row[0]), row[1]
+    volts, ts, inverter = float(row[0]), row[1], row[2]
     age = _reading_age_seconds(ts)
     if age is None:
         logger.warning("power check: unparseable timestamp %r — ignoring freshness", ts)
 
     if age is not None and age > settings.kb_power_max_age_seconds:
         logger.warning(
-            "power check STALE (%.0fs old, grid=%.1fV) — treating as ON BATTERY and pausing; "
-            "the sungrow poller may be down, and a last-known-good value is not evidence "
+            "power check STALE (%.0fs old, grid=%.1fV, inverter %s) — treating as ON BATTERY and "
+            "pausing; the sungrow poller may be down, and a last-known-good value is not evidence "
             "the grid is up. Pausing the GPU is the safe default on a UPS that cannot ride out a "
             "fluctuation; rows stay 'pending' and the next run resumes here",
             age,
             volts,
+            inverter,
         )
         return True
 
-    # ANY dip in the window keeps the GPU down: resuming into a flickering supply
-    # is worse than staying paused a few minutes longer, and a sagging grid is
-    # exactly when the UPS can least absorb a 150W spike.
-    floor = min(float(r[0]) for r in rows if r[0] is not None)
-    if floor < settings.kb_power_min_grid_volts:
-        volts = floor
-        logger.warning(
-            "ON BATTERY (grid=%.1fV < %.1fV) — drain pausing; rows stay 'pending' and the run "
-            "resumes on grid restore (kb-ac-restore.timer) or the next scheduled run",
-            volts,
-            settings.kb_power_min_grid_volts,
-        )
-        return True
-    return False
+    # Any-row voltage floor, then >= 3 consecutive off-grid rows — the SAME
+    # verdict grid_state() uses (kbworker.power_rules.window_verdict).
+    verdict = window_verdict(rows, settings.kb_power_min_grid_volts)
+    if verdict is None:
+        return False
+    rule, detail = verdict
+    logger.warning(
+        "ON BATTERY (inverter %s, rule=%s: %s) — drain pausing; rows stay 'pending' and the run "
+        "resumes on grid restore (kb-ac-restore.timer) or the next scheduled run",
+        inverter,
+        rule,
+        detail,
+    )
+    return True
 
 
 def grid_state() -> str:
@@ -165,8 +188,9 @@ def grid_state() -> str:
     no readings, or a reading older than ``kb_power_max_age_seconds`` (checked
     via :func:`_reading_age_seconds`, so the naive-local carve-out applies) all
     come back ``'unknown'``, and ``scripts/ac_restore.sh`` simply keeps waiting.
-    ``'grid'`` requires the WHOLE window healthy — the same any-dip floor as the
-    guard — so the trigger will not resume into a flickering supply either.
+    ``'grid'`` requires the WHOLE window healthy under the guard's own verdict
+    (``power_rules.window_verdict``: any-dip floor + consecutive off-grid rows),
+    so the trigger will not resume into a flickering supply either.
     """
     if not (settings.kb_power_db or "").strip():
         return "unknown"
@@ -180,8 +204,7 @@ def grid_state() -> str:
     age = _reading_age_seconds(rows[0][1])
     if age is None or age > settings.kb_power_max_age_seconds:
         return "unknown"
-    floor = min(float(r[0]) for r in rows)
-    return "battery" if floor < settings.kb_power_min_grid_volts else "grid"
+    return "battery" if window_verdict(rows, settings.kb_power_min_grid_volts) else "grid"
 
 
 def battery_pause_marker_path() -> Path:
@@ -195,7 +218,9 @@ def battery_pause_marker_path() -> Path:
     return Path(settings.kb_state_dir).expanduser() / BATTERY_PAUSE_MARKER
 
 
-def record_battery_pause(counts: Mapping[str, Any], marker: Path | None = None) -> None:
+def record_battery_pause(
+    counts: Mapping[str, Any], marker: Path | None = None
+) -> dict[str, Any] | None:
     """Arm (or disarm) the AC-restore trigger from a finished run's counts.
 
     Called ONCE from the tail of ``consolidate.main()``, right after
@@ -212,8 +237,19 @@ def record_battery_pause(counts: Mapping[str, Any], marker: Path | None = None) 
     (``'battery'`` verbatim, from the stop log) and never renamed. Fail-open
     both ways: a marker that cannot be written or removed logs and never fails
     the run whose report is about to be pushed.
+
+    Returns the PRIOR marker's payload (``{'at', 'deferred'}``) when this run
+    found one — i.e. this run is the RESUME of a battery pause — else ``None``
+    (review #8 H7d: the digest names a resumed run as such). Read before the
+    marker is rewritten or cleared; a malformed marker reads as ``None``.
     """
     marker = battery_pause_marker_path() if marker is None else marker
+    prior: dict[str, Any] | None = None
+    try:
+        loaded = json.loads(marker.read_text(encoding="utf-8"))
+        prior = loaded if isinstance(loaded, dict) else None
+    except (OSError, ValueError):
+        prior = None
     stopped = counts.get("stopped") or {}
     battery = [
         v for v in stopped.values() if isinstance(v, Mapping) and v.get("reason") == "battery"
@@ -221,7 +257,7 @@ def record_battery_pause(counts: Mapping[str, Any], marker: Path | None = None) 
     try:
         if not battery:
             marker.unlink(missing_ok=True)
-            return
+            return prior
         total = 0
         for entry in battery:
             try:
@@ -240,6 +276,7 @@ def record_battery_pause(counts: Mapping[str, Any], marker: Path | None = None) 
         )
     except Exception:  # noqa: BLE001 — the trigger may never fail the run's report
         logger.exception("battery-pause marker update failed (%s)", marker)
+    return prior
 
 
 def _cli() -> int:

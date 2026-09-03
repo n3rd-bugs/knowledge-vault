@@ -51,6 +51,7 @@ SETUP_SCRIPTS = frozenset(
         "turn-start.sh",
         "kb-hook-dispatch.sh",
         "kb-flush-backfill.sh",
+        "update.sh",
     }
 )
 

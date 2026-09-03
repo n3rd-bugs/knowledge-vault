@@ -15,16 +15,29 @@ Golden case schema (all criteria optional, at least one required; additive):
   expect_rank_le: R — the positive match's rank must be <= R (catches "still
                   found, but demoted" ranking regressions that hit@K cannot see)
   forbid_item_id: N — FAIL if that id appears in the top-K
-  kwargs:         {boost_project, expand, as_of, type, domain, tags} forwarded to
-                  search() so those ranking/filter knobs are exercised by the eval
-                  (expand is the public tri-state bool mapped to hops exactly like
-                  the MCP surface; type/domain/tags map straight through to the
-                  same-named filters, letting a case pin a single artefact class)
+  kwargs:         {boost_project, expand, as_of, include_superseded, type, domain,
+                  tags} forwarded to search() so those ranking/filter knobs are
+                  exercised by the eval (expand is the public tri-state bool mapped
+                  to hops exactly like the MCP surface; type/domain/tags map
+                  straight through to the same-named filters, letting a case pin a
+                  single artefact class; as_of and include_superseded are the two
+                  BITEMPORAL axes — valid time and transaction time — so a case can
+                  assert a fact as-of an instant or reach a superseded revision;
+                  review #8 H5, the E1 prerequisite)
 
 Metrics: hit@5 counts CASES PASSED (all present criteria ok) / all cases. MRR
 averages 1/rank over cases carrying a positive criterion (expect_substr or
 expect_item_id) — forbid-only cases never dilute it. For an all-`expect_substr`
 set both metrics are bit-identical to the pre-extension harness.
+
+MRR QUANTUM (review #8, KB 31857): because MRR is a mean of 1/rank over the
+positive-criterion cases, ONE case slipping rank 1 -> 2 moves it by exactly
+(1 - 1/2) / n_positive = 0.5/52 = 0.0096 on today's 52-case set — or an
+equivalent decomposition (two cases slipping 2 -> 3 and 3 -> 4 read the same).
+The 08-29 step 0.9365 -> 0.9269 was exactly one quantum and coincided with 661
+new summaries + doc-refresh churn (22/22 top-5 ids swapped): corpus
+composition, not a ranking regression. A single-quantum move is read PER CASE
+at the eval epoch (the per-case diff names the slipped case), never as drift.
 
 GPU courtesy (Invariant 8): this replays REAL searches → bge-m3 embed calls only;
 kbcore.search has no extractor path, so the 14B is never invoked here.
@@ -58,7 +71,9 @@ K = 5
 # instead of silently testing nothing (the harness must stay trustworthy).
 # type/domain/tags let a case exercise search()'s filters so precision cases can
 # pin a query to a single artefact class (e.g. type='decision', tags=['hw:x']).
-ALLOWED_CASE_KWARGS = frozenset({"boost_project", "expand", "as_of", "type", "domain", "tags"})
+ALLOWED_CASE_KWARGS = frozenset(
+    {"boost_project", "expand", "as_of", "include_superseded", "type", "domain", "tags"}
+)
 _CRITERIA_KEYS = ("expect_substr", "expect_item_id", "forbid_item_id")
 
 
@@ -124,6 +139,11 @@ def _search_kwargs(case: dict) -> dict:
         kwargs["hops"] = search_expand.hops_from_expand(raw["expand"])
     if "as_of" in raw:
         kwargs["as_of"] = _parse_as_of(raw["as_of"])
+    if "include_superseded" in raw:
+        # Transaction-time axis (review #8 H5): a bitemporal case may reach the
+        # superseded revisions default search rightly hides. Coerced to bool so
+        # a YAML 'yes'/1 cannot smuggle a non-bool into search().
+        kwargs["include_superseded"] = bool(raw["include_superseded"])
     # type/domain/tags map straight through to the identically-named search()
     # filters (no translation, unlike expand→hops / as_of→datetime).
     for key in ("type", "domain", "tags"):

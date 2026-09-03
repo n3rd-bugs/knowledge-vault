@@ -10,10 +10,8 @@ DB (Invariant 2). The 14B extractor is invoked ONLY here, keep_alive=0 (Invarian
 from __future__ import annotations
 
 import logging
-import shutil
 import time
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from kbcore import (
@@ -31,7 +29,6 @@ from kbcore import (
 )
 from kbcore.config import settings
 from kbcore.db import advisory_lock
-from kbcore.ingest import ingest
 from kbcore.review import auto_resolve_contradiction
 from kbworker import (
     allocator,
@@ -59,6 +56,18 @@ from kbworker.cohort import (  # noqa: F401
     reset_cohort_stats,
 )
 
+# The drain loop (QUEUE_BATCH / MAX_REFILLS / _drain_ingest_queue / _drain_step)
+# moved to kbworker.drainloop (mechanical split, 2026-09-03, review #8 H0) —
+# re-imported for the same seam reason: the tests drive and REBIND them as
+# ``consolidate.<name>``, and drainloop reads its five patched collaborators
+# back through THIS module at call time (see its docstring).
+from kbworker.drainloop import (  # noqa: F401
+    MAX_REFILLS,
+    QUEUE_BATCH,
+    _drain_ingest_queue,
+    _drain_step,
+)
+
 # The power guard moved to kbworker.powerguard (mechanical split, 2026-08-21,
 # review #5) — re-imported for the same seam reason: should_stop resolves the
 # global ``_on_battery``, and the test suite patches ``consolidate._on_battery``.
@@ -79,6 +88,18 @@ from kbworker.prep import (  # noqa: F401
     _warn_if_oversized,
     window_budget_bytes,
     window_budget_tokens,
+)
+
+# Host telemetry, the timed step runner and the run report moved to
+# kbworker.run_report (same split) — re-imported: main() and the tests call
+# them as ``consolidate.<name>``.
+from kbworker.run_report import (  # noqa: F401
+    _disk_pct,
+    _host_memory,
+    _rejection_rate,
+    _rerank_probe_step,
+    _run_step,
+    _write_report,
 )
 from kbworker.tail_ops import (  # noqa: F401
     _CONTRA_STATS,
@@ -117,25 +138,6 @@ EVIDENCE_PAIR_CAP_UNBOUNDED = 48  # no-deadline days: catch-up capacity
 # Read at call time (_evidence_pair_cap), like the divisor, so a patched cap
 # keeps its exact pre-split meaning.
 EVIDENCE_PAIR_CAP: int | None = None
-
-# MEANING CHANGED 2026-08-01: this is the ceiling on ingest_queue ROWS one REFILL
-# may materialise — a memory bound — and no longer the budget for a whole run.
-# It was both, and the two units are not the same thing: a run stopped after 200
-# ROWS, but the work is measured in JOBS (a coalesced session of 350 rows is one
-# group, a one-row note is also one group), so a night of small submissions
-# stopped at 200 rows with hours of window left and a night of one big session
-# spent the whole budget on it. The drain now refills until the queue is empty or
-# the stand-down guard fires; this only bounds how much is read per refill.
-QUEUE_BATCH = 200
-
-# Backstop on the refill loop. Each refill is bounded, but the SUPPLY is not:
-# clients can enqueue while the drain runs, and a single-row submission is
-# eligible immediately (no quiet period), so "refill until pending is empty"
-# could in principle never terminate. The real bound is the deadline/battery
-# guard; this exists so a run without one (an owner-requested `main(stop=None)`)
-# still ends. At kb_drain_cohort=30 this is 6,000 groups — orders of magnitude
-# past what a night's GPU window can extract, so hitting it is a loud anomaly.
-MAX_REFILLS = 200
 
 # STARVATION FIX. The pair cap // this is reserved, at the FRONT of each
 # nightly batch, for rows that already carry a decisive suggestion
@@ -207,132 +209,6 @@ def should_stop() -> str | None:
     reason = "deadline" if _past_deadline() else ("battery" if _on_battery() else None)
     _stop_cache = (now, reason)
     return reason
-
-
-def _drain_ingest_queue() -> tuple[int, int]:
-    """Step 0: extract queued remote submissions — the ONLY place the 14B runs on
-    remote content (Invariant 8). Per-group isolation: one bad group logs + continues.
-
-    A REFILL LOOP (2026-08-01), not one poll. The old shape asked
-    ``pending_groups`` once for :data:`QUEUE_BATCH` ROWS and processed whatever
-    that returned, which conflated two units: the budget was rows, the work is
-    jobs. A night of small submissions therefore stopped after 200 one-row groups
-    with most of its window unused, while a night holding one 350-row coalesced
-    session spent the entire budget on that single session. Each iteration now
-    asks for enough groups to fill ONE cohort, processes them through the
-    unchanged cohort machinery, and asks again — until the queue is drained, the
-    stand-down guard fires, or :data:`MAX_REFILLS` trips.
-
-    PROCESSED GROUPS ARE EXCLUDED FOR THE REST OF THE RUN, and this is load
-    bearing rather than an optimisation. A group that DEFERS (extractor/embedder
-    outage) is left 'pending' on purpose, and a content failure under the attempts
-    cap is left retryable-'failed' — both are still drainable a millisecond
-    later, so a naive refill would re-fetch the group it just failed and retry it
-    until the deferral/attempts cap retired it, collapsing a policy of "one
-    attempt per NIGHT" into "N attempts per run". The keys are tracked here, for
-    this run only, and passed to ``pending_groups`` as ``exclude``.
-
-    THREE PASSES PER COHORT (2026-07-29), then ingest job by job. Batching is per
-    cohort and never per run: the crash window stays one cohort wide (the same
-    exposure the extraction prefetch already had) and only ``kb_drain_cohort``
-    plans — each pinning its transcript — are live at once. Ingest and
-    ``mark_group_extracted`` deliberately stay per job: batching those would
-    widen the pre-existing "written but still pending" window for real.
-
-    The stand-down guard is asked BETWEEN cohorts here — across refills too, so
-    the exemption is for the run's FIRST cohort only, not for the first cohort of
-    every refill; the check before that first one belongs to the run
-    (:func:`_drain_step`), because "should this run start at all" is a question
-    about the run, not about a batch. Stopping can land mid-GROUP now that a
-    group spans several window jobs — its rows are simply still 'pending', so the
-    next run re-extracts the group from its first window and the already-ingested
-    items dedupe on (kind, uri, content_hash) (Invariant 3).
-
-    Returns ``(rows_drained, items_saved)``.
-    """
-    cohort = max(1, int(settings.kb_drain_cohort))
-    # Seeded where the dict lives (kbworker.cohort — mechanical move 2026-08-14);
-    # every key is ADDED, never renamed, because the report is read night-over-night.
-    reset_cohort_stats(cohort)
-    live = ensemble.mode() == "live"
-
-    drained = 0
-    saved_total = 0
-    reserve = allocator.TailReserve.for_run()  # window left for the LLM tail
-    run_t0 = time.monotonic()  # the weekday drain budget's clock (drainsched)
-    batches_done = 0  # across ALL refills: only the run's FIRST cohort is exempt
-    processed: set[tuple[str, str]] = set()
-    stopped = False
-    for _refill in range(MAX_REFILLS):
-        groups = ingest_queue.pending_groups(
-            limit=QUEUE_BATCH, max_groups=cohort, exclude=processed
-        )
-        # Belt and braces for the exclusion: whatever the SQL returns, a group
-        # this run has already touched is never processed twice, so the loop
-        # always makes progress and therefore always terminates.
-        groups = [g for g in groups if (g["project"], g["group_uri"]) not in processed]
-        if not groups:
-            break
-        processed.update((g["project"], g["group_uri"]) for g in groups)
-        _COHORT_STATS["cohort_refills"] += 1
-        _COHORT_STATS["cohort_groups_considered"] += len(groups)
-        _COHORT_STATS["cohort_eligible"] += len(groups)
-
-        jobs = _assemble_jobs(groups)
-        cohorting = cohort > 1 and live and bool(jobs)
-        batches = _batch_jobs(jobs, cohort) if cohorting else ([jobs] if jobs else [])
-
-        for n, batch in enumerate(batches):
-            # Same exemption as the guard, for the same reason: the run's first
-            # cohort is _drain_step's call, not a batch's.
-            reason = (
-                should_stop()
-                or drainsched.drain_budget_reason(run_t0)
-                or reserve.deny_reason(batches[n:])
-                if batches_done
-                else None
-            )
-            if reason:
-                left = sum(len(b) for b in batches[n:])
-                logger.warning(
-                    "drain pausing (%s) after %d refill(s): %d cohort(s) / %d job(s) "
-                    "deferred — rows stay 'pending' and the next eligible run resumes here",
-                    reason,
-                    _COHORT_STATS["cohort_refills"],
-                    len(batches) - n,
-                    left,
-                )
-                _COHORT_STATS["deadline_deferred_jobs"] = left  # never renamed (telemetry)
-                if reason == drainsched.DRAIN_BUDGET_REASON:
-                    # Review #6 contract: still-pending ROWS the weekday budget shed.
-                    _COHORT_STATS["drained_deferred"] = ingest_queue.queue_depth()
-                _note_stop("queued_drained", reason, left)
-                stopped = True
-                break
-            batches_done += 1
-            t0 = time.monotonic()
-            pre_by_key, plan_by_key = _cohort_prepare(batch) if cohorting else ({}, {})
-            for job in batch:
-                rows, saved = _drain_job(
-                    job,
-                    pre_extracted=pre_by_key.get(job["key"]),
-                    planned=plan_by_key.get(job["key"]),
-                )
-                drained += rows
-                saved_total += saved
-            reserve.record(len(batch), time.monotonic() - t0)  # this run's s/job
-        if stopped:
-            break
-    else:
-        logger.warning(
-            "drain hit the %d-refill backstop with work still pending — the queue is "
-            "being filled at least as fast as it drains",
-            MAX_REFILLS,
-        )
-    # AFTER the loop, so tonight's deferral bumps are counted: an impending
-    # deferral-cap escalation must reach the digest (review #3 P1 rider).
-    record_deferral_pressure()
-    return drained, saved_total
 
 
 def _evidence_pair_cap(now: datetime | None = None) -> int:
@@ -439,136 +315,6 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int]:
     return refreshed, auto_resolved
 
 
-def _disk_pct() -> float:
-    """Percent used on the filesystem holding KB_RAW."""
-    p = settings.raw
-    while not p.exists() and p != p.parent:
-        p = p.parent
-    usage = shutil.disk_usage(p if p.exists() else Path("/"))
-    return round(usage.used / usage.total * 100, 1)
-
-
-def _host_memory(meminfo: Path = Path("/proc/meminfo")) -> tuple[float, float]:
-    """(swap % used, MemAvailable in GiB) — ONE procfs read, beside disk_pct.
-
-    Swap hit 14G/16G on 2026-08-21 with zero telemetry anywhere (review #5
-    ops-3). Framing per the verifier: cold-page parking under the consolidate
-    cgroup plus Ollama loads, NOT imminent OOM — 43Gi MemAvailable at the peak —
-    so this is telemetry, never an alarm. The digest renders a positive-only
-    line when swap tops 80% (pkg-reporting); both raw numbers ride every run
-    report so the trend is answerable from data. ``meminfo`` is a parameter for
-    hermetic tests only.
-    """
-    fields: dict[str, int] = {}
-    for line in meminfo.read_text(encoding="ascii", errors="replace").splitlines():
-        key, _, rest = line.partition(":")
-        parts = rest.split()
-        if parts and parts[0].isdigit():
-            fields[key] = int(parts[0])  # kB
-    swap_total = fields.get("SwapTotal", 0)
-    swap_pct = (
-        round((swap_total - fields.get("SwapFree", 0)) / swap_total * 100, 1) if swap_total else 0.0
-    )
-    return swap_pct, round(fields.get("MemAvailable", 0) / 1048576, 1)
-
-
-def _rejection_rate() -> float | None:
-    rejected, saved = consolidation.extraction_stats()
-    total = rejected + saved
-    return round(rejected / total, 3) if total else None
-
-
-def _rerank_probe_step(counts: dict[str, Any]) -> None:
-    """Tail step (review #5 ops-4): ask the rerank sidecar to prove it can score.
-
-    ``kbcore.rerank.probe`` (pkg-search) POSTs a fixed two-document probe and
-    returns ``{'ok': bool, 'latency_ms': int|None}``, itself fail-open. Guarded
-    with ``hasattr`` + try/except so this tree imports and runs even before that
-    helper lands: no probe, or no ``kb_rerank_url`` configured, means no keys and
-    therefore no digest line (positive-only). A red eval night's meta must say
-    which ranking system was measured — on 08-18 nothing ruled the sidecar in or
-    out, and it demonstrably parks ~272MB in swap, so first-touch timeouts are
-    armed; ``'failed'`` here is the attribution, in meta instead of journald.
-    """
-    from kbcore import rerank
-
-    if not (settings.kb_rerank_url or "").strip() or not hasattr(rerank, "probe"):
-        return
-    try:
-        result = rerank.probe() or {}
-        counts["rerank_probe"] = "ok" if result.get("ok") else "failed"
-        counts["rerank_probe_ms"] = result.get("latency_ms")
-    except Exception:  # noqa: BLE001 — fail-open like every tail step
-        logger.exception("rerank probe failed")
-        counts["rerank_probe"] = "failed"
-        counts["rerank_probe_ms"] = None
-
-
-def _run_step(counts: dict[str, Any], key: str, fn) -> None:
-    """Run one step, isolating failure: log and leave the count at 0.
-
-    Also TIMES it. A pass ran for over an hour producing nothing, and there was
-    no way to say which step consumed it without guessing — the same blind spot
-    that hid a 40% CPU fallback and an inert cohort path. Durations land in the
-    run report (counts["step_secs"]), which is persisted in
-    consolidation_requests.result, so "where did the hour go" is answerable from
-    data on the next run rather than by instrumenting after the fact.
-    """
-    t0 = time.monotonic()
-    try:
-        counts[key] = fn()
-    except Exception:  # noqa: BLE001 — one step must not abort the pass
-        logger.exception("consolidation step %r failed", key)
-    finally:
-        secs = round(time.monotonic() - t0, 1)
-        counts.setdefault("step_secs", {})[key] = secs
-        # WARNING so it survives the unit's default level: an INFO line here was
-        # invisible in journald and cost hours of archaeology.
-        if secs >= 60:
-            logger.warning("consolidation step %r took %.0fs", key, secs)
-
-
-def _write_report(counts: dict[str, Any]) -> int:
-    ts = datetime.now(UTC)
-    body = "Nightly consolidation report\n\n" + "\n".join(f"- {k}: {v}" for k, v in counts.items())
-    return ingest(
-        "kb-system",
-        "report",
-        f"Consolidation report {ts.date().isoformat()}",
-        body,
-        kind="chat",
-        uri=f"report:{ts.isoformat()}",
-        trust="verified",
-        meta={"consolidation": True, **counts},
-    )
-
-
-def _drain_step(counts: dict[str, Any], stop: StopCheck | None) -> int:
-    """Step 0, with the stand-down guard asked BEFORE the first cohort.
-
-    BOOT-CATCH-UP CONSEQUENCE, and it is the intended behaviour: the timer is
-    ``Persistent=true``, so a box that boots at 14:00 after a power cut fires the
-    missed 03:30 run immediately — already hours past the noon deadline. Asking
-    the guard before the first cohort means such a run DEFERS the whole drain to
-    the next nightly instead of putting the 14B on the GPU in the middle of the
-    working day, which is exactly what the deadline exists to prevent. Nothing is
-    lost: the rows stay 'pending' and ingest is idempotent (Invariant 3).
-    """
-    ensemble.reset_shadow_counter()  # per-run shadow accumulator (WP-B2)
-    reason = stop() if stop is not None else None
-    if reason:
-        # The long-lived watcher runs main() repeatedly in ONE process; leaving
-        # the previous run's cohort telemetry standing would report work this
-        # run never did.
-        _COHORT_STATS.clear()
-        _note_stop("queued_drained", reason, ingest_queue.queue_depth())
-        return 0
-    drained, saved = _drain_ingest_queue()
-    counts["queued_items_saved"] = saved
-    counts["ensemble_shadow_survivors"] = ensemble.shadow_survivor_total()
-    return drained
-
-
 def nightly() -> dict[str, Any]:
     """The UNATTENDED entry point (kb-consolidate.service / ``make consolidate``).
 
@@ -600,6 +346,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
 
         _STOP_LOG.clear()
         reset_stop_cache()
+        run_t0 = time.monotonic()  # wall clock for the digest run line (review #8 H7)
         since = consolidation.last_consolidation_at()
         counts: dict[str, Any] = {
             "queued_drained": 0,
@@ -756,7 +503,9 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # WHY the run is as short as it is, and how much it left behind. Rides
         # into consolidation_requests.result with the rest of the report.
         counts["stopped"] = {k: dict(v) for k, v in _STOP_LOG.items()}
-        record_battery_pause(counts)  # arm/disarm the AC-restore trigger (powerguard)
+        # arm/disarm the AC-restore trigger; a run that consumed a pause marker is a
+        # RESUME and the digest says so (review #8 H7d — prior payload or None).
+        counts["resumed_from_pause"] = record_battery_pause(counts)
         counts["review_queue_open"] = consolidation.open_review_count()
         counts["ingest_queue_pending"] = ingest_queue.queue_depth()
         _run_step(counts, "fleet_degenerate_by_project", fleet_health.degenerate_by_project)
@@ -770,6 +519,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         counts["extraction_rejection_rate"] = _rejection_rate()
         _rerank_probe_step(counts)  # sidecar health into tonight's meta (review #5)
 
+        counts["run_secs"] = round(time.monotonic() - run_t0, 1)  # ADDED key (H7)
         report_id = _write_report(counts)
         counts["report_item_id"] = report_id
         counts["skipped"] = False

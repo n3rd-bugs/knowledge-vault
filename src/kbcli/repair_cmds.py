@@ -217,4 +217,5 @@ def repair_judge_flagged(
 # The cross-project twin linker lives in its own module (ratchet); importing it
 # here registers `kb repair cross-twins` onto repair_app so main.py's single
 # `import repair_cmds` still wires every repair command.
+from kbcli import repair_audit as _repair_audit  # noqa: E402,F401
 from kbcli import repair_crosstwins as _repair_crosstwins  # noqa: E402,F401

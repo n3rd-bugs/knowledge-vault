@@ -119,7 +119,7 @@ def degenerate_by_project(hours: int | None = None) -> dict[str, dict[str, int]]
     return out
 
 
-def fleet_by_box(hours: int | None = None) -> dict[str, dict[str, int]]:
+def fleet_by_box(hours: int | None = None) -> dict[str, dict[str, Any]]:
     """Per SUBMITTING BOX: the degenerate/total split, keyed by the authenticated
     principal the enqueue path stamps into ``meta->>'submitted_by'`` (KB 19663).
 
@@ -136,6 +136,15 @@ def fleet_by_box(hours: int | None = None) -> dict[str, dict[str, int]]:
     ``fleet_by_box`` beside the project view; nothing is renamed. The window is
     the same tiled one as the project view (:func:`window_start`), so the two
     aggregates always describe the same rows.
+
+    ``hook_version`` (review #8 H15): the box's most recent stamped hook version
+    in the window, read from ``meta->>'hook_version'`` — the digest install.sh
+    records in ``.setup-version`` and the flush hook sends over REST. It is the
+    only server-side way to tell WHICH boxes carry a given fix (the IPv4 pin, the
+    H11 envelope gate). ABSENT means absent: a box whose rows carry no stamp
+    (pre-stamp hooks, or the MCP transport, which never sends it) gets no key
+    rather than a blank — and that absence is itself signal, exactly like
+    ``(unknown)`` above. The digest's tolerant reader ignores the key.
     """
     start = window_start(hours)
     with connect() as conn:
@@ -143,7 +152,10 @@ def fleet_by_box(hours: int | None = None) -> dict[str, dict[str, int]]:
             f"""
             SELECT coalesce(nullif(btrim(meta->>'submitted_by'), ''), '(unknown)') AS box,
                    count(*) FILTER (WHERE {_DEGENERATE_URI_SQL}) AS degenerate,
-                   count(*) AS total
+                   count(*) AS total,
+                   (array_agg(meta->>'hook_version' ORDER BY created_at DESC, id DESC)
+                      FILTER (WHERE nullif(btrim(meta->>'hook_version'), '') IS NOT NULL)
+                   )[1] AS hook_version
               FROM ingest_queue
              WHERE created_at > %s
              GROUP BY box
@@ -151,7 +163,13 @@ def fleet_by_box(hours: int | None = None) -> dict[str, dict[str, int]]:
             """,  # noqa: S608 — _DEGENERATE_URI_SQL is a constant fragment
             (start,),
         ).fetchall()
-    return {str(b): {"degenerate": int(d), "total": int(t)} for b, d, t in rows}
+    out: dict[str, dict[str, Any]] = {}
+    for box, degenerate, total, hook_version in rows:
+        counts: dict[str, Any] = {"degenerate": int(degenerate), "total": int(total)}
+        if hook_version:
+            counts["hook_version"] = str(hook_version)
+        out[str(box)] = counts
+    return out
 
 
 def stale_hook_projects(report: Any) -> list[str]:

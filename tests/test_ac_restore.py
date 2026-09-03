@@ -131,7 +131,8 @@ def test_consolidate_re_exports_the_recorder():
 
 
 def test_mains_tail_arms_the_trigger_on_a_battery_run(kb, monkeypatch, tmp_path):
-    monkeypatch.setattr(consolidate.ingest_queue, "queue_depth", lambda: 41)
+    # H6 (pkg-pipeline) counts only rows that existed at run start: queue_depth(before=...)
+    monkeypatch.setattr(consolidate.ingest_queue, "queue_depth", lambda *a, **k: 41)
     monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)
     state_dir = tmp_path / "state"
     monkeypatch.setattr(settings, "kb_state_dir", state_dir)
@@ -160,11 +161,18 @@ def test_mains_tail_disarms_the_trigger_on_a_clean_run(kb, monkeypatch, tmp_path
 
 
 def _power_db(tmp_path, rows) -> str:
-    """A stand-in sungrow DB; rows are (grid_voltage, iso_timestamp)."""
+    """A stand-in sungrow DB in the poller's real two-table shape; rows are
+    (grid_voltage, iso_timestamp) readings of the BATTERY inverter (id 1).
+    tests/test_powerguard.py covers the multi-inverter and raw_data cases."""
     path = tmp_path / "sungrow.sqlite3"
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT)")
-    conn.executemany("INSERT INTO monitor_inverterreading VALUES (?,?)", rows)
+    conn.execute("CREATE TABLE monitor_inverter (id INTEGER PRIMARY KEY, has_battery BOOL)")
+    conn.executemany("INSERT INTO monitor_inverter VALUES (?,?)", [(1, 1), (2, 0)])
+    conn.execute(
+        "CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT, "
+        "inverter_id INTEGER, raw_data TEXT)"
+    )
+    conn.executemany("INSERT INTO monitor_inverterreading VALUES (?,?,1,NULL)", rows)
     conn.commit()
     conn.close()
     return str(path)
@@ -245,10 +253,19 @@ def test_the_script_is_executable_and_parses_clean():
     assert proc.returncode == 0, proc.stderr
 
 
-def _rig(tmp_path, state_word: str = "grid", debounce: int = 60):
+def _rig(
+    tmp_path,
+    state_word: str = "grid",
+    debounce: int = 60,
+    unit_state: str = "inactive",
+    backup_state: str = "inactive",
+):
     """A hermetic script rig: fake HOME + state dir, a stubbed probe via the
     script's documented PYTHON_BIN seam, a recording systemctl stub on PATH, and
-    KB_ENV_FILE pointing at a test env file so the real .env is never sourced."""
+    KB_ENV_FILE pointing at a test env file so the real .env is never sourced.
+
+    ``unit_state`` is what the stub answers for `is-active kb-consolidate.service`
+    and ``backup_state`` for either backup unit (review #8 H10b/d rigs)."""
     home = tmp_path / "home"
     state = tmp_path / "state"
     bindir = tmp_path / "bin"
@@ -263,7 +280,12 @@ def _rig(tmp_path, state_word: str = "grid", debounce: int = 60):
     # `is-active` query on every pass (answered silently as inactive here), and
     # the tests' "no service was touched" assertions mean starts, not queries.
     sysctl.write_text(
-        f'#!/usr/bin/env bash\ncase "$*" in *start*|*stop*) echo "$@" >> "{calls}";; esac\n'
+        "#!/usr/bin/env bash\n"
+        'case "$*" in\n'
+        f'  *is-active*kb-consolidate*) echo "{unit_state}";;\n'
+        f'  *is-active*kb-backup*) echo "{backup_state}";;\n'
+        f'  *start*|*stop*) echo "$@" >> "{calls}";;\n'
+        "esac\n"
     )
     sysctl.chmod(0o755)
     envfile = tmp_path / "test.env"
@@ -348,3 +370,110 @@ def test_script_dry_run_prints_the_decision_and_changes_nothing(tmp_path):
     (state / "battery-pause.json").unlink()
     proc = _run(env, "--dry-run")
     assert proc.returncode == 0 and "no pause marker" in proc.stdout
+
+
+# ------------------------------ stand-down and the attempt cap (review #8 H10b/c/d)
+
+
+def _armed(state, age: int = 120):
+    """Marker armed + a debounce stamp already older than the 60 s rig debounce."""
+    (state / "battery-pause.json").write_text("{}")
+    stamp = state / "grid-ok.stamp"
+    stamp.touch()
+    old = datetime.now(UTC).timestamp() - age
+    os.utime(stamp, (old, old))
+    return stamp
+
+
+@pytest.mark.parametrize("unit_state", ["active", "activating"])
+def test_a_live_consolidation_stands_the_trigger_down(tmp_path, unit_state):
+    """8afdc43's is-active branch, rigged: no start, stamp untouched, silent stdout."""
+    state, calls, env = _rig(tmp_path, unit_state=unit_state)
+    stamp = _armed(state)
+    before = stamp.stat().st_mtime
+    proc = _run(env)
+    assert (proc.returncode, proc.stdout) == (0, "")
+    assert not calls.exists(), "a live run must never be started again"
+    assert stamp.exists() and stamp.stat().st_mtime == before, "the stamp is untouched"
+    dry = _run(env, "--dry-run")
+    assert dry.returncode == 0 and "standing down" in dry.stdout
+    assert "kb-consolidate.service" in dry.stdout
+
+
+@pytest.mark.parametrize("backup_state", ["active", "activating"])
+def test_a_running_backup_stands_the_trigger_down(tmp_path, backup_state):
+    """H10b: the Sep 1 ticks at boot+0:38 and boot+5:36 landed inside the boot-path
+    backup while the guard only fires at boot+10 — a drain must not start under a
+    dump or an offsite push, from either backup unit."""
+    state, calls, env = _rig(tmp_path, backup_state=backup_state)
+    stamp = _armed(state)
+    proc = _run(env)
+    assert (proc.returncode, proc.stdout) == (0, "")
+    assert not calls.exists() and stamp.exists()
+    dry = _run(env, "--dry-run")
+    assert "standing down" in dry.stdout and "kb-backup" in dry.stdout
+
+
+def test_a_failed_consolidation_stands_the_trigger_down(tmp_path):
+    """H10c: kicking a failing unit every 5 minutes is not a resume — the nightly
+    owns the retry (pre-trigger behaviour); OnFailure has already paged."""
+    state, calls, env = _rig(tmp_path, unit_state="failed")
+    _armed(state)
+    proc = _run(env)
+    assert (proc.returncode, proc.stdout) == (0, "")
+    assert not calls.exists()
+    assert "failed" in _run(env, "--dry-run").stdout
+
+
+def test_each_resume_start_is_counted_and_the_count_is_swept_with_the_marker(tmp_path):
+    state, calls, env = _rig(tmp_path)
+    _armed(state)
+    proc = _run(env)
+    assert proc.returncode == 0 and calls.exists()
+    assert (state / "resume-attempts").read_text().strip() == "1"
+    assert "resume attempt 1/3" in proc.stdout
+    (state / "battery-pause.json").unlink()  # a clean run cleared the marker
+    _run(env)
+    assert not (state / "resume-attempts").exists(), "the counter is swept with the stamp"
+
+
+def test_the_attempt_cap_says_so_once_then_stands_down(tmp_path):
+    """H10c: after 3 starts without the marker clearing, ONE line and then silence."""
+    state, calls, env = _rig(tmp_path)
+    _armed(state)
+    (state / "resume-attempts").write_text("3\n")
+    first = _run(env)
+    assert first.returncode == 0 and not calls.exists()
+    assert "leaving leftovers to the nightly" in first.stdout
+    assert (state / "resume-attempts").read_text().strip() == "4"
+    second = _run(env)
+    assert (second.returncode, second.stdout) == (0, "") and not calls.exists()
+    assert (state / "resume-attempts").read_text().strip() == "4"
+    assert (state / "battery-pause.json").exists(), "the marker is never removed here"
+
+
+def test_dry_run_at_the_cap_changes_nothing(tmp_path):
+    state, calls, env = _rig(tmp_path)
+    _armed(state)
+    (state / "resume-attempts").write_text("3")
+    proc = _run(env, "--dry-run")
+    assert proc.returncode == 0 and "would stand down" in proc.stdout
+    assert (state / "resume-attempts").read_text() == "3" and not calls.exists()
+
+
+def test_record_battery_pause_returns_the_prior_marker_it_consumed(tmp_path):
+    """Review #8 H7d: the digest names a RESUME. A clean run that found a
+    marker returns its payload (then disarms); a run that found none returns
+    None; a fresh pause both re-arms and reports the prior payload."""
+    marker = tmp_path / "battery-pause.json"
+    assert powerguard.record_battery_pause({"stopped": {}}, marker=marker) is None
+    marker.write_text('{"at": "2026-08-30T00:59:56+00:00", "deferred": 3}')
+    prior = powerguard.record_battery_pause({"stopped": {}}, marker=marker)
+    assert prior == {"at": "2026-08-30T00:59:56+00:00", "deferred": 3}
+    assert not marker.exists(), "a clean run still disarms after reporting"
+    marker.write_text("not json at all")
+    assert powerguard.record_battery_pause({"stopped": {}}, marker=marker) is None
+    marker.write_text('{"at": "x", "deferred": 1}')
+    counts = {"stopped": {"queued_drained": {"reason": "battery", "deferred": 9}}}
+    assert powerguard.record_battery_pause(counts, marker=marker) == {"at": "x", "deferred": 1}
+    assert json.loads(marker.read_text())["deferred"] == 9, "a fresh pause re-arms the marker"

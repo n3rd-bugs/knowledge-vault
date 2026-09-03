@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import UTC, datetime
 from typing import Any, NamedTuple
 
 from psycopg.types.json import Jsonb
@@ -97,14 +98,14 @@ def enqueue(
     commit: str | None = None,
     source_uri: str | None = None,
     allow_reserved: bool = False,
+    hook_version: str | None = None,
 ) -> EnqueueResult:
     """Scrub and enqueue a submission. Returns an :class:`EnqueueResult`.
 
     Rejects unknown kinds, empty content, and oversized content (domain errors).
     The content is SCRUBBED before storage and the dedupe hash is over the
     scrubbed text, so re-submitting identical content is a no-op. ``allow_reserved``
-    is set only by trusted LOCAL callers (the CLI session flush) so a PreCompact
-    hook may file into kb-system; the public REST/MCP path always leaves it false.
+    is set only by trusted LOCAL callers (the CLI flush); REST/MCP leave it false.
 
     Resubmitting content whose only existing row is TERMINALLY FAILED (status
     'failed', attempts ≥ MAX_ATTEMPTS) resets that row to 'pending'/attempts=0 and
@@ -132,7 +133,6 @@ def enqueue(
         raise InvalidOperation(f"content exceeds the {MAX_CONTENT_BYTES}-byte limit")
     if queue_depth() >= MAX_PENDING:
         raise InvalidOperation("ingest queue is full; try again after the nightly drain")
-
     clean, redactions = scrub(content)
     content_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()
     meta: dict[str, Any] = {}
@@ -146,6 +146,7 @@ def enqueue(
         ("branch", branch),
         ("commit", commit),
         ("source_uri", source_uri),
+        ("hook_version", hook_version),  # review #8 H15: fleet version column
     ):
         if value:
             meta[key] = scrub(value)[0]
@@ -304,13 +305,14 @@ def escalate_rows(ids: list[int], error: str) -> None:
         )
 
 
-def queue_depth() -> int:
-    """Count of pending submissions. Resilient to migration 002 not yet applied."""
+def queue_depth(before: datetime | None = None) -> int:
+    """Count of pending submissions — only those created before ``before`` when given (the
+    run start: a row enqueued mid-run is not 'deferred'; H6). Resilient to migration 002."""
     with connect() as conn:
-        exists = conn.execute("SELECT to_regclass('ingest_queue')").fetchone()[0]
-        if exists is None:
+        if conn.execute("SELECT to_regclass('ingest_queue')").fetchone()[0] is None:
             return 0
-        row = conn.execute("SELECT count(*) FROM ingest_queue WHERE status = 'pending'").fetchone()
+        sql = "SELECT count(*) FROM ingest_queue WHERE status = 'pending' AND created_at < %s"
+        row = conn.execute(sql, (before or datetime.max.replace(tzinfo=UTC),)).fetchone()
     return int(row[0])
 
 

@@ -12,16 +12,20 @@ day-logic pattern — and a run that already wrote a weekly item this week skips
 
 READS: the week's nightly consolidation reports (kb-system ``report`` items,
 ``meta.consolidation`` — the eval sentinel's no-new-table channel), the week's
-``search_misses`` (top-10 by count), the promote surface, and the PRIOR weekly
-item's meta: promotes have no ``resolved_at`` to window on, so 'promoted this
-week' is a CHECKPOINT DIFF against the ``promoted_total`` each weekly persists.
+``search_misses`` (top-10 by count + the calibration percentiles), the promote
+surface, the typed-edge totals (:func:`kbcore.save_nudge.typed_edge_counts`,
+its recorded first caller — review #8 H9b), and the PRIOR weekly item's meta:
+promotes and typed edges have no ``resolved_at``/window to count on, so
+'this week' is a CHECKPOINT DIFF against the ``promoted_total`` /
+``typed_edge_totals`` each weekly persists.
 WRITES: one kb-system ``report`` item (full table, ``meta.weekly_report``) and
 ONE push through kbcore.notify — pure ASCII, <20 lines, sent with
 ``title='KB weekly'`` (push_digest keyword override, review #5 ops-1) so the
 phone distinguishes it from the nightly at a glance. Search-miss
 retention rides along (:func:`kbcore.search_misses.sweep_old`, the migration-018
 carve-out). Counts keys are ADDED, never renamed: ``weekly_report_pushed``,
-``weekly_report_item_id``, ``search_misses_swept``.
+``weekly_report_item_id``, ``search_misses_swept``. Display dates are LOCAL
+(review #8 H9f; Invariant 7 — stored UTC, local only at display).
 """
 
 from __future__ import annotations
@@ -37,6 +41,12 @@ from kbcore.config import settings
 from kbcore.db import connect
 from kbcore.drainsched import _DAYS  # the ONE mon..sun table (no second copy)
 from kbcore.ingest import ingest
+from kbworker.weekly_instruments import nights, typed_edge_diff
+
+# Review #8 H9 instrument reads (typed-edge totals, calibration percentiles):
+# one fail-open query each, in kbworker.weekly_reads so this file stays under
+# its cap; re-imported here so ``weekly._calibration_stats`` keeps resolving.
+from kbworker.weekly_reads import _calibration_stats, _typed_edge_totals  # noqa: F401
 
 # THE ESTABLISHED SEAM (mechanical split, review #5 Wave F): rendering moved to
 # kbworker.weekly_render when the promote table + injection fence reached this
@@ -124,12 +134,18 @@ def _run(counts: dict[str, Any]) -> bool | None:
         prev = prior[1].get("promoted_total")
         if isinstance(prev, int) and not isinstance(prev, bool):
             promoted_7d = max(0, promoted_total - prev)
+    # Review #8 H9b/d: the typed-edge checkpoint (same pattern as promoted_total)
+    # and the calibration percentiles — each fail-open to None (rendered n/a).
+    typed_totals = _typed_edge_totals()
+    typed_diff = typed_edge_diff(typed_totals, prior[1].get("typed_edge_totals") if prior else None)
+    calibration = _calibration_stats()
     swept = search_misses.sweep_old()
     counts["search_misses_swept"] = swept
 
     meta: dict[str, Any] = {
         "weekly_report": True,
-        "nights": len(reports),
+        "nights": len(reports),  # the RUN count (the checkpoint diff's axis, unchanged)
+        "local_nights": len(nights(reports)),  # H9f: rows the table actually shows
         "search_misses_7d": miss_stats["total"],
         "search_misses_distinct_7d": miss_stats["distinct"],
         "promote_candidates": candidates,
@@ -138,8 +154,15 @@ def _run(counts: dict[str, Any]) -> bool | None:
     }
     if promoted_7d is not None:
         meta["promoted_7d"] = promoted_7d
+    if typed_totals is not None:
+        meta["typed_edge_totals"] = typed_totals  # next week's checkpoint
+    if typed_diff is not None:
+        meta["typed_edges_7d"] = typed_diff
+    if calibration is not None:
+        meta["calibration_7d"] = calibration
+    local_now = now.astimezone()  # display only: header/title dates are LOCAL (H9f)
     body = _report_body(
-        now,
+        local_now,
         reports,
         miss_stats,
         top,
@@ -148,19 +171,33 @@ def _run(counts: dict[str, Any]) -> bool | None:
         promoted_7d,
         swept,
         promote_rows,
+        typed_totals=typed_totals,
+        typed_diff=typed_diff,
+        calibration=calibration,
+        floor=settings.kb_miss_relevance_floor,
     )
     item_id = ingest(
         "kb-system",
         "report",
-        f"KB weekly report {now.date().isoformat()}",
+        f"KB weekly report {local_now.date().isoformat()}",
         body,
         kind="chat",
-        uri=f"weekly-report:{now.isoformat()}",
+        uri=f"weekly-report:{now.isoformat()}",  # the UTC instant stays the identity
         trust="verified",
         meta=meta,
     )
     counts["weekly_report_item_id"] = item_id
-    lines = _push_lines(now, reports, miss_stats, top, candidates, promoted_7d, item_id)
+    lines = _push_lines(
+        local_now,
+        reports,
+        miss_stats,
+        top,
+        candidates,
+        promoted_7d,
+        item_id,
+        typed_totals=typed_totals,
+        typed_diff=typed_diff,
+    )
     pushed = bool(notify.push_digest(lines, title="KB weekly"))
     logger.info(
         "weekly report written (item %s), push %s", item_id, "sent" if pushed else "not sent"

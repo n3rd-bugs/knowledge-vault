@@ -228,7 +228,10 @@ def test_a_deadline_mid_run_stops_BETWEEN_cohorts_and_leaves_the_rest_pending(kb
     assert [statuses[i] for i in ids] == ["extracted"] * 2 + ["pending"] * 4, (
         "the unreached remainder is not still pending"
     )
-    assert consolidate._STOP_LOG["queued_drained"] == {"reason": "deadline", "deferred": 2}
+    # Review #8 H6: the stop log carries the still-pending ROWS (4), the same number
+    # as drained_deferred; the jobs unit keeps its own telemetry key (2 groups).
+    assert consolidate._STOP_LOG["queued_drained"] == {"reason": "deadline", "deferred": 4}
+    assert consolidate._COHORT_STATS["drained_deferred"] == 4
     assert consolidate._COHORT_STATS["deadline_deferred_jobs"] == 2
 
     # ...and the next run resumes exactly there.

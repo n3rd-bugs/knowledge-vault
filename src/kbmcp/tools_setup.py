@@ -156,7 +156,7 @@ export KB_ENROL_CODE={enrol.code}   # single use, expires in ~{mins} min
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
 for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
          kb-mcp-call.sh notify-complete.sh turn-start.sh \
-         kb-hook-dispatch.sh kb-flush-backfill.sh; do
+         kb-hook-dispatch.sh kb-flush-backfill.sh update.sh; do
   curl -4 -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh

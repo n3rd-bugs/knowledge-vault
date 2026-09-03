@@ -19,6 +19,21 @@ the A/B restores its two extra replays. GPU courtesy (Invariant 8) is unchanged:
 real searches → embeds only; kbcore.search has no extractor path, so the 14B is
 never invoked. Kill switches: ``kb_eval_in_consolidation`` (whole eval),
 :data:`GRAPH_AB_ENABLED`, :data:`TRUST_METRIC_ENABLED`.
+
+E1 TELEMETRY (review #8 H5, KB 31857): the composition pass also records WHICH
+hit satisfied each golden case — ``eval_satisfier_types`` /
+``eval_summary_only_cases`` / ``eval_satisfier_ids`` (kbworker.eval_composition)
+— the >=5-night series the eval epoch's summaries verdict and identifier-mass
+go/no-go read. The rerank rollup ``eval_rerank_outcome`` is fallback > active >
+off and the digest renders the tally verbatim (H7a).
+
+MRR QUANTUM: MRR is a mean of 1/rank over the positive-criterion cases, so ONE
+golden case slipping rank 1 -> 2 moves it by exactly (1 - 1/2) / n_positive =
+0.5/52 = 0.0096 on today's set — or an equivalent decomposition (two cases
+slipping 2 -> 3 and 3 -> 4 read the same). The 08-29 step 0.9365 -> 0.9269 was
+exactly one quantum of corpus composition (661 new summaries + doc-refresh
+churn, 22/22 top-5 ids swapped). A single-quantum move is a PER-CASE read at
+the eval epoch, never drift; REGRESSION_EPSILON (0.05) is ~5 quanta away.
 """
 
 from __future__ import annotations
@@ -30,8 +45,19 @@ from typing import Any
 
 from kbcore import eval_harness, search_expand
 from kbcore.config import settings
-from kbcore.search import search
-from kbworker import eval_trust
+
+# `search` is the composition instrument's patch surface (tests patch
+# `eval_sentinel.search`); kbworker.eval_composition reads it back through here.
+from kbcore.search import search  # noqa: F401
+
+# The top-5 composition instrument moved to kbworker.eval_composition
+# (mechanical split, 2026-09-03, review #8 H0) — same seam: callers and tests
+# reach it as ``eval_sentinel._trust_composition`` / ``TRUST_K``, and it reads
+# ``search`` back through this module (see its docstring).
+from kbworker.eval_composition import (  # noqa: F401
+    TRUST_K,
+    _trust_composition,
+)
 
 # THE ESTABLISHED SEAM (mechanical split, review #5 Wave F): the regression
 # detector moved to its own module when the verified-lift watch reached this
@@ -55,7 +81,6 @@ logger = logging.getLogger("kbworker.eval_sentinel")
 # reclaims the two nightly A/B replays; re-enable with real proposed fixtures.
 GRAPH_AB_ENABLED = False
 TRUST_METRIC_ENABLED = True
-TRUST_K = 5  # top-K window the trust composition is measured over
 
 
 def run_sentinel(counts: dict[str, Any]) -> None:
@@ -111,20 +136,24 @@ def _run(counts: dict[str, Any]) -> None:
     # a meta number instead of a red night. getattr, so a stubbed evaluate()
     # returning bare tuples (the sentinel test rig) still counts 0.
     counts["eval_chain_resolved"] = sum(1 for r in _results if getattr(r, "chain_resolved", False))
-    # Review #5 ops-4 / review #6 instrument fix: which rerank path scored
-    # tonight's replay, PER CASE — kbcore.rerank accumulates a thread-local
-    # {active, fallback} tally across the harness's searches, 'off' is derived
-    # (see rerank.outcome_tally). ``eval_rerank_outcome`` keeps its key and
-    # value domain but is now the WORST observed outcome across cases
-    # (fallback > off > active), never just the final case's; the tally is an
-    # ADDED key. Snapshot here, before the instruments replay more searches.
+    # Review #5 ops-4 / review #6 instrument fix / review #8 H7a: which rerank
+    # path scored tonight's replay, PER CASE — kbcore.rerank accumulates a
+    # thread-local {active, fallback} tally across the harness's searches,
+    # 'off' is derived (see rerank.outcome_tally). ``eval_rerank_outcome``
+    # keeps its key and value domain and rolls up fallback > active > off:
+    # 'fallback' if ANY case was measured on the fused order, else 'active' if
+    # the sidecar scored anything, else 'off' (NO case reranked). The review #6
+    # order (fallback > off > active) read 'off' on every healthy night because
+    # one golden case structurally has <2 fused candidates — the scalar hid
+    # the sidecar's activity. The tally is an ADDED key the digest renders
+    # VERBATIM. Snapshot here, before the instruments replay more searches.
     try:
         from kbcore import rerank as _rerank
 
         tally = _rerank.outcome_tally(len(golden))
         counts["eval_rerank_tally"] = tally
         counts["eval_rerank_outcome"] = next(
-            (o for o in ("fallback", "off", "active") if tally.get(o)), "off"
+            (o for o in ("fallback", "active", "off") if tally.get(o)), "off"
         )
     except Exception:  # noqa: BLE001 — observability may never fail the eval
         pass
@@ -224,75 +253,3 @@ def _graph_expansion_ab(golden: list[dict]) -> dict[str, Any]:
         "eval_ab_delta_hit_at_5": round(on_hit - off_hit, 4),
         "eval_ab_delta_mrr": round(on_mrr - off_mrr, 4),
     }
-
-
-# --- instrument 2: trust composition of the top-5 ----------------------------
-
-
-def _trust_composition(golden: list[dict]) -> dict[str, Any]:
-    """Trust AND type composition of the golden queries' top-5 (report-only).
-
-    Two shares, POOLED (micro) over every top-5 hit of every query so a query
-    returning one hit does not weigh like one returning five:
-
-    * ``eval_top5_unverified_share`` — hits with trust != 'verified'. ~91% of the
-      corpus is unverified (quote-grounded auto-extractions, Invariant 4) and
-      NOTHING else sees whether the verified minority SURFACES: a golden case
-      passes identically whether its answer was hand-verified or unreviewed.
-    * ``eval_top5_summary_share`` — hits whose ``type == 'summary'``.
-      Consolidation-minted summaries are ~9% of items, all unverified, and exempt
-      from every hygiene pass; a month of this share says whether they earn their
-      top-5 slots or crowd out the primaries they summarize.
-
-    Structurally report-only: replays the QUERIES read-only with ``tool=None`` (no
-    access_log write — eval reads are not usage), touches no ranking input, and
-    returns numbers. Retrieval order is unchanged. Measured on the PRODUCTION
-    DEFAULT config — plain query, default hops, no per-case knobs — because the
-    question is what an ordinary agent query surfaces.
-
-    Two Wave-F riders on the same read-only pass (review #5): the DISTINCT top-5
-    item ids are persisted (``eval_top5_item_ids`` — the weekly promote table
-    prefers candidates the eval actually surfaces; they were counted but never
-    persisted), and :func:`kbworker.eval_trust.verified_lift` turns the share
-    into the watched lift ratio (+ ``eval_trust_status='watch'`` on a trip).
-    """
-    unverified = 0
-    summary = 0
-    total = 0
-    top5_ids: set[int] = set()
-    for case in golden:
-        query = case.get("q")
-        if not query:
-            continue
-        for hit in search(query, k=TRUST_K, tool=None):
-            total += 1
-            unverified += int(hit.trust != "verified")
-            summary += int(hit.type == "summary")
-            top5_ids.add(hit.item_id)
-    unverified_share = round(unverified / total, 4) if total else 0.0
-    summary_share = round(summary / total, 4) if total else 0.0
-    logger.info(
-        "top-%d composition over %d queries: %d/%d unverified (%.1f%%), %d/%d summary (%.1f%%)",
-        TRUST_K,
-        len(golden),
-        unverified,
-        total,
-        100 * unverified_share,
-        summary,
-        total,
-        100 * summary_share,
-    )
-    result = {
-        "eval_top5_unverified_share": unverified_share,
-        "eval_top5_unverified": unverified,
-        # The lift NUMERATOR, persisted explicitly (review #6): every surface
-        # rendering the lift renders this count and the corpus fraction beside
-        # it, so denominator decay can never masquerade as a ranking move.
-        "eval_top5_verified": total - unverified,
-        "eval_top5_summary_share": summary_share,
-        "eval_top5_summary": summary,
-        "eval_top5_results": total,
-        "eval_top5_item_ids": sorted(top5_ids),
-    }
-    result.update(eval_trust.verified_lift(unverified_share, len(golden)))
-    return result

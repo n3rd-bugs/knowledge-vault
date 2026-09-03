@@ -8,23 +8,33 @@
 # timer now triggers THIS guard instead of kb-consolidate.service directly.
 #
 # ORDERING (the systemd-idiomatic "run B, then me, then C"):
-#   Wants=/After=kb-backup.service        — ensure a backup has RUN, and wait for it.
+#   Wants=/After=kb-backup-local.service  — ensure a LOCAL backup has RUN, and wait for it.
 #   Wants=/Before=kb-consolidate.service  — then let the catch-up drain proceed.
 # Wants (not a bare After=) is required because at OnBootSec the backup is not yet
 # in any transaction to order against: in the 00:15-boot case its 00:30 timer has
 # not fired, and after a daytime power cut its Persistent catch-up has already
 # FINISHED and gone inactive. Pulling it in guarantees the ordering in every case.
-# The cost is one extra pg_dump per boot — cheap, and a fresh dump taken right
-# after a power event, before a 7h drain, is if anything desirable on this box.
+#
+# WHY THE LOCAL UNIT (review #8 H10a, 2026-09-03). This guard used to pull
+# kb-backup.service, whose run includes the encrypted offsite push when
+# KB_OFFSITE_ENABLED=true. "One extra pg_dump per boot — cheap" was only true
+# WITHOUT that leg: on 2026-09-01 the boot catch-up waited 2h59m behind the
+# offsite push on modem WAN. kb-backup-local.service runs `backup.sh
+# --local-only` (dump + raw archive + integrity gate + sidecar + prune, no push);
+# the nightly kb-backup.timer keeps the offsite leg. The guard must never Want,
+# nor order After, a unit that pushes offsite (tests/test_backup_local.py) — an
+# After= alone would still park the boot path behind a Persistent catch-up's
+# push. If both backup units run at one boot, backup.sh serialises the local
+# legs under a lock it releases before the push, so the dumps never race.
 #
 # The drain itself still runs as kb-consolidate.service (its readiness wait,
 # tiktoken seeding, OnFailure and post-run backup all apply unchanged); this unit
 # is a pure ordering barrier and does no work of its own. It has no [Install]:
 # only kb-consolidate-boot.timer starts it, never a boot target directly.
 [Unit]
-Description=Knowledge Vault boot catch-up guard (backup before the catch-up drain)
-Wants=kb-backup.service
-After=kb-backup.service
+Description=Knowledge Vault boot catch-up guard (local backup before the catch-up drain)
+Wants=kb-backup-local.service
+After=kb-backup-local.service
 Wants=kb-consolidate.service
 Before=kb-consolidate.service
 OnFailure=kb-notify-fail@%n.service

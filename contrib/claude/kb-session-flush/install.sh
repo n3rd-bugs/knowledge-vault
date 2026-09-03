@@ -284,6 +284,15 @@ install -m 0755 "$SKILL_DIR/kb-hook-dispatch.sh" "$DISPATCH"
 # directory still installs.
 BACKFILL="$HOOKS/kb-flush-backfill.sh"
 [ -f "$SKILL_DIR/kb-flush-backfill.sh" ] && install -m 0755 "$SKILL_DIR/kb-flush-backfill.sh" "$BACKFILL"
+# The self-update (review #8 H15). NOT A HOOK -- registered for no event: an
+# owner-run refresh that fetches whatever the server MANIFEST lists into
+# ~/.claude/kb-setup, verifies each file's sha256 and re-runs this installer. It
+# is the one command the pre-brief's OUT OF DATE banner points at, replacing a
+# hand-maintained paste that had gone stale (SHARING.md named 4 of 8 assets and
+# died right here at the dispatcher). Optional (`[ -f ]`) like the rest, so an
+# older skill directory still installs.
+UPDATE="$HOOKS/update.sh"
+[ -f "$SKILL_DIR/update.sh" ] && install -m 0755 "$SKILL_DIR/update.sh" "$UPDATE"
 
 # Co-locate the jq we just used NEXT TO THE HOOKS (originally a Windows fix, KB
 # item 496: Claude Code may have inherited a PATH from before jq was installed).
@@ -755,7 +764,7 @@ if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_SETUP_BEARER:-}${KB_TOKEN:-}${KB_ENRO
     # Every hook asset this installer manages. install.sh itself is served in
     # the manifest but never copied into $HOOKS, so it is not checked here.
     for _hf in flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh \
-      kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh; do
+      kb-hook-dispatch.sh notify-complete.sh turn-start.sh kb-flush-backfill.sh update.sh; do
       _want=$(printf '%s' "$_vfiles" | kb_json_get "$_hf" || true)
       if [ -f "$HOOKS/$_hf" ]; then
         _got=$(kb_sha256 "$HOOKS/$_hf" || true)

@@ -11,11 +11,36 @@
 # (private-key file — kept off-box in production, supplied only for the drill),
 # then run the same throwaway restore + 1% row-count check. Default (no flag)
 # stays the pure-local drill.
+#
+# --auto (timer mode, review #6 Wave G): EVEN months drill the offsite path so
+# age-decrypt + rclone stay machine-proven — but ONLY when the off-box age
+# identity has been supplied; otherwise fall back to local rather than page a
+# false FAIL from an unattended timer.
+#   Review #8 H12: the month is the LOCAL calendar month. It used to be
+#   `date -u +%m`; the timer fires 04:30 PKT on the 1st, which is 23:30 UTC on
+#   the LAST day of the previous month, so Sep 1 read "August", demanded
+#   --offsite, and printed the fallback line for the wrong month. The KB stores
+#   UTC (Invariant 7), but "the 1st of an even month" is a calendar statement
+#   in the same LOCAL clock the timer's OnCalendar uses.
+#
+# --dry-run (any mode): print the mode + visibility line and exit 0 before
+# touching docker or the remote — the test seam, and a cheap rehearsal before
+# the 10-01 drill (which MUST run with the identity supplied: KB 28833).
+#
+# Every drill prints ONE visibility line first, so the journal (and the digest
+# that reads it) can tell a local drill from an offsite one at a glance — an
+# offsite drill that silently fell back to local proves nothing about the
+# offsite path:
+#   restore_test: drill mode=<local|offsite> identity=<present|absent> month=<MM> (...)
+#
+# Test seams: KB_ENV_FILE overrides the env file sourced (default: the repo
+# .env, as in backup.sh/offsite.sh); KB_DRILL_MONTH overrides the month --auto
+# reads (default: local `date +%m`).
 set -uo pipefail
 umask 077
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="${REPO_DIR}/.env"
+ENV_FILE="${KB_ENV_FILE:-${REPO_DIR}/.env}"
 if [[ -f "${ENV_FILE}" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -29,26 +54,39 @@ CONT="kb-restore-test"
 IMAGE="pgvector/pgvector:pg16"
 DBPASS="${KB_DB_PASSWORD:-restore-test}"
 
+# LOCAL month (see the --auto header note); a malformed override falls back.
+DRILL_MONTH="${KB_DRILL_MONTH:-$(date +%m)}"
+[[ "${DRILL_MONTH}" =~ ^[0-9]{1,2}$ ]] || DRILL_MONTH="$(date +%m)"
+IDENTITY="${KB_AGE_IDENTITY:-}"
+IDENTITY="${IDENTITY/#\~/${HOME}}"
+IDENTITY_STATE="absent"
+if [[ -n "${IDENTITY}" && -r "${IDENTITY}" ]]; then IDENTITY_STATE="present"; fi
+
 MODE="local"
-case "${1:-}" in
-  --offsite) MODE="offsite" ;;
-  --auto)
-    # Timer mode (review #6 Wave G): even months drill the offsite path so
-    # age-decrypt + rclone stay machine-proven — but ONLY when the off-box age
-    # identity has been supplied for the drill; otherwise fall back to local
-    # rather than page a false FAIL from an unattended timer.
-    if (( 10#$(date -u +%m) % 2 == 0 )) && [[ -n "${KB_AGE_IDENTITY:-}" && -r "${KB_AGE_IDENTITY/#\~/${HOME}}" ]]; then
-      MODE="offsite"
-    else
-      MODE="local"
-      if (( 10#$(date -u +%m) % 2 == 0 )); then
-        echo "restore_test: even month wanted --offsite but KB_AGE_IDENTITY is absent — local drill (supply the identity to prove the offsite path)"
+DRY_RUN=0
+for arg in "$@"; do
+  case "${arg}" in
+    --offsite) MODE="offsite" ;;
+    --dry-run) DRY_RUN=1 ;;
+    --auto)
+      if (( 10#${DRILL_MONTH} % 2 == 0 )) && [[ "${IDENTITY_STATE}" == "present" ]]; then
+        MODE="offsite"
+      else
+        MODE="local"
+        if (( 10#${DRILL_MONTH} % 2 == 0 )); then
+          echo "restore_test: even month wanted --offsite but KB_AGE_IDENTITY is absent — local drill (supply the identity to prove the offsite path)"
+        fi
       fi
-    fi
-    ;;
-  "") ;;
-  *) echo "restore_test: unknown argument '$1' (usage: restore_test.sh [--offsite|--auto])" >&2; exit 2 ;;
-esac
+      ;;
+    *) echo "restore_test: unknown argument '${arg}' (usage: restore_test.sh [--offsite|--auto] [--dry-run])" >&2; exit 2 ;;
+  esac
+done
+
+echo "restore_test: drill mode=${MODE} identity=${IDENTITY_STATE} month=${DRILL_MONTH} (local calendar; even months drill offsite when the identity is supplied)"
+if (( DRY_RUN == 1 )); then
+  echo "restore_test: dry-run — decided only; no container, no fetch"
+  exit 0
+fi
 
 TMP_FETCH=""
 fail() { echo "restore_test: FAIL — $*" >&2; cleanup; exit 1; }
@@ -131,7 +169,7 @@ if [[ -r "${SIDECAR}" ]]; then
     || fail "chunks with NULL embedding restored=${R_NULLEMB} != sidecar=${S_NULLEMB}"
   L_ITEMS="$(count kb-db items)"; L_CHUNKS="$(count kb-db chunks)"
   echo "restore_test: advisory vs live: items ${R_ITEMS}/${L_ITEMS:-?}, chunks ${R_CHUNKS}/${L_CHUNKS:-?} (drift = writes since dump)"
-  echo "restore_test: PASS (exact match against the dump's count sidecar)"
+  echo "restore_test: PASS (exact match against the dump's count sidecar; mode=${MODE})"
 else
   # Pre-sidecar dump (or offsite object without a local sidecar): the old
   # advisory-grade 1% live comparison is the only available check.
@@ -147,6 +185,6 @@ else
   echo "restore_test: items restored=${R_ITEMS} live=${L_ITEMS} | chunks restored=${R_CHUNKS} live=${L_CHUNKS}"
   within_1pct "${R_ITEMS}"  "${L_ITEMS}"  || fail "items count ${R_ITEMS} not within 1% of live ${L_ITEMS}"
   within_1pct "${R_CHUNKS}" "${L_CHUNKS}" || fail "chunks count ${R_CHUNKS} not within 1% of live ${L_CHUNKS}"
-  echo "restore_test: PASS (items & chunks within 1% of live; sidecar unavailable)"
+  echo "restore_test: PASS (items & chunks within 1% of live; sidecar unavailable; mode=${MODE})"
 fi
 # cleanup runs via the EXIT trap

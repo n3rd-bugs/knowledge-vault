@@ -11,9 +11,12 @@ happens inside ``kbcore.review.promote`` (V4 — the human stays the decider).
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import typer
 
 from kbcore import review_promote
+from kbcore import review_promote_runs as runs_mod  # the command below shares its name
 from kbcore.config import settings
 from kbcore.errors import KBError
 
@@ -134,9 +137,15 @@ def review_promote_run(
 
     The run key is the ``sources.uri`` all of a session run's extraction items
     share (e.g. ``session:<id>`` from the flush hook). The dry run prints each
-    item's id, TYPE and TITLE so the owner vets content, not a count; every
-    promotion then goes through the singular owner chokepoint (V4), exactly as
-    ``kb review promote-batch`` does.
+    item's id, PROJECT, TYPE and TITLE so the owner vets content, not a count;
+    every promotion then goes through the singular owner chokepoint (V4),
+    exactly as ``kb review promote-batch`` does.
+
+    THE PREVIEW IS PINNED (review #8 H13b, V4 fidelity): after the confirmation
+    the EXACT item ids the owner just vetted go to ``promote_batch`` — the run is
+    never re-selected, so an item that lands under the same run key between the
+    preview and the confirm is not promoted unseen (it shows up in the next dry
+    run instead).
     """
     try:
         preview = review_promote.promote_run(run_key)
@@ -146,7 +155,10 @@ def review_promote_run(
         typer.echo(f"no active unverified items for run {run_key!r}")
         return
     for r in preview:
-        typer.echo(f"[{r['item_id']}] {r['type']:<8.8}  {r['title']} -- {r['outcome']}")
+        typer.echo(
+            f"[{r['item_id']}] {r['project']:<14.14}  {r['type']:<8.8}  {r['title']} "
+            f"-- {r['outcome']}"
+        )
     would = sum(1 for r in preview if r["outcome"].startswith("would promote"))
     if not apply:
         typer.echo(f"dry run: {would} item(s) would promote - re-run with --apply to write")
@@ -156,11 +168,36 @@ def review_promote_run(
         return
     typer.confirm(f"promote {would} item(s) from this run to verified?", abort=True)
     try:
-        results = review_promote.promote_run(run_key, dry_run=False)
+        results = review_promote.promote_batch([r["item_id"] for r in preview])
     except KBError as e:
         _fail(e)
-    for r in results:
-        typer.echo(f"[{r['item_id']}] {r['outcome']}")
-    promoted = sum(1 for r in results if r["outcome"].startswith("promoted"))
-    errs = sum(1 for r in results if r["outcome"].startswith("error"))
+    for iid, outcome in results:
+        typer.echo(f"[{iid}] {outcome}")
+    promoted = sum(1 for _, o in results if o.startswith("promoted"))
+    errs = sum(1 for _, o in results if o.startswith("error"))
     typer.echo(f"promote-run: {promoted} promoted, {errs} error(s), {len(results)} item(s)")
+
+
+def review_promote_runs(
+    days: int = typer.Option(7, "--days", help="look back this many days (default 7)"),
+    limit: int = typer.Option(20, "--limit", help="max runs shown, largest first"),
+) -> None:
+    """List recent session runs that still hold promotable items - READ-ONLY.
+
+    Largest run first, so the paste-ready next step is the top row:
+    ``kb review promote-run <run key>`` (a dry run), then ``--apply``. Writes
+    nothing; a run whose items are all verified/archived is not listed.
+    """
+    try:
+        rows = runs_mod.list_promote_runs(days, limit=limit)
+    except KBError as e:
+        _fail(e)
+    if not rows:
+        typer.echo(f"no session runs with promotable items in the last {days} day(s)")
+        return
+    typer.echo(f"{'items':>5}  {'last seen (UTC)':<16}  {'projects':<18}  run key")
+    for r in rows:
+        seen = r["last_seen"].astimezone(UTC).strftime("%Y-%m-%d %H:%M")
+        projects = ",".join(r["projects"])
+        typer.echo(f"{r['candidates']:>5}  {seen:<16}  {projects:<18.18}  {r['run_key']}")
+    typer.echo(f"{len(rows)} run(s); next: kb review promote-run {rows[0]['run_key']} [--apply]")

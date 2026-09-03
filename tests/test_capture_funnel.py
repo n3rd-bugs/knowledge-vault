@@ -356,6 +356,10 @@ _FETCH_LOOPS = {
     # The README's enrolment bootstrap block is the same paste for a human
     # reader, and had gone stale the same way (4 of 8).
     "README enrolment bootstrap block": REPO / "README.md",
+    # SHARING.md 2.5 is the operator guide's copy of the same paste. It named 4 of
+    # 8 assets until review #8 (install.sh died at the dispatcher), because it was
+    # the one fetch list this registry did not derive.
+    "SHARING.md 2.5 enrolment bootstrap block": REPO / "SHARING.md",
 }
 
 

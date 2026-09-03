@@ -1,11 +1,9 @@
 """kbcore.llm — Ollama /api/chat extractor client (PLAN.md §7.2, Invariant 8).
 
 The nightly 14B extractor turns a session transcript into a list of grounded
-knowledge items. ``keep_alive`` comes from ``settings.kb_llm_keep_alive``
-(owner decision 2026-07: default -1 = RESIDENT — idle residency is power-cheap
-and removes the per-call reload that dominated consolidation runtime; set 0 to
-restore unload-per-call and reclaim ~10GB VRAM). Network/format failures become
-an :class:`ExtractorUnavailable` domain error; raw traces stay in the logs.
+knowledge items. ``keep_alive`` comes from ``settings.kb_llm_keep_alive`` (FINITE
+seconds, never -1 — CLAUDE.md rule 8, corrected 2026-07-29). Network/format
+failures become an :class:`ExtractorUnavailable` domain error; traces stay in logs.
 """
 
 from __future__ import annotations
@@ -107,7 +105,6 @@ def parse_model_json(content: str) -> Any:
 _TIMEOUT = httpx.Timeout(600.0, connect=10.0)
 
 
-# Invariant 8: unload the extractor the instant the call returns.
 def _keep_alive() -> int:
     """Per-call keep_alive from config (read at call time so tests/env can flip)."""
     return settings.kb_llm_keep_alive
@@ -199,16 +196,21 @@ def _chat(
     model: str | None = None,
     keep_alive: int | str | None = None,
     seed: int | None = None,
+    think: bool | None = None,
 ) -> str:
     """POST /api/chat; return the message content.
 
     ``keep_alive`` defaults to ``settings.kb_llm_keep_alive`` (None sentinel →
-    resolved at call time). Callers may override per call; with the default -1
-    the model stays resident between calls (owner decision, see config).
+    resolved at call time; a FINITE residency, Invariant 8). Callers may override
+    it per call.
 
     ``seed`` (optional) pins Ollama sampling so a re-run reproduces the same draw —
     the nightly judge paths pass a per-content seed so their verdicts stop drifting
     night to night (review finding). None leaves sampling unseeded.
+
+    ``think`` (review #8 H3) is INERT unless set: Ollama's ``think`` key is emitted
+    ONLY when it is a real bool, so a caller that does not pass it sends the
+    byte-identical request it always did. Never a per-model policy.
     """
     payload: dict[str, Any] = {
         "model": model or settings.kb_extract_model,
@@ -218,6 +220,8 @@ def _chat(
     }
     if json_format:
         payload["format"] = "json"
+    if think is not None:
+        payload["think"] = think
     # Same explicit-num_ctx rule as extract_items: the runtime default truncates
     # long judge/summary inputs and cuts output mid-JSON (bench 2026-07-18).
     payload["options"] = {"num_ctx": settings.kb_llm_num_ctx}
@@ -243,9 +247,18 @@ def chat(
     json_format: bool = False,
     model: str | None = None,
     keep_alive: int | str | None = None,
+    seed: int | None = None,
+    think: bool | None = None,
 ) -> str:
-    """Public single-shot chat (deep search). Same failure contract as ``_chat``."""
-    return _chat(messages, json_format=json_format, model=model, keep_alive=keep_alive)
+    """Public single-shot chat (deep search, same-fact judge). Same contract as ``_chat``."""
+    return _chat(
+        messages,
+        json_format=json_format,
+        model=model,
+        keep_alive=keep_alive,
+        seed=seed,
+        think=think,
+    )
 
 
 _SUMMARIZE_SYSTEM = (
@@ -316,6 +329,13 @@ def evidence_side(
     return side if side in ("a", "b") else "neither"
 
 
+def _pair_judge_kwargs() -> dict[str, Any]:
+    """Model + ``think`` for the TWO pair judges ONLY — :func:`items_contradict` and
+    ``twin_judge.judge_same_fact`` (review #8 H3). Empty ``KB_PAIR_JUDGE_MODEL`` ⇒ the
+    extract model with ``think`` unset: the byte-identical incumbent request."""
+    return {"model": settings.pair_judge_model, "think": settings.pair_judge_think}
+
+
 _CONTRADICT_SYSTEM = (
     "You compare two knowledge items and decide whether they factually CONTRADICT — "
     "state incompatible facts or decisions about the same thing (not merely different "
@@ -341,6 +361,7 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
         ],
         json_format=True,
         seed=_draw_seed(a_title, a_body, b_title, b_body),
+        **_pair_judge_kwargs(),
     )
     try:
         data = parse_model_json(content)
@@ -382,6 +403,7 @@ def verify_item(
     *,
     judge_model: str | None = None,
     keep_alive: int | None = None,
+    think: bool | None = None,
 ) -> dict[str, Any]:
     """Factored support verdict for one extracted item: does the transcript back it?
 
@@ -391,7 +413,7 @@ def verify_item(
     the caller isolates the item. Connectivity failures surface as
     :class:`ExtractorUnavailable` via ``_chat``. Deterministic per-content seed
     (:func:`_draw_seed`) so re-judging the same item reproduces the same draw;
-    ``judge_model``/``keep_alive`` default to the settings-driven behavior.
+    ``judge_model``/``keep_alive``/``think`` default to the settings-driven behavior.
     """
     content = _chat(
         [
@@ -410,6 +432,7 @@ def verify_item(
         model=judge_model,
         keep_alive=keep_alive,
         seed=_draw_seed(title, body),
+        think=think,
     )
     try:
         parsed = parse_model_json(content)

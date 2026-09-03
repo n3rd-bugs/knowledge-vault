@@ -205,3 +205,12 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   preserves any other hooks you have.
 - To disable: remove the entries from `~/.claude/settings.json` `hooks`, or
   delete `~/.claude/kb-flush.env` (the hooks no-op without config).
+
+## Keeping the hooks current
+
+The pre-brief compares `~/.claude/hooks/.setup-version` with the server's
+`/api/setup/manifest.json` once per session and prints an `OUT OF DATE` banner
+when they differ. `bash ~/.claude/hooks/update.sh` then fetches every asset the
+manifest lists into `~/.claude/kb-setup`, verifies each file's sha256 and re-runs
+`install.sh` (`--dry-run` fetches and verifies only). The file list comes from the
+server, never from a hand-kept paste, so it can be neither short nor long.

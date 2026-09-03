@@ -21,16 +21,21 @@ Rules of the road:
   bugs) — no Ollama call, no extra embed (Invariant 8 untouched).
 * BEST-EFFORT: any failure returns ``""`` — a nudge must never fail a save.
 * Weekly typed-edge delta (the review #6 target: >=20 new
-  fixes/depends_on/implements edges per week; kill rule at <5 after 2 weeks):
-  :func:`typed_edge_counts` is the CHEAP QUERY the weekly's checkpoint-diff
-  pattern adopts — a query, deliberately not a nightly counts key (the nightly
-  never touches this module).
+  fixes/depends_on/implements edges per week; kill rule at <5 after 2 weeks,
+  evaluated ONLY on weeks with >=10 fired nudges — review #8 registry amendment:
+  on absence of exposure extend, never kill): :func:`typed_edge_counts` is the
+  CHEAP QUERY the weekly's checkpoint-diff pattern adopts (caller landed review
+  #8 H9b, kbworker.weekly) — a query, deliberately not a nightly counts key (the
+  nightly never touches this module). Exposure is counted from journald: every
+  fire logs ONE INFO line ``save-nudge fired item=<id> candidates=<k>`` (H9c),
+  deliberately not a nightly counts key either.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 
 from kbcore import scope
 from kbcore.config import settings
@@ -68,6 +73,9 @@ def suffix(project: str, item_type: str, title: str, item_id: int, has_links: bo
         return ""
     if not candidates:
         return ""
+    # The fired-count instrument (review #8 H9c): a journald line, not a counts
+    # key — the <5/wk kill rule is judged only on weeks with >=10 of these.
+    logger.info("save-nudge fired item=%s candidates=%d", item_id, len(candidates))
     lines = [f"\nsimilar active bug items in {project}:"]
     lines += [f"\n  [{cid}] {ctitle}" for cid, ctitle in candidates]
     lines.append(f"\nif this fixes one: kb_link src_item_id={item_id} rel=fixes dst_item_id=<id>")
@@ -114,21 +122,24 @@ def _similar_active_bugs(
     return [(int(r[0]), r[1]) for r in rows]
 
 
-def typed_edge_counts() -> dict[str, int]:
+def typed_edge_counts(rels: Sequence[str] = TYPED_EDGE_RELS) -> dict[str, int]:
     """Current item-to-item totals per typed edge — the weekly delta's read side.
 
     One grouped scan of ``relations``, zero-filled so the shape is stable
-    (``{fixes: N, depends_on: N, implements: N}``). RECORDED CONTRACT (Wave G):
-    the weekly typed-edge delta is computed by snapshotting this QUERY through
-    the weekly's existing checkpoint-diff pattern — there is no nightly counts
-    key for it, so nothing here runs unattended.
+    (``{fixes: N, depends_on: N, implements: N}`` by default). RECORDED
+    CONTRACT (Wave G; first caller landed review #8 H9b): kbworker.weekly
+    snapshots this QUERY into its report meta (``typed_edge_totals``) and diffs
+    it against the prior weekly's checkpoint — there is no nightly counts key
+    for it, so nothing here runs unattended. ``rels`` widens the scan (the
+    weekly adds ``alternative_to`` so the cross-twin linker's edge rides the
+    same checkpoint diff); the default stays the nudge's three.
     """
-    out = dict.fromkeys(TYPED_EDGE_RELS, 0)
+    out = dict.fromkeys(rels, 0)
     with connect() as conn:
         rows = conn.execute(
             "SELECT rel, count(*) FROM relations WHERE rel = ANY(%s) "
             "AND src_kind = 'item' AND dst_kind = 'item' GROUP BY rel",
-            (list(TYPED_EDGE_RELS),),
+            (list(rels),),
         ).fetchall()
     for rel, n in rows:
         out[rel] = int(n)

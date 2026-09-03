@@ -7,6 +7,8 @@
 #                       KB_PROMPT_RECALL (default on); trivial prompts skipped;
 #                       CONNECTOR mode skipped unless KB_PROMPT_RECALL_CONNECTOR=1
 #                       (a headless claude -p per prompt costs tokens + latency).
+#                       Harness envelopes (<task-notification>, <system-reminder>)
+#                       are dropped before any gate: machine text, not a question.
 # Config: ~/.claude/kb-flush.env (shared with the flush hook). Fails SILENTLY
 # (exit 0, no output) — recall must never break a prompt. TWO exceptions, both
 # LOGGED rather than printed, because a hook that cannot work must not be the
@@ -452,6 +454,14 @@ if [ "$EV" = "UserPromptSubmit" ]; then
   # Skip trivial prompts (continuations, acknowledgements, slash commands) — no
   # point searching, and no context noise.
   case "$PROMPT" in /*) exit 0 ;; esac
+  # MACHINE-SHAPED "prompts" are harness envelopes, not questions (review #8 H11):
+  # Claude Code feeds sub-agent completions and injected reminders through
+  # UserPromptSubmit, and 60-75% of a week's thin search misses were exactly
+  # these. Nothing in them is searchable; every hit would be noise in context.
+  # The REAL prefix has NO backslash -- the '<\task-notification>' seen in the
+  # lenses is a JSON-escape artefact, and a pattern written with the backslash
+  # never matches anything. Sits BEFORE the length gate so it never searches.
+  case "$PROMPT" in '<task-notification>'* | '<system-reminder>'*) exit 0 ;; esac
   [ "${#PROMPT}" -ge 12 ] || exit 0
   # CONTENT-WORD GATE: a prompt made only of acknowledgements/stopwords/generic
   # imperatives ("Yes please review and update") carries nothing searchable —
@@ -546,11 +556,13 @@ else
       if [ "$_local" != "$_remote" ]; then
         printf '[KB setup] Your hook scripts are OUT OF DATE (installed %s, server %s).\n' \
           "${_local:-unversioned}" "$_remote"
-        printf 'Re-run the installer to pick up the current scripts:\n'
+        printf 'One command refreshes every script from the server manifest and re-installs:\n'
+        printf '  bash ~/.claude/hooks/update.sh\n'
+        printf 'Or by hand (the same files update.sh fetches):\n'
         printf '  cd ~/.claude/kb-setup 2>/dev/null || mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup\n'
         printf '  for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \\\n'
         printf '           kb-mcp-call.sh notify-complete.sh turn-start.sh \\\n'
-        printf '           kb-hook-dispatch.sh kb-flush-backfill.sh; do\n'
+        printf '           kb-hook-dispatch.sh kb-flush-backfill.sh update.sh; do\n'
         printf '    curl -fsS -4 -H "Authorization: Bearer $KB_TOKEN" "%s/api/setup/$f" -o "$f"\n' "${KB_REST_URL%/}"
         printf '  done && bash install.sh\n'
         printf 'This is FYI — nothing is broken, but newer scripts may capture more.\n\n'

@@ -13,6 +13,7 @@ import sys
 import typer
 
 from kbcli import (
+    bench_cmds,
     deepsearch_cmd,
     eval_cmds,
     graph_cmds,
@@ -36,6 +37,7 @@ app.add_typer(review_cmds.review_app, name="review")
 app.add_typer(principal_cmds.principal_app, name="principal")
 app.add_typer(eval_cmds.eval_app, name="eval")
 app.add_typer(repair_cmds.repair_app, name="repair")
+app.add_typer(bench_cmds.bench_app, name="bench")
 # Phase 5 top-level commands (bodies in kbcli.graph_cmds to keep this file small).
 app.command("stats")(graph_cmds.stats_cmd)
 app.command("deep-search")(deepsearch_cmd.deep_search_cmd)

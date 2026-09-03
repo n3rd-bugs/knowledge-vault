@@ -12,7 +12,7 @@ out, and the rerank tally is thread-local state — no DB, no sidecar, no LLM.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -73,6 +73,8 @@ FULL_NIGHT = {
     "swap_used_pct": 90.0,
     "rerank_probe": "failed",
     "stopped": {"evidence_refreshed": {"reason": "battery", "deferred": 20}},
+    # review #8 H7a: a fallback night carries its tally in the alert tier
+    "eval_rerank_tally": {"active": 50, "fallback": 2, "off": 0},
 }
 
 
@@ -84,8 +86,18 @@ def test_alert_class_lines_render_first_and_the_digest_is_hard_capped():
     assert lines[2] == "EXPIRY: 3 untriaged rows reach expiry age within 7d"
     assert lines[3] == "STALE HOOKS suspected: alpha"
     assert lines[4] == "drain: 2 row(s) escalated to failed at the deferral cap"
-    assert lines[5] == "drained: 1", "facts follow the alerts in their old order"
-    assert "expired: 500 (cap; 767 still eligible)" in lines
+    # Review #8 H7b: rerank fallback, the battery PAUSE, swap and the miss
+    # counters are alert-class now, so the 20-line cap trims only routine facts.
+    assert lines[5] == "rerank: active 50 / fallback 2 / off 0"
+    assert lines[6] == "paused (battery): evidence_refreshed(20)"
+    assert lines[7] == "swap: 90% used"
+    assert lines[8] == "empty-result searches: 4"
+    assert lines[9] == "thin-result searches: 2"
+    assert lines[10] == "drained: 1", "facts follow the alerts in their old order"
+    assert digest_mod._alert_lines(FULL_NIGHT) == lines[:10], "the cap never trims an alert"
+    # On this 30-line fixture the cap trims ROUTINE facts (the saturation line
+    # among them) — it is still produced, and it survives any ordinary night.
+    assert "expired: 500 (cap; 767 still eligible)" in digest_mod._fact_lines(FULL_NIGHT)
     assert all(line.isascii() for line in lines), "ntfy to a phone: pure ASCII"
 
 
@@ -129,10 +141,12 @@ def test_expired_line_stays_plain_when_the_cap_did_not_bind():
 
 
 def test_drained_deferred_renders_the_contract_line_positive_only():
+    # Wording since review #8 H6/H7: the count is honest on EVERY stop path
+    # (budget, guard, pre-first-cohort), so the line no longer names the budget.
     lines = digest_mod.digest_lines({"queued_drained": 1, "drained_deferred": 12})
-    assert "drain: 12 item(s) deferred to the weekend budget" in lines
+    assert "drain: 12 deferred" in lines
     for counts in ({"queued_drained": 1, "drained_deferred": 0}, {"queued_drained": 1}):
-        assert not any("weekend budget" in ln for ln in digest_mod.digest_lines(counts))
+        assert not any("deferred" in ln for ln in digest_mod.digest_lines(counts))
 
 
 # --- battery-pause line -------------------------------------------------------
@@ -260,10 +274,13 @@ WEEK = [
 ]
 MISS_STATS = {"total": 0, "distinct": 0, "empty": 0, "thin": 0}
 NOW = datetime(2026, 8, 27, 1, 30)
+# Rows are grouped by LOCAL night since review #8 H9f; pin the deployment's zone
+# so the 02:00Z fixtures file under their own date on any box (07:00 local).
+PKT = timezone(timedelta(hours=5))
 
 
 def test_weekly_body_gains_the_stocks_block_and_the_expired_column():
-    body = weekly_render._report_body(NOW, WEEK, MISS_STATS, [], 0, 0, None, 0, [])
+    body = weekly_render._report_body(NOW, WEEK, MISS_STATS, [], 0, 0, None, 0, [], tz=PKT)
     lines = body.splitlines()
     header = next(ln for ln in lines if ln.startswith("night"))
     for col in ("expired", "v-top5", "corp-v"):
@@ -281,7 +298,7 @@ def test_weekly_body_gains_the_stocks_block_and_the_expired_column():
 
 
 def test_weekly_push_gains_one_stocks_line_and_lift_components_stay_inline():
-    lines = weekly_render._push_lines(NOW, WEEK, MISS_STATS, [], 0, None, 42)
+    lines = weekly_render._push_lines(NOW, WEEK, MISS_STATS, [], 0, None, 42, tz=PKT)
     assert "queue open: 14,981 -> 17,330" in lines, "exactly the ONE budgeted stocks line"
     assert sum("queue open" in ln for ln in lines) == 1
     assert "verified lift: 5.400 -> 10.800 (v-top5 10 -> 9, corpus 0.041 -> 0.034)" in lines, (
@@ -395,7 +412,25 @@ def test_sentinel_reports_off_when_no_case_reranked(monkeypatch, _quiet_sentinel
     counts: dict = {}
     eval_sentinel.run_sentinel(counts)
     assert counts["eval_rerank_tally"] == {"active": 0, "fallback": 0, "off": 5}
-    assert counts["eval_rerank_outcome"] == "off"
+    assert counts["eval_rerank_outcome"] == "off", "'off' now means NO case reranked"
+
+
+def test_sentinel_reports_active_when_cases_reranked_without_fallback(monkeypatch, _quiet_sentinel):
+    """Review #8 H7a: rollup fallback > active > off. One golden case structurally
+    has <2 fused candidates, so the review #6 order (fallback > off > active)
+    read 'off' on every healthy night and hid the sidecar's activity."""
+    _stub_golden(monkeypatch, 5)
+
+    def fake_evaluate(golden=None, golden_path=None):
+        for _ in range(4):
+            rerank._note("active", 0.5)
+        return ([], 1.0, 0.9)
+
+    monkeypatch.setattr(eval_sentinel.eval_harness, "evaluate", fake_evaluate)
+    counts: dict = {}
+    eval_sentinel.run_sentinel(counts)
+    assert counts["eval_rerank_tally"] == {"active": 4, "fallback": 0, "off": 1}
+    assert counts["eval_rerank_outcome"] == "active"
 
 
 def test_sentinel_self_times_into_the_step_secs_ledger(monkeypatch, _quiet_sentinel):

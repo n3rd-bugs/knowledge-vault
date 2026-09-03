@@ -69,9 +69,13 @@ def test_red_night_push_escalates_title_and_priority(monkeypatch):
 # --- cross-package digest lines (wave_f_rules contracts) ----------------------
 
 
-def test_swap_line_renders_only_past_80_percent():
+def test_swap_line_renders_only_past_the_alert_threshold():
+    # Review #8 H7b: alert-class past SWAP_ALERT_PCT (70; was a fact line past 80).
     assert "swap: 93% used" in digest_mod.digest_lines({"swap_used_pct": 93.4})
-    for counts in ({"swap_used_pct": 80.0}, {"swap_used_pct": 12.0}, {}):
+    assert digest_mod.digest_lines({"swap_used_pct": 80.0, "queued_drained": 1})[0] == (
+        "swap: 80% used"
+    )
+    for counts in ({"swap_used_pct": 70.0}, {"swap_used_pct": 12.0}, {}):
         assert not any("swap:" in line for line in digest_mod.digest_lines(counts))
 
 

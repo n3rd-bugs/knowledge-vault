@@ -266,9 +266,9 @@ def promote_run(run_key: str, *, dry_run: bool = True) -> list[dict[str, Any]]:
     consolidation output. Everything that MUTATES — owner gate, per-item
     isolation, audit rows, the trust flip through ``kbcore.review.promote`` —
     is :func:`promote_batch` (V4: this adds a selector, never an escalation
-    surface). DRY-RUN BY DEFAULT. Returns ``[{item_id, type, title, outcome}]``
-    sorted by item id — titles and types so the CLI shows the owner CONTENT to
-    vet, never just a count.
+    surface). DRY-RUN BY DEFAULT. Returns ``[{item_id, project, type, title,
+    outcome}]`` sorted by item id — project, type and title so the CLI shows the
+    owner CONTENT to vet, never just a count (the CLI pins the vetted ids, H13b).
     """
     scope.require_owner("promote-run")
     key = (run_key or "").strip()
@@ -277,7 +277,7 @@ def promote_run(run_key: str, *, dry_run: bool = True) -> list[dict[str, Any]]:
     with connect() as conn:
         rows = conn.execute(
             """
-            SELECT i.id, i.type, i.title FROM items i
+            SELECT i.id, i.type, i.title, i.project FROM items i
             JOIN sources s ON s.id = i.source_id
             WHERE s.kind = 'session' AND s.uri = %(key)s
               AND i.status = 'active' AND s.trust = 'unverified'
@@ -286,8 +286,14 @@ def promote_run(run_key: str, *, dry_run: bool = True) -> list[dict[str, Any]]:
             """,
             {"key": key, "excluded": list(CANDIDATE_EXCLUDED_TYPES)},
         ).fetchall()
-    info = {int(r[0]): (r[1], r[2]) for r in rows}
+    info = {int(r[0]): (r[1], r[2], r[3]) for r in rows}
     return [
-        {"item_id": iid, "type": info[iid][0], "title": info[iid][1], "outcome": outcome}
+        {
+            "item_id": iid,
+            "project": info[iid][2],
+            "type": info[iid][0],
+            "title": info[iid][1],
+            "outcome": outcome,
+        }
         for iid, outcome in promote_batch(list(info), dry_run=dry_run)
     ]

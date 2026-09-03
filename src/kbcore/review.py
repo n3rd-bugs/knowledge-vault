@@ -266,12 +266,20 @@ def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:
     the request cannot read must be byte-identical to a missing row — the SAME
     "does not exist" NotFound, never a project-naming error (no-oracle
     guarantee, WEBUI_TIERED_ACCESS_PLAN Phase 1).
+
+    LOCKED + RE-CHECKED (review #8 H13a): the row is read ``FOR UPDATE OF rq`` and
+    its ``resolved`` flag checked AFTER the walls, exactly as :func:`dismiss` does.
+    A promote racing an auto-apply/bulk reject (or the reverse) therefore waits for
+    the other resolver's commit and then refuses the already-resolved row instead
+    of minting an archived-but-verified item. The readability wall still runs
+    BEFORE the resolved check, so a withheld row is indistinguishable open or
+    resolved (the same byte-identical NotFound either way).
     """
     row = conn.execute(
         """
-        SELECT rq.item_id, i.project
+        SELECT rq.item_id, i.project, rq.resolved
         FROM review_queue rq LEFT JOIN items i ON i.id = rq.item_id
-        WHERE rq.id = %s
+        WHERE rq.id = %s FOR UPDATE OF rq
         """,
         (queue_id,),
     ).fetchone()
@@ -293,6 +301,8 @@ def _queued_item_id(conn: psycopg.Connection, queue_id: int) -> int:
     # Readable now, so a write-rejection may safely name the project
     # (public-only instance: cannot resolve a review for a non-public item).
     scope.assert_writable(row[1])
+    if row[2]:
+        raise InvalidOperation(f"review queue row {queue_id} is already resolved")
     return row[0]
 
 
@@ -320,6 +330,10 @@ def promote(queue_id: int) -> int:
     carries ``proposed_supersede``, retire the old item with the now-active
     replacement AFTER this transaction commits (a fresh supersede() transaction that
     can see the just-promoted active replacement; owner scope short-circuits its caps).
+
+    RACE-SAFE (review #8 H13a): ``_queued_item_id`` locks the row (``FOR UPDATE OF
+    rq``) and refuses one already resolved, so a bulk/auto reject that commits first
+    makes this raise ``InvalidOperation`` rather than verify an archived item.
     """
     scope.require_owner("promote")
     with transaction() as conn:
@@ -362,7 +376,9 @@ def reject(queue_id: int) -> int:
     non-owner may reject only an item whose source ``trust='unverified'``; archiving
     verified knowledge is a retrieval-suppression primitive that stays owner-only
     (a NULL/absent source trust counts as verified/protected). Owner short-circuits
-    both the cap and the confinement.
+    both the cap and the confinement. RACE-SAFE (review #8 H13a): the row is locked
+    and re-checked in ``_queued_item_id`` — a promote that committed first makes this
+    raise ``InvalidOperation`` instead of archiving freshly verified knowledge.
     """
     scope.require_cap(scope.CAP_REVIEW_RESOLVE, "reject")
     with transaction() as conn:

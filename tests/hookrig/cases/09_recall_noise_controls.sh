@@ -4,6 +4,8 @@
 #       the model's context, so it must stay quiet unless a search is worth it.
 #       The gates (kb-session-brief.sh:39-68):
 #         * UserPromptSubmit + a slash command            -> skip (:44)
+#         * a harness envelope (<task-notification>,
+#           <system-reminder>) -- machine text            -> skip (review #8 H11)
 #         * prompt shorter than 12 characters             -> skip (:45)
 #         * fewer than 2 non-stopword content words       -> skip (:50-58)
 #           ("Yes please review and update" is all stoplist)
@@ -40,6 +42,20 @@ expect_silent "ok thanks!!" "11-char prompt (<12)"
 step "stopword-only prompts would inject k-best NOISE"
 expect_silent "Yes please review and update" "acknowledgement-only prompt"
 expect_silent "ok now continue with that please" "generic-imperative prompt"
+
+step "machine-shaped prompts (harness envelopes) are not prompts"
+# Claude Code feeds sub-agent completions and injected reminders through
+# UserPromptSubmit; 60-75% of a week's thin search misses were these. The REAL
+# prefix has NO backslash (the '<\task-notification>' seen in lenses is a
+# JSON-escape artefact) -- a gate written with the backslash matches nothing, so
+# these fixtures are the literal envelopes, long and word-rich enough to pass
+# every later gate if the envelope gate were missing.
+expect_silent "<task-notification>
+<task-id>agent-7</task-id>
+<status>completed</status>
+<summary>the build is green and every test passes on the branch</summary>
+</task-notification>" "task-notification envelope"
+expect_silent "<system-reminder>the todo list changed and the file was modified since you read it</system-reminder>" "system-reminder envelope"
 
 step "a substantive prompt DOES search"
 stub_reset

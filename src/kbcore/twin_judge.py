@@ -60,34 +60,29 @@ def _fenced(label: str, project: str, title: str, body: str, nonce: str) -> str:
     return f"BEGIN {label} {nonce} (project {project})\n{title}\n{body}\nEND {label} {nonce}"
 
 
-def judge_same_fact(a_id: int, a_project: str, b_id: int, b_project: str) -> tuple[bool, bool, str]:
-    """``(same_fact, judged, rationale)`` for one cross-project pair. FAIL-CLOSED.
-
-    ``judged=False`` means "no usable verdict" (model down, unparseable output, or
-    a ``same_fact`` that is not a JSON boolean) and the caller must refuse the
-    pair; it is never reported as a negative judgement, because the two are
-    different facts about the run.
-    """
-    (a_title, a_body), (b_title, b_body) = item_pair_texts(a_id, b_id)
+def same_fact_messages(
+    a_project: str, a_title: str, a_body: str, b_project: str, b_title: str, b_body: str
+) -> list[dict[str, str]]:
+    """The judge's exact request: system prompt + both items nonce-fenced (a fresh
+    nonce per call). Shared with :mod:`kbcore.bench_judge` so the agreement probe
+    asks the UNMODIFIED question through the same request shape."""
     nonce = secrets.token_hex(8)
-    try:
-        content = llm.chat(
-            [
-                {"role": "system", "content": SAME_FACT_SYSTEM},
-                {
-                    "role": "user",
-                    "content": (
-                        f"{_fenced('ITEM_A', a_project, a_title, a_body, nonce)}\n\n"
-                        f"{_fenced('ITEM_B', b_project, b_title, b_body, nonce)}\n\n"
-                        "Do ITEM_A and ITEM_B record the same underlying fact?"
-                    ),
-                },
-            ],
-            json_format=True,
-        )
-    except (ExtractorUnavailable, ExtractionFailed) as e:
-        logger.warning("judge unavailable for %s/%s: %s", a_id, b_id, e)
-        return False, False, f"judge unavailable: {e.__class__.__name__}"
+    return [
+        {"role": "system", "content": SAME_FACT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"{_fenced('ITEM_A', a_project, a_title, a_body, nonce)}\n\n"
+                f"{_fenced('ITEM_B', b_project, b_title, b_body, nonce)}\n\n"
+                "Do ITEM_A and ITEM_B record the same underlying fact?"
+            ),
+        },
+    ]
+
+
+def parse_verdict(content: str) -> tuple[bool, bool, str]:
+    """``(same_fact, judged, rationale)`` from raw judge output — FAIL-CLOSED, LITERALLY
+    (module doc): only a real JSON boolean ``same_fact`` is a verdict."""
     try:
         data = llm.parse_model_json(content)
     except (ValueError, TypeError):
@@ -101,3 +96,29 @@ def judge_same_fact(a_id: int, a_project: str, b_id: int, b_project: str) -> tup
         return False, False, "judge verdict was not a JSON boolean same_fact"
     rationale = " ".join(str(data.get("reason") or "").split())
     return same, True, rationale or ("same fact" if same else "not the same fact")
+
+
+def judge_same_fact(a_id: int, a_project: str, b_id: int, b_project: str) -> tuple[bool, bool, str]:
+    """``(same_fact, judged, rationale)`` for one cross-project pair. FAIL-CLOSED.
+
+    ``judged=False`` means "no usable verdict" (model down, unparseable output, or
+    a ``same_fact`` that is not a JSON boolean) and the caller must refuse the
+    pair; it is never reported as a negative judgement, because the two are
+    different facts about the run.
+    """
+    (a_title, a_body), (b_title, b_body) = item_pair_texts(a_id, b_id)
+    try:
+        content = llm.chat(
+            same_fact_messages(a_project, a_title, a_body, b_project, b_title, b_body),
+            json_format=True,
+            # Per-content seed (review #8 H3c): 'same' was sticky via the link row
+            # while 'not same' was re-asked every run — a one-way ratchet toward
+            # linking. The same pair now reproduces the same draw night to night.
+            seed=llm._draw_seed(a_title, a_body, b_title, b_body),
+            # The pair-judge seat (KB_PAIR_JUDGE_MODEL / _THINK); empty = incumbent.
+            **llm._pair_judge_kwargs(),
+        )
+    except (ExtractorUnavailable, ExtractionFailed) as e:
+        logger.warning("judge unavailable for %s/%s: %s", a_id, b_id, e)
+        return False, False, f"judge unavailable: {e.__class__.__name__}"
+    return parse_verdict(content)

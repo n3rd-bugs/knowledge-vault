@@ -265,11 +265,18 @@ def _power_db(tmp_path, volts, age_seconds=0):
     series = volts if isinstance(volts, (list, tuple)) else [volts]
     p = tmp_path / "power.sqlite3"
     c = sqlite3.connect(p)
-    c.execute("CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT)")
+    # The guard reads the BATTERY inverter only (monitor_inverter.has_battery = 1,
+    # review #8 H2), so the fixture carries the poller's real two-table shape.
+    c.execute("CREATE TABLE monitor_inverter (id INTEGER PRIMARY KEY, has_battery BOOL)")
+    c.execute("INSERT INTO monitor_inverter VALUES (1, 1)")
+    c.execute(
+        "CREATE TABLE monitor_inverterreading (grid_voltage REAL, timestamp TEXT, "
+        "inverter_id INTEGER, raw_data TEXT)"
+    )
     base = datetime.now(UTC) - timedelta(seconds=age_seconds)
     for i, v in enumerate(series):
         c.execute(
-            "INSERT INTO monitor_inverterreading VALUES (?,?)",
+            "INSERT INTO monitor_inverterreading VALUES (?,?,1,NULL)",
             (v, (base - timedelta(seconds=i)).isoformat()),
         )
     c.commit()

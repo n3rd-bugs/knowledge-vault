@@ -57,7 +57,7 @@ def test_marked_duplicate_absent_by_default_present_with_flag():
 
 def test_kb_search_surfaces_archived_and_duplicate_flags():
     """The MCP surface must expose BOTH new status flags and wire them through."""
-    src = (Path(__file__).resolve().parent.parent / "src/kbmcp/server.py").read_text()
+    src = (Path(__file__).resolve().parent.parent / "src/kbmcp/tools_core.py").read_text()
     assert "include_archived: bool = False" in src
     assert "include_duplicate: bool = False" in src
     assert "include_archived=include_archived" in src

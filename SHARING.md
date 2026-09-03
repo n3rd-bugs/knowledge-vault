@@ -247,11 +247,22 @@ by having a bearer pasted into it:
 export KB_ENROL_CODE=kbe_…            # from kb_setup; single use, ~15 min
 export KB_REST_URL=https://api.<host>
 mkdir -p ~/.claude/kb-setup && cd ~/.claude/kb-setup
-for f in install.sh flush-session-to-kb.sh kb-session-brief.sh kb-mcp-call.sh; do
+for f in install.sh flush-session-to-kb.sh kb-session-brief.sh \
+         kb-mcp-call.sh notify-complete.sh turn-start.sh \
+         kb-hook-dispatch.sh kb-flush-backfill.sh update.sh; do
   curl -4 -fsS -H "Authorization: Bearer $KB_ENROL_CODE" "$KB_REST_URL/api/setup/$f" -o "$f"
 done
 bash install.sh
 ```
+
+Fetch **every served asset, not just the four hook scripts**: `install.sh`
+installs `kb-hook-dispatch.sh` unconditionally (it is the only script registered
+with Claude Code), so a four-file fetch dies at the installer. The authoritative
+list is `GET /api/setup/manifest.json` (a content-derived version plus a sha256
+per file); a mechanical test keeps this block equal to the served set. Once a
+box is installed, `~/.claude/hooks/update.sh` refreshes everything from that
+manifest with one command and re-runs the installer — the pre-brief's
+`[KB setup] ... OUT OF DATE` banner points at it.
 
 Why a code rather than the credential: `kb_setup` answers into a chat
 transcript, and the session hooks flush transcripts **into the KB**, which is

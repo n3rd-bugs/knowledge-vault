@@ -23,13 +23,15 @@ from kbcore import consolidation, llm
 from kbcore.config import settings
 from kbcore.review import close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
+from kbworker import summary_stamps
 
 logger = logging.getLogger("kbworker.consolidate")
 
 CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
 
-# Contradiction pairs judged this run, across projects — the per-night budget is
-# shared (settings.kb_contradiction_pair_cap), so it has to be counted somewhere
+# Contradiction pairs judged this run, across projects — the budget is shared
+# (settings.kb_contradiction_pair_cap) and PER RUN, not per night (a resumed fragment
+# gets a fresh allotment; day-keyed caps are Wave I), so it has to be counted somewhere
 # both _contradictions and the report can see. Reset per run, like _COHORT_STATS.
 _CONTRA_STATS: dict[str, int] = {"judged": 0}
 
@@ -57,12 +59,20 @@ def _note_stop(step: str, reason: str, deferred: int) -> None:
     tags were silently dropped. Every step's remaining work is now re-derived
     from the queue/data on the next eligible run, and the log claims exactly
     that, no more.
+
+    THE NUMBER IS THE STEP'S HONEST REMAINING WORK, in the step's own unit
+    (review #8): for the drain, still-pending queue ROWS that already existed at
+    run start (H6 — a submission landing mid-run is not 'deferred'); for
+    summaries, tags this run would actually have WRITTEN (H8 — the all-flagged
+    residue and stamped no-yield tags are excluded); for contradictions and
+    evidence, candidate pairs. Callers pass exactly what the next eligible run
+    will find waiting, so the pause marker, the report and the digest agree.
     """
     prior = _STOP_LOG.get(step, {}).get("deferred", 0)
     _STOP_LOG[step] = {"reason": reason, "deferred": prior + deferred}
     logger.warning(
-        "step %r pausing (%s): %d item(s) deferred — the next eligible run "
-        "re-derives its remaining work and resumes here",
+        "step %r pausing (%s): %d unit(s) of remaining work deferred — the next "
+        "eligible run re-derives its remaining work and resumes here",
         step,
         reason,
         deferred,
@@ -114,20 +124,39 @@ def _summaries(since: datetime | None, stop: StopCheck | None = None) -> int:
     newest summary, :func:`kbcore.consolidation.tags_needing_summary`), not from
     the run mark ``_write_report`` used to advance even over a stood-down step.
     ``since`` rides along for the call/patch surface only.
+
+    TODO == WRITABLE WORK (review #8 H8). The selection applies the same content
+    exclusion the feeding query does (H8a, in SQL), and a tag a prior attempt
+    could not summarize — too few sources, or an EMPTY body from the model — is
+    stamped (:mod:`kbworker.summary_stamps`) and skipped until new items arrive
+    for it (H8b). So the 'deferred' number a stand-down reports is tags this run
+    would actually have written, never a residue re-tried nightly, and a no-yield
+    tag costs exactly one summarizer call per change in its feeding set.
     """
     written = 0
-    todo = consolidation.tags_needing_summary(since)
-    for n, (project, tag, _new) in enumerate(todo):
+    stamps = summary_stamps.load()
+    selected = consolidation.tags_needing_summary(since)
+    todo = [t for t in selected if not summary_stamps.skip(stamps, *t)]
+    if len(selected) != len(todo):
+        logger.info(
+            "summaries: %d stamped tag(s) skipped — a prior attempt yielded nothing and "
+            "no new item has arrived for them since",
+            len(selected) - len(todo),
+        )
+    for n, (project, tag, new_count) in enumerate(todo):
         if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
             _note_stop("summaries_written", reason, len(todo) - n)
             break
         sources = consolidation.active_items_with_tag(project, tag)
         if len(sources) < 3:
+            summary_stamps.record(stamps, project, tag, new_count, "too_few_sources")
             continue
         body = llm.summarize_items(tag, sources)
         if not body.strip():
+            summary_stamps.record(stamps, project, tag, new_count, "empty_body")
             continue
         consolidation.create_summary(project, tag, body, [s["id"] for s in sources])
+        summary_stamps.clear(stamps, project, tag)
         written += 1
     return written
 
@@ -138,7 +167,7 @@ def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None
     One LLM call per pair, so this is one of the three tail steps that used to
     run past the deadline unbounded: ``stop`` is asked every
     :data:`STOP_CHECK_EVERY` pairs and ``cap`` bounds the pairs judged (the
-    caller's REMAINING share of the per-night budget). Stopping loses nothing — a
+    caller's REMAINING share of the per-RUN budget). Stopping loses nothing — a
     pair that is still near-but-not-dup is re-offered by the same query next run,
     and ``record_contradiction`` is idempotent for the ones already judged.
 
@@ -197,9 +226,10 @@ def _contradiction_pair_cap(now: datetime | None = None) -> int:
 def _contradictions_all(
     projects: list[str], stop: StopCheck | None = None, cap: int | None = None
 ) -> int:
-    """Step 3 across every project under ONE shared per-night pair budget.
+    """Step 3 across every project under ONE shared per-RUN pair budget.
 
-    The budget is per NIGHT, not per project, so a single large project cannot
+    The budget is per RUN (a resumed fragment gets a fresh allotment; day-keyed
+    caps are Wave I), not per project, so a single large project cannot
     consume the whole GPU window; projects are taken in order and whatever is not
     reached is offered again next run (nothing is written, nothing is lost).
     The default budget is day-aware (:func:`_contradiction_pair_cap`); an
@@ -212,7 +242,7 @@ def _contradictions_all(
     for project in projects:
         remaining = budget - _CONTRA_STATS["judged"]
         if remaining <= 0:
-            logger.info("contradiction judging hit the per-night cap of %d pairs", budget)
+            logger.info("contradiction judging hit the per-run cap of %d pairs", budget)
             break
         queued += _contradictions(project, stop, remaining)
     return queued

@@ -8,14 +8,24 @@ over tonight's metrics, the prior run's baseline and the anchored floors.
 test already uses, same pattern as kbworker.tail_steps / kbworker.digest), and
 the logger keeps the ``kbworker.eval_sentinel`` name these WARNING lines have
 always carried in journald.
+
+DETECTOR HYGIENE (review #9a EV-2, KB 31857 follow-up): the baseline and the
+recovery anchor read only FALLBACK-FREE prior evals (``kbcore.eval_baseline``),
+and a trip measured on a night whose own replay fell back is a MEASUREMENT,
+not a corpus regression — labelled as such in the WARNING, recorded under the
+ADDED key ``eval_regression_measurement`` and never enqueued as a
+``search_regression`` row; nor does such a night auto-resolve an open row
+(a contaminated HIGH is not evidence of recovery either). ``eval_regression``
+keeps its meaning: True only for a fallback-free trip.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any
 
-from kbcore import consolidation
+from kbcore import eval_baseline
 from kbcore import review as review_mod
 from kbcore.config import settings
 
@@ -25,11 +35,21 @@ REGRESSION_EPSILON = 0.05  # absolute hit@5 / MRR drop vs the prior run that tri
 REVIEW_REASON = "search_regression"
 
 
+def _tonights_fallbacks(counts: Mapping[str, Any]) -> int:
+    """How many of tonight's primary-replay cases fell back to the fused order.
+
+    ``eval_sentinel._run`` snapshots ``counts['eval_rerank_tally']`` BEFORE it
+    calls the detector; a run without the tally (rerank off) reads as 0.
+    """
+    return eval_baseline.rerank_fallbacks(counts)
+
+
 def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> None:
-    prior = consolidation.previous_eval_metrics()
+    prior = eval_baseline.previous_eval_metrics()
     open_row = review_mod.open_review_by_reason(REVIEW_REASON)
     floor_h = settings.kb_eval_min_hit5
     floor_m = settings.kb_eval_min_mrr
+    fallbacks = _tonights_fallbacks(counts)
 
     # Two independent trips: (1) a drop beyond epsilon vs the previous run, and
     # (2) an ANCHORED ABSOLUTE floor. The floor catches a gradual sub-epsilon drift
@@ -39,6 +59,30 @@ def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> N
     dropped = prior is not None and (
         prior["hit_at_5"] - hit_at_5 > REGRESSION_EPSILON or prior["mrr"] - mrr > REGRESSION_EPSILON
     )
+    if (below_floor or dropped) and fallbacks:
+        # A trip on a fallback night is a MEASUREMENT (module docstring): say so,
+        # record it, and leave the queue alone — the next fallback-free night
+        # re-measures against the same clean baseline; the floor still backstops.
+        counts["eval_regression_measurement"] = {
+            "rerank_fallback": fallbacks,
+            "hit_at_5": round(hit_at_5, 4),
+            "mrr": round(mrr, 4),
+            "below_floor": below_floor,
+            "dropped": bool(dropped),
+        }
+        logger.warning(
+            "SEARCH-QUALITY measurement (rerank fallback %d): hit@5 %.3f MRR %.3f tripped "
+            "(prior %s, floor %.2f/%.2f, epsilon %.2f) on a replay measured partly on the "
+            "fused order — not recorded as a corpus regression",
+            fallbacks,
+            hit_at_5,
+            mrr,
+            f"{prior['hit_at_5']:.3f}/{prior['mrr']:.3f}" if prior else "none",
+            floor_h,
+            floor_m,
+            REGRESSION_EPSILON,
+        )
+        return
     if below_floor or dropped:
         counts["eval_regression"] = True
         # Recovery ANCHOR = the pre-drift baseline we must climb back to. Never let
@@ -81,6 +125,15 @@ def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> N
     # No regression: self-heal a stale flag only on FULL recovery to the SAME
     # anchor (>= baseline, not baseline − epsilon) AND above the floor, so a partial
     # rebound never auto-retracts a still-degraded state and drags the baseline down.
+    # Never on a fallback night: a stalled replay's number is not evidence either way.
+    if open_row is not None and fallbacks:
+        logger.info(
+            "search-quality: open regression row %d left as is — tonight's replay fell back "
+            "on %d case(s), so its numbers cannot prove recovery",
+            open_row[0],
+            fallbacks,
+        )
+        return
     if open_row is not None:
         queue_id, detail = open_row
         base_h = float(detail.get("baseline_hit_at_5", 0.0))

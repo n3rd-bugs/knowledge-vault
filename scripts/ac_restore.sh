@@ -165,9 +165,17 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   exit 0
 fi
 
+# The marker's pause instant, for the resume line only (review #9a INS-8: AGE is
+# the debounce stamp's age since the FIRST healthy tick after the stand-down,
+# not how long the grid has held — say exactly that). The marker is JSON written
+# by powerguard.record_battery_pause; 'at' is pulled with sed (no jq dependency),
+# fractional seconds dropped, '?' when a marker carries none.
+PAUSED_AT="$(sed -n 's/.*"at": *"\([^"]*\)".*/\1/p' "${MARKER}" 2>/dev/null | head -n 1 | sed -E 's/\.[0-9]+//')"
+PAUSED_AT="${PAUSED_AT:-?}"
+
 echo "$(( ATTEMPTS_N + 1 ))" > "${ATTEMPTS}"
 systemctl --user start --no-block kb-consolidate.service
-echo "ac_restore: grid stable for ${AGE}s (>= ${GRID_DEBOUNCE_SECONDS}s) — resuming the battery-paused nightly (kb-consolidate.service; resume attempt $(( ATTEMPTS_N + 1 ))/${RESUME_MAX_ATTEMPTS})"
+echo "ac_restore: grid healthy on consecutive ticks ${AGE}s apart (debounce ${GRID_DEBOUNCE_SECONDS}s) — resuming the battery-paused nightly (paused ${PAUSED_AT}; kb-consolidate.service; resume attempt $(( ATTEMPTS_N + 1 ))/${RESUME_MAX_ATTEMPTS})"
 rm -f -- "${STAMP}"
 # The marker stays: the resumed run's clean finish clears it (record_battery_pause),
 # so a resume that pauses again on battery leaves this trigger armed.

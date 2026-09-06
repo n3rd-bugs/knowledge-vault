@@ -20,11 +20,16 @@ jitter 49.7-50.4).
 
 NEVER ANY-ROW. Grid-tied evening discharge (the 19:00 hour) shows the same
 signature for a row or two: 37 single and 14 double matches since 08-01, all
-of them grid (incl. 09-01 19:00:36). Real off-grid runs are 32-282 rows long.
-Requiring ``OFFGRID_CONSECUTIVE_ROWS`` (3) CONSECUTIVE matches separates the
-two populations with no overlap in the measured history; an any-row rule would
-mint a new phantom class. Real onsets DO dip (09-02 20:35-36, 08-28 23:11-12
-read 0 V for a row or two), so the any-row voltage floor stays as the fast path.
+of them grid (incl. 09-01 19:00:36). MEASURED DISTRIBUTION (review #9a, the
+ledger since Sep 3 — the source for any future change to either constant):
+23 off-grid-signature runs of >= 3 rows, 15 of them only 3-13 rows long, while
+the 12 one/two-row grid-tied matches in the same span stayed silent. So
+``OFFGRID_CONSECUTIVE_ROWS`` (3) separates the two populations by a margin of
+ONE row (2 vs 3), not the '32-282 rows, no overlap' the first cut claimed;
+these are off-grid-SIGNATURE runs, not confirmed outages (the poller persists
+no running_state bit). An any-row rule would mint a new phantom class. Real
+onsets DO dip (09-02 20:35-36, 08-28 23:11-12 read 0 V for a row or two), so
+the any-row voltage floor stays as the fast path.
 
 Not knobs on purpose: ``kbcore.config`` sits at its ratchet ceiling, and these
 are properties of THIS inverter's firmware. Re-derive the threshold table on

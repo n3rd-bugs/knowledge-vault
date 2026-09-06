@@ -32,6 +32,12 @@ against THIS pass's PRODUCTION-DEFAULT replay (no per-case kwargs), so a
 kwargs-pinned case is scored on what an ordinary agent query surfaces. Its own
 guard: a broken rider costs ``eval_satisfier_status='error'``, never the
 composition shares.
+
+Review #9a EV-1/EV-4: this replay's OWN rerank participation is recorded per
+case (``eval_case_rerank_composition``, keyed like ``kbworker.eval_cases``) and
+rolled up (``eval_rerank_tally_composition``) — the primary tally is snapshot
+before this pass and never described it, so the satisfier series' cleanliness
+was only ever inferable from journald.
 """
 
 from __future__ import annotations
@@ -41,9 +47,9 @@ from collections.abc import Mapping
 from types import ModuleType
 from typing import Any
 
-from kbcore import eval_harness
+from kbcore import eval_harness, rerank
 from kbcore.items import get_item
-from kbworker import eval_trust
+from kbworker import eval_cases, eval_trust
 
 logger = logging.getLogger("kbworker.eval_sentinel")
 TRUST_K = 5  # top-K window the trust composition is measured over
@@ -93,11 +99,13 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
     total = 0
     top5_ids: set[int] = set()
     per_case: list[tuple[dict, list[Any]]] = []
+    outcomes: dict[str, str] = {}
     for case in golden:
         query = case.get("q")
         if not query:
             continue
         hits = list(_seam().search(query, k=TRUST_K, tool=None))
+        outcomes[eval_cases.case_key(str(query), outcomes)] = rerank.last_outcome()
         per_case.append((case, hits))
         for hit in hits:
             total += 1
@@ -128,6 +136,8 @@ def _trust_composition(golden: list[dict]) -> dict[str, Any]:
         "eval_top5_summary": summary,
         "eval_top5_results": total,
         "eval_top5_item_ids": sorted(top5_ids),
+        "eval_case_rerank_composition": outcomes,
+        "eval_rerank_tally_composition": eval_cases.rerank_tally(outcomes),
     }
     try:  # the satisfier rider has its OWN guard: it may never cost the shares
         result.update(_satisfier_telemetry(per_case))

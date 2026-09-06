@@ -291,7 +291,7 @@ def test_promote_table_prefers_eval_top5_and_appends_paste_ready(kb, weekly_on, 
     monkeypatch.setattr(settings, "kb_promote_candidate_min_recalls", 0)
     a = ingest("p1", "note", "older candidate", "body a", uri="pc:a", trust="unverified")
     b = ingest("p1", "note", "eval-surfaced candidate", "body b", uri="pc:b", trust="unverified")
-    ingest(  # the nightly report whose meta carries the persisted eval top-5 ids
+    rep = ingest(  # the nightly report whose meta carries the persisted eval top-5 ids
         "kb-system",
         "report",
         "Consolidation report",
@@ -301,6 +301,12 @@ def test_promote_table_prefers_eval_top5_and_appends_paste_ready(kb, weekly_on, 
         trust="verified",
         meta={"consolidation": True, "eval_top5_item_ids": [b], "eval_top5_verified_lift": 7.5},
     )
+    # The weekly window is whole COMPLETED nights (review #9a INS-6 fix): a report
+    # created "now" is the night in progress and rolls to next week — backdate it.
+    from kbcore.db import transaction
+
+    with transaction() as conn:
+        conn.execute("UPDATE items SET created_at = now() - interval '1 day' WHERE id = %s", (rep,))
     counts: dict = {}
     assert weekly.maybe_weekly(counts, now=A_SUNDAY) is True
     body = _weekly_body(counts)

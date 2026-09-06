@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
 
 from kbcore import consolidation, llm
 from kbcore.config import settings
@@ -44,10 +43,14 @@ StopCheck = Callable[[], "str | None"]
 # the grid drops or the deadline passes.
 STOP_CHECK_EVERY = 5
 
+
 # Why each step stood down, and how much it left behind. Persisted in the run
 # report (counts["stopped"]) — a run that quietly did a third of its work is
-# indistinguishable from a broken one unless it SAYS why it stopped.
-_STOP_LOG: dict[str, dict[str, Any]] = {}
+# indistinguishable from a broken one unless it SAYS why it stopped. The object
+# lives in kbworker.stop_log (review #9a: it also carries the run's start and
+# first battery stand-down instants) and is re-imported here, so
+# ``tail_ops._STOP_LOG`` / ``consolidate._STOP_LOG`` stay ONE shared object.
+from kbworker.stop_log import _STOP_LOG, pause_payload  # noqa: E402, F401
 
 
 def _note_stop(step: str, reason: str, deferred: int) -> None:
@@ -70,6 +73,7 @@ def _note_stop(step: str, reason: str, deferred: int) -> None:
     """
     prior = _STOP_LOG.get(step, {}).get("deferred", 0)
     _STOP_LOG[step] = {"reason": reason, "deferred": prior + deferred}
+    _STOP_LOG.note_reason(reason)  # stamps the FIRST battery stand-down of the run (#9a INS-2)
     logger.warning(
         "step %r pausing (%s): %d unit(s) of remaining work deferred — the next "
         "eligible run re-derives its remaining work and resumes here",

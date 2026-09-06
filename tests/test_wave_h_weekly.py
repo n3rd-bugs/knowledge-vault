@@ -30,19 +30,23 @@ needs_db = pytest.mark.skipif(not DB_UP, reason="compose Postgres not reachable"
 PKT = timezone(timedelta(hours=5))  # the deployment's zone, pinned
 A_SUNDAY = datetime(2026, 8, 16, 1, 30)  # local; weekday() == 6 == _DAYS['sun']
 MISS_STATS = {"total": 0, "distinct": 0, "empty": 0, "thin": 0}
-NOW = datetime(2026, 8, 30, 1, 30, tzinfo=PKT)
+NOW = datetime(2026, 8, 31, 1, 30, tzinfo=PKT)  # the Monday 01:30 weekly; night_of == 08-30
 
 
 def _run(at: datetime, **meta):
     return (at, meta)
 
 
-# A fragmented Saturday night (paused 01:30 local, resumed 03:00 local) plus a
-# Sunday 10:00 local boot catch-up: three runs, two LOCAL nights. In UTC-date
-# terms the two Saturday fragments fall on 08-29 while the catch-up is 08-30.
+# A fragmented Saturday night — the 01:00 nightly (30 min, paused at 01:30
+# local), its grid-restore resume at 03:00 local and a Sunday 10:00 local boot
+# catch-up — plus a Sunday-EVENING 20:00 local run: four runs, two LOCAL nights
+# under the start-keyed NOON rule (review #9a INS-1; re-pinned from the 06:00
+# finish-keyed rule, under which the 10:00 catch-up was its own row). In UTC-date
+# terms the two Saturday fragments fall on 08-29 while both Sunday runs are 08-30.
 FRAGMENTED = [
     _run(
         datetime(2026, 8, 29, 20, 30, tzinfo=UTC),
+        run_secs=1800,  # started 20:00Z = 01:00 local: the nightly's start keys the night
         queued_drained=3,
         queued_items_saved=2,
         review_triaged=100,
@@ -74,47 +78,65 @@ FRAGMENTED = [
         review_queue_open=15_200,
         quiet_expiry_counts={"eligible_remaining": 120},
     ),
+    _run(
+        datetime(2026, 8, 30, 15, 0, tzinfo=UTC),  # 20:00 local Sunday: opens the NEXT night
+        queued_drained=2,
+        review_triaged=5,
+        eval_hit_at_5=0.99,
+        eval_mrr=0.95,
+        review_queue_open=15_300,
+        quiet_expiry_counts={"eligible_remaining": 100},
+    ),
 ]
 
 
 # --- (f) rows by LOCAL night ------------------------------------------------------
 
 
-def test_nights_group_fragments_and_file_pre_dawn_runs_under_the_previous_night():
+def test_nights_group_fragments_and_file_pre_noon_runs_under_the_previous_night():
     grouped = weekly_instruments.nights(FRAGMENTED, PKT)
     assert [n for n, _ in grouped] == [date(2026, 8, 29), date(2026, 8, 30)]
-    assert [len(runs) for _, runs in grouped] == [2, 1]
-    assert weekly_instruments.nights_line(FRAGMENTED, PKT) == "nights reported: 2 (3 runs)"
+    assert [len(runs) for _, runs in grouped] == [3, 1], (
+        "the nightly, its resume AND the 10:00 catch-up are one night; the evening run is not"
+    )
+    assert weekly_instruments.nights_line(FRAGMENTED, PKT) == "nights reported: 2 (4 runs)"
     # The rule is LOCAL: pin a different zone and the grouping moves with it —
-    # in UTC-5 the 05:00Z catch-up is 00:00 local, i.e. still pre-dawn of the
-    # 29th, so all three runs fold into ONE night there.
+    # in UTC-5 the 15:00Z evening run is 10:00 local, i.e. still the morning
+    # after the 29th's night, so all four runs fold into ONE night there.
     utc_minus5 = timezone(timedelta(hours=-5))
     assert [n for n, _ in weekly_instruments.nights(FRAGMENTED, utc_minus5)] == [date(2026, 8, 29)]
 
 
-def test_night_rows_sum_flows_take_the_last_runs_gauges_and_show_the_runs_column():
+def test_night_rows_sum_flows_take_the_clean_runs_gauges_and_show_the_runs_column():
     rows = weekly_instruments.night_rows(FRAGMENTED, PKT)
     assert len(rows) == 2
     sat, sun = rows
-    assert sat.startswith("2026-08-29   (2)  ")
+    assert sat.startswith("2026-08-29   (3)  ")
     cells = sat.split()
-    assert cells[2:6] == ["7", "3", "150", "500"], "flows SUM over the night's runs"
-    assert cells[6:8] == ["0.970", "0.910"], "eval columns come from the LAST run"
+    assert cells[2:6] == ["8", "3", "160", "500"], "flows SUM over the night's runs"
+    assert cells[6:8] == ["0.970", "0.910"], (
+        "eval columns come from the night's last fallback-free run CARRYING an mrr "
+        "(the catch-up has none); review #9a INS-5"
+    )
+    assert cells[-1] == "-", "no run carries a rerank tally: the fb column is blank"
     assert sun.startswith("2026-08-30   (1)  ")
-    assert sun.split()[2:6] == ["1", "-", "10", "-"], "absent keys render '-', never 0"
+    assert sun.split()[2:6] == ["2", "-", "5", "-"], "absent keys render '-', never 0"
 
 
 def test_report_body_and_push_use_local_nights_and_the_local_header_date():
     body = weekly_render._report_body(NOW, FRAGMENTED, MISS_STATS, [], 0, 0, None, 0, [], tz=PKT)
     lines = body.splitlines()
-    assert "window: 7d ending 2026-08-30; nights reported: 2 (3 runs)" in lines
+    assert "window: 7 nights 2026-08-23..2026-08-29; nights reported: 2 (4 runs)" in lines, (
+        "the window is whole COMPLETED nights ending before night_of(now) (review #9a INS-6)"
+    )
     header = next(ln for ln in lines if ln.startswith("night "))
-    assert header.split()[:3] == ["night", "runs", "drained"]
+    assert header.split()[:3] == ["night", "runs", "drained"] and header.split()[-1] == "fb"
     assert sum(ln.startswith("2026-08-29") for ln in lines) == 1, "one row per local night"
+    assert weekly_instruments.FB_NOTE in lines
     push = weekly_render._push_lines(NOW, FRAGMENTED, MISS_STATS, [], 0, None, 42, tz=PKT)
-    assert push[0] == "KB weekly 2026-08-30"
-    assert push[1] == "nights reported: 2 (3 runs)"
-    assert "7d: drained 8, saved 3, triaged 160" in push, "7d flows still sum every run"
+    assert push[0] == "KB weekly 2026-08-31"
+    assert push[1] == "nights reported: 2 (4 runs)"
+    assert "7d: drained 10, saved 3, triaged 165" in push, "7d flows still sum every run"
     assert len(push) <= weekly_render.PUSH_MAX_LINES and all(ln.isascii() for ln in push)
 
 
@@ -125,9 +147,9 @@ def test_expiry_eligible_left_reads_the_nested_key_first_to_last():
     series = weekly_instruments._nested_series(
         FRAGMENTED, "quiet_expiry_counts", "eligible_remaining"
     )
-    assert series == [767.0, 600.0, 120.0]
+    assert series == [767.0, 600.0, 120.0, 100.0]
     body = weekly_render._report_body(NOW, FRAGMENTED, MISS_STATS, [], 0, 0, None, 0, [], tz=PKT)
-    assert "  expiry eligible left:    767 -> 120" in body.splitlines()
+    assert "  expiry eligible left:    767 -> 100" in body.splitlines()
     absent = weekly_render._report_body(NOW, [], MISS_STATS, [], 0, 0, None, 0, [], tz=PKT)
     assert "  expiry eligible left:    n/a" in absent.splitlines()
     assert (

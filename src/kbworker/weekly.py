@@ -31,7 +31,7 @@ carve-out). Counts keys are ADDED, never renamed: ``weekly_report_pushed``,
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -41,7 +41,8 @@ from kbcore.config import settings
 from kbcore.db import connect
 from kbcore.drainsched import _DAYS  # the ONE mon..sun table (no second copy)
 from kbcore.ingest import ingest
-from kbworker.weekly_instruments import nights, typed_edge_diff
+from kbworker.digest_lines import window_bounds
+from kbworker.weekly_instruments import nights, typed_edge_diff, window_reports
 
 # Review #8 H9 instrument reads (typed-edge totals, calibration percentiles):
 # one fail-open query each, in kbworker.weekly_reads so this file stays under
@@ -116,14 +117,33 @@ def _is_weekly_day(now: datetime | None = None) -> bool:
     return (now or datetime.now()).weekday() == day
 
 
+def _nights_through(prior: tuple | None) -> date | None:
+    """The prior weekly's last reported night (``nights_through`` meta), or None."""
+    raw = prior[1].get("nights_through") if prior else None
+    try:
+        return date.fromisoformat(str(raw)) if raw else None
+    except ValueError:
+        return None
+
+
 def _run(counts: dict[str, Any]) -> bool | None:
     """Assemble + persist + push one weekly report. None = already done this week."""
     now = datetime.now(UTC)
     prior = _prior_weekly()
     if prior is not None and (now - prior[0]).days < WINDOW_DAYS - 1:
-        logger.info("weekly report already written %s — skipping this run", prior[0].date())
+        logger.info(
+            "weekly report already written %s (item %s) — skipping this run",
+            prior[0].astimezone().date(),  # LOCAL, like the title (review #9a INS-9)
+            prior[2],
+        )
         return None
-    reports = _nightly_reports()
+    # Review #9a INS-6: fetch one day more than the window and trim to WHOLE
+    # COMPLETED local nights, tiling exactly after last week's nights_through —
+    # so no run is ever lost or double-counted across consecutive weeklies.
+    start_after = _nights_through(prior)  # exact tiling after last week (INS-6 fix)
+    reports = window_reports(
+        _nightly_reports(WINDOW_DAYS + 1), now, nights_back=WINDOW_DAYS, start_after=start_after
+    )
     miss_stats = search_misses.stats(days=WINDOW_DAYS)
     top = search_misses.top_misses(days=WINDOW_DAYS, limit=TOP_MISSES)
     candidates = review_promote.count_promote_candidates()
@@ -151,6 +171,7 @@ def _run(counts: dict[str, Any]) -> bool | None:
         "promote_candidates": candidates,
         "promoted_total": promoted_total,  # next week's checkpoint
         "search_misses_swept": swept,
+        "nights_through": window_bounds(now, None, WINDOW_DAYS, start_after)[1].isoformat(),
     }
     if promoted_7d is not None:
         meta["promoted_7d"] = promoted_7d
@@ -175,6 +196,8 @@ def _run(counts: dict[str, Any]) -> bool | None:
         typed_diff=typed_diff,
         calibration=calibration,
         floor=settings.kb_miss_relevance_floor,
+        expire_cap=settings.kb_review_expire_cap,
+        start_after=start_after,
     )
     item_id = ingest(
         "kb-system",
@@ -205,26 +228,27 @@ def _run(counts: dict[str, Any]) -> bool | None:
     return pushed
 
 
-def _prior_weekly() -> tuple[datetime, dict[str, Any]] | None:
-    """Newest weekly item's ``(created_at, meta)`` — the checkpoint + rerun guard."""
+def _prior_weekly() -> tuple[datetime, dict[str, Any], int] | None:
+    """Newest weekly item's ``(created_at, meta, id)`` — the checkpoint + rerun guard."""
     with connect() as conn:
         row = conn.execute(
-            "SELECT created_at, meta FROM items "
+            "SELECT created_at, meta, id FROM items "
             "WHERE project = %s AND type = 'report' AND meta @> %s "
             "ORDER BY created_at DESC LIMIT 1",
             ("kb-system", Jsonb({"weekly_report": True})),
         ).fetchone()
     if row is None:
         return None
-    return row[0], (row[1] if isinstance(row[1], dict) else {})
+    return row[0], (row[1] if isinstance(row[1], dict) else {}), int(row[2])
 
 
 def _nightly_reports(days: int = WINDOW_DAYS) -> list[tuple[datetime, dict[str, Any]]]:
-    """The window's nightly consolidation reports, OLDEST first (the trend axis).
+    """The last ``days`` x 24 h of nightly consolidation reports, OLDEST first.
 
     The report item's meta carries the run's whole counts dict (consolidate's
     ``_write_report``), so the dial series — eval metrics, unverified share —
-    need no new table.
+    need no new table. The caller trims this to whole local nights
+    (``weekly_instruments.window_reports``); the SQL cut is only the fetch.
     """
     with connect() as conn:
         rows = conn.execute(

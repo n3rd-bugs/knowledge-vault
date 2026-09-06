@@ -241,7 +241,9 @@ def test_trust_watch_derives_the_count_from_parts_and_degrades_bare():
 
 
 def _report(day: int, **meta):
-    return (datetime(2026, 8, day, 2, 0), meta)
+    # 10:00Z = 15:00 local under the pinned zone: an afternoon run OPENS the
+    # night of its own date under the start-keyed noon rule (review #9a INS-1).
+    return (datetime(2026, 8, day, 10, 0), meta)
 
 
 WEEK = [
@@ -275,7 +277,7 @@ WEEK = [
 MISS_STATS = {"total": 0, "distinct": 0, "empty": 0, "thin": 0}
 NOW = datetime(2026, 8, 27, 1, 30)
 # Rows are grouped by LOCAL night since review #8 H9f; pin the deployment's zone
-# so the 02:00Z fixtures file under their own date on any box (07:00 local).
+# so the 10:00Z fixtures file under their own date on any box (15:00 local).
 PKT = timezone(timedelta(hours=5))
 
 
@@ -293,7 +295,10 @@ def test_weekly_body_gains_the_stocks_block_and_the_expired_column():
     stocks = "\n".join(lines)
     assert "review queue open:" in stocks and "14,981 -> 17,330" in stocks
     assert "never-triaged open:" in stocks and "100 -> 160" in stocks
-    assert "expired/night:" in stocks and "2 -> 500" in stocks
+    # Review #9a INS-4: a FLOW renders as the window total (+ nights at cap when
+    # a cap is passed), never as a first -> last 'stock'.
+    assert "expired (window):" in stocks and "502 total" in stocks
+    assert "expired/night" not in stocks
     assert "reject suggestions open:" in stocks and "395 -> 1,264" in stocks
 
 

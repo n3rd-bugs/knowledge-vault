@@ -20,17 +20,21 @@ inspection), and the phone push previews are bounded harder still.
 
 from __future__ import annotations
 
-from datetime import datetime, tzinfo
+from datetime import date, datetime, tzinfo
 from typing import Any
 
 from kbcore import search_misses
+from kbworker.digest_lines import window_bounds
 from kbworker.weekly_instruments import (  # noqa: F401
+    FB_NOTE,
     _calibration_line,
     _cell,
     _contradiction_lines,
     _nested_series,
     _typed_edge_line,
     _verified_top5,
+    clean_reports,
+    expired_line,
     night_rows,
     nights_line,
 )
@@ -120,8 +124,11 @@ def _push_lines(
             f"saved {_sum(reports, 'queued_items_saved')}, "
             f"triaged {_sum(reports, 'review_triaged')}"
         ),
-        f"eval hit@5: {_trend(_series(reports, 'eval_hit_at_5'))}",
-        f"eval mrr: {_trend(_series(reports, 'eval_mrr'))}",
+        # Review #9a EV-1: the two primary-replay series read fallback-free
+        # reports only (a stalled sidecar measures the fused order); the
+        # composition-pass lines below are clean by construction, unfiltered.
+        f"eval hit@5: {_trend(_series(clean_reports(reports), 'eval_hit_at_5'))}",
+        f"eval mrr: {_trend(_series(clean_reports(reports), 'eval_mrr'))}",
         f"top5 unverified: {_trend(_series(reports, 'eval_top5_unverified_share'))}",
         # The lift never renders alone (review #6): ~90% of one week's climb was
         # corpus-denominator decay, so its components ride the same line.
@@ -173,35 +180,43 @@ def _report_body(
     calibration: dict[str, Any] | None = None,
     floor: float = 0.0,
     tz: tzinfo | None = None,
+    expire_cap: int | None = None,
+    start_after: date | None = None,
 ) -> str:
     """The full weekly table persisted as the kb-system report item's body.
 
-    Rows are ONE PER LOCAL NIGHT (review #8 H9f): flows summed over the night's
-    runs with the run count beside the date, eval/stock columns from the last
-    run. The instruments block carries the Wave I trigger series.
+    Rows are ONE PER LOCAL NIGHT (review #8 H9f), keyed on the run START over
+    a window of whole nights (review #9a INS-1/6): flows summed over the
+    night's runs with the run count beside the date, eval/stock columns from
+    the night's last fallback-free run with the ``fb`` count beside them. The
+    instruments block carries the Wave I trigger series.
     """
+    w = window_bounds(now, tz, WINDOW_DAYS, start_after)  # exact tiling (INS-6 fix)
     lines = [
         "KB weekly trend report",
         "",
-        f"window: {WINDOW_DAYS}d ending {now.date().isoformat()}; {nights_line(reports, tz)}",
+        f"window: {(w[1] - w[0]).days + 1} nights {w[0].isoformat()}..{w[1].isoformat()}; "
+        f"{nights_line(reports, tz)}",
         "",
         # v-top5/corp-v are the lift's numerator count and denominator fraction
         # (review #6 — a lift with no components invites the denominator-decay
         # misread); 'expired' makes the 2 -> 55 -> 500 cap ramp read as a trend.
         "night       runs  drained  saved  triaged  expired  hit@5   mrr     "
-        "unv-top5   v-lift  v-top5  corp-v",
+        "unv-top5   v-lift  v-top5  corp-v   fb",
     ]
     lines += night_rows(reports, tz)
+    lines.append(FB_NOTE)
     # STOCKS (review #6): first -> last levels beside the flow table above —
     # flows alone hid +2,349 queue growth, the expiry ramp and the swap creep.
     # 'expiry eligible left' (H9a) is the cap-raise trigger's series: a NESTED
-    # key, and a different predicate from db_snapshot's 'eligible now'.
+    # key, and a different predicate from db_snapshot's 'eligible now'. The
+    # 'expired' line is a FLOW — window total + nights at cap (review #9a INS-4).
     lines += [
         "",
         "stocks (first -> last over the window):",
         f"  review queue open:       {_trend_int(_series(reports, 'review_queue_open'))}",
         f"  never-triaged open:      {_trend_int(_series(reports, 'never_triaged_open'))}",
-        f"  expired/night:           {_trend_int(_series(reports, 'review_expired'))}",
+        f"  expired (window):        {expired_line(reports, tz, expire_cap)}",
         "  expiry eligible left:    "
         f"{_trend_int(_nested_series(reports, 'quiet_expiry_counts', 'eligible_remaining'))}",
         f"  reject suggestions open: {_trend_int(_series(reports, 'reject_suggestions_pending'))}",

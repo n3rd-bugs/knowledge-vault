@@ -21,7 +21,7 @@ from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any
 
-NIGHT_ROLLOVER_HOUR = 6  # a run finishing before 06:00 LOCAL belongs to the previous night
+NIGHT_ROLLOVER_HOUR = 12  # a run STARTING before noon LOCAL belongs to the previous night
 
 # RETIRED LINE (review #6): 'review rows start expiring <date>' was permanently
 # true post-rails — wallpaper; 'expired: N' + the EXPIRY 7d line do its job. The
@@ -39,16 +39,34 @@ def _expiring_soon(value: Any, today: date | None = None) -> bool:
     return when <= (today or date.today()) + timedelta(days=DIGEST_EXPIRY_HORIZON_DAYS)
 
 
+def window_bounds(
+    now: datetime, tz: tzinfo | None = None, nights_back: int = 7, start_after: date | None = None
+) -> tuple[date, date]:
+    """``(first, last)`` COMPLETED local nights a weekly covers (review #9a INS-6):
+    ``last`` is the night BEFORE ``night_of(now)`` — the weekly fires inside the
+    Sunday night, so that night's later runs roll into NEXT week instead of
+    vanishing; ``first`` tiles after the prior weekly's ``nights_through``."""
+    last = night_of(now, tz) - timedelta(days=1)
+    span = timedelta(days=nights_back - 1)
+    first = start_after + timedelta(days=1) if start_after else last - span
+    return min(first, last), last
+
+
 def night_of(at: datetime, tz: tzinfo | None = None) -> date:
-    """The LOCAL calendar night a run belongs to (review #8 H7d / H9f).
+    """The LOCAL calendar night a run belongs to (review #8 H7d / H9f; #9a INS-1).
 
     Stored instants are UTC (Invariant 7); this is the display-time rule both
     the digest's RESUME line and the weekly's per-night rows share: convert to
     local (``tz`` None = the box's zone; tests pin one) and file anything
     before :data:`NIGHT_ROLLOVER_HOUR` under the night that began the day
-    before — the 01:00 nightly, a pause + resume and the pre-dawn boot catch-up
-    land on ONE row, and the pre-existing UTC off-by-one (a 20:30Z Saturday
-    finish is Sunday 01:30 on this UTC+5 box) is gone. A naive input is UTC.
+    before. A naive input is UTC.
+
+    ``at`` is the run's START (review #9a INS-1: keyed on the finish, a nightly
+    overrunning the rollover filed under the NEXT night — the Sep 5 06:57
+    finish split its own night in two). The rollover is NOON, decided
+    deliberately: the 01:00 nightly, a grid-restore resume at 07:10 or 09:32
+    and a 10:00 boot catch-up are all continuations of the night they finish,
+    so they land on ONE row; a run starting after noon opens the coming night.
     """
     aware = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
     local = aware.astimezone(tz)
@@ -128,6 +146,9 @@ def _hm(secs: float) -> str:
     return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m {seconds:02d}s"
 
 
+TIMED_STEP_MIN_SECS = 1.0  # a ledger entry under this is an instant/stood-down step
+
+
 def _run_duration_line(counts: Mapping[str, Any]) -> str | None:
     """How long the run took, from the data the report already carries.
 
@@ -135,6 +156,10 @@ def _run_duration_line(counts: Mapping[str, Any]) -> str | None:
     (an ADDED key, not required); otherwise the ``step_secs`` cost ledger sums
     to the TIMED total and the label says so — the ledger omits untimed glue,
     so the two numbers are not the same thing and are never labelled alike.
+    The wall-clock form counts the steps that took >= :data:`TIMED_STEP_MIN_SECS`
+    against the ledger size (review #9a INS-7: ``run_report._run_step`` ledgers
+    EVERY invoked step, so '(20 steps timed)' was a constant on every run —
+    five of those twenty were stood down and fifteen more finished instantly).
     """
     steps = counts.get("step_secs")
     timed = (
@@ -148,10 +173,20 @@ def _run_duration_line(counts: Mapping[str, Any]) -> str | None:
     )
     wall = counts.get("run_secs")
     if isinstance(wall, int | float) and not isinstance(wall, bool) and wall > 0:
-        return f"run: {_hm(wall)} ({len(timed)} steps timed)"
+        slow = sum(1 for v in timed.values() if v >= TIMED_STEP_MIN_SECS)
+        return f"run: {_hm(wall)} ({slow}/{len(timed)} steps >= 1s)"
     if timed and sum(timed.values()) > 0:
         return f"steps timed: {_hm(sum(timed.values()))} over {len(timed)}"
     return None
+
+
+def _instant(value: Any) -> datetime | None:
+    """An ISO instant as an aware datetime (naive = UTC), or None when unparseable."""
+    try:
+        at = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return at if at.tzinfo is not None else at.replace(tzinfo=UTC)
 
 
 def _resume_line(counts: Mapping[str, Any], tz: tzinfo | None = None) -> str | None:
@@ -159,24 +194,26 @@ def _resume_line(counts: Mapping[str, Any], tz: tzinfo | None = None) -> str | N
 
     Review #8 H7d: a resumed run used to read as an ordinary short night. The
     producer contract is ``counts['resumed_from_pause']`` = the PRIOR pause
-    marker payload ``{'at': <UTC iso>, 'deferred': N}`` (powerguard's
-    ``record_battery_pause`` returning what it replaced), absent/None when the
-    run did not resume anything. Night and clock are LOCAL at render time only.
+    marker payload (powerguard's ``record_battery_pause`` returning what it
+    replaced), absent/None when the run did not resume anything. ``'at'`` is
+    the paused run's FIRST battery stand-down instant (review #9a INS-2 — it
+    used to be the marker's write time, 2h44m after the grid came back on Sep
+    5), ``'deferred'`` its total, and ``'started'`` (ADDED, tail_ops) the paused
+    run's start, which keys the night (INS-1; ``'at'`` when absent, pre-H.1
+    markers). Night and clock are LOCAL at render time only.
     """
     prior = counts.get("resumed_from_pause")
     if not isinstance(prior, Mapping):
         return None
-    try:
-        at = datetime.fromisoformat(str(prior.get("at")))
-    except (TypeError, ValueError):
+    at = _instant(prior.get("at"))
+    if at is None:
         return None
-    aware = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
-    local = aware.astimezone(tz)
+    started = _instant(prior.get("started")) or at
     deferred = prior.get("deferred")
     shown = deferred if isinstance(deferred, int) and not isinstance(deferred, bool) else "?"
     return (
-        f"RESUME of {night_of(aware, tz).isoformat()} "
-        f"(paused {local.strftime('%H:%M')} local, {shown} deferred)"
+        f"RESUME of {night_of(started, tz).isoformat()} "
+        f"(paused {at.astimezone(tz).strftime('%H:%M')} local, {shown} deferred)"
     )
 
 

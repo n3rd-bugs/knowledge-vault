@@ -51,7 +51,7 @@ from pathlib import Path
 
 import yaml
 
-from kbcore import search_expand
+from kbcore import rerank, search_expand
 from kbcore.db import connect
 
 # THE ESTABLISHED SEAM (mechanical split, review #5 Wave F): usage mining moved
@@ -95,6 +95,7 @@ class CaseResult:
     passed: bool  # ALL present criteria ok → feeds hit@5
     criteria: list[CriterionResult] = field(default_factory=list)
     chain_resolved: bool = False  # expect_item_id followed superseded_by to a live head
+    rerank: str = "off"  # this case's rerank participation: active | fallback | off (#9a)
 
 
 def load_golden(golden_path: Path | None = None) -> list[dict]:
@@ -223,6 +224,7 @@ def _evaluate_case(case: dict) -> CaseResult:
     # 180-day cutoff, permanently exempting it from archiving and growing
     # access_log ~125 rows/night. Eval reads are not usage (review finding).
     hits = search(query, k=K, tool=None, **_search_kwargs(case))
+    outcome = rerank.last_outcome()  # per-case: search() notes exactly one outcome per call
     hit_ids = [h.item_id for h in hits]
     criteria: list[CriterionResult] = []
     rank: int | None = None
@@ -273,7 +275,7 @@ def _evaluate_case(case: dict) -> CaseResult:
         )
         criteria.append(CriterionResult("forbid_item_id", ok, detail))
 
-    return CaseResult(query, rank, all(c.ok for c in criteria), criteria, chain_resolved)
+    return CaseResult(query, rank, all(c.ok for c in criteria), criteria, chain_resolved, outcome)
 
 
 def evaluate(

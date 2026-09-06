@@ -27,6 +27,13 @@ hit satisfied each golden case — ``eval_satisfier_types`` /
 go/no-go read. The rerank rollup ``eval_rerank_outcome`` is fallback > active >
 off and the digest renders the tally verbatim (H7a).
 
+MEASUREMENT HYGIENE (review #9a EV-3/EV-4): the rerank sidecar is WARMED before
+the tally is armed (``kbcore.rerank.warm_up`` — its first touches after a drain
+stalled on 3/3 drain nights and measured 15-22 cases on the fused order;
+``eval_rerank_warmup`` = ``{calls, secs, ok}``, fail-open, no key without a
+sidecar), and the primary replay's per-case ranks and rerank outcomes persist
+keyed by query (``kbworker.eval_cases`` — E1's per-case diff prerequisite).
+
 MRR QUANTUM: MRR is a mean of 1/rank over the positive-criterion cases, so ONE
 golden case slipping rank 1 -> 2 moves it by exactly (1 - 1/2) / n_positive =
 0.5/52 = 0.0096 on today's set — or an equivalent decomposition (two cases
@@ -54,6 +61,7 @@ from kbcore.search import search  # noqa: F401
 # (mechanical split, 2026-09-03, review #8 H0) — same seam: callers and tests
 # reach it as ``eval_sentinel._trust_composition`` / ``TRUST_K``, and it reads
 # ``search`` back through this module (see its docstring).
+from kbworker import eval_cases
 from kbworker.eval_composition import (  # noqa: F401
     TRUST_K,
     _trust_composition,
@@ -119,12 +127,7 @@ def _run(counts: dict[str, Any]) -> None:
         counts["eval_status"] = "skipped"  # golden set missing/empty
         logger.info("search-quality sentinel: golden set missing/empty — eval skipped")
         return
-    try:  # arm the per-case rerank tally for the replay below (review #6)
-        from kbcore import rerank as _rerank_arm
-
-        _rerank_arm.reset_tally()
-    except Exception:  # noqa: BLE001 — observability may never fail the eval
-        pass
+    _warm_and_arm(counts)
     _results, hit_at_5, mrr = eval_harness.evaluate(golden=golden)
     counts["eval_status"] = "ok"
     counts["eval_hit_at_5"] = round(hit_at_5, 4)
@@ -136,6 +139,9 @@ def _run(counts: dict[str, Any]) -> None:
     # a meta number instead of a red night. getattr, so a stubbed evaluate()
     # returning bare tuples (the sentinel test rig) still counts 0.
     counts["eval_chain_resolved"] = sum(1 for r in _results if getattr(r, "chain_resolved", False))
+    # Per-case ranks + rerank outcomes keyed by query (review #9a EV-4): E1's
+    # per-case diff. ADDED keys, shape-tolerant to the stubbed rig above.
+    counts.update(eval_cases.per_case_keys(_results))
     # Review #5 ops-4 / review #6 instrument fix / review #8 H7a: which rerank
     # path scored tonight's replay, PER CASE — kbcore.rerank accumulates a
     # thread-local {active, fallback} tally across the harness's searches,
@@ -171,6 +177,29 @@ def _run(counts: dict[str, Any]) -> None:
         _instrument(counts, "eval_trust_status", lambda: _trust_composition(golden))
     else:
         counts["eval_trust_status"] = "disabled"
+
+
+def _warm_and_arm(counts: dict[str, Any]) -> None:
+    """Warm the rerank sidecar (review #9a EV-3), THEN arm the per-case tally (review #6).
+
+    Order is the point: the warm-up's probes happen before the tally exists, so
+    a stall absorbed here never counts as a case, and a stall NOT absorbed shows
+    up in the tally as before. Each half is fail-open on its own — a raising
+    warm-up costs only its key, never the arming; no sidecar means no key.
+    """
+    try:
+        from kbcore import rerank as _rerank
+    except Exception:  # noqa: BLE001 — observability may never fail the eval
+        return
+    if (settings.kb_rerank_url or "").strip():
+        try:
+            counts["eval_rerank_warmup"] = _rerank.warm_up()
+        except Exception:  # noqa: BLE001 — measurement hygiene, never the measurement
+            logger.warning("rerank warm-up failed; the replay proceeds unwarmed", exc_info=True)
+    try:
+        _rerank.reset_tally()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _instrument(

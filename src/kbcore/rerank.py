@@ -154,6 +154,57 @@ def probe() -> dict[str, bool | int | None]:
         return {"ok": False, "latency_ms": None}
 
 
+# Warm-up bounds (review #9a EV-3): the sidecar's FIRST touches after a drain
+# ran 780-1160 ms per task on 3/3 drain nights, pushing 5-batch golden queries
+# over the 2 s timeout and measuring 15-22 of 52 cases on the fused order; the
+# stall clears within ~60 s of use. Two consecutive probes under the target say
+# it has cleared; the call and wall-clock caps keep a dead sidecar cheap.
+WARMUP_TARGET_MS = 300
+WARMUP_STREAK = 2
+WARMUP_MAX_CALLS = 30
+WARMUP_MAX_SECS = 60.0
+
+
+def warm_up(
+    target_ms: int = WARMUP_TARGET_MS,
+    streak: int = WARMUP_STREAK,
+    max_calls: int = WARMUP_MAX_CALLS,
+    max_secs: float = WARMUP_MAX_SECS,
+) -> dict[str, int | float | bool]:
+    """Probe the sidecar until it answers fast, bounded: ``{'calls', 'secs', 'ok'}``.
+
+    Measurement hygiene, not ranking code: the eval sentinel calls this BEFORE
+    arming the tally so a first-touch stall is absorbed here instead of inside
+    ``eval_mrr``. ``ok`` is True once ``streak`` consecutive probes both
+    discriminate and come back under ``target_ms``; False when the caps hit
+    first (a down sidecar, or a stall the caps could not outwait — the tally
+    then says so). Fail-open like :func:`probe` and NEVER raises; with
+    ``kb_rerank_url`` unset it returns zero calls without any HTTP. Never
+    touches the per-search participation state.
+    """
+    t0 = time.monotonic()
+    calls = 0
+    fast = 0
+    ok = False
+    while settings.kb_rerank_url and calls < max_calls and time.monotonic() - t0 < max_secs:
+        result = probe()
+        calls += 1
+        latency = result.get("latency_ms")
+        if result.get("ok") and isinstance(latency, int) and latency < target_ms:
+            fast += 1
+            if fast >= streak:
+                ok = True
+                break
+        else:
+            fast = 0
+    secs = round(time.monotonic() - t0, 1)
+    if calls:
+        logger.info(
+            "rerank warm-up: %d probe(s) in %.1fs, %s", calls, secs, "ok" if ok else "NOT ok"
+        )
+    return {"calls": calls, "secs": secs, "ok": ok}
+
+
 def _documents(conn, item_ids: list[int], evidence: dict[int, str] | None = None) -> dict[int, str]:
     """title + body-prefix per candidate, one parameterized query.
 

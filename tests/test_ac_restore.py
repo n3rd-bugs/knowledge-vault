@@ -35,6 +35,19 @@ REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "ac_restore.sh"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_stop_log():
+    """The stop log carries the run's first battery stand-down instant (review
+    #9a INS-2) and record_battery_pause prefers it over now(): clear it around
+    every test so a marker written from hand-built counts stamps 'now', as the
+    marker-lifecycle pins below expect."""
+    from kbworker import stop_log
+
+    stop_log._STOP_LOG.clear()
+    yield
+    stop_log._STOP_LOG.clear()
+
+
 # ------------------------------------------------------- the marker lifecycle
 
 
@@ -459,6 +472,32 @@ def test_dry_run_at_the_cap_changes_nothing(tmp_path):
     proc = _run(env, "--dry-run")
     assert proc.returncode == 0 and "would stand down" in proc.stdout
     assert (state / "resume-attempts").read_text() == "3" and not calls.exists()
+
+
+def test_the_resume_line_names_the_markers_pause_instant(tmp_path):
+    """Review #9a INS-8: the resume line says what AGE is (consecutive healthy
+    ticks, not grid-hold time) and names the marker's pause instant."""
+    state, calls, env = _rig(tmp_path, state_word="grid", debounce=60)
+    _armed(state)
+    (state / "battery-pause.json").write_text(
+        json.dumps(
+            {
+                "at": "2026-09-04T23:12:55.538123+00:00",
+                "deferred": 71,
+                "recorded_at": "2026-09-05T01:57:16+00:00",
+            }
+        )
+    )
+    proc = _run(env)
+    assert proc.returncode == 0, proc.stderr
+    assert "grid healthy on consecutive ticks" in proc.stdout
+    assert "grid stable for" not in proc.stdout
+    assert "resuming the battery-paused nightly (paused 2026-09-04T23:12:55+00:00;" in proc.stdout
+    assert calls.read_text().strip() == "--user start --no-block kb-consolidate.service"
+    _armed(state)  # the pre-H.1 '{}' marker: no instant to name
+    proc = _run(env)
+    assert proc.returncode == 0 and "(paused ?;" in proc.stdout
+    assert subprocess.run(["bash", "-n", str(SCRIPT)], capture_output=True).returncode == 0
 
 
 def test_record_battery_pause_returns_the_prior_marker_it_consumed(tmp_path):

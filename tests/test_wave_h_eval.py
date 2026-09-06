@@ -277,17 +277,21 @@ def test_drain_deferred_line_wording_and_shape_tolerance():
 # --- H7d: RESUME line + the shared LOCAL-night rule ------------------------------
 
 
-def test_night_of_files_pre_dawn_runs_under_the_previous_night():
+def test_night_of_files_pre_noon_runs_under_the_previous_night():
+    """Re-pinned by review #9a INS-1: the rollover is NOON and the instant is
+    the run's START, so a 10:00 boot catch-up (or a 09:32 grid-restore resume)
+    belongs to the night it caught up — decided, not a side effect."""
     assert digest_lines.night_of(datetime(2026, 8, 29, 20, 30, tzinfo=UTC), PKT) == date(
         2026, 8, 29
     ), "01:30 local Sunday morning is still Saturday night"
     assert digest_lines.night_of(datetime(2026, 8, 30, 5, 0, tzinfo=UTC), PKT) == date(
-        2026, 8, 30
-    ), "a 10:00 local boot catch-up is its own day"
-    assert digest_lines.night_of(datetime(2026, 8, 30, 1, 0), PKT) == date(2026, 8, 30), (
-        "a naive instant is UTC (Invariant 7): 06:00 local is the rollover"
+        2026, 8, 29
+    ), "a 10:00 local boot catch-up belongs to the night it caught up"
+    assert digest_lines.night_of(datetime(2026, 8, 30, 7, 0), PKT) == date(2026, 8, 30), (
+        "a naive instant is UTC (Invariant 7): 12:00 local is the rollover"
     )
-    assert digest_lines.night_of(datetime(2026, 8, 30, 0, 59), PKT) == date(2026, 8, 29)
+    assert digest_lines.night_of(datetime(2026, 8, 30, 6, 59), PKT) == date(2026, 8, 29)
+    assert digest_lines.NIGHT_ROLLOVER_HOUR == 12
 
 
 def test_resume_line_renders_the_prior_marker_local_and_first():
@@ -356,7 +360,11 @@ def test_run_duration_line_prefers_wall_clock_and_labels_the_ledger_honestly():
     ledger = {"step_secs": {"a": 3600.0, "b": 720.0, "eval_sentinel": 90.4, "flag": True}}
     assert digest_lines._run_duration_line(ledger) == "steps timed: 1h 13m over 3"
     wall = {**ledger, "run_secs": 5.0 * 3600 + 12 * 60}
-    assert digest_lines._run_duration_line(wall) == "run: 5h 12m (3 steps timed)"
+    assert digest_lines._run_duration_line(wall) == "run: 5h 12m (3/3 steps >= 1s)"
+    # Review #9a INS-7: the ledger holds EVERY invoked step (stood-down and
+    # instant ones at 0.0), so the count names the steps that actually took time.
+    padded = {"run_secs": 266.0, "step_secs": {"a": 93.7, "b": 0.5, "c": 0.0, "d": 0, "e": 1.0}}
+    assert digest_lines._run_duration_line(padded) == "run: 4m 26s (2/5 steps >= 1s)"
     assert digest_lines._run_duration_line({"step_secs": {"a": 42}}) == "steps timed: 0m 42s over 1"
     for counts in ({}, {"step_secs": {}}, {"step_secs": "x"}, {"run_secs": 0}):
         assert digest_lines._run_duration_line(counts) is None

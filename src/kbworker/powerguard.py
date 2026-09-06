@@ -225,8 +225,9 @@ def record_battery_pause(
 
     Called ONCE from the tail of ``consolidate.main()``, right after
     ``counts['stopped']`` is recorded. If any step paused with reason
-    ``'battery'``, a JSON marker ``{'at': <UTC iso>, 'deferred': <total>}`` is
-    written ATOMICALLY (tmp + rename — kb-ac-restore.timer polls this path
+    ``'battery'``, a JSON marker (``tail_ops.pause_payload`` — ``'at'`` is the
+    run's FIRST battery stand-down, review #9a INS-2) is written ATOMICALLY
+    (tmp + rename — kb-ac-restore.timer polls this path
     every 5 minutes and must never read a half-written file). Otherwise the run
     completed with no battery pause, so the marker is removed if present: a
     clean finish means nothing is waiting, and it is the ONLY thing that
@@ -238,8 +239,8 @@ def record_battery_pause(
     both ways: a marker that cannot be written or removed logs and never fails
     the run whose report is about to be pushed.
 
-    Returns the PRIOR marker's payload (``{'at', 'deferred'}``) when this run
-    found one — i.e. this run is the RESUME of a battery pause — else ``None``
+    Returns the PRIOR marker's payload (``{'at', 'deferred', ...}``) when this
+    run found one — i.e. this run is the RESUME of a battery pause — else ``None``
     (review #8 H7d: the digest names a resumed run as such). Read before the
     marker is rewritten or cleared; a malformed marker reads as ``None``.
     """
@@ -264,7 +265,9 @@ def record_battery_pause(
                 total += int(entry.get("deferred") or 0)
             except (TypeError, ValueError):
                 pass  # a malformed count must not cost the marker
-        payload = {"at": datetime.now(UTC).isoformat(), "deferred": total}
+        from kbworker.stop_log import pause_payload  # lazy: the CLI probe stays light
+
+        payload = pause_payload(total)
         marker.parent.mkdir(parents=True, exist_ok=True)
         tmp = marker.with_name(marker.name + ".tmp")
         tmp.write_text(json.dumps(payload), encoding="utf-8")

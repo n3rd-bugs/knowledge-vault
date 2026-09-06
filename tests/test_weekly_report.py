@@ -69,7 +69,7 @@ def test_a_malformed_day_fails_toward_off(kb, weekly_on, monkeypatch, caplog):
 
 
 def test_the_weekly_run_writes_the_item_and_pushes_ascii_under_20_lines(kb, weekly_on, monkeypatch):
-    _nightly_report(
+    first = _nightly_report(
         "2026-08-10",
         queued_drained=3,
         queued_items_saved=2,
@@ -78,7 +78,7 @@ def test_the_weekly_run_writes_the_item_and_pushes_ascii_under_20_lines(kb, week
         eval_mrr=0.80,
         eval_top5_unverified_share=0.64,
     )
-    _nightly_report(
+    second = _nightly_report(
         "2026-08-15",
         queued_drained=5,
         queued_items_saved=4,
@@ -87,6 +87,18 @@ def test_the_weekly_run_writes_the_item_and_pushes_ascii_under_20_lines(kb, week
         eval_mrr=0.90,
         eval_top5_unverified_share=0.61,
     )
+    # The window is whole COMPLETED nights (review #9a INS-6 fix): a report created
+    # "now" belongs to the night in progress and rolls into NEXT week's weekly, so
+    # the fixtures are backdated onto two completed nights.
+    from kbcore.db import transaction
+
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE items SET created_at = now() - interval '2 days' WHERE id = %s", (first,)
+        )
+        conn.execute(
+            "UPDATE items SET created_at = now() - interval '1 day' WHERE id = %s", (second,)
+        )
     for _ in range(2):
         search_misses.record("esp32 ledc fade é", None, "mcp.kb_search")
     sent: list[tuple[list[str], dict]] = []

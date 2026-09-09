@@ -114,7 +114,14 @@ def _run_step(counts: dict[str, Any], key: str, fn) -> None:
 
 def _write_report(counts: dict[str, Any]) -> int:
     ts = datetime.now(UTC)
-    body = "Nightly consolidation report\n\n" + "\n".join(f"- {k}: {v}" for k, v in counts.items())
+    # BODY = scalar counts ONLY (review #9a follow-up, 2026-09-09). The body is
+    # chunked + embedded like any item; nested telemetry (per-case ranks keyed by
+    # the golden QUERY TEXT, id lists, tallies) belongs in meta alone — dumping
+    # it here put all 52 golden queries verbatim into every nightly report, and
+    # four reports then outranked the real answers (hit@5 0.981 -> 0.923).
+    body = "Nightly consolidation report\n\n" + "\n".join(
+        f"- {k}: {v}" for k, v in counts.items() if not isinstance(v, dict | list | tuple)
+    )
     return ingest(
         "kb-system",
         "report",

@@ -254,6 +254,38 @@ kb_json_probe || {
 }
 if [ -n "$KB_JQ_BIN" ]; then JSON_MODE="jq ($KB_JQ_BIN)"; else JSON_MODE="python3 fallback ($KB_PY_BIN) -- no jq found"; fi
 
+# ------------------------------------------------ THE CHECKPOINT TRUST STAMP
+# Written ONCE, BEFORE any hook is copied into place, and never overwritten
+# (wave C, proposal_v2 C1/C9; rig case 37). Offset checkpoints are never deleted
+# by the hooks any more, so "no offset file" has exactly two meanings: a
+# transcript that started AFTER this stamp is genuinely new and drains from 0;
+# one that started BEFORE it was worked by an older hook that deleted its
+# checkpoint after a full drain, so a from-0 send would RESEND the whole
+# session -- the flush hook refuses those (`unseeded`) until the owner seeds
+# them (`kb-flush-backfill.sh --seed <sid> <bytes|current>`). Re-running the
+# installer must therefore never move the stamp forward: `set -C` (noclobber)
+# makes the write create-only at the filesystem level, and the [ -e ] guard
+# keeps the summary line honest. ISO-8601 UTC, the same shape the transcript's
+# first-record timestamp carries, so the hook compares the two as strings.
+STATE="$HOOKS/state"
+mkdir -p "$STATE"
+STAMP="$STATE/.checkpoints-trusted-since"
+if [ -r "$STAMP" ]; then
+  STAMP_NOTE="kept $(head -c 40 "$STAMP" 2>/dev/null | tr -d '\r\n' || true)"
+elif [ -e "$STAMP" ]; then
+  # Present but unreadable (a root-owned stamp from a sudo'd run, a mode 000
+  # accident): it is still the box's stamp -- never replace it, never let the
+  # read kill the install under set -e.
+  STAMP_NOTE="kept (unreadable -- fix its permissions; the hook needs to read it)"
+else
+  _stamp_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u)
+  (
+    set -C
+    printf '%s\n' "$_stamp_ts" >"$STAMP"
+  ) 2>/dev/null || true
+  STAMP_NOTE="written $_stamp_ts (pre-existing transcripts need --seed before they drain; see SKILL.md)"
+fi
+
 install -m 0755 "$SKILL_DIR/flush-session-to-kb.sh" "$HOOK"
 BRIEF="$HOOKS/kb-session-brief.sh"
 install -m 0755 "$SKILL_DIR/kb-session-brief.sh" "$BRIEF"
@@ -795,6 +827,127 @@ if [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_SETUP_BEARER:-}${KB_TOKEN:-}${KB_ENRO
   fi
 fi
 
+# ------------------------------------------------------------ THE SWEEP TIMER
+# The sweep (`kb-flush-backfill.sh --auto`) is what drains transcripts whose
+# session never fired another hook: a killed terminal, a crashed IDE, a laptop
+# that slept through SessionEnd. Two triggers run it -- the hooks' own
+# piggyback (every box, no scheduler) and, on Linux, a `systemd --user` timer
+# rendered here from a heredoc (no new served asset). GATES, in order: not on
+# Windows (Git Bash has no user manager; SHARING.md documents an optional
+# schtasks line, never executed by this installer), KB_SWEEP_TIMER=1 (default;
+# 0 opts out), KB_SWEEP_INTERVAL >= 60 (0 is the documented OFF switch for the
+# sweep -- an `OnUnitActiveSec=0s` timer would be a back-to-back loop), the
+# INSTALLED backfill must understand `--auto` (a box that received these hooks
+# before the sweep rewrite would otherwise run a unit that exits 2 every tick
+# while this line said `scheduled`; the gate self-heals on the next install),
+# `systemctl --user` must ANSWER (`degraded` is an answer -- the owner box
+# reports it -- so the exit code is ignored and only the state word counts;
+# the `--auto` probe sits after it so a permanent reason wins over a transient
+# one), and the unit directory must be writable. Everything else is best-effort:
+# EVERY systemctl call is `|| true`, the heredocs render into a private temp
+# dir (never into a directory systemd scans, and a write failure there cannot
+# abort the install under set -e), and the unit files are byte-identical
+# across runs (copied only when they differ) so a re-install never churns
+# them. Paths inside the unit are double-quoted -- systemd's Exec= quoting --
+# so a HOME with a space (rig case 24) does not word-split at run time.
+# Rendered AFTER the .setup-version stamp, and this block never touches
+# kb-flush.env. Exactly ONE `sweep:` line is printed.
+SWEEP_INTERVAL="${KB_SWEEP_INTERVAL:-1800}"
+case "$SWEEP_INTERVAL" in '' | *[!0-9]*) SWEEP_INTERVAL=1800 ;; esac
+SWEEP_UNITD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SWEEP_STATE=""
+if kb_is_windows; then
+  SWEEP_NOTE="not scheduled (Windows: the hooks' piggyback trigger runs the sweep; see SHARING.md for the optional schtasks line)"
+elif [ "${KB_SWEEP_TIMER:-1}" != "1" ]; then
+  SWEEP_NOTE="not scheduled (KB_SWEEP_TIMER=${KB_SWEEP_TIMER}; the hooks' piggyback trigger still runs the sweep)"
+elif [ "$SWEEP_INTERVAL" -lt 60 ]; then
+  SWEEP_NOTE="not scheduled (KB_SWEEP_INTERVAL=$SWEEP_INTERVAL; the sweep is off -- 0 disables it, the floor is 60s)"
+elif ! command -v systemctl >/dev/null 2>&1; then
+  SWEEP_NOTE="not scheduled (no systemctl on this box; the hooks' piggyback trigger runs the sweep)"
+else
+  SWEEP_STATE=$(systemctl --user is-system-running 2>/dev/null | head -n1 | tr -cd 'a-z-' || true)
+  if [ -z "$SWEEP_STATE" ] || [ "$SWEEP_STATE" = "offline" ]; then
+    SWEEP_NOTE="not scheduled (systemctl --user is not answering${SWEEP_STATE:+: $SWEEP_STATE}; the hooks' piggyback trigger runs the sweep)"
+  elif ! grep -q -- '--auto' "$BACKFILL" 2>/dev/null; then
+    SWEEP_NOTE="not scheduled (the installed kb-flush-backfill.sh has no --auto yet; re-run install.sh after update.sh brings the sweep rewrite -- the hooks' piggyback trigger runs the sweep meanwhile)"
+  elif ! { mkdir -p "$SWEEP_UNITD" 2>/dev/null && [ -d "$SWEEP_UNITD" ] && [ -w "$SWEEP_UNITD" ]; }; then
+    SWEEP_NOTE="not scheduled (could not write $SWEEP_UNITD; the hooks' piggyback trigger runs the sweep)"
+  else
+    SWEEP_BASH=$(command -v bash 2>/dev/null || echo /usr/bin/bash)
+    SWEEP_TOUCH=$(command -v touch 2>/dev/null || echo /usr/bin/touch)
+    _swrender=0
+    _swdir=$(mktemp -d "${TMPDIR:-/tmp}/kb-flush-sweep.XXXXXX" 2>/dev/null) || _swdir=""
+    if [ -n "$_swdir" ] && [ -d "$_swdir" ]; then
+      _swrender=1
+      # KillMode=process: a drain still holding its session lock at unit exit
+      # is not killed mid-chunk. Persistent=true: a missed window fires at the
+      # next boot (proposal_v2 C9). PATH carries ~/.local/bin so an owner-box
+      # `uv` mint resolves; a fleet box simply falls to NEEDS TOKEN as today.
+      { cat >"$_swdir/kb-flush-sweep.service" <<EOF
+[Unit]
+Description=KB session-flush sweep (kb-flush-backfill.sh --auto)
+
+[Service]
+Type=oneshot
+KillMode=process
+TimeoutStartSec=45min
+NoNewPrivileges=true
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=$SWEEP_TOUCH "$STATE/.sweep.trigger"
+ExecStart=$SWEEP_BASH "$HOOKS/kb-flush-backfill.sh" --auto
+EOF
+      } 2>/dev/null || _swrender=0
+      { cat >"$_swdir/kb-flush-sweep.timer" <<EOF
+[Unit]
+Description=KB session-flush sweep every ${SWEEP_INTERVAL}s
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${SWEEP_INTERVAL}s
+RandomizedDelaySec=120
+AccuracySec=1min
+Persistent=true
+Unit=kb-flush-sweep.service
+
+[Install]
+WantedBy=timers.target
+EOF
+      } 2>/dev/null || _swrender=0
+    fi
+    _swchanged=0
+    if [ "$_swrender" = 1 ]; then
+      for _swu in service timer; do
+        if ! cmp -s "$_swdir/kb-flush-sweep.$_swu" "$SWEEP_UNITD/kb-flush-sweep.$_swu" 2>/dev/null; then
+          install -m 0644 "$_swdir/kb-flush-sweep.$_swu" "$SWEEP_UNITD/kb-flush-sweep.$_swu" 2>/dev/null && _swchanged=1 || true
+        fi
+      done
+    fi
+    [ -n "$_swdir" ] && rm -rf "$_swdir" 2>/dev/null || true
+    if [ "$_swrender" = 1 ] && [ -f "$SWEEP_UNITD/kb-flush-sweep.timer" ] && [ -f "$SWEEP_UNITD/kb-flush-sweep.service" ]; then
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      _swen=0
+      systemctl --user enable --now kb-flush-sweep.timer >/dev/null 2>&1 || _swen=$?
+      if [ "$_swen" = 0 ]; then
+        SWEEP_NOTE="scheduled (kb-flush-sweep.timer every ${SWEEP_INTERVAL}s, user manager $SWEEP_STATE$([ "$_swchanged" = 1 ] && printf '; unit files rendered' || printf '; unit files unchanged'))"
+      else
+        SWEEP_NOTE="not scheduled (systemctl --user enable --now kb-flush-sweep.timer failed rc=$_swen; unit files rendered in $SWEEP_UNITD -- re-run that command by hand; the hooks' piggyback trigger runs the sweep meanwhile)"
+      fi
+    else
+      SWEEP_NOTE="not scheduled (could not write the unit files under $SWEEP_UNITD; the hooks' piggyback trigger runs the sweep)"
+    fi
+    # A user manager without linger stops with the last login, and so does the
+    # timer. FYI only -- the piggyback trigger covers the logged-in case anyway.
+    if command -v loginctl >/dev/null 2>&1; then
+      _swling=$(loginctl show-user "${USER:-$(id -un 2>/dev/null)}" -p Linger --value 2>/dev/null || true)
+      case "$_swling" in
+        yes | '') ;;
+        *) echo "linger:   loginctl reports Linger=$_swling -- the sweep timer stops when you log out; \`loginctl enable-linger\` keeps it running (optional)" ;;
+      esac
+    fi
+  fi
+fi
+echo "sweep:    $SWEEP_NOTE"
+
 # Discover the notification channel from the KB host. The owner should never
 # have to paste a token into a chat: a credential typed into a session is
 # captured by the flush hooks being installed here and ends up in the KB. 404
@@ -837,12 +990,18 @@ echo "dispatch: $DISPATCH (the ONLY hook registered per event; it fans stdin out
 echo "config:   $CFG  ($MODE)"
 echo "json:     $JSON_MODE"
 echo "settings: $SETTINGS  (PreCompact + SessionEnd + SessionStart + UserPromptSubmit + Stop registered)"
+echo "stamp:    $STAMP  ($STAMP_NOTE)"
 if [ -f "$BACKFILL" ]; then
-  echo "backfill: $BACKFILL  (owner-run, NOT registered as a hook)"
+  echo "backfill: $BACKFILL  (the sweep; NOT registered as a hook -- run by the timer above and by the hooks' piggyback trigger)"
   echo
-  echo "this box already has transcripts the hooks never saw. Sweep them in:"
-  echo "  $BACKFILL            # dry run: what would be flushed"
-  echo "  $BACKFILL --push     # flush every remainder, oldest first"
+  echo "transcripts that predate the stamp have no trusted checkpoint and are NOT drained until you seed them:"
+  if grep -q -- '--seed' "$BACKFILL" 2>/dev/null; then
+    echo "  $BACKFILL                           # the table: which transcripts are unseeded/ready/flushed"
+    echo "  $BACKFILL --seed <sid> current      # 'already captured up to here' (or an explicit byte offset)"
+  else
+    echo "  $BACKFILL                           # the table (dry run)"
+    echo "  # this backfill predates --seed: run update.sh once the sweep rewrite lands. Do NOT --push it -- it resends from 0."
+  fi
 fi
 echo
 echo "smoke test (feeds a fake PreCompact event to the hook):"

@@ -19,6 +19,16 @@
 #       In every early-stop case the log must NOT claim success: the pre-brief
 #       lifts these lines into the next session, so a false "ok" is how a user
 #       comes to believe a session was captured when it was not.
+#
+#       FLIPPED 2026-09-11 (wave C, KB 33783 root cause / KB 34161 wave S): a
+#       drained SessionEnd KEEPS the offset file, at exactly the transcript size.
+#       This case used to assert the file was RETIRED, on the premise that a
+#       future session with a "recycled id" would otherwise resume from a stale
+#       offset. The premise is false for Claude Code -- session UUIDs are never
+#       recycled, they are RESUMED (3-6x/day on the owner box) -- and deleting
+#       the checkpoint is precisely what made every resume re-send the whole
+#       transcript from byte 0 under whatever project the cwd resolved to.
+#       Offsets are never deleted by an event (proposal_v2 Appendix B, W1-W5).
 . /rig/lib.sh
 
 # ============================================================ 1. per-firing cap
@@ -154,14 +164,17 @@ assert_contains "$AEND" "session:end-1" "SessionEnd stamps the session identity 
 assert_not_contains "$AEND" '"session:"' "never a degenerate identity, even on the last firing"
 assert_not_contains "$AEND" '""' "no key is sent with an empty value"
 
-step "a fully-drained SessionEnd retires the offset file"
-# Leaving it behind would make a future session with a recycled id resume from
-# a stale offset and skip its opening bytes.
-if [ -z "$(offset_file)" ]; then
-  pass "the offset file was removed after a drained SessionEnd"
+step "a fully-drained SessionEnd KEEPS the offset file, at the transcript size"
+# The never-delete rule (KB 33783/34161): the checkpoint is the only thing that
+# stops a `claude --resume` of this very session from re-sending every byte
+# from 0. It must survive the terminal firing and equal SIZE2, so the next
+# firing on this session id sends only what is appended after it.
+if [ -n "$(offset_file)" ]; then
+  pass "the offset file survived a drained SessionEnd ($(offset_file))"
 else
-  fail "offset file survived a drained SessionEnd: $(offset_file) -> $(read_offset)"
+  fail "the offset file was deleted after a drained SessionEnd -- a resume would re-send from 0"
 fi
+assert_eq "$SIZE2" "$(read_offset)" "the surviving offset equals the transcript size"
 
 # ============================================== 3. a chunk the model refuses
 new_home connfail

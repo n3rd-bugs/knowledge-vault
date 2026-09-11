@@ -127,8 +127,11 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
 ## Notes / limits (field-verified — KB items 495-498)
 
 - The hook returns instantly; extraction is deferred to the nightly drain.
-- **Chunking**: deltas are split into <=900 KB line-aligned chunks (server row cap
-  is 1 MB); up to 1 GB per session. Chunks travel gzip+base64 in `transcript_gz`
+- **Chunking**: deltas are cut on an ABSOLUTE lattice — cell edges every
+  `KB_FLUSH_CHUNK` (700 KB) bytes from byte 0, each snapped back to a line end —
+  so a from-0 pass and a delta pass produce the same chunks and the server can
+  dedupe a resend by content; no chunk exceeds `KB_FLUSH_SEND_MAX` (950 KB;
+  server row cap is 1 MB); up to 1 GB per session. Chunks travel gzip+base64 in `transcript_gz`
   (~10x less wire). Do NOT use HTTP `Content-Encoding: gzip` — the origin does not
   decode it (KB item 497).
 - **Edge limits** (when the KB is behind a CDN/proxy): keep requests small — a
@@ -181,14 +184,17 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   unpinned curls died silently (flush/brief/enrol) while notifications kept
   working — the pin lives in the config layer so every consumer inherits it.
 - **Partial-line safety** — a flush window that ends in an unterminated JSONL line
-  is trimmed to the last complete line and the remainder is held for the next
-  firing (never advanced past mid-line, so no straddled message is lost); the
-  terminal `SessionEnd` firing sends the final line as-is so nothing is dropped.
-- **Bounded state** — the CONNECTOR/MCP/REMOTE `.offset` files are deleted on a
-  fully-drained `SessionEnd` and swept if older than 30 days; `flush-session.log`
-  is truncated to its last 500 lines once it exceeds 1 MB; per-session `recall-*`
-  state files older than 7 days are pruned. All housekeeping is confined to the
-  hooks' own `~/.claude/hooks` state/log dirs.
+  is trimmed to the last complete line and the remainder is HELD for the next
+  firing or the sweep (never advanced past mid-line, so no straddled message is
+  lost) — on every event, `SessionEnd` included: a half-written last record is
+  a session Claude Code is still writing, and the sweep picks it up once the
+  file has been quiet.
+- **Bounded state** — `flush-session.log` is truncated to its last 500 lines
+  once it exceeds 1 MB; per-session `recall-*` state files older than 7 days are
+  pruned; an `.offset` checkpoint is retired ONLY by the hook's own state sweep,
+  once a day, when its transcript no longer exists on the box (see the
+  lifecycle below — never on an event, never on age alone). All housekeeping is
+  confined to the hooks' own `~/.claude/hooks` state/log dirs.
 - **Never-silent failures**: the flush hook refuses to POST an empty/invalid
   body (logs `BUG: request body build failed`), and the SessionStart pre-brief
   surfaces any recent flush failure INTO the next session's context so it is
@@ -205,6 +211,69 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   preserves any other hooks you have.
 - To disable: remove the entries from `~/.claude/settings.json` `hooks`, or
   delete `~/.claude/kb-flush.env` (the hooks no-op without config).
+
+## Offset checkpoints: never deleted, the trust stamp, seeding, the sweep
+
+Every session's progress lives in ONE file, `~/.claude/hooks/state/<session>.offset`
+— the byte offset of the transcript the KB has accepted. Since wave C (2026-09)
+that file is **never deleted by an event**: a drained `SessionEnd` leaves it at
+`offset == size` (notifications then read `kb 5.2MB synced`), a resumed session
+continues from it, and the server refuses a re-send of bytes it already holds for
+that session. The only writers are: `+accepted bytes` after each 2xx chunk, `0`
+when the transcript shrank (logged `reason=shrank`), a branch seed when a new
+transcript turns out to be a copy of a sibling (logged `branch of <parent8>`), and
+the owner's `--seed`. A checkpoint is retired only by the hook's daily state
+sweep, and only when its transcript is gone from every Claude Code projects dir.
+
+**The trust stamp.** `install.sh` writes `state/.checkpoints-trusted-since`
+(ISO-8601 UTC) exactly once and never moves it. A transcript with no checkpoint
+whose first record is NEWER than the stamp is a genuinely new session and drains
+from 0. One that is OLDER was worked by a pre-wave-C hook that deleted its
+checkpoint after draining — sending it from 0 would resend the whole session —
+so the hook **refuses** it, writes `<session>.unseeded`, and logs once a day:
+
+```
+flush <project> unseeded: refusing to send <bytes> from 0 (transcript predates the
+checkpoint stamp) — seed it: kb-flush-backfill.sh --seed <sid> current|<bytes>
+```
+
+Notifications show `kb ?/199.0MB unseeded`; the pre-brief's `[KB sweep]` line
+counts them. Two clean exits, both owner decisions:
+
+```bash
+kb-flush-backfill.sh                          # the table: unseeded / ready / flushed / busy / stalled
+kb-flush-backfill.sh --seed <sid> current     # "everything currently on disk is already in the KB"
+kb-flush-backfill.sh --seed <sid> <bytes>     # "captured up to this byte" (snapped DOWN to a line end)
+KB_FLUSH_ALLOW_UNSEEDED=1                     # or: let it send from 0 deliberately (the server dedupes)
+```
+
+`KB_FLUSH_ALLOW_UNSEEDED=1` is safe ONLY once the server's resend guard is live
+(wave S) AND these never-delete hooks are installed on that box — an older backfill
+resends from byte 0 with no guard behind it, and the server dedupes only chunks cut
+on the lattice. Until both hold, seed instead.
+
+Seed LOW when in doubt: a low seed costs at most one overlapping chunk (refused by
+the server when it lands on the cut lattice, else one duplicate row); a high seed
+loses lines. Never hand-edit or delete an offset file.
+
+**The sweep.** `kb-flush-backfill.sh --auto` walks every transcript on the box and
+feeds each unflushed remainder through the real flush hook — it is what captures a
+session whose terminal was killed, whose IDE crashed, or whose laptop slept through
+`SessionEnd`. Two triggers run it: the hooks' own piggyback (any firing, at most
+every `KB_SWEEP_INTERVAL` = 1800 s — every box, no scheduler) and, on Linux, a
+`systemd --user` timer `install.sh` renders into
+`~/.config/systemd/user/kb-flush-sweep.{service,timer}` (`OnBootSec=10min`,
+`OnUnitActiveSec=<KB_SWEEP_INTERVAL>s`, `Persistent=true`; `KB_SWEEP_TIMER=0`
+opts out, `KB_SWEEP_INTERVAL=0` turns the sweep off, and a backfill that predates
+`--auto` is not scheduled until the next install; the installer prints one `sweep:` line saying which). A sweep never
+touches a session that was active in the last 15 min, holds a trailing half-line
+like the hook, and leaves one line in `state/.sweep-last`. Its health is visible
+without opening a log: notifications append `sweep:never` / `sweep:26h stale` /
+`sweep:STALLED n` / `sweep:unknown n` only when something is wrong, and the
+SessionStart pre-brief prints one `[KB sweep]` line with the action (`stalled`
+means nothing has triggered a sweep for over 6 h — the timer is not firing).
+Windows (Git Bash) has the piggyback trigger only; SHARING.md documents an
+optional, manual `schtasks` line.
 
 ## Keeping the hooks current
 

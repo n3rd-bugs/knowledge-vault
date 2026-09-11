@@ -30,7 +30,7 @@ counts as green; see [Known defect](#known-defect-xfail)).
 | `stub_server.py` | dependency-free (stdlib) stub serving **both** transports and recording every request to JSONL. Decodes `transcript_gz` so assertions see the real payload bytes. |
 | `stub_contract.py` | the submission contract the stub enforces, mirrored from `kbcore`/`kbrest` with the source line cited against each constant — so a drift between stub and server is a reviewable diff, not a silently permissive test. |
 | `Dockerfile.<variant>` | a deliberately worse-equipped box, built FROM the base image, selected per case with a `# IMAGE: <variant>` header — see [Image variants](#image-variants). |
-| `lib.sh` | assertions plus the fakes each transport precondition needs (`fake_uv`, `fake_claude`, `fake_claude_json`, `fake_kb_repo`), the Windows fakes (`fake_uname_windows`, `fake_cygpath`, `fake_win32_timeout`, `record_nohup`, `expose_setsid`), `extract_block`, and the event builders. Uses `$RIG_JQ`/`$RIG_PY`, never a bare `jq`/`python3`. |
+| `lib.sh` | assertions plus the fakes each transport precondition needs (`fake_uv`, `fake_claude`, `fake_claude_json`, `fake_kb_repo`), the Windows fakes (`fake_uname_windows`, `fake_cygpath`, `fake_win32_timeout`, `record_nohup`, `expose_setsid`, `expose_flock`), the stub knobs (`stub_fail`, `stub_delay`), the sweep clock (`pin_sweep_clock` / `unpin_sweep_clock` → `KB_BACKFILL_NOW`), `extract_block`, and the event builders. Fixtures (`mk_transcript`, `mk_big_transcript`) carry a first-record `"timestamp"` like a real transcript, 1 s ahead of the case clock so a fixture built in the same second as `install.sh`'s `.checkpoints-trusted-since` stamp still reads as *newer*; `RIG_FIXTURE_TS=2020-01-01T00:00:00.000Z` builds a PRE-stamp one. Uses `$RIG_JQ`/`$RIG_PY`, never a bare `jq`/`python3`. |
 | `run.sh` | builds the base image + every variant a case asks for, starts the stub, runs each case in a **fresh** container of its image, prints the PASS/FAIL table, cleans up. The skill under test defaults to the repo copy `contrib/claude/kb-session-flush` (override with `KB_SKILL_DIR`). |
 | `cases/*.sh` | one file per assertion group. Every case header names the KB fact it pins. |
 
@@ -40,15 +40,45 @@ The stub speaks:
   (replies with the `Mcp-Session-Id` **response header**),
   `notifications/initialized`, `tools/call` (`kb_ingest_session`, `kb_search`).
 * `POST /api/ingest-session` — the real REST contract, mirrored from
-  `src/kbrest/server.py:156`, `src/kbcore/ingest_queue.py:22` and
+  `src/kbrest/server.py:168`, `src/kbcore/ingest_queue.py:22` and
   `src/kbcore/compress.py:21-22`: `401` (missing/invalid bearer), `422`
-  (malformed body), `400` (empty transcript, over 1,000,000 bytes, bad kind,
-  both transcript forms, undecodable gzip), else `202`
-  `{queue_id,duplicate,requeued,permanently_failed}`.
+  (malformed body, a non-string `session_uri`, or a malformed `flush_*` stamp,
+  `src/kbrest/schemas.py:80-87` — string stamps are `fullmatch`ed so a trailing
+  newline is refused like the server's anchored pattern; the int check is
+  deliberately *stricter* than pydantic lax: `12.0`/`true` are 422 here),
+  `400` (empty transcript, over 1,000,000 bytes, bad kind, both transcript
+  forms, undecodable gzip), else `202` `{queue_id,duplicate,requeued,permanently_failed}`.
+  **Dedupe is keyed like the wave-S server** (KB 33783/34161, `stub_contract.py`
+  `Queue.take`): a `kind=session` chunk with a non-degenerate `session_uri`
+  starting `session:` is identified by `(session_uri, content_hash)` across
+  *every* project — a resend under another project answers `duplicate:true`
+  with a null `queue_id`, byte-identical to a same-project repeat (no oracle);
+  everything else falls back to the legacy `(kind, project, content_hash)`
+  arbiter. The record carries harness-only `dedupe_key` (`session`|`legacy`),
+  `duplicate_kind` (`same-project`|`cross-project`|null) and
+  `session_uri_normalised`. The eight `flush_*` telemetry fields are recorded
+  **verbatim** (a number stays a number, a string a string) plus
+  `flush_consistent` (`src/kbcore/models.py:268-274` — recorded, never a refusal).
 * `GET /api/search` — the REMOTE-mode recall endpoint, mirroring
   `src/kbrest/server.py:93` / `SearchHit` closely enough to exercise the hook's
   url-encoding and bullet formatting (bearer-gated: `401` without it).
 * `GET /__requests` (the JSONL record), `POST /__reset`, `GET /__health`.
+* `POST /__fail {"times": N, "code": C}` — the next N ingest-session answers
+  (REST, and an MCP `kb_ingest_session` tool call alike) return HTTP C; `C = 0`
+  closes the connection with **no** response, which curl reports as `000`.
+  Every injected hit is recorded (`status: C`, `injected: C`) so a case can
+  count what a retry chain did; an injected failure never consumes the dedupe
+  key, so the retried chunk lands as a new row. The gate applies **before the
+  bearer check as well**, so an unauthenticated request spends a slot too —
+  count `.injected` hits, not `.auth`. Cleared by `/__reset`. A malformed body
+  (non-int `times`/`code`) is a `400`, and `lib.sh`'s `stub_fail` turns that
+  into a red check on the spot (it checks the HTTP code) rather than a silent no-op.
+* `POST /__delay {"ms": N}` — every ingest answer is held N ms; the env
+  `RIG_DELAY_MS` on the stub sets the default (that is how the Windows lane's
+  case 08 arms a 12 s think-time without an endpoint call). `{}` (= `lib.sh`
+  `stub_delay` with **no** argument) and `/__reset` restore that env default;
+  `stub_delay 0` is a literal zero and removes a lane's think-time until reset.
+  Malformed `ms` → `400` → `stub_delay` fails loudly like `stub_fail`.
 
 ## The hermetic guarantee
 
@@ -92,7 +122,8 @@ production, and a sub-agent once truncated the live schema. So:
 | `11_guard_always_on` | `KB_HOOK_GUARD` is checked on line 14 of **both** hooks, before the config is even read: guarded firings do no work in **MCP and LOCAL** modes and on both brief events. Every assertion is paired with a positive control | correction to the inverted **885** |
 | `12_incomplete_config_silence` | an incomplete transport config (`KB_REST_URL`/`KB_MCP_URL` with an empty `KB_TOKEN`) logs a `NOT CONFIGURED` line instead of being a permanent silent no-op, and the next `SessionStart` surfaces it | **1174** |
 | `13_connector_chunking` | CONNECTOR relay byte contract, with a **recorder standing in for the model** (`CLAUDE_BIN` is just a path): a 60 KB delta relays as sequential `KB_CONNECTOR_CHUNK` windows, each cut on a **line** boundary and individually valid JSONL, the chunks reassemble **byte for byte**, the offset reaches EOF, the firing logs a truthful `ok bytes=` (never `partial`), the child is invoked headless with a tool allowlist and no permission bypass, and a drained transcript re-sends nothing | — |
-| `14_connector_caps_and_resume` | every way a CONNECTOR firing stops EARLY still leaves the session **resumable, never truncated**: `KB_CONNECTOR_MAX` caps a `PreCompact` firing (logged `partial` + `per-firing cap reached`, never `ok`) and later firings drain the rest with no re-send or loss; `SessionEnd` **ignores** the cap and retires the offset file; a refused chunk advances the offset by exactly the accepted bytes and is retried verbatim; `Error`/`NOTOOL`/no-id replies all count as failure; a still-being-written partial line is held on `PreCompact` but **sent** at `SessionEnd` | — |
+| `14_connector_caps_and_resume` | every way a CONNECTOR firing stops EARLY still leaves the session **resumable, never truncated**: `KB_CONNECTOR_MAX` caps a `PreCompact` firing (logged `partial` + `per-firing cap reached`, never `ok`) and later firings drain the rest with no re-send or loss; `SessionEnd` **ignores** the cap and **keeps the offset file at the transcript size** (flipped 2026-09-11 — it used to assert the file was retired, on the false "recycled id" premise; session UUIDs are resumed, never recycled, and the deletion is what made every resume re-send from 0); a refused chunk advances the offset by exactly the accepted bytes and is retried verbatim; `Error`/`NOTOOL`/no-id replies all count as failure; a still-being-written partial line is held on `PreCompact` but **sent** at `SessionEnd` (connector arm) | **33783**, **34161** |
+| `15_large_transcript` | the flush loop at scale over REST: a 12 MB delta drains in one firing byte-for-byte across ~30 chunks each ≤ 1,000,000 bytes; `KB_FLUSH_MAX` caps a `PreCompact` firing (`partial`, never `ok`) and repeated firings drain the rest exactly once; `SessionEnd` lifts the cap and **keeps the offset file at the transcript size** (flipped 2026-09-11, same fact as case 14); a single 2 MB line does not stall the loop; growth after a flush is picked up next firing; shipped defaults are `KB_FLUSH_CHUNK` 700,000 / `KB_FLUSH_SEND_MAX` 950,000 / `KB_FLUSH_MAX` 200 MB (C2) | **33783**, **34161** |
 | `20_no_jq_python_fallback` *(image: `nojq`)* | a box with **no jq** (and no sudo): install succeeds on the **python3** backend, the mode chain (incl. MCP auto-discovery from `~/.claude.json`) still resolves, four events register, MCP **and** REST flushes really submit; and install.sh's jq merge vs its python merge produce a **byte-identical** `settings.json` from the same seeded input (foreign hooks, unicode, mixed types preserved) | **1173**, **1152** |
 | `21_no_json_tool_loud` *(image: `nojson`)* | **no jq and no python3**: install **fails loudly** with a sudo-free remedy (names `~/.local/bin`, the co-location path and `KB_JQ`; never `apt install`) and writes no `settings.json`; a flush **and** a brief fired in that state exit 0, print nothing, and each append a rate-limited `NOT CONFIGURED` line the pre-brief lifts into the next session | **1174** |
 | `22_colocated_jq_and_kb_jq` *(image: `nojson`)* | backend-chain links 2 and 3 on a box with no JSON tool at all: a jq **beside the hooks** and `KB_JQ=/path/to/jq` each make install + flush + recall work, and the installer propagates that jq into `~/.claude/hooks/` so the box survives losing `KB_JQ` | **496** |
@@ -100,6 +131,9 @@ production, and a sub-agent once truncated the live schema. So:
 | `24_paths_with_spaces` | a `HOME` **and** a project dir containing spaces: install, jq co-location, PreCompact flush, SessionEnd delta flush, offset file, per-prompt recall and pre-brief all work; `"kb hook rig"` slugifies to `kb-hook-rig` | — |
 | `25_no_cygpath_fallback` *(image: `winsim`)* | Windows **without cygpath**: the pure-shell `C:\` -> `/c/` conversion keeps the flush working, `install.sh` still registers a spawnable command (`$EXEPATH`-derived, else bare `bash.exe`), plus unit assertions on `kb_winpath` extracted from the *installed* hook | **1153** |
 | `26_portable_block_identity` | the shared portable block appears exactly once per script and is **byte-identical** across all four, is sourceable standalone, and its jq/python3 backends agree primitive by primitive (field read, object build incl. a file-sourced value, validation, URL encoding) | — |
+| `37_install_timer` | install.sh (C9): the `.checkpoints-trusted-since` stamp is written once, in UTC, BEFORE any hook is copied and never overwritten; the `kb-flush-sweep` user timer is rendered AFTER `.setup-version`, byte-identical across runs, and gated (Windows, `KB_SWEEP_TIMER=0`, no `--auto` in the served backfill, missing / degraded / `enable`-failing `systemctl`) — every path completes the install and prints exactly ONE `sweep:` line. |
+| `38_rig_stub_plumbing` | the rig's OWN wave-C plumbing (C10), stub-only so a failure is a rig defect: dedupe keyed on `(session_uri, content_hash)` across projects (cross-project resend → `duplicate:true`, null id, four keys only, never names the canonical project) with the legacy `(kind, project, hash)` fallback for no/degenerate uri; the eight `flush_*` fields recorded verbatim, `flush_consistent` recorded and never a refusal, malformed stamps → 422 (fullmatch; a non-string `session_uri` is a 422, never a crashed handler); `POST /__fail` (N × code, `0` = dropped connection → curl `000`, hits recorded, dedupe key not consumed, MCP tool calls too, cleared by reset; a malformed knob body is a loud `stub_fail`/`stub_delay` failure); `POST /__delay` (`{}` restores the env default); fixtures carry a first-record timestamp (`RIG_FIXTURE_TS` for a pre-stamp one); `pin_sweep_clock`; `expose_flock` | **33783**, **34161** (rig fact) |
+| `39_notify_brief_state` | notify-complete.sh / kb-session-brief.sh (C9): the `kb <flushed>/<size>` progress keeps its shape and gains ` synced`, ` retry#N`, `?/<size> unseeded` and (unhealthy only) ` sweep:<age>` from the per-session state files; the brief prints a `[KB sweep]` line only when the sweep is stale/stalled/never ran, and its staleness scanner matches `sid=<sid8>` before falling back to the project. |
 
 ## Image variants
 
@@ -119,15 +153,15 @@ falling back. `--clean` removes the variants too.
 | --- | --- | --- |
 | `nojq` | `jq` (keeps `python3`) | `command -v jq` must really find nothing |
 | `nojson` | `jq` **and** `python3` | same, for both |
-| `winsim` | `setsid`; adds a writable `/c` and `/d` | `util-linux` is Essential (un-removable via apt), and a converted `C:\…` path must resolve to a real file |
+| `winsim` | `setsid` **and `flock`** (Git Bash has neither); adds a writable `/c` and `/d` | `util-linux` is Essential (un-removable via apt), `command -v flock` must really find nothing for the hooks' mkdir lock path (`<okey>.offset.lock.d/pid`, proposal_v2 App. B) to run, and a converted `C:\…` path must resolve to a real file. The build fails if either binary is still resolvable. |
 
 Each variant **moves** the tool to `/rigbin` instead of deleting it, and the
 image sets `RIG_JQ`/`RIG_PY` to those paths: `/rigbin` is on no `PATH`, so the
 harness can still build fixtures and assert while the code under test can find
 nothing. `lib.sh` therefore uses `$RIG_JQ`/`$RIG_PY` and never a bare `jq`.
 A case that deliberately re-exposes a tool (case 22 copying a jq next to the
-hooks, case 23's `expose_setsid` positive control) does it explicitly, in the
-case source.
+hooks, case 23's `expose_setsid` positive control, case 36's `expose_flock`)
+does it explicitly, in the case source.
 
 ## Known defect (XFAIL)
 

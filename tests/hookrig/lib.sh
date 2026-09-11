@@ -76,6 +76,34 @@ stub_enrol_project() { # <project>
   "$RIG_CURL" -sS -X POST "$STUB/__enrol_project" --data "$1" >/dev/null
 }
 stub_requests() { "$RIG_CURL" -sS "$STUB/__requests"; }
+# Fault injection (C6/C10): make the NEXT <times> ingest-session answers fail
+# with HTTP <code>; code 0 closes the connection with no response (curl 000).
+# Every injected hit is still recorded with "injected": <code>, so
+# `stub_count '.injected'` counts the attempts a retry chain made. The gate
+# sits BEFORE the bearer check, so an unauthenticated request spends a slot too.
+# The stub answers 400 for a malformed body (a non-int times/code); the HTTP
+# code is checked HERE so a typo becomes a failed check on the spot, never a
+# silently unarmed knob that surfaces one step later as a wrong retry count.
+# (Checked via %{http_code}, NOT `curl -f`: -f hangs up on the 400 body and
+# the stub then logs a ConnectionResetError traceback that reads like a crash.)
+stub_knob() { # <path> <json-body> <label> -> 0 on 200, else fail + 1
+  local code
+  code=$("$RIG_CURL" -sS -o /dev/null -w '%{http_code}' -X POST "$STUB/$1" \
+    --data "$2" 2>/dev/null) || code=000
+  [ "$code" = 200 ] || { fail "$3: the stub refused $2 (http $code)"; return 1; }
+}
+stub_fail() { # <times> [code=502]
+  stub_knob __fail "{\"times\": ${1:-1}, \"code\": ${2:-502}}" stub_fail
+}
+# Latency injection: delay every ingest answer by <ms>. `stub_delay 0` = no
+# delay at all; `stub_delay` with NO argument sends {} and restores the stub's
+# own default (its RIG_DELAY_MS env -- the lane think-time wincase 08 relies
+# on), which is also what stub_reset restores. Fails loudly like stub_fail.
+stub_delay() { # [ms]
+  local body='{}'
+  [ -n "${1:-}" ] && body="{\"ms\": $1}"
+  stub_knob __delay "$body" stub_delay
+}
 stub_count() { # jq-filter -> count of matching records
   stub_requests | "$RIG_JQ" -c "select($1)" 2>/dev/null | wc -l | tr -d ' '
 }
@@ -104,7 +132,11 @@ wait_stub() { # min-records [timeout-s] -- wait for the DETACHED hook child to l
 }
 
 log_count() { # pattern -> how many matching lines the flush log has
-  [ -f "$LOGF" ] && grep -cE "$1" "$LOGF" 2>/dev/null || echo 0
+  # grep -c prints 0 AND exits 1 on no match, so the old `|| echo 0` printed "0" twice
+  # (an `assert_eq 0 $(log_count …)` could never pass). One number, always.
+  [ -f "$LOGF" ] || { echo 0; return 0; }
+  _lc=$(grep -cE "$1" "$LOGF" 2>/dev/null) || true
+  echo "${_lc:-0}"
 }
 
 # Wait for a FIRING to finish, not merely to start. Every firing ends with exactly
@@ -280,10 +312,11 @@ EOF
 }
 
 # ------------------------------------------- windows (Git Bash) simulation fakes
-# Used by cases 23 and 25. These are the parts of Windows a case CAN fake from
-# its own $HOME (they land in $HOME/bin, which new_home puts first on PATH). The
-# two parts it cannot -- no setsid on PATH, and a writable /c so that a converted
-# C:\ path resolves to a real file -- come from Dockerfile.winsim.
+# Used by cases 23, 25 and 36. These are the parts of Windows a case CAN fake
+# from its own $HOME (they land in $HOME/bin, which new_home puts first on PATH).
+# The three parts it cannot -- no setsid on PATH, no flock on PATH, and a
+# writable /c so that a converted C:\ path resolves to a real file -- come from
+# Dockerfile.winsim.
 fake_uname_windows() { # `uname -s` -> MINGW64_NT-10.0, exactly like Git Bash
   cat >"$HOME/bin/uname" <<'EOF'
 #!/usr/bin/env bash
@@ -347,6 +380,30 @@ exec /rigbin/setsid "$@"
 EOF
   chmod +x "$HOME/bin/setsid"
 }
+expose_flock() { # POSITIVE CONTROL: put flock back (winsim parks it in /rigbin)
+  # Git Bash has no flock, so on the winsim image the hooks' session lock must
+  # take the mkdir path (kb_lock_take, proposal_v2 Appendix B). Re-exposing the
+  # real binary through $HOME/bin is how case 36 proves the flock path still
+  # wins where flock exists. The wrapper inherits fd 9, which is the whole
+  # point: `exec 9>lock; flock -n 9` works through it unchanged.
+  cat >"$HOME/bin/flock" <<'EOF'
+#!/usr/bin/env bash
+echo "flock $*" >>"$HOME/lock.calls"
+exec /rigbin/flock "$@"
+EOF
+  chmod +x "$HOME/bin/flock"
+}
+
+# --------------------------------------------------------------- sweep clock
+# kb-flush-backfill.sh (stage 2, item C7) reads KB_BACKFILL_NOW -- epoch seconds
+# -- instead of `date +%s` when it is set, so a case can pin "now" and assert the
+# quiet window, the stall back-off and the 24 h state sweep without sleeping.
+# The hooks are fired from THIS shell (fire/install_hooks), so an exported value
+# passes straight through; these two keep the export explicit in the case source.
+pin_sweep_clock() { # <epoch-seconds>
+  export KB_BACKFILL_NOW="$1"
+}
+unpin_sweep_clock() { unset KB_BACKFILL_NOW; }
 
 # Extract the shared portable block out of a skill script so its helpers can be
 # unit-tested directly (and diffed across the four copies).
@@ -355,26 +412,44 @@ extract_block() { # script-path outfile
 }
 
 # ------------------------------------------------------------------ transcripts
+# Every fixture record carries a "timestamp" (ISO-8601 Z, ms precision), exactly
+# like a real Claude Code transcript (all 7 live transcripts on the owner box do,
+# hybrid_v1 s2.4). The wave-C hook reads the FIRST record's timestamp to decide
+# whether a transcript with no offset file predates `.checkpoints-trusted-since`
+# (the unseeded refusal, C1) -- a fixture without one would be refused on every
+# first firing. Default: 1 s AHEAD of the case's clock, so a fixture built in the
+# same wall-clock second as install.sh's stamp still compares strictly newer.
+# RIG_FIXTURE_TS overrides it (e.g. "2020-01-01T00:00:00.000Z" for a PRE-stamp
+# transcript, which is how case 29 provokes the refusal).
 mk_transcript() { # path n-lines [tag]
-  "$RIG_PY" - "$1" "$2" "${3:-line}" <<'EOF'
+  "$RIG_PY" - "$1" "$2" "${3:-line}" "${RIG_FIXTURE_TS:-}" <<'EOF'
 import json, sys
-path, n, tag = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+from datetime import datetime, timedelta, timezone
+path, n, tag, ts = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+if not ts:
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 with open(path, "w", encoding="utf-8") as fh:
     for i in range(n):
-        fh.write(json.dumps({"type": "user", "tag": tag, "i": i, "text": f"{tag} message {i}"}) + "\n")
+        rec = {"type": "user", "timestamp": ts, "tag": tag, "i": i, "text": f"{tag} message {i}"}
+        fh.write(json.dumps(rec) + "\n")
 EOF
 }
 
 mk_big_transcript() { # path total-bytes -- ragged line lengths so the 900000
-  "$RIG_PY" - "$1" "$2" <<'EOF'
+  "$RIG_PY" - "$1" "$2" "${RIG_FIXTURE_TS:-}" <<'EOF'
 import json, sys
-path, target = sys.argv[1], int(sys.argv[2])
+from datetime import datetime, timedelta, timezone
+path, target, ts = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+if not ts:
+    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 # byte window NEVER lands on a line boundary by luck
 written, i = 0, 0
 with open(path, "w", encoding="utf-8") as fh:
     while written < target:
         pad = "x" * (37 + (i * 13) % 91)
-        line = json.dumps({"type": "assistant", "i": i, "pad": pad}) + "\n"
+        line = json.dumps({"type": "assistant", "timestamp": ts, "i": i, "pad": pad}) + "\n"
         fh.write(line)
         written += len(line)
         i += 1

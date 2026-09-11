@@ -202,10 +202,25 @@ always exit 0, so the log is the only signal. Look for `local … ok bytes=` (LO
 (CONNECTOR). `partial … will resume` means more follows; `NOT CONFIGURED` and `NOT CAPTURED` are the
 loud failures.
 
+**Checkpoints are never deleted; pre-existing transcripts need a seed.** Each session's accepted
+byte offset lives in `~/.claude/hooks/state/<session>.offset` and survives `SessionEnd` (a drained
+session reads `kb 5.2MB synced` in the completion ping); the server refuses a re-send of bytes it
+already holds. `install.sh` stamps `state/.checkpoints-trusted-since` once: a transcript with no
+checkpoint that predates the stamp was captured by an older hook and is **refused** (`unseeded`,
+`kb ?/199.0MB unseeded`) until you decide — `kb-flush-backfill.sh --seed <sid> current` (already
+in the KB) or `--seed <sid> <bytes>` (captured up to here; seed LOW when in doubt). A sweep
+(`kb-flush-backfill.sh --auto`) picks up sessions that never fired `SessionEnd`; it runs from the
+hooks' own piggyback trigger every 30 min on every box and, on Linux, from the `systemd --user`
+timer `install.sh` renders (`sweep: scheduled …` in its output). Health: the ping appends
+`sweep:never|<age> stale|STALLED n|unknown n` only when unhealthy, the pre-brief prints one
+`[KB sweep]` line with the action. Windows gets the piggyback only (optional `schtasks` line in
+[SHARING.md §2.6](SHARING.md#26-after-install-checkpoints-seeding-and-the-sweep)).
+
 **CONNECTOR does not scale.** It relays one model call per ~24 KB, so a large session is capped by
 `KB_CONNECTOR_SESSION_MAX` (2 MB): above it only the most recent bytes are relayed and the rest is
 dropped with a `NOT CAPTURED` line naming the transcript so you can re-ingest it. Use a bearer
-transport for big sessions — it chunks at 900 KB with no model in the path. Tunables:
+transport for big sessions — it chunks at 700 KB (on a fixed lattice, so a resend dedupes) with no
+model in the path. Tunables:
 `KB_FLUSH_CHUNK`, `KB_FLUSH_MAX`, `KB_CONNECTOR_CHUNK`, `KB_CONNECTOR_MAX`,
 `KB_CONNECTOR_SESSION_MAX`.
 

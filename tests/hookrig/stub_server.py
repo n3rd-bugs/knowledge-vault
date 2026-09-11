@@ -9,8 +9,20 @@ stub_contract.py. Routes:
                              RESPONSE HEADER), `notifications/initialized`,
                              `tools/call` (kb_ingest_session, kb_search).
   POST /api/ingest-session   REST: 401 / 422 / 400 / 202, see stub_contract.py.
+                             Dedupe keyed on (session_uri, content_hash) with the
+                             legacy (kind, project, hash) fallback; the eight
+                             flush_* stamp fields are recorded VERBATIM.
   GET  /__requests           the JSONL record (harness only, never recorded)
-  POST /__reset              truncate the record, forget sessions + dedupe
+  POST /__reset              truncate the record, forget sessions + dedupe, clear
+                             the __fail queue, restore the RIG_DELAY_MS default
+  POST /__fail               {"times": N, "code": C}: the next N ingest-session
+                             answers (REST and MCP tool call alike) are HTTP C;
+                             C = 0 closes the connection with NO response (curl
+                             reports 000). Each such hit IS recorded (status C,
+                             "injected": C) so a case can count attempts.
+  POST /__delay              {"ms": N}: delay every ingest answer by N ms from
+                             now (the env RIG_DELAY_MS sets the default for a
+                             stub started with it, e.g. the Windows lane)
   GET  /__health             readiness probe
 
 Every request is appended to the record as one JSON object, with `transcript_gz`
@@ -30,15 +42,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from stub_contract import Invalid, Queue, enqueue_result, validate_submission
+from stub_contract import (
+    FLUSH_FIELDS,
+    Invalid,
+    Queue,
+    enqueue_result,
+    flush_consistent,
+    validate_flush,
+    validate_submission,
+)
 
 TOKEN = os.environ.get("RIG_TOKEN", "kbrig_0000000000000000000000000000")
+# Delay every ingest answer (REST and MCP) by this many ms -- the way wincases/08
+# proves a >= 1 MB POST survives a 12 s server think-time on Schannel (C6).
+DELAY_MS_DEFAULT = int(os.environ.get("RIG_DELAY_MS", "0") or 0)
 # What a PROJECT-SCOPED enrolment redeems to. Distinct from TOKEN so a case can
 # tell "the machine used the credential it just redeemed" from "it fell back to
 # something else it happened to have".
 PROJECT_TOKEN = os.environ.get("RIG_PROJECT_TOKEN", "kbg_" + "a" * 43)
 RECORD_PATH = os.environ.get("RIG_RECORD", "/tmp/requests.jsonl")
 PORT = int(os.environ.get("RIG_PORT", "8000"))
+# 0.0.0.0 is right inside the --internal network; a desk-check outside docker
+# (python3 stub_server.py against curl on one host) sets RIG_BIND=127.0.0.1.
+BIND = os.environ.get("RIG_BIND", "0.0.0.0")
 # Where the rig mounted the skill, so the stub can serve the REAL scripts.
 SKILL_DIR = Path(os.environ.get("SKILL", "/skill"))
 SETUP_SCRIPTS = frozenset(
@@ -78,6 +104,13 @@ class State:
     # goes to kb-tokens.env and NO shared KB_TOKEN is ever written — and that is
     # precisely the shape in which a bare $KB_TOKEN reference is unbound.
     enrol_project: str = ""
+    # POST /__fail: how many of the NEXT ingest answers fail, and with what code
+    # (0 = close without a response). Transport faults are the one thing a
+    # hermetic stub cannot otherwise produce, and C6's retry/marker contract is
+    # defined entirely by them.
+    fail_times: int = 0
+    fail_code: int = 0
+    delay_ms: int = DELAY_MS_DEFAULT
 
     @classmethod
     def reset(cls) -> None:
@@ -86,9 +119,21 @@ class State:
             cls.sessions = set()
             cls.spent_codes = set()
             cls.enrol_project = ""
+            cls.fail_times = 0
+            cls.fail_code = 0
+            cls.delay_ms = DELAY_MS_DEFAULT
             with open(RECORD_PATH, "w", encoding="utf-8"):
                 pass
         Queue.reset()
+
+    @classmethod
+    def take_failure(cls) -> int | None:
+        """Consume one queued failure: its HTTP code, or None when none is queued."""
+        with cls.lock:
+            if cls.fail_times <= 0:
+                return None
+            cls.fail_times -= 1
+            return cls.fail_code
 
     @classmethod
     def record(cls, rec: dict[str, Any]) -> None:
@@ -122,9 +167,17 @@ def _record_meta(rec: dict[str, Any], args: dict[str, Any]) -> None:
     for k in ("repo", "branch", "commit"):
         rec[k] = args.get(k)
     rec["empty_keys"] = sorted(k for k, v in args.items() if isinstance(v, str) and not v.strip())
+    # The flush_* telemetry stamps (src/kbrest/schemas.py:80-87), VERBATIM and
+    # only when present: a number the hook sent as a string shows up as a string
+    # here, which is exactly the drift a case must be able to see.
+    for k in FLUSH_FIELDS:
+        if k in args:
+            rec[k] = args[k]
 
 
-def _accepted(rec: dict[str, Any], project: str, text: str, res: dict[str, Any]) -> None:
+def _accepted(
+    rec: dict[str, Any], project: str, text: str, res: dict[str, Any], facts: dict[str, Any]
+) -> None:
     rec.update(
         project=project,
         transcript_bytes=len(text.encode("utf-8")),
@@ -132,6 +185,7 @@ def _accepted(rec: dict[str, Any], project: str, text: str, res: dict[str, Any])
         ends_with_newline=text.endswith("\n"),
         transcript=text,
         result=res,
+        **facts,
     )
 
 
@@ -260,6 +314,28 @@ class Handler(BaseHTTPRequestHandler):
             # under test).
             State.enrol_project = raw.decode("utf-8").strip()
             self._send(200, b"ok\n", "text/plain")
+            return
+        if path in ("/__fail", "/__delay"):
+            # Harness-only fault/latency injection (never recorded). /__fail takes
+            # {"times": N, "code": C} ("count" is accepted for "times"); /__delay
+            # takes {"ms": N}. A malformed body is a 400 so a typo in a case
+            # cannot silently arm nothing.
+            try:
+                knobs = json.loads(raw.decode("utf-8") or "{}")
+                if not isinstance(knobs, dict):
+                    raise ValueError("body must be a JSON object")
+                with State.lock:
+                    if path == "/__fail":
+                        State.fail_times = int(knobs.get("times", knobs.get("count", 1)))
+                        State.fail_code = int(knobs.get("code", 502))
+                        armed = {"times": State.fail_times, "code": State.fail_code}
+                    else:
+                        State.delay_ms = int(knobs.get("ms", DELAY_MS_DEFAULT))
+                        armed = {"ms": State.delay_ms}
+            except (ValueError, TypeError) as e:
+                self._send(400, json.dumps({"error": str(e)}).encode("utf-8"))
+                return
+            self._send(200, json.dumps(armed).encode("utf-8"))
             return
         if path == "/mcp":
             self._mcp(raw)
@@ -417,16 +493,51 @@ class Handler(BaseHTTPRequestHandler):
         rec["kind"] = args.get("kind")
         rec["encoding"] = "gz" if args.get("transcript_gz") else "plain"
         _record_meta(rec, args)
+        if self._ingest_gate(rec):
+            return
         try:
             project, text = validate_submission(args)
         except (ValueError, Invalid) as e:
             rec.update(is_error=True, reason=str(e))
             self._done(rec, 200, _rpc_text(rid, str(e), is_error=True))
             return
-        res = enqueue_result(text)
+        res, facts = enqueue_result(
+            text, project=project, kind=args.get("kind"), session_uri=args.get("session_uri")
+        )
         rec["is_error"] = False
-        _accepted(rec, project, text, res)
+        _accepted(rec, project, text, res, facts)
         self._done(rec, 200, _rpc_text(rid, json.dumps(res)))
+
+    # ------------------------------------------------------ harness injection
+    def _ingest_gate(self, rec: dict[str, Any]) -> bool:
+        """Apply the harness knobs to ONE ingest answer: the delay, then a queued
+        failure. True when the request was answered (or dropped) here.
+
+        Runs BEFORE validation -- and before the bearer check as well -- so an
+        injected 401/5xx/000 is seen even by a request the stub would otherwise
+        reject, and the hit is recorded either way -- `stub_count '.injected'`
+        is how a case counts retry attempts. Consequently an unauthenticated
+        request consumes an armed slot too: count `.injected` hits, not `.auth`.
+        """
+        delay = State.delay_ms
+        if delay > 0:
+            time.sleep(delay / 1000.0)
+        code = State.take_failure()
+        if code is None:
+            return False
+        rec["injected"] = code
+        if code == 0:
+            # Simulated network death: record the hit, then close the socket
+            # without writing a status line. curl reports http_code 000
+            # ("Empty reply from server"), exactly what a dropped connection
+            # looks like to the hook.
+            rec["status"] = 0
+            rec.setdefault("bearer", self._bearer())
+            State.record(rec)
+            self.close_connection = True
+            return True
+        self._done(rec, code, {"error": f"injected failure {code}"})
+        return True
 
     # -------------------------------------------------------------------- REST
     def _rest_ingest(self, raw: bytes) -> None:
@@ -438,23 +549,27 @@ class Handler(BaseHTTPRequestHandler):
             "auth": auth,
             "bytes": len(raw),
         }
-        if auth != "ok":
-            self._done(rec, 401, {"error": "unauthorized"})
-            return
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             payload = None
+        if isinstance(payload, dict):
+            rec["project"] = payload.get("project")
+            rec["kind"] = payload.get("kind")
+            rec["encoding"] = "gz" if payload.get("transcript_gz") else "plain"
+            _record_meta(rec, payload)
+        if self._ingest_gate(rec):
+            return
+        if auth != "ok":
+            self._done(rec, 401, {"error": "unauthorized"})
+            return
         if not isinstance(payload, dict):
             rec["reason"] = "body is not a JSON object"
             self._done(rec, 422, {"detail": [{"msg": rec["reason"]}]})
             return
-        rec["project"] = payload.get("project")
-        rec["kind"] = payload.get("kind")
-        rec["encoding"] = "gz" if payload.get("transcript_gz") else "plain"
-        _record_meta(rec, payload)
         try:
             project, text = validate_submission(payload)
+            stamp = validate_flush(payload)
         except ValueError as e:  # shape -> pydantic would have refused the model
             rec["reason"] = str(e)
             self._done(rec, 422, {"detail": [{"msg": str(e)}]})
@@ -463,16 +578,21 @@ class Handler(BaseHTTPRequestHandler):
             rec["reason"] = str(e)
             self._done(rec, 400, {"error": str(e)})
             return
-        res = enqueue_result(text)
-        _accepted(rec, project, text, res)
+        if stamp:
+            # src/kbcore/models.py:268-274 -- recorded, never a refusal.
+            rec["flush_consistent"] = flush_consistent(stamp, len(text.encode("utf-8")))
+        res, facts = enqueue_result(
+            text, project=project, kind=payload.get("kind"), session_uri=payload.get("session_uri")
+        )
+        _accepted(rec, project, text, res, facts)
         self._done(rec, 202, res)
 
 
 def main() -> None:
     State.reset()
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv = ThreadingHTTPServer((BIND, PORT), Handler)
     srv.daemon_threads = True
-    print(f"kb-hookrig-stub listening on :{PORT} recording to {RECORD_PATH}", flush=True)
+    print(f"kb-hookrig-stub listening on {BIND}:{PORT} recording to {RECORD_PATH}", flush=True)
     srv.serve_forever()
 
 

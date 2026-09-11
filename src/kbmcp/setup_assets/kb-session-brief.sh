@@ -569,6 +569,69 @@ else
       fi
     fi
   fi
+
+  # ------------------------------------------------------- is the sweep alive?
+  # The sweep (`kb-flush-backfill.sh --auto`, run by the systemd --user timer
+  # install.sh renders and by the hooks' piggyback trigger) is what drains a
+  # transcript whose session died without a SessionEnd. It leaves one line in
+  # state/.sweep-last per run; the trigger file's mtime says when something
+  # last ASKED for a sweep. ONE `[KB sweep]` line, ASCII only, and ONLY when
+  # there is something to act on -- a healthy box prints nothing here:
+  #   never ran although one is expected (the timer unit exists, or a trigger
+  #     fired long ago and nothing completed);
+  #   stalled: the last run is older than 6 h AND nothing has triggered a sweep
+  #     since -- the timer is not firing (a trigger NEWER than the last run means
+  #     a sweep was asked for and has not finished: different fix, said so);
+  #   N transcripts STALLED (the sweep gave up on them after repeated failures);
+  #   N unseeded transcripts awaiting the owner's --seed decision.
+  _sw_state="$HOME/.claude/hooks/state"
+  _sw_last="$_sw_state/.sweep-last"
+  _sw_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true; }
+  _sw_age() { # <epoch> -> 12m | 3h | 2d
+    _swd=$(( $(_kb_now) - $1 ))
+    [ "$_swd" -ge 0 ] || _swd=0
+    if [ "$_swd" -lt 3600 ]; then printf '%sm' "$((_swd / 60))"
+    elif [ "$_swd" -lt 172800 ]; then printf '%sh' "$((_swd / 3600))"
+    else printf '%sd' "$((_swd / 86400))"; fi
+  }
+  _sw_line=""
+  _sw_trig=$(_sw_mtime "$_sw_state/.sweep.trigger")
+  case "$_sw_trig" in '' | *[!0-9]*) _sw_trig=0 ;; esac
+  if [ -f "$_sw_last" ]; then
+    _sw_ts=$(sed -n 's/^ts=\([0-9]*\).*/\1/p' "$_sw_last" 2>/dev/null | head -1)
+    [ -n "$_sw_ts" ] || _sw_ts=$(_sw_mtime "$_sw_last")
+    case "$_sw_ts" in '' | *[!0-9]*) _sw_ts=0 ;; esac
+    _sw_now=$(_kb_now)
+    if [ "$_sw_ts" -gt 0 ] && [ "$_sw_now" -gt 0 ] && [ "$((_sw_now - _sw_ts))" -gt 21600 ]; then
+      if [ "$_sw_trig" -le "$_sw_ts" ]; then
+        _sw_line="last run $(_sw_age "$_sw_ts") ago -- stalled: nothing has triggered a sweep since (the timer is not firing; check: systemctl --user status kb-flush-sweep.timer)"
+      else
+        _sw_line="last run $(_sw_age "$_sw_ts") ago -- a sweep was triggered $(_sw_age "$_sw_trig") ago and has not completed; see ~/.claude/hooks/flush-session.log"
+      fi
+    fi
+    _sw_st=$(sed -n 's/.* stalled=\([0-9]*\).*/\1/p' "$_sw_last" 2>/dev/null | head -1)
+    _sw_un=$(sed -n 's/.* unknown=\([0-9]*\).*/\1/p' "$_sw_last" 2>/dev/null | head -1)
+    if [ -n "$_sw_st" ] && [ "$_sw_st" -gt 0 ]; then
+      _sw_line="${_sw_line:+$_sw_line; }$_sw_st transcript(s) STALLED after repeated failures -- see ~/.claude/hooks/flush-session.log"
+    fi
+    if [ -n "$_sw_un" ] && [ "$_sw_un" -gt 0 ]; then
+      _sw_line="${_sw_line:+$_sw_line; }$_sw_un unseeded transcript(s) need an owner decision: kb-flush-backfill.sh (the table), then kb-flush-backfill.sh --seed <sid> <bytes|current>"
+    fi
+  else
+    # `never` needs BOTH a rendered timer unit (a sweep is expected here) AND
+    # no recent ask: a trigger younger than 6 h means a sweep was requested and
+    # may still be running; absent (the timer's ExecStartPre would have touched
+    # it) or older, nothing fires. Same rule as notify-complete.sh, 6 h scale.
+    _sw_exp=0
+    if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/kb-flush-sweep.timer" ]; then
+      if [ "$_sw_trig" -le 0 ] || [ "$(( $(_kb_now) - _sw_trig ))" -gt 21600 ]; then _sw_exp=1; fi
+    fi
+    [ "$_sw_exp" = 1 ] && _sw_line="never ran -- the sweep timer is rendered but no sweep has completed (check: systemctl --user status kb-flush-sweep.timer; or run kb-flush-backfill.sh --auto by hand)"
+  fi
+  if [ -n "$_sw_line" ]; then
+    printf '[KB sweep] %s\n' "$_sw_line" | LC_ALL=C tr -cd '\040-\176\n'
+    printf '\n'
+  fi
 fi
 
 HITS=""
@@ -752,21 +815,62 @@ if [ "$MODE" = "brief" ]; then
     # (FAILED: / chunk FAILED / BUG: / NOT CONFIGURED). An `http=[45]..` branch
     # used to sit here too and was dead — no hook has ever written `http=`; the
     # REST failure line carries its status as `chunk FAILED (500)`.
+    #
+    # SID-AWARE (wave C). The log is machine-wide and interleaves every session
+    # on the box, so "a later ok line" used to clear a failure that belonged to a
+    # DIFFERENT session — the resumed session's success masked the killed one's
+    # loss. The hook now ends its ok/partial lines with ` sid=<8>`: a failure
+    # carrying a sid is cleared only by a later fully-drained line with the SAME
+    # sid. Lines without a sid (older hooks, the sweep's own lines) fall back to
+    # the PROJECT token, and a line with neither keeps today's rule (any later
+    # ok clears it). The newest still-uncleared failure is what gets surfaced.
+    # `unseeded:` is the wave-C refusal (`flush <proj> unseeded: refusing to
+    # send N from 0 ...`, wave_c_brief C1): a pre-stamp transcript the hook will
+    # not drain until the owner seeds it; it clears like any other failure once
+    # that session (or, sid-less, that project) drains fully.
     RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
-      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED|NEEDS TOKEN/ { fail=$0; failn=NR; next }
+      function proj(line,   f, n) {
+        # <ts> flush|local|connector <proj> ...   or   <ts> backfill <sid8> <proj> ...
+        n = split(line, f, " ")
+        if (n >= 3 && (f[2] == "flush" || f[2] == "local" || f[2] == "connector")) {
+          if (f[3] ~ /^(NOT|BUG:|FAILED:?|chunk)$/) return ""
+          return f[3]
+        }
+        if (n >= 4 && f[2] == "backfill") return f[4]
+        return ""
+      }
+      function key(line,   p) {
+        if (match(line, /sid=[A-Za-z0-9._-]+/)) return "sid:" substr(line, RSTART + 4, RLENGTH - 4)
+        p = proj(line)
+        if (p != "") return "proj:" p
+        return "*"
+      }
+      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED|NEEDS TOKEN|unseeded:/ {
+        k = key($0); fail[k] = $0; failn[k] = NR; fp[k] = proj($0); next
+      }
       / (ok|partial) bytes=/ {
         # Belt and braces (HIGH-1): a summary whose (offset X/Y) shows X<Y is an
         # INCOMPLETE drain — count it as a failure even if the matching FAILED line
         # scrolled out of the tail window, or this was the terminal SessionEnd
         # firing that strands the tail forever. Only a fully-drained X>=Y line
         # (the LOCAL/network " ok bytes=" marker) clears a prior failure.
+        k = key($0); p = proj($0); done = 1
         if (match($0, /offset [0-9]+\/[0-9]+/)) {
           seg = substr($0, RSTART + 7, RLENGTH - 7)
-          if (split(seg, a, "/") == 2 && (a[1] + 0) < (a[2] + 0)) { fail=$0; failn=NR }
-          else { okn=NR }
-        } else { okn=NR }
+          if (split(seg, a, "/") == 2 && (a[1] + 0) < (a[2] + 0)) done = 0
+        }
+        if (!done) { fail[k] = $0; failn[k] = NR; fp[k] = p; next }
+        for (j in fail) {
+          if (j == k || j == "*" || k == "*") { delete fail[j]; continue }
+          # Project fallback: never across two DIFFERENT sids.
+          if (p != "" && fp[j] == p && !(j ~ /^sid:/ && k ~ /^sid:/)) delete fail[j]
+        }
       }
-      END { if (failn > 0 && failn > okn) print fail }')
+      END {
+        best = 0
+        for (j in fail) if (failn[j] > best) { best = failn[j]; out = fail[j] }
+        if (best > 0) print out
+      }')
     [ -n "$RECENT_FAIL" ] && FLUSH_WARN="⚠ KB session-flush reported a recent failure — capture may be
 incomplete until it succeeds (it retries each compaction). Last error:
   $RECENT_FAIL

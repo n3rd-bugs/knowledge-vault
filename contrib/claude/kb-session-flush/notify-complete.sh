@@ -119,7 +119,82 @@ kb_posixpath() { # JSON-escaped native Windows path -> POSIX; anything else pass
   printf '%s' "$_kbw"
 }
 
-kb_progress() { # -> "kb <flushed>/<size>" | "kb <size> synced" | nothing at all
+kb_mtime() { # <path> -> epoch mtime, or nothing
+  _kbm=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true)
+  case "$_kbm" in '' | *[!0-9]*) ;; *) printf '%s' "$_kbm" ;; esac
+}
+
+kb_age() { # <epoch> -> "12m" | "3h" | "2d" (ASCII; nothing when unparsable)
+  case "${1:-}" in '' | *[!0-9]*) return 0 ;; esac
+  _kbn=$(date +%s 2>/dev/null || echo 0)
+  case "$_kbn" in '' | *[!0-9]*) return 0 ;; esac
+  _kbd=$((_kbn - $1))
+  [ "$_kbd" -ge 0 ] || _kbd=0
+  if [ "$_kbd" -lt 3600 ]; then printf '%sm' "$((_kbd / 60))"
+  elif [ "$_kbd" -lt 172800 ]; then printf '%sh' "$((_kbd / 3600))"
+  else printf '%sd' "$((_kbd / 86400))"; fi
+}
+
+# A per-session marker the flush hook keeps BESIDE the checkpoint. Both spellings
+# are probed (`<okey>.retry` and `<okey>.offset.retry`) so this reader cannot
+# drift from whichever the hook settles on -- a wrong guess here would be a
+# suffix that silently never appears.
+kb_marker() { # <state> <okey> <ext> -> the marker path when it exists
+  if [ -e "$1/$2.$3" ]; then printf '%s' "$1/$2.$3"
+  elif [ -e "$1/$2.offset.$3" ]; then printf '%s' "$1/$2.offset.$3"; fi
+}
+
+# The sweep's health, appended ONLY when unhealthy (ASCII, KB 12885): the ping
+# is the one per-turn channel on a box that lives in resumed sessions and never
+# sees a SessionStart brief. Healthy = silent.
+#   sweep:never       no sweep has ever completed although one is expected
+#                     (the systemd timer is rendered, or a trigger fired long ago)
+#   sweep:26h stale   .sweep-last older than 3 x KB_SWEEP_INTERVAL (timer dead?)
+#   sweep:STALLED 1   transcripts the sweep gave up retrying for now
+#   sweep:unknown 6   unseeded transcripts awaiting an owner --seed decision
+# KB_SWEEP_INTERVAL=0 is the documented OFF switch (hybrid_v1 s2.8): no cadence
+# means no "stale" and no "never" -- there is nothing to be late against.
+kb_sweep_note() { # <state> -> " sweep:<...>" | nothing
+  _swi="${KB_SWEEP_INTERVAL:-1800}"
+  case "$_swi" in '' | *[!0-9]*) _swi=1800 ;; esac
+  _swf="$1/.sweep-last"
+  if [ ! -f "$_swf" ]; then
+    # `never` needs BOTH: a rendered timer unit (a sweep is expected on this
+    # box) AND no recent ask -- a trigger younger than 3 x the interval means a
+    # sweep was requested and may still be running; older, or absent although
+    # the timer's ExecStartPre would have touched it, means nothing fires.
+    [ "$_swi" -gt 0 ] || return 0
+    [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/kb-flush-sweep.timer" ] || return 0
+    if [ -e "$1/.sweep.trigger" ]; then
+      _swt=$(kb_mtime "$1/.sweep.trigger")
+      _swn=$(date +%s 2>/dev/null || echo 0)
+      case "$_swt$_swn" in
+        *[!0-9]* | '') return 0 ;;
+        *) [ "$((_swn - _swt))" -gt "$((3 * _swi))" ] || return 0 ;;
+      esac
+    fi
+    printf ' sweep:never'
+    return 0
+  fi
+  _swts=$(sed -n 's/^ts=\([0-9]*\).*/\1/p' "$_swf" 2>/dev/null | head -1)
+  [ -n "$_swts" ] || _swts=$(kb_mtime "$_swf")
+  _swn=$(date +%s 2>/dev/null || echo 0)
+  case "$_swts$_swn" in
+    *[!0-9]* | '') ;;
+    *)
+      if [ "$_swi" -gt 0 ] && [ "$((_swn - _swts))" -gt "$((3 * _swi))" ]; then
+        printf ' sweep:%s stale' "$(kb_age "$_swts")"
+        return 0
+      fi
+      ;;
+  esac
+  _swst=$(sed -n 's/.* stalled=\([0-9]*\).*/\1/p' "$_swf" 2>/dev/null | head -1)
+  _swun=$(sed -n 's/.* unknown=\([0-9]*\).*/\1/p' "$_swf" 2>/dev/null | head -1)
+  if [ -n "$_swst" ] && [ "$_swst" -gt 0 ]; then printf ' sweep:STALLED %s' "$_swst"
+  elif [ -n "$_swun" ] && [ "$_swun" -gt 0 ]; then printf ' sweep:unknown %s' "$_swun"; fi
+}
+
+kb_progress() { # -> "kb <flushed>/<size>[ retry#N]" | "kb <size> synced" | "kb ?/<size> unseeded" | nothing
   _tp=$(printf '%s' "$INPUT" | grep -o '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
   _tp=$(kb_posixpath "$_tp")
   # No transcript in the event, or a path this shell cannot open (a deleted
@@ -141,28 +216,57 @@ kb_progress() { # -> "kb <flushed>/<size>" | "kb <size> synced" | nothing at all
 
   # BRANCH 1 — the checkpoint file exists: the network transports (MCP/REST) own
   # it and advance it after each accepted chunk, so it is exactly "bytes of this
-  # transcript the KB has taken". Report progress against the current size.
+  # transcript the KB has taken". Checkpoints are NEVER deleted by the hooks any
+  # more (wave C): a drained session keeps its file at offset == size and reads
+  # `synced`; a ` retry#N` suffix means the last chunk failed N times and the
+  # Stop gate is backing off (the marker is removed once the offset catches up).
   if [ -e "$_off" ]; then
     _flushed=$(cat "$_off" 2>/dev/null || true)
     # A corrupt (non-numeric, or unreadable) checkpoint is NOT reported as zero:
     # the hook itself treats it as "restart from 0", but printing "0/5.2MB" would
     # claim nothing is captured when the truth is that we cannot tell. Omit.
     case "$_flushed" in '' | *[!0-9]*) return 0 ;; esac
-    # A transcript that shrank (rotated/replaced) can leave the checkpoint above
-    # the size; the hook restarts from 0 next firing. "6.0/5.2MB" is nonsense, so
-    # clamp rather than print it.
-    [ "$_flushed" -gt "$_size" ] && _flushed="$_size"
+    _sfx=""
+    _rt=$(kb_marker "$_state" "${_okey:-default}" retry)
+    if [ -n "$_rt" ]; then
+      # N = the marker's 2nd field. 0 (a lock-deferred chunk, nothing failed
+      # yet) reads as a bare ` retry` -- `retry#0` would claim zero retries.
+      _rn=$(awk 'NR == 1 { print $2 }' "$_rt" 2>/dev/null)
+      case "$_rn" in '' | *[!0-9]* | 0) _sfx=" retry" ;; *) _sfx=" retry#$_rn" ;; esac
+    fi
+    # offset >= size is "everything the file holds has been accepted". A
+    # checkpoint ABOVE the size (rotated/replaced transcript; the hook logs
+    # `reason=shrank` and restarts) reads the same way rather than "6.0/5.2MB".
+    if [ "$_flushed" -ge "$_size" ]; then
+      _h=$(kb_human "$_size") || return 0
+      [ -n "$_h" ] || return 0
+      printf 'kb %s synced%s' "$_h" "$_sfx"
+      return 0
+    fi
     _h=$(kb_human "$_flushed" "$_size") || return 0
     [ -n "$_h" ] || return 0
-    printf 'kb %s' "$_h"
+    printf 'kb %s%s' "$_h" "$_sfx"
     return 0
   fi
 
-  # BRANCH 2 — no checkpoint file. The flush hook DELETED it after a terminal
-  # SessionEnd drain (fully captured), or nothing has ever flushed. The backfill
-  # ledger is the durable record that survives the deletion: it holds
-  # "<session key><TAB><bytes accounted for>" for every session a sweep
-  # finished.
+  # BRANCH 1b — no checkpoint, but the hook has REFUSED to start one: the
+  # transcript predates the box's `.checkpoints-trusted-since` stamp, so a
+  # from-0 send would resend a session an older hook already captured. Nothing
+  # of it is known to be in the KB and nothing will be until the owner seeds
+  # it (`kb-flush-backfill.sh --seed <sid> current|<bytes>`). Say exactly that.
+  if [ -n "$(kb_marker "$_state" "${_okey:-default}" unseeded)" ]; then
+    _h=$(kb_human "$_size") || return 0
+    [ -n "$_h" ] || return 0
+    printf 'kb ?/%s unseeded' "$_h"
+    return 0
+  fi
+
+  # BRANCH 2 — no checkpoint file and no refusal. Hooks from before wave C
+  # DELETED the checkpoint after a terminal SessionEnd drain and the backfill
+  # ledger was the durable record that survived it: "<session key><TAB><bytes
+  # accounted for>" per session a sweep finished. The ledger is INERT now (no
+  # longer written) but is still honoured as a read-only relic, so a session
+  # drained under the old hooks keeps reading `synced` instead of a false zero.
   _led="$_state/.backfill-done"
   if [ -f "$_led" ]; then
     # Split on TAB *or* US (0x1F): the ledger is written TAB-separated, and the
@@ -218,6 +322,11 @@ kb_progress() { # -> "kb <flushed>/<size>" | "kb <size> synced" | nothing at all
 # Belt and braces around the whole computation: a stat that errors, an awk that
 # is missing, a $HOME that is not writable — none of it may cost the ping.
 KBPART=$(kb_progress 2>/dev/null || true)
+# The sweep's health rides on the kb segment (never on its own: a LOCAL box has
+# no sweep to report on) and only when there is something to act on.
+if [ -n "$KBPART" ]; then
+  KBPART="$KBPART$(kb_sweep_note "$HOME/.claude/hooks/state" 2>/dev/null || true)"
+fi
 
 # "(3m20s, kb 4.1/5.2MB)", "(3m20s)", "(kb 4.1/5.2MB)" or nothing — the
 # parenthetical carries whatever is actually known.

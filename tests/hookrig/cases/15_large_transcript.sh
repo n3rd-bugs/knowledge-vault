@@ -16,6 +16,13 @@
 #       logic can be exercised in seconds. Production defaults are asserted
 #       separately, from the script source, so shrinking them for the test can
 #       never quietly become shrinking them for real.
+#
+#       FLIPPED 2026-09-11 (wave C, KB 33783 root cause / KB 34161 wave S): a
+#       drained SessionEnd KEEPS the offset file at exactly the transcript size
+#       (this case used to assert it was retired -- the deletion that made every
+#       `--resume` re-send the whole transcript from 0). The shipped chunk
+#       default moves 900,000 -> 700,000 with a 950,000 send cap (C2, absolute
+#       lattice, proposal_v2 Appendix A).
 . /rig/lib.sh
 
 new_home bigflush
@@ -26,7 +33,8 @@ install_hooks >/dev/null
 step "the shipped defaults are the production ones"
 # Read from the installed script, not from this shell: the point is that the
 # overrides below are a TEST affordance, not a change to what users get.
-assert_file_contains "$HOOKS/flush-session-to-kb.sh" 'KB_FLUSH_CHUNK:-900000' "default chunk is 900,000 bytes"
+assert_file_contains "$HOOKS/flush-session-to-kb.sh" 'KB_FLUSH_CHUNK:-700000' "default chunk is 700,000 bytes (C2 lattice cell)"
+assert_file_contains "$HOOKS/flush-session-to-kb.sh" 'KB_FLUSH_SEND_MAX:-950000' "default send cap is 950,000 bytes (< the 1,000,000 row cap)"
 assert_file_contains "$HOOKS/flush-session-to-kb.sh" 'KB_FLUSH_MAX:-209715200' "default per-firing cap is 200 MB"
 
 WORK="$HOME/work/bigrepo"
@@ -126,18 +134,20 @@ S3=$(wc -c <"$W3/t.jsonl")
 export KB_FLUSH_CHUNK=400000 KB_FLUSH_MAX=3000000
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$W3/t.jsonl" "$W3" end-1 SessionEnd)"
 wait_log "flush .* ok bytes=" 180 || fail "SessionEnd did not drain: $(tail -3 "$LOGF" | tr '\n' '|')"
-# The log is the authority here: a drained SessionEnd RETIRES its offset file, so
-# read_offset legitimately reports 0 afterwards.
+# The log AND the checkpoint agree: a drained SessionEnd logs the full size and
+# KEEPS its offset file at that size (never-delete, KB 33783/34161) -- the next
+# `--resume` of this session id must send only what is appended after it.
 if grep -qE "flush .* ok bytes=$S3 \(offset $S3/$S3\)" "$LOGF"; then
   pass "SessionEnd drained all $S3 bytes in one firing despite the budget"
 else
   fail "SessionEnd did not drain fully: $(grep flush "$LOGF" | tail -2 | tr '\n' '|')"
 fi
-if [ -z "$(offset_file)" ]; then
-  pass "the offset file was retired after a drained SessionEnd"
+if [ -n "$(offset_file)" ]; then
+  pass "the offset file survived a drained SessionEnd ($(offset_file))"
 else
-  fail "offset file survived a drained SessionEnd: $(read_offset)"
+  fail "the offset file was deleted after a drained SessionEnd -- a resume would re-send from 0"
 fi
+assert_eq "$S3" "$(read_offset)" "the surviving offset equals the transcript size"
 
 # ------------------------------------- 3. a single line larger than one chunk
 # A pasted 2 MB tool output is one JSONL record. It cannot be cut on a line

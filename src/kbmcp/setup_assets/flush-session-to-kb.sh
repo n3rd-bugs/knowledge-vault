@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
+# KB-FLUSH-LINEAGE: never-delete-offsets v2
 # Claude Code PreCompact/SessionEnd hook: flush this session's NEW transcript
-# delta into the Knowledge Vault before compaction. Large sessions supported:
-# deltas are sent as sequential <=900KB line-boundary chunks (up to 1 GB total),
-# with the offset advancing per accepted chunk (mid-delta resume on failure). Detaches immediately so it
-# never blocks/stalls compaction. Config lives in ~/.claude/kb-flush.env:
+# delta into the Knowledge Vault before compaction. Deltas are cut on an ABSOLUTE
+# 700 KB line-boundary lattice (KB_FLUSH_CHUNK; never above KB_FLUSH_SEND_MAX), the
+# per-session offset advances per accepted chunk and is NEVER deleted (a drained
+# SessionEnd leaves offset==size; resumes continue from there); a transcript with
+# no offset is sent from 0 only when it post-dates the box's checkpoint stamp
+# (else refused as "unseeded"); the project is pinned ONCE per session from the
+# transcript's first git cwd record. Detaches immediately so it never blocks
+# compaction. Config lives in ~/.claude/kb-flush.env:
 #   LOCAL  (KB host): KB_DIR=/path/to/kb-repo   [UV=/path/to/uv]
 #   MCP    (client) : KB_MCP_URL=https://host/mcp   KB_TOKEN=...  (reuses the
 #                     `claude mcp` connector registration — zero extra config)
@@ -258,6 +263,435 @@ kb_json_probe || {
 }
 DETACH="$(kb_detach_cmd)"
 
+# Only ONE drain may own a session's offset file at a time. PreCompact and
+# SessionEnd both detach, and a large transcript keeps a child busy for minutes,
+# so firings overlap routinely. Two children then read the same offset, relay the
+# same chunk, and the slower one's late write can REWIND the offset and re-send
+# bytes already accepted. The trio below is the whole lock discipline.
+# >>> KB LOCK TRIO v1
+# ONE session drains at a time. flock where it exists; a pid-owned mkdir dir
+# otherwise (atomic everywhere, incl. Git Bash). This block is copied
+# BYTE-IDENTICAL into kb-flush-backfill.sh (C7) and funnel-pinned, so it must be
+# edited in ONE place. Reclaim a mkdir dir ONLY when its pid is DEAD (or absent)
+# AND the dir has made no progress for KB_FLUSH_LOCK_STALE_MIN minutes — never on
+# wall-clock age alone, so a healthy long drain (which touches the dir per chunk)
+# is never stolen. The trap removes ONLY a dir this process owns.
+# _kbl_mode/_kbl_f/_kbl_d/_kbl_own are the trio's shared globals for this shell.
+kb_lock_take() { # <okey> -- 0 = we own it, 1 = someone else is draining
+  _kbl_own=0
+  _kbl_f="$STATE/${1:-default}.offset.lock"
+  _kbl_d="$STATE/${1:-default}.offset.lock.d"
+  if command -v flock >/dev/null 2>&1; then
+    { exec 9>"$_kbl_f"; } 2>/dev/null || return 1
+    flock -n 9 2>/dev/null || return 1
+    _kbl_mode=flock
+    return 0
+  fi
+  _kbl_mode=mkdir
+  if mkdir "$_kbl_d" 2>/dev/null; then
+    printf %s "$$" >"$_kbl_d/pid"
+    _kbl_own=1
+  else
+    _kbl_p=$(cat "$_kbl_d/pid" 2>/dev/null)
+    if { [ -z "$_kbl_p" ] || ! kill -0 "$_kbl_p" 2>/dev/null; } &&
+      [ -n "$(find "$_kbl_d" -maxdepth 0 -mmin +"${KB_FLUSH_LOCK_STALE_MIN:-120}" 2>/dev/null)" ]; then
+      rm -f "$_kbl_d/pid"
+      rmdir "$_kbl_d" 2>/dev/null && mkdir "$_kbl_d" 2>/dev/null &&
+        printf %s "$$" >"$_kbl_d/pid" && _kbl_own=1
+    fi
+  fi
+  [ "${_kbl_own:-0}" = 1 ] || return 1
+  # EXIT runs the cleanup exactly once; INT/TERM must EXIT (not merely clean up
+  # and carry on relaying a chunk it can no longer checkpoint).
+  trap '[ "$(cat "$_kbl_d/pid" 2>/dev/null)" = "$$" ] && rm -f "$_kbl_d/pid" && rmdir "$_kbl_d" 2>/dev/null' EXIT
+  trap 'exit 143' INT TERM
+  return 0
+}
+kb_lock_touch() { # keep a live mkdir dir fresh so it is never seen as stale
+  [ "${_kbl_mode:-}" = mkdir ] && touch "$_kbl_d" 2>/dev/null
+  return 0
+}
+kb_lock_owned() { # 0 = we still hold it (flock: always; mkdir: our pid)
+  [ "${_kbl_mode:-}" = flock ] && return 0
+  [ "$(cat "$_kbl_d/pid" 2>/dev/null)" = "$$" ]
+}
+kb_lock_release() { # give up the lock BEFORE the state sweep re-takes per candidate
+  if [ "${_kbl_mode:-}" = flock ]; then
+    exec 9>&-
+  else
+    [ "$(cat "$_kbl_d/pid" 2>/dev/null)" = "$$" ] && { rm -f "$_kbl_d/pid"; rmdir "$_kbl_d" 2>/dev/null; }
+  fi
+  trap - EXIT INT TERM
+}
+# <<< KB LOCK TRIO v1
+export -f kb_lock_take kb_lock_touch kb_lock_owned kb_lock_release
+
+# >>> KB FIRST RECORD v1
+# The first record's <field> (cwd or timestamp) scanned from the head of a
+# transcript. Copied BYTE-IDENTICAL into kb-flush-backfill.sh (C7) so the hook
+# and the sweep derive a session's project and its first-seen time from the SAME
+# bytes. jq when there is a jq; python3 otherwise (same chain as the hooks).
+kb_first_record_field() { # <transcript> <cwd|timestamp> -> first record's value
+  _kfrf=""
+  _kfrk="${2:-cwd}"
+  if [ -n "$KB_JQ_BIN" ]; then
+    _kfrf=$(head -n "${KB_FLUSH_PIN_SCAN:-200}" "$1" 2>/dev/null |
+      "$KB_JQ_BIN" -r --arg k "$_kfrk" 'select(type == "object") | .[$k] // empty' 2>/dev/null | head -n1)
+  fi
+  if [ -z "$_kfrf" ]; then
+    _kfry="${KB_PY_BIN:-$(command -v python3 2>/dev/null || true)}"
+    [ -n "$_kfry" ] && _kfrf=$(head -n "${KB_FLUSH_PIN_SCAN:-200}" "$1" 2>/dev/null | "$_kfry" -c 'import json,sys
+k=sys.argv[1]
+for line in sys.stdin:
+    try: rec = json.loads(line)
+    except Exception: continue
+    if isinstance(rec, dict) and isinstance(rec.get(k), str) and rec[k].strip():
+        sys.stdout.write(rec[k]); break' "$_kfrk" 2>/dev/null)
+  fi
+  [ -n "$_kfrf" ] && kb_winpath "$_kfrf"
+}
+# <<< KB FIRST RECORD v1
+# kb_winpath lives in the portable block, which exports nothing itself; the
+# detached child calls kb_first_record_field (which calls kb_winpath), so BOTH
+# must reach it — an unexported function is "command not found" there, which
+# once made the timestamp probe return empty and the unseeded refusal never fire.
+export -f kb_first_record_field kb_winpath
+
+# BRANCH / FORK SEED (C1, Appendix C). A copied/resumed transcript shares a byte
+# prefix with the parent that already flushed it. Detect the sibling with the
+# same first line, cmp to the first differing byte, snap DOWN to a newline, and
+# seed the offset there so ONLY the fork's own bytes ever leave. Sets BSEED (>0)
+# and BRANCH_OF (parent's 8-char id) when a parent is found; BSEED="" otherwise.
+# One cmp per new transcript (stops at the first difference). Runs BEFORE the
+# timestamp rule and BEFORE the shrank restart.
+kb_branch_seed() {
+  BSEED=""
+  BRANCH_OF=""
+  [ "${KB_FLUSH_BRANCH_SCAN:-1}" = 1 ] || return 0
+  command -v cmp >/dev/null 2>&1 || return 0
+  _first=$(head -c 4096 "$T" | head -n1)
+  [ -n "$_first" ] || return 0
+  _tsz=$(stat -c%s "$T" 2>/dev/null || stat -f%z "$T" 2>/dev/null || wc -c <"$T" | tr -d ' ')
+  case "$_tsz" in '' | *[!0-9]*) _tsz=0 ;; esac
+  _best=0
+  _parent=""
+  for _p in "$(dirname "$T")"/*.jsonl; do
+    [ -e "$_p" ] || continue
+    [ "$_p" = "$T" ] && continue
+    [ "$(head -c 4096 "$_p" | head -n1)" = "$_first" ] || continue
+    # Shared-prefix length, from cmp's EXIT STATUS first: 0 = identical files
+    # (prefix = whole file); 1 = they differ, and stdout says where ("differ:
+    # byte N" under a UTF-8 locale, "differ: char N" under C/POSIX and on BSD —
+    # hence LC_ALL=C and a word-agnostic parse; N is the first DIFFERING byte,
+    # 1-based, so the prefix is N-1) or stdout is EMPTY when one file is a
+    # prefix of the other (EOF message on stderr) and the prefix is the whole
+    # shorter file; >= 2 = cmp could not compare (unreadable sibling): no seed
+    # from THIS sibling — a failed parse must never fall through to "identical".
+    _cmpout=$(LC_ALL=C cmp "$T" "$_p" 2>/dev/null)
+    _rc=$?
+    [ "$_rc" -le 1 ] || continue
+    _psz=$(stat -c%s "$_p" 2>/dev/null || stat -f%z "$_p" 2>/dev/null || wc -c <"$_p" | tr -d ' ')
+    case "$_psz" in '' | *[!0-9]*) _psz=0 ;; esac
+    if [ "$_rc" = 0 ]; then
+      _off=$_psz
+    else
+      _diff=$(printf '%s' "$_cmpout" | sed -n 's/.*differ: [a-z]* \([0-9][0-9]*\).*/\1/p')
+      if [ -n "$_diff" ]; then
+        _off=$((_diff - 1))
+      else
+        _off=$((_psz < _tsz ? _psz : _tsz))
+      fi
+    fi
+    case "$_off" in '' | *[!0-9]*) _off=0 ;; esac
+    # Never seed past what the PARENT actually checkpointed: a parent whose tail
+    # was never flushed (held partial line, undrained delta, itself refused as
+    # unseeded) has bytes nobody sent, and a parent with NO offset file has no
+    # flushed prefix at all — skip it, so the fork falls to the timestamp rule.
+    _pk=$(printf '%s' "$(basename "$_p" .jsonl)" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120) # same shape as OKEY
+    _po=$(cat "$STATE/$_pk.offset" 2>/dev/null)
+    case "$_po" in '' | *[!0-9]*) continue ;; esac
+    [ "$_off" -gt "$_po" ] && _off=$_po
+    [ "$_off" -gt "$_best" ] && { _best=$_off; _parent=$(basename "$_p" .jsonl); }
+  done
+  [ -n "$_parent" ] && [ "$_best" -gt 0 ] || return 0
+  # Never seed past our own EOF (a parent longer than this fork).
+  [ "${SIZE:-0}" -gt 0 ] && [ "$_best" -gt "$SIZE" ] && _best=$SIZE
+  # Snap the shared-prefix length DOWN to the last newline at or before it, over
+  # a bounded 1 MB tail window (Appendix C) so the arithmetic never reads a
+  # 199 MB prefix into memory. Same last-newline trim the chunk loop uses.
+  _sp=$(mktemp) || return 0
+  head -c "$_best" "$T" | tail -c 1048576 >"$_sp"
+  _wb=$(stat -c%s "$_sp" 2>/dev/null || stat -f%z "$_sp" 2>/dev/null || wc -c <"$_sp" | tr -d ' ')
+  case "$_wb" in '' | *[!0-9]*) _wb=0 ;; esac
+  _base=$((_best > _wb ? _best - _wb : 0))
+  if [ "$(tail -c1 "$_sp")" != "" ]; then
+    _part=$(tail -n1 "$_sp" | wc -c)
+    _after=$((_wb - _part))
+  else
+    _after=$_wb
+  fi
+  rm -f "$_sp"
+  [ "$_after" -ge 0 ] || _after=0
+  BSEED=$((_base + _after))
+  # The stamp value is pattern-checked server-side ([A-Za-z0-9._-]): sanitise.
+  BRANCH_OF=$(printf '%s' "$_parent" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-8)
+  return 0
+}
+export -f kb_branch_seed
+
+# THE offset writer (Appendix B invariant). Every offset write in the bearer
+# child goes through here: it re-checks lock ownership FIRST (a lock lost
+# mid-drain means another drain is authoritative — stop, never rewind), then
+# writes atomically. `noclobber` is the first-sight W2 case (mv -n); every other
+# writer (W1 advance, W2b seed-on-shrink, W3 shrank->0) REPLACES the file.
+kb_offset_write() { # <value> [noclobber]
+  kb_lock_owned || { echo "$(date -Is) flush $PROJECT lock lost — stopping ev=$EV sid=$SIDS"; exit 0; }
+  printf %s "$1" >"$OFFF.t" || return 1
+  if [ "${2:-}" = noclobber ]; then
+    mv -n "$OFFF.t" "$OFFF" 2>/dev/null
+    rm -f "$OFFF.t"
+  else
+    mv "$OFFF.t" "$OFFF"
+  fi
+}
+export -f kb_offset_write
+
+# Decide OFFSET before the first send, UNDER the lock (V1-m8 writer invariant).
+# Sets OFFSET (and BRANCH_OF). Returns 1 when the firing must refuse (an
+# unseeded pre-stamp transcript) — the caller then exits 0 with nothing sent.
+# Order: branch seed FIRST (both on a fresh offset and on a shrink), then the
+# trusted/unseeded timestamp rule, then the shrank restart.
+kb_decide_offset() {
+  BRANCH_OF=""
+  if [ ! -f "$OFFF" ]; then
+    kb_branch_seed
+    if [ -n "$BSEED" ] && [ "$BSEED" -gt 0 ]; then
+      kb_offset_write "$BSEED" noclobber
+      OFFSET=$BSEED
+      rm -f "$OFF_UNSEEDED"
+      echo "$(date -Is) flush $PROJECT branch of $BRANCH_OF: seeded offset=$BSEED (copied history already flushed as the parent) ev=$EV sid=$SIDS"
+      return 0
+    fi
+    # Trusted-vs-unseeded: a no-offset transcript is sent from 0 only when we can
+    # SEE it is newer than the box's checkpoint stamp, or the owner forces it.
+    # The stamp is written by install.sh at the wave-C install; a box without
+    # one (a hand-copied hook) gets it created-if-absent HERE, as "now" — the
+    # safe direction: every transcript that already existed is pre-stamp and is
+    # refused (the old delete-lineage may already have flushed it), new sessions
+    # proceed. A transcript that carries NO timestamp record cannot be dated and
+    # proceeds — real Claude Code transcripts always carry one in the first
+    # records; only synthetic/hand-fired fixtures do not, and refusing those
+    # would strand every test session for no protection gained.
+    _stamp="$STATE/.checkpoints-trusted-since"
+    if [ ! -s "$_stamp" ]; then
+      date -u +%Y-%m-%dT%H:%M:%SZ >"$_stamp.t" 2>/dev/null && mv -n "$_stamp.t" "$_stamp" 2>/dev/null
+      rm -f "$_stamp.t"
+    fi
+    _fts=$(kb_first_record_field "$T" timestamp)
+    _since=$(head -n1 "$_stamp" 2>/dev/null | tr -d ' \r')
+    if [ "${KB_FLUSH_ALLOW_UNSEEDED:-0}" = 1 ] || [ -z "$_fts" ] ||
+      { [ -n "$_since" ] && [ "$_fts" \> "$_since" ]; }; then
+      OFFSET=0
+      kb_offset_write 0 noclobber
+      rm -f "$OFF_UNSEEDED"
+      return 0
+    fi
+    # Refuse — ONE line per 24 h per session, rate-limited by the marker mtime.
+    _now=$(date +%s 2>/dev/null || echo 0)
+    case "$_now" in '' | *[!0-9]*) _now=0 ;; esac
+    _lm=$(stat -c %Y "$OFF_UNSEEDED" 2>/dev/null || stat -f %m "$OFF_UNSEEDED" 2>/dev/null || echo 0)
+    case "$_lm" in '' | *[!0-9]*) _lm=0 ;; esac
+    if [ "$((_now - _lm))" -ge 86400 ]; then
+      echo "$(date -Is) flush $PROJECT unseeded: refusing to send $SIZE from 0 (transcript predates the checkpoint stamp) — seed it: kb-flush-backfill.sh --seed ${SID:-$OKEY} current|$SIZE ev=$EV sid=$SIDS"
+      touch "$OFF_UNSEEDED" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  # An offset exists: the session is seeded (by us, a branch seed or the owner's
+  # --seed), so a stale unseeded marker must not keep notify saying "unseeded".
+  rm -f "$OFF_UNSEEDED"
+  OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
+  case "$OFFSET" in
+    '' | *[!0-9]*)
+      echo "$(date -Is) flush $PROJECT offset unreadable — restarting from 0 ev=$EV sid=$SIDS"
+      OFFSET=0
+      ;;
+  esac
+  if [ "$SIZE" -lt "$OFFSET" ]; then
+    kb_branch_seed
+    if [ -n "$BSEED" ] && [ "$BSEED" -gt 0 ]; then
+      kb_offset_write "$BSEED"
+      OFFSET=$BSEED
+      echo "$(date -Is) flush $PROJECT branch of $BRANCH_OF: seeded offset=$BSEED (copied history already flushed as the parent) ev=$EV sid=$SIDS"
+    else
+      echo "$(date -Is) flush $PROJECT transcript shrank ($SIZE < offset $OFFSET) reason=shrank — restarting from 0 ev=$EV sid=$SIDS"
+      OFFSET=0
+      kb_offset_write 0
+    fi
+  fi
+  return 0
+}
+export -f kb_decide_offset
+
+# State sweep (C8). Runs in the detached child AFTER kb_lock_release, once per
+# 24 h. Retire a session's state set ONLY when the offset is older than 30 days
+# AND the transcript is gone under BOTH config roots. One subshell per candidate
+# so a re-taken lock is released on subshell exit; a .retry beside a retired
+# offset means bytes were still pending -> a loss note.
+kb_state_sweep() {
+  _sl="$STATE/.state-sweep.last"
+  _now=$(date +%s 2>/dev/null || echo 0)
+  case "$_now" in '' | *[!0-9]*) _now=0 ;; esac
+  _lm=$(stat -c %Y "$_sl" 2>/dev/null || stat -f %m "$_sl" 2>/dev/null || echo 0)
+  case "$_lm" in '' | *[!0-9]*) _lm=0 ;; esac
+  [ "$((_now - _lm))" -ge 86400 ] || return 0
+  printf %s "$_now" >"$_sl.t" 2>/dev/null && mv "$_sl.t" "$_sl" 2>/dev/null || true
+  _r1="$HOME/.claude/projects"
+  _r2="${CLAUDE_CONFIG_DIR:-}/projects"
+  for _of in "$STATE"/*.offset; do
+    [ -e "$_of" ] || continue
+    (
+      _k=$(basename "$_of" .offset)
+      [ -n "$(find "$_of" -maxdepth 0 -mmin +43200 2>/dev/null)" ] || exit 0
+      _tr=""
+      [ -d "$_r1" ] && _tr=$(find "$_r1" -mindepth 2 -maxdepth 2 -name "$_k.jsonl" -print -quit 2>/dev/null)
+      if [ -z "$_tr" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "$_r2" ]; then
+        _tr=$(find "$_r2" -mindepth 2 -maxdepth 2 -name "$_k.jsonl" -print -quit 2>/dev/null)
+      fi
+      [ -n "$_tr" ] && exit 0 # transcript present, however old -> KEEP
+      kb_lock_take "$_k" || exit 0
+      _loss=""
+      [ -f "$STATE/$_k.retry" ] && _loss=" (retry marker present: bytes were pending)"
+      # The whole per-session state set of Appendix I (<okey>.<suffix>; only the
+      # lock keeps the .offset infix) plus a leftover atomic-write temp. The lock
+      # dir, when this box uses one, is ours now and kb_lock_release removes it.
+      rm -f "$STATE/$_k.offset" "$STATE/$_k.offset.lock" "$STATE/$_k.offset.t" \
+        "$STATE/$_k.last" "$STATE/$_k.gate" "$STATE/$_k.retry" "$STATE/$_k.project" \
+        "$STATE/$_k.unseeded" "$STATE/$_k.sweep"
+      kb_lock_release
+      echo "$(date -Is) flush state sweep: retired sid=$_k transcript gone$_loss"
+    )
+  done
+}
+export -f kb_state_sweep
+
+# Session pin (C4). Decide a session's project ONCE and cache it in
+# STATE/<okey>.project as "<slug>\t<how>". Order: cache -> the git root of the
+# transcript's FIRST cwd record (.kbproject there, else its basename) ->
+# firing-time derivation from the event cwd. Sets PROJECT, PROJECT_BY (the
+# how: record|kbproject|gitfirst|firing) and PROJECT_MINTABLE (1 only for a real
+# git root, never for $HOME/$TMPDIR//tmp or a non-git dir). KB_FLUSH_PROJECT_PIN=0
+# restores today's per-firing derivation.
+kb_slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//'; }
+# Sets globals _KP_SLUG and _KP_HOW from a git-root dir (reads .kbproject when
+# present). Sets globals rather than echoing so the how survives — a $(subshell)
+# caller would discard it (the incident this whole file guards against).
+kb_project_from_dir() { # <dir>
+  _kpd="$1"
+  _kpraw=$(basename "$_kpd")
+  _KP_HOW=gitfirst
+  if [ -r "$_kpd/.kbproject" ]; then
+    _kpdecl=$(head -n1 "$_kpd/.kbproject" 2>/dev/null | tr -d '\r' | cut -c1-64)
+    [ -n "$_kpdecl" ] && { _kpraw="$_kpdecl"; _KP_HOW=kbproject; }
+  fi
+  _KP_SLUG=$(kb_slugify "$_kpraw")
+}
+kb_ephemeral_dir() { # 0 = a dir we must never auto-mint from ($HOME, $TMPDIR, /tmp)
+  _kbe="${TMPDIR:-}"
+  _kbe="${_kbe%/}"
+  case "$1" in
+    "$HOME" | /tmp | /tmp/*) return 0 ;;
+  esac
+  [ -n "$_kbe" ] && [ "$1" = "$_kbe" ] && return 0
+  return 1
+}
+# The DISTINCT cwd values of the first KB_FLUSH_PIN_SCAN records, in order —
+# the pin scans these for the first one that is a git dir (a session launched
+# in $HOME that then `cd`s into a repo pins to that repo, not to $HOME). Same
+# jq-then-python chain as kb_first_record_field, which stays untouched (it is
+# the block the backfill copies byte-for-byte).
+kb_record_cwds() { # <transcript> -> one cwd per line
+  _krc=""
+  if [ -n "$KB_JQ_BIN" ]; then
+    _krc=$(head -n "${KB_FLUSH_PIN_SCAN:-200}" "$1" 2>/dev/null |
+      "$KB_JQ_BIN" -r 'select(type == "object") | .cwd // empty' 2>/dev/null | awk '!s[$0]++')
+  fi
+  if [ -z "$_krc" ]; then
+    _krcy="${KB_PY_BIN:-$(command -v python3 2>/dev/null || true)}"
+    [ -n "$_krcy" ] && _krc=$(head -n "${KB_FLUSH_PIN_SCAN:-200}" "$1" 2>/dev/null | "$_krcy" -c 'import json,sys
+seen=set()
+for line in sys.stdin:
+    try: rec = json.loads(line)
+    except Exception: continue
+    c = rec.get("cwd") if isinstance(rec, dict) else None
+    if isinstance(c, str) and c.strip() and c not in seen:
+        seen.add(c); sys.stdout.write(c + "\n")' 2>/dev/null)
+  fi
+  [ -n "$_krc" ] && printf '%s\n' "$_krc"
+}
+# 0 when the EVENT cwd's own git root is a real (non-ephemeral) repo that names
+# $PROJECT — the only condition under which a firing-derived slug may mint.
+# Recomputed on EVERY firing, so the first derivation and every later cache hit
+# reach the same answer (a pinned slug never mints on the strength of a
+# DIFFERENT repo the event happens to fire from).
+kb_firing_mintable() {
+  _kfm=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$_kfm" ] || return 1
+  kb_ephemeral_dir "$_kfm" && return 1
+  kb_project_from_dir "$_kfm"
+  [ "$_KP_SLUG" = "$PROJECT" ]
+}
+kb_pin_project() {
+  PROJECT_MINTABLE=0
+  _pc="$OFF_PROJECT"
+  if [ "${KB_FLUSH_PROJECT_PIN:-1}" = 1 ] && [ -s "$_pc" ]; then
+    PROJECT=$(cut -f1 "$_pc" 2>/dev/null)
+    PROJECT_BY=$(cut -s -f2 "$_pc" 2>/dev/null) # -s: a tab-less line is a MISS, not how=<slug>
+    if [ -n "$PROJECT" ] && [ -n "$PROJECT_BY" ]; then
+      case "$PROJECT_BY" in
+        gitfirst | kbproject) PROJECT_MINTABLE=1 ;;
+        *) kb_firing_mintable && PROJECT_MINTABLE=1 ;;
+      esac
+      return 0
+    fi
+  fi
+  # Derive. With pinning on, anchor to the FIRST recorded cwd that is a real git
+  # dir (never $HOME/$TMPDIR//tmp, even when one of those is itself a repo); the
+  # firing-time event cwd is the fallback, and the whole rule when pinning is off.
+  _proot=""
+  if [ "${KB_FLUSH_PROJECT_PIN:-1}" = 1 ]; then
+    while IFS= read -r _pcwd; do
+      [ -n "$_pcwd" ] || continue
+      _pcwd=$(kb_winpath "$_pcwd")
+      _proot=$(git -C "$_pcwd" rev-parse --show-toplevel 2>/dev/null) || _proot=""
+      [ -n "$_proot" ] && ! kb_ephemeral_dir "$_proot" && break
+      _proot=""
+    done < <(kb_record_cwds "$T")
+  fi
+  if [ -n "$_proot" ]; then
+    kb_project_from_dir "$_proot"
+    PROJECT="$_KP_SLUG"
+    PROJECT_BY="$_KP_HOW"
+    PROJECT_MINTABLE=1
+  else
+    # Firing-time derivation from the event cwd (today's rule).
+    _fdir=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null) || _fdir=""
+    if [ -n "$_fdir" ]; then
+      kb_project_from_dir "$_fdir"
+      PROJECT="$_KP_SLUG"
+    else
+      PROJECT=$(kb_slugify "$(basename "${CWD:-sessions}")")
+    fi
+    PROJECT_BY=firing
+    kb_firing_mintable && PROJECT_MINTABLE=1 # never for $HOME/$TMPDIR//tmp or a non-git dir
+  fi
+  [ -n "$PROJECT" ] || { PROJECT=sessions; PROJECT_BY=firing; PROJECT_MINTABLE=0; }
+  if [ "${KB_FLUSH_PROJECT_PIN:-1}" = 1 ]; then
+    printf '%s\t%s\n' "$PROJECT" "$PROJECT_BY" >"$_pc.t" 2>/dev/null && mv "$_pc.t" "$_pc" 2>/dev/null || true
+  fi
+}
+
+
 INPUT=$(cat)
 T=$(printf '%s' "$INPUT" | kb_json_get transcript_path)
 CWD=$(printf '%s' "$INPUT" | kb_json_get cwd)
@@ -270,29 +704,53 @@ T=$(kb_winpath "$T")
 CWD=$(kb_winpath "$CWD")
 [ -n "$T" ] && [ -f "$T" ] || exit 0
 
-# Project = the working repo's dir name, slugified (falls back to "sessions").
-# THE GIT ROOT, not the cwd. A session started in a subdirectory (repeater/main,
-# src/, docs/) used to file under that subdirectory's name — so the same repo
-# produced different projects depending on where you happened to start, split its
-# knowledge across them, and had no token for the accidental ones. The repo root
-# is the stable identity; a non-git directory still falls back to the cwd.
-PROJECT_DIR=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null) || PROJECT_DIR=""
-[ -n "$PROJECT_DIR" ] || PROJECT_DIR="${CWD:-sessions}"
-# A workspace may NAME ITSELF: a `.kbproject` file at the repo root (or the cwd
-# for a non-git tree) overrides the directory name. Needed whenever the folder
-# and the project are not the same thing — a clone or worktree under a different
-# name, two checkouts that are one logical project, or a monorepo area that
-# deserves its own. Only the first line is read, and it is slugified by exactly
-# the same rules as a directory name, because this is repo-controlled data:
-# whatever it contains can only ever become [a-z0-9-].
-PROJECT_RAW=$(basename "$PROJECT_DIR")
-if [ -r "$PROJECT_DIR/.kbproject" ]; then
-  PROJECT_DECLARED=$(head -n1 "$PROJECT_DIR/.kbproject" 2>/dev/null | tr -d '\r' | cut -c1-64)
-  [ -n "$PROJECT_DECLARED" ] && PROJECT_RAW="$PROJECT_DECLARED"
-fi
-PROJECT=$(printf '%s' "$PROJECT_RAW" | tr '[:upper:]' '[:lower:]' |
-  tr -c 'a-z0-9-' '-' | sed 's/-\{2,\}/-/g;s/^-//;s/-$//')
+# The per-session offset key and its state paths. Computed ONCE here (moved up
+# from the transport arms) so the pin cache, the offset writers and the lock all
+# share one identity. OKEY is the sanitised session id (or the transcript path
+# when there is none); the shape is pinned against notify-complete.sh by the
+# funnel, so keep it byte-for-byte.
+STATE="$HOME/.claude/hooks/state"
+mkdir -p "$STATE" 2>/dev/null || true
+OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
+OFFF="$STATE/${OKEY:-default}.offset"
+SIDS=$(printf '%s' "${SID:-$OKEY}" | cut -c1-8)
+# The rest of the per-session state set (Appendix I), named ONCE: <okey>.<suffix>
+# — only the lock keeps the .offset infix (<okey>.offset.lock[.d/pid]). notify,
+# the brief, the Stop gate and the backfill all read these by the same names,
+# and kb_state_sweep retires exactly this set.
+OFF_LAST="$STATE/${OKEY:-default}.last"
+OFF_GATE="$STATE/${OKEY:-default}.gate"
+OFF_RETRY="$STATE/${OKEY:-default}.retry"
+OFF_PROJECT="$STATE/${OKEY:-default}.project"
+OFF_UNSEEDED="$STATE/${OKEY:-default}.unseeded"
+OFF_SWEEP="$STATE/${OKEY:-default}.sweep"
+export OFF_LAST OFF_GATE OFF_RETRY OFF_PROJECT OFF_UNSEEDED OFF_SWEEP
+
+# Wave-C knobs, read in ONE place (Appendix contract defaults).
+export KB_FLUSH_CHUNK="${KB_FLUSH_CHUNK:-700000}"
+export KB_FLUSH_SEND_MAX="${KB_FLUSH_SEND_MAX:-950000}"
+export KB_FLUSH_MAX="${KB_FLUSH_MAX:-209715200}"
+export KB_FLUSH_ALLOW_UNSEEDED="${KB_FLUSH_ALLOW_UNSEEDED:-0}"
+export KB_FLUSH_BRANCH_SCAN="${KB_FLUSH_BRANCH_SCAN:-1}"
+export KB_FLUSH_LOCK_STALE_MIN="${KB_FLUSH_LOCK_STALE_MIN:-120}"
+export KB_FLUSH_PROJECT_PIN="${KB_FLUSH_PROJECT_PIN:-1}"
+export KB_FLUSH_PIN_SCAN="${KB_FLUSH_PIN_SCAN:-200}"
+# CLAUDE_CONFIG_DIR is the second config root the state sweep probes (C8); export
+# it (possibly empty) so the detached child sees the same value the parent did.
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-}"
+
+# Project = pinned ONCE per session from the transcript's first cwd record (C4),
+# cached in STATE/<okey>.project. Falls back to the firing-time derivation (the
+# git root of the event cwd, its .kbproject, else the slugified basename) when
+# there is no usable cwd record or KB_FLUSH_PROJECT_PIN=0. Sets PROJECT,
+# PROJECT_BY (record|kbproject|gitfirst|firing) and PROJECT_MINTABLE.
+kb_pin_project
 [ -z "$PROJECT" ] && PROJECT=sessions
+PROJECT_MTIME=$(stat -c %Y "$T" 2>/dev/null || stat -f %m "$T" 2>/dev/null || echo 0)
+case "$PROJECT_MTIME" in '' | *[!0-9]*) PROJECT_MTIME=0 ;; esac
+MTIME="$PROJECT_MTIME"
+BOX="${KB_BOX:-$(hostname 2>/dev/null || uname -n 2>/dev/null || echo box)}"
+BOX=$(printf '%s' "$BOX" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)
 # Git context for code_ref anchoring: kb_ingest_session accepts repo/branch/
 # commit and the drain stamps a code_ref from them. Local plumbing reads only
 # (ms-cheap, no network); a non-git CWD degrades silently to empty. The network
@@ -333,6 +791,12 @@ LOG="$HOME/.claude/hooks/flush-session.log"
 # the reference set mechanically from the script, so the whole CLASS is guarded,
 # not the one instance.
 export T CWD SID PROJECT LOG REPO BRANCH COMMIT CFG HOOKVER
+# Wave-C additions the detached child reads: the session identity/paths (OKEY,
+# OFFF, STATE), the pin result (PROJECT_BY) and the per-firing flush stamps
+# (MTIME, BOX, SIDS). Every one is read inside a child, so every one is exported
+# (the class this file exists to guard — see the OKEY incident below).
+export OKEY OFFF STATE PROJECT_BY MTIME BOX SIDS
+export -f kb_pin_project kb_slugify kb_project_from_dir kb_ephemeral_dir
 # The detached child is a FRESH bash: hand it the JSON backend (which may be
 # python3, with no jq anywhere on the box) as exported vars + functions.
 export KB_JQ_BIN KB_PY_BIN KB_JSON_PROBED
@@ -342,36 +806,6 @@ export -f kb_json_build kb_json_valid
 # cannot even report itself (every summary line is written AFTER the loop).
 export KB_TIMEOUT_BIN KB_TIMEOUT_PROBED
 export -f kb_timeout _kb_timeout_ok
-
-# Only ONE drain may own a session's offset file at a time. PreCompact and
-# SessionEnd both detach, and a large transcript keeps a child busy for minutes,
-# so firings overlap routinely. Two children then read the same offset, relay the
-# same chunk, and the slower one's late write can REWIND the offset and re-send
-# bytes already accepted. flock where it exists; a mkdir lock (atomic everywhere,
-# including Git Bash) otherwise. A lock older than an hour is assumed dead — a
-# drain that long has already failed, and refusing forever would be worse.
-kb_take_lock() { # <lockpath> -- 0 = we own it, 1 = someone else is draining
-  _kbl="$1"
-  if command -v flock >/dev/null 2>&1; then
-    # BRACES MATTER. `exec 9>f 2>/dev/null` applies BOTH redirections to the
-    # shell permanently, so the whole drain's stderr went to /dev/null for the
-    # rest of the run — silencing exactly the diagnostics this file exists to
-    # preserve. Scoping the 2>/dev/null to the group keeps fd 9 open and stderr
-    # intact.
-    { exec 9>"$_kbl"; } 2>/dev/null || return 0
-    flock -n 9 2>/dev/null || return 1
-    return 0
-  fi
-  if ! mkdir "$_kbl.d" 2>/dev/null; then
-    _kba=$(find "$_kbl.d" -maxdepth 0 -mmin +60 2>/dev/null)
-    [ -n "$_kba" ] || return 1
-    rmdir "$_kbl.d" 2>/dev/null || true
-    mkdir "$_kbl.d" 2>/dev/null || return 1
-  fi
-  trap 'rmdir "$_kbl.d" 2>/dev/null || true' EXIT INT TERM
-  return 0
-}
-export -f kb_take_lock
 
 # Feed the bearer to curl on STDIN (curl -K -), never on the command line: argv
 # is world-visible through /proc/<pid>/cmdline and `ps`, and a credential has
@@ -394,13 +828,11 @@ kb_curl_auth_config() { # -> curl config on stdout
 }
 export -f kb_curl_auth_config
 
-# Opportunistic housekeeping — bound our OWN state/log growth so a daily-driver
-# machine doesn't accumulate thousands of dead .offset files and an unrotated
-# multi-MB log. Cheap (runs before the detach) and scoped strictly to the hooks'
-# own dirs; never touches anything else.
-STATE="$HOME/.claude/hooks/state"
-mkdir -p "$STATE" 2>/dev/null || true
-find "$STATE" -name '*.offset' -mtime +30 -delete 2>/dev/null || true
+# Opportunistic housekeeping — bound our OWN log growth so a daily-driver machine
+# doesn't accumulate an unrotated multi-MB log. Offsets are NEVER deleted here
+# (KB-FLUSH-LINEAGE never-delete-offsets v2): the 30-day `find … -delete` is gone
+# and its job moved to kb_state_sweep (C8) in the detached child, which retires a
+# session's state ONLY once its transcript is gone under both config roots.
 if [ -f "$LOG" ]; then
   LSIZE=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || wc -c <"$LOG" | tr -d " ")
   case "$LSIZE" in "" | *[!0-9]*) LSIZE=0 ;; esac
@@ -437,7 +869,10 @@ PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || tr
 # "ask the KB for a token" message. A remote machine must never mint its own
 # credentials (Invariant 12: authority comes from kbcore.scope, never from an
 # argument). Verified by test: no repo -> no mint.
-if [ -z "$PROJ_TOKEN" ] && [ -z "${KB_TOKEN:-}" ] && [ -d "${KB_REPO:-/nonexistent}" ]; then
+# NEVER auto-mint for a slug that came from $HOME, $TMPDIR, /tmp or a non-git
+# dir (C4): PROJECT_MINTABLE is set by kb_pin_project and is 1 only for a real
+# git-root project. A firing-derived or ephemeral slug must not spawn a token.
+if [ -z "$PROJ_TOKEN" ] && [ -z "${KB_TOKEN:-}" ] && [ -d "${KB_REPO:-/nonexistent}" ] && [ "${PROJECT_MINTABLE:-0}" = 1 ]; then
   MINTED=$(cd "$KB_REPO" 2>/dev/null && timeout 45 uv run python - "$PROJECT" "$(hostname 2>/dev/null || echo this-machine)" <<'MINTPY' 2>/dev/null
 import sys
 project, machine = sys.argv[1], sys.argv[2]
@@ -520,48 +955,37 @@ if [ -n "${KB_DIR:-}" ]; then
   ' </dev/null >>"$LOG" 2>&1 &
 elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TOKEN:-}" ]; then
   # MCP or REMOTE: submit the delta over the network, CHUNKED. Large sessions
-  # (up to 1 GB) are sent as sequential ≤900 KB windows cut at line boundaries;
+  # (up to 1 GB) are sent on an ABSOLUTE lattice cut at line boundaries (C2);
   # the per-session byte offset advances after EACH accepted chunk, so a failure
   # resumes mid-delta next firing. Chunks go via a temp file (kb_json_build's `f`
   # type reads it verbatim) — passing the text as an argv would hit the kernel's
-  # ~128 KB per-argument limit long before 1 MB.
-  STATE="$HOME/.claude/hooks/state"
-  mkdir -p "$STATE"
-  OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
-  OFFF="$STATE/${OKEY:-default}.offset"
+  # ~128 KB per-argument limit long before 1 MB. STATE/OKEY/OFFF and the knobs
+  # were computed once up top; the offset is NEVER deleted here.
   HELPER="$HOOKDIR/kb-mcp-call.sh"
-  # Overridable for the same reason KB_CONNECTOR_MAX is: the budget is a policy
-  # choice, not a constant of nature, and a cap that cannot be set small cannot
-  # be tested at all (a 200 MB fixture per run is not a test, it is a wait).
-  export KB_FLUSH_CHUNK="${KB_FLUSH_CHUNK:-900000}"
-  export KB_FLUSH_MAX="${KB_FLUSH_MAX:-209715200}"
-  # OKEY IS THE SESSION IDENTITY and it MUST be exported: the child below stamps
-  # every chunk with "session:$OKEY", and an unexported OKEY made that literally
-  # "session:" on every machine — a degenerate URI that coalesced unrelated
-  # projects into one extraction (see the export note above).
   export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF OKEY HELPER EV
   "$DETACH" bash -c '
-    CHUNK="$KB_FLUSH_CHUNK"; MAX_PER_FIRING="$KB_FLUSH_MAX"   # rest resumes next firing
+    CHUNK="$KB_FLUSH_CHUNK"; SEND_MAX="$KB_FLUSH_SEND_MAX"; MAX_PER_FIRING="$KB_FLUSH_MAX"
     [ "$EV" = "SessionEnd" ] && MAX_PER_FIRING=1099511627776   # terminal firing: drain all
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
-    if ! kb_take_lock "$OFFF.lock"; then
-      [ "$EV" = "SessionEnd" ] && echo "$(date -Is) flush $PROJECT NOT CAPTURED: the final firing could not take the session lock (another drain was still running) — re-ingest $T if this session matters"
+    # ONE drain at a time. A held lock is NOT a loss any more — the offset is
+    # never deleted, so the next Stop/PreCompact or the sweep resumes the delta.
+    if ! kb_lock_take "$OKEY"; then
+      [ "$EV" = "SessionEnd" ] && echo "$(date -Is) flush $PROJECT SessionEnd deferred (lock held by a running drain) — the next Stop or the sweep resumes it ev=$EV sid=$SIDS"
       exit 0
     fi
-    OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
-    case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac   # empty/corrupt offset -> restart
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
-    # A transcript SMALLER than the stored offset was rotated, truncated or
-    # replaced (or the offset was corrupted upward). Without this branch the
-    # `-le` below exits 0 forever and the session is never captured again —
-    # silently, with no log line, until the 30-day sweep removes the offset.
-    if [ "$SIZE" -lt "$OFFSET" ]; then
-      echo "$(date -Is) flush $PROJECT transcript shrank ($SIZE < offset $OFFSET) — restarting from 0"
-      OFFSET=0
-      printf "%s" 0 >"$OFFF.t" 2>/dev/null && mv "$OFFF.t" "$OFFF" 2>/dev/null || true
+    # SIZE=0 is UNREADABLE, not shrank (V1-m4): a failed stat must never clobber
+    # a good checkpoint down to 0. Do not drain, do not write the offset.
+    if [ "$SIZE" = 0 ]; then
+      [ -f "$OFFF" ] && echo "$(date -Is) flush $PROJECT size unreadable ($SIZE) — not draining ev=$EV sid=$SIDS"
+      exit 0
     fi
+    # Decide OFFSET under the lock: branch seed, then trusted/unseeded, then
+    # shrank. A refusal (unseeded pre-stamp transcript) returns 1 -> exit 0.
+    BRANCH_OF=""
+    kb_decide_offset || exit 0
     [ "$SIZE" -le "$OFFSET" ] && exit 0
-    SENT=0
+    SENT=0; DUP=0
     set --   # git context, appended to every request body; empty fields omitted
     # THE SESSION IDENTITY. Every chunk of one session must carry the same value
     # or the server cannot tell that 45 rows are one conversation: it then runs
@@ -589,31 +1013,42 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     [ -z "$KB_MCP_URL" ] && [ -n "${HOOKVER:-}" ] && set -- "$@" hook_version s "$HOOKVER"
     while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$MAX_PER_FIRING" ]; do
       TMPC=$(mktemp) || { echo "$(date -Is) flush $PROJECT BUG: mktemp failed"; break; }
-      tail -c +$((OFFSET+1)) "$T" | head -c "$CHUNK" >"$TMPC"
-      BYTES=$(_fsize "$TMPC")
-      [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
-      # ALWAYS cut on a line boundary: trim to the last newline unless the chunk
-      # already ends in one. Robust to the transcript growing after SIZE was read
-      # (an EOF-crossing window is still trimmed), so the offset never advances
-      # into the middle of a JSONL line and no straddled message is lost. Only a
-      # single line longer than CHUNK is sent unterminated (server tolerates it).
-      if [ "$(tail -c1 "$TMPC")" != "" ]; then
-        PART=$(tail -n1 "$TMPC" | wc -c)
-        KEEP=$((BYTES - PART))
+      # ABSOLUTE LATTICE (C2, Appendix A). The chunk end is the smallest lattice
+      # point B_k > OFFSET, where B_k is the position after the last newline at or
+      # before k*CHUNK measured from byte 0 — a function of the FILE only, so a
+      # from-0 pass and a delta pass cut IDENTICAL chunks (bar the EOF/oversize
+      # cells). Widen by one cell when the line at OFFSET straddles the edge.
+      HELD=0
+      LK=$(( OFFSET / CHUNK + 1 ))
+      while :; do
+        EDGE=$(( LK * CHUNK )); [ "$EDGE" -gt "$SIZE" ] && EDGE=$SIZE
+        tail -c +$((OFFSET+1)) "$T" | head -c $((EDGE - OFFSET)) >"$TMPC"
+        BYTES=$(_fsize "$TMPC")
+        [ "$BYTES" -gt 0 ] || { HELD=2; break; }
+        if [ "$(tail -c1 "$TMPC")" = "" ]; then
+          break                                        # window ends in \n: chunk end = B_k
+        fi
+        PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
         if [ "$KEEP" -gt 0 ]; then
-          head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"
-          BYTES=$KEEP
-        elif [ "$BYTES" -lt "$CHUNK" ]; then
-          # No newline anywhere AND smaller than a full chunk => a single line still
-          # being written. HOLD it (break, no advance) so the COMPLETED line is picked
-          # up next firing, instead of shipping a half-line the drain drops as malformed
-          # JSON. EXCEPTION: the terminal SessionEnd firing at EOF has no next firing —
-          # send the final line as-is rather than lose it silently (the drain still
-          # drops it only if truly malformed, so sending never loses data).
-          if [ "$EV" = "SessionEnd" ] && [ $((OFFSET + BYTES)) -ge "$SIZE" ]; then
-            :
-          else
-            rm -f "$TMPC"; break
+          head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
+          break                                        # trimmed to the last \n < EDGE
+        elif [ "$EDGE" -ge "$SIZE" ]; then
+          HELD=2; break                                # partial last line at EOF: HELD on EVERY bearer event
+        else
+          LK=$((LK + 1))                               # line at OFFSET straddles the edge: widen one cell
+        fi
+      done
+      if [ "$HELD" = 2 ]; then rm -f "$TMPC"; break; fi
+      # OVERSIZE (> SEND_MAX): a > 250 KB straddle or a giant line. Trim to the
+      # last \n <= OFFSET+SEND_MAX; if that leaves nothing, send OFFSET..+SEND_MAX
+      # as an unterminated fragment (as today for a line longer than a chunk).
+      if [ "$BYTES" -gt "$SEND_MAX" ]; then
+        tail -c +$((OFFSET+1)) "$T" | head -c "$SEND_MAX" >"$TMPC"
+        BYTES=$(_fsize "$TMPC")
+        if [ "$(tail -c1 "$TMPC")" != "" ]; then
+          PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
+          if [ "$KEEP" -gt 0 ]; then
+            head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
           fi
         fi
       fi
@@ -637,13 +1072,23 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         rm -f "$TMPC.args"
       else
         BODYF="$TMPC.body"
+        # Flush telemetry stamps ride the REST body ONLY (the MCP tool signature
+        # is closed). Per-chunk: numeric offset/bytes/size, the event, and the
+        # per-firing box/mtime/pin/branch context. Built fresh each chunk because
+        # offset/bytes change; empty-valued stamps are omitted so a value the
+        # server schema pattern-checks is never sent blank.
+        STAMPS="flush_offset n $OFFSET flush_bytes n $BYTES flush_size n $SIZE flush_mtime n $MTIME"
+        [ -n "$EV" ] && STAMPS="$STAMPS flush_event s $EV"
+        [ -n "$BOX" ] && STAMPS="$STAMPS flush_box s $BOX"
+        [ -n "$PROJECT_BY" ] && STAMPS="$STAMPS flush_project_by s $PROJECT_BY"
+        [ -n "$BRANCH_OF" ] && STAMPS="$STAMPS flush_branch_of s $BRANCH_OF"
         if command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 \
            && gzip -c "$TMPC" | base64 | tr -d "\n" >"$TMPC.gz64" && [ -s "$TMPC.gz64" ]; then
-          kb_json_build "$BODYF" project s "$PROJECT" kind s session transcript_gz f "$TMPC.gz64" "$@"
+          kb_json_build "$BODYF" project s "$PROJECT" kind s session transcript_gz f "$TMPC.gz64" "$@" $STAMPS
           rm -f "$TMPC.gz64"
         else
           rm -f "$TMPC.gz64"
-          kb_json_build "$BODYF" project s "$PROJECT" kind s session transcript f "$TMPC" "$@"
+          kb_json_build "$BODYF" project s "$PROJECT" kind s session transcript f "$TMPC" "$@" $STAMPS
         fi
         if [ ! -s "$BODYF" ] || ! kb_json_valid "$BODYF"; then
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
@@ -656,11 +1101,19 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
         # A flaked response read (000) whose body still carries a queue id was
         # ACCEPTED by the server (KB item 497) — count it as success.
         case "$CODE" in 2*) : ;; *) grep -q "queue_id" "$TMPC.resp" 2>/dev/null && CODE=202 ;; esac
+        # Count chunks the server answered as already-present, for the dup= tally.
+        # (Double-quoted pattern: this whole drain is one single-quoted bash -c, so
+        # a single-quoted grep pattern with a space/glob would break the quoting.)
+        case "$CODE" in 2*|202) grep -Eq "\"duplicate\": *true" "$TMPC.resp" 2>/dev/null && DUP=$((DUP + 1)) ;; esac
         rm -f "$BODYF" "$TMPC.resp"
       fi
       rm -f "$TMPC"
       case "$CODE" in
-        2*|202) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
+        2*|202)
+          # W1. kb_offset_write re-checks ownership first: a lock lost mid-drain
+          # (the holder was reclaimed) means another drain is authoritative now,
+          # so it logs "lock lost — stopping" and exits rather than rewinding.
+          OFFSET=$((OFFSET + BYTES)); kb_offset_write "$OFFSET"; SENT=$((SENT + BYTES)); kb_lock_touch ;;
         *) echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume"; break ;;
       esac
     done
@@ -672,14 +1125,16 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     # on the terminal SessionEnd firing (HIGH-1).
     if [ "$SENT" -gt 0 ]; then
       if [ "$OFFSET" -ge "$SIZE" ]; then
-        echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)"
+        echo "$(date -Is) flush $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE) dup=$DUP ev=$EV sid=$SIDS"
       else
-        echo "$(date -Is) flush $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE) — will resume"
+        echo "$(date -Is) flush $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE) — will resume dup=$DUP ev=$EV sid=$SIDS"
       fi
     fi
-    # Terminal event, fully drained: drop this session'"'"'s offset file (else it is
-    # dead weight forever). The 30-day sweep at hook start catches the rest.
-    [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
+    # The offset is NEVER deleted on a terminal event (never-delete-offsets v2):
+    # a drained SessionEnd leaves offset==SIZE and a resume continues from there.
+    # Release the lock, then sweep dead state (transcript gone under both roots).
+    kb_lock_release
+    kb_state_sweep
   ' </dev/null >>"$LOG" 2>&1 &
 elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # CONNECTOR: zero-config — uses the claude.ai KB connector bridged into
@@ -687,10 +1142,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # relays each chunk into kb_ingest_session. The MODEL is the data path, so
   # chunks are small (~24 KB echo fidelity) and each flush costs Claude usage —
   # bearer modes (MCP/REST) are the efficient path; this is the no-setup one.
-  STATE="$HOME/.claude/hooks/state"
-  mkdir -p "$STATE"
-  OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
-  OFFF="$STATE/${OKEY:-default}.offset"
+  # STATE/OKEY/OFFF were computed once up top; the offset is NEVER deleted here.
   export CLAUDE_BIN OFFF OKEY EV
   export KB_CONNECTOR_CHUNK="${KB_CONNECTOR_CHUNK:-24000}"
   export KB_CONNECTOR_MAX="${KB_CONNECTOR_MAX:-240000}"
@@ -712,15 +1164,22 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     # TERMINAL firing it is not: there is no next firing, so whatever the winner
     # does not reach is lost — and staying silent lets its " ok bytes=" line be
     # read as a fully captured session.
-    if ! kb_take_lock "$OFFF.lock"; then
+    if ! kb_lock_take "$OKEY"; then
       [ "$EV" = "SessionEnd" ] && echo "$(date -Is) connector $PROJECT NOT CAPTURED: the final firing could not take the session lock (another drain was still running), so any remaining bytes were not relayed — re-ingest $T if this session matters"
       exit 0
     fi
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
     case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
+    # SIZE=0 is UNREADABLE, not shrank (V1-m4): never clobber a good checkpoint
+    # down to 0 on a failed stat. Same writer invariant as the bearer arms.
+    if [ "$SIZE" = 0 ]; then
+      [ -f "$OFFF" ] && echo "$(date -Is) connector $PROJECT size unreadable ($SIZE) — not draining ev=$EV sid=$SIDS"
+      exit 0
+    fi
     if [ "$SIZE" -lt "$OFFSET" ]; then
-      echo "$(date -Is) connector $PROJECT transcript shrank ($SIZE < offset $OFFSET) — restarting from 0"
+      echo "$(date -Is) connector $PROJECT transcript shrank ($SIZE < offset $OFFSET) reason=shrank — restarting from 0 ev=$EV sid=$SIDS"
+      kb_lock_owned || { echo "$(date -Is) connector $PROJECT lock lost — stopping ev=$EV sid=$SIDS"; exit 0; }
       OFFSET=0
       printf "%s" 0 >"$OFFF.t" 2>/dev/null && mv "$OFFF.t" "$OFFF" 2>/dev/null || true
     fi
@@ -843,8 +1302,11 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
         # would reinstate the permanent stall this branch exists to prevent.
         # (No apostrophes in here: the whole drain is one single-quoted bash -c.)
         *[Dd][Uu][Pp][Ll][Ii][Cc][Aa][Tt][Ee]*|*already\ queued*)
-          OFFSET=$((OFFSET + BYTES)); printf "%s" "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
-        *[0-9]*) OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)) ;;
+          kb_lock_owned || { echo "$(date -Is) connector $PROJECT lock lost — stopping ev=$EV sid=$SIDS"; exit 0; }
+          OFFSET=$((OFFSET + BYTES)); printf "%s" "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)); kb_lock_touch ;;
+        *[0-9]*)
+          kb_lock_owned || { echo "$(date -Is) connector $PROJECT lock lost — stopping ev=$EV sid=$SIDS"; exit 0; }
+          OFFSET=$((OFFSET + BYTES)); printf '%s' "$OFFSET" >"$OFFF.t" && mv "$OFFF.t" "$OFFF"; SENT=$((SENT + BYTES)); kb_lock_touch ;;
         *) echo "$(date -Is) connector $PROJECT chunk FAILED (no id: $OUTLOG) at offset $OFFSET — will resume"; break ;;
       esac
     done
@@ -861,16 +1323,19 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       SKIPNOTE=""
       [ "$SKIPPED" -gt 0 ] && SKIPNOTE=" NOT CAPTURED $SKIPPED bytes"
       if [ "$OFFSET" -ge "$SIZE" ]; then
-        echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)$SKIPNOTE"
+        echo "$(date -Is) connector $PROJECT ok bytes=$SENT (offset $OFFSET/$SIZE)$SKIPNOTE ev=$EV sid=$SIDS"
       elif [ "$EV" = "SessionEnd" ]; then
         echo "$(date -Is) connector $PROJECT NOT CAPTURED $((SIZE-OFFSET)) bytes (offset $OFFSET/$SIZE)$SKIPNOTE — SessionEnd is the FINAL firing for this session, so these bytes will NOT resume. Re-ingest $T, or switch to a bearer transport in $CFG"
       else
-        echo "$(date -Is) connector $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE)$SKIPNOTE — will resume"
+        echo "$(date -Is) connector $PROJECT partial bytes=$SENT (offset $OFFSET/$SIZE)$SKIPNOTE — will resume ev=$EV sid=$SIDS"
       fi
     fi
     [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -ge "$CAP" ] && [ "$EV" != "SessionEnd" ] &&       echo "$(date -Is) connector $PROJECT per-firing cap reached ($CAP); $((SIZE-OFFSET)) bytes resume next firing"
-    # Terminal event, fully drained: drop this session'"'"'s offset file.
-    [ "$EV" = "SessionEnd" ] && [ "$OFFSET" -ge "$SIZE" ] && rm -f "$OFFF" 2>/dev/null
+    # Offset NEVER deleted (never-delete-offsets v2): release the lock, then sweep
+    # dead state. The CONNECTOR transport has no bearer sweep, so a never-resumed
+    # SessionEnd tail is covered by the NOT CAPTURED line above, not by a delete.
+    kb_lock_release
+    kb_state_sweep
   ' </dev/null >>"$LOG" 2>&1 &
 else
   # NO transport is configured (no KB_DIR, no KB_MCP_URL/KB_REST_URL+KB_TOKEN, no

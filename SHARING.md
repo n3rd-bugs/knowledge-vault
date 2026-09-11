@@ -264,6 +264,50 @@ box is installed, `~/.claude/hooks/update.sh` refreshes everything from that
 manifest with one command and re-runs the installer — the pre-brief's
 `[KB setup] ... OUT OF DATE` banner points at it.
 
+## 2.6 After install: checkpoints, seeding and the sweep
+
+The hooks keep one checkpoint per session (`~/.claude/hooks/state/<session>.offset`,
+the accepted byte offset) and **never delete it**: a drained `SessionEnd` leaves
+it at `offset == size`, the server refuses a re-send of what it already holds for
+that session, and only the hook's daily state sweep retires a checkpoint whose
+transcript is gone from the box. `install.sh` writes
+`state/.checkpoints-trusted-since` exactly once (ISO-8601 UTC; a re-install
+keeps it). A transcript with no checkpoint whose first record is older than the
+stamp was captured by a pre-wave-C hook that deleted its checkpoint, so the hook
+refuses to send it from 0 (`unseeded`, once a day in `flush-session.log`; the
+completion ping reads `kb ?/<size> unseeded`) until the owner seeds it:
+
+```bash
+~/.claude/hooks/kb-flush-backfill.sh                         # the table per transcript
+~/.claude/hooks/kb-flush-backfill.sh --seed <sid> current    # already in the KB up to now
+~/.claude/hooks/kb-flush-backfill.sh --seed <sid> <bytes>    # captured up to here (snapped to a line end)
+```
+
+Seed LOW when unsure (one overlapping chunk at most, deduped server-side); never
+hand-edit or delete an offset file. The sweep (`kb-flush-backfill.sh --auto`)
+drains sessions that never fired `SessionEnd`. It runs from the hooks' piggyback
+trigger (every box, every `KB_SWEEP_INTERVAL` = 1800 s) and, on Linux, from the
+`systemd --user` timer `install.sh` renders when `systemctl --user` answers
+(`~/.config/systemd/user/kb-flush-sweep.{service,timer}`; `KB_SWEEP_TIMER=0`
+opts out, `KB_SWEEP_INTERVAL=0` turns the sweep off, a backfill that predates
+`--auto` is not scheduled until the next install; the install prints one `sweep:`
+line; `loginctl enable-linger` keeps it firing after logout). Its health rides on the completion ping (`sweep:never`,
+`sweep:26h stale`, `sweep:STALLED n`, `sweep:unknown n` — only when unhealthy) and
+on the pre-brief's `[KB sweep]` line.
+
+**Windows (Git Bash).** No user manager, so the piggyback trigger is the only
+automatic sweep — a transcript whose session was killed and never resumed, on a
+box where no KB hook fires again, waits for a human. OPTIONAL and manual (never
+run by `install.sh`): a Task Scheduler entry that runs the sweep every 30 min
+while you are logged on. Run it from Git Bash, exactly as written —
+`MSYS_NO_PATHCONV=1` stops MSYS rewriting the `//` switches, and the quoted
+`bash.exe -l -c` keeps the System32 `timeout.exe` trap out of the way:
+
+```bash
+MSYS_NO_PATHCONV=1 schtasks //Create //F //TN "KB Flush Sweep" //SC MINUTE //MO 30 //RL LIMITED \
+  //TR "\"C:\Program Files\Git\usr\bin\bash.exe\" -l -c \"~/.claude/hooks/kb-flush-backfill.sh --auto\""
+```
+
 Why a code rather than the credential: `kb_setup` answers into a chat
 transcript, and the session hooks flush transcripts **into the KB**, which is
 then backed up off-site. A live bearer sent that way is durable in three places

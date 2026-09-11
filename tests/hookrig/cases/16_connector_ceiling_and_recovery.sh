@@ -74,8 +74,10 @@ assert_contains "$LINE" "KB_MCP_URL" "it names the transport that WOULD capture 
 step "the bytes kept are the most RECENT ones, not the oldest"
 # The final line of the transcript is the newest content; it must be inside what
 # was relayed. The first line must NOT be.
-LASTLINE=$(tail -1 "$T" | head -c 60)
-FIRSTLINE=$(head -1 "$T" | head -c 60)
+# Records now open with a type + timestamp prefix common to every line (wave C fixtures
+# carry timestamps), so slice the per-record "i" marker instead of the first 60 bytes.
+LASTLINE=$(tail -1 "$T" | grep -oE '"i": [0-9]+,')
+FIRSTLINE=$(head -1 "$T" | grep -oE '"i": [0-9]+,')
 ALL=$(relay_concat)
 assert_contains "$ALL" "$LASTLINE" "the newest content was relayed"
 assert_not_contains "$ALL" "$FIRSTLINE" "the oldest content was the part dropped"

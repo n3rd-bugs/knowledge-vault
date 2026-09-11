@@ -47,6 +47,12 @@ assert_file_contains() { # file needle label
   if [ -f "$1" ] && grep -qF -- "$2" "$1"; then pass "$3"; else fail "$3 -- [$2] not in $1"; fi
 }
 assert_file_missing() { if [ -e "$1" ]; then fail "$2 -- $1 exists"; else pass "$2"; fi; }
+# "Not advanced" for an OFFSET file: since wave C the hook writes a 0 checkpoint at the
+# first trusted sight of a transcript (Appendix B writer W2, KB 34161), so a failed first
+# chunk leaves the file present with 0 rather than absent. Either is "nothing accepted".
+assert_offset_not_advanced() { # offset-file label
+  if [ ! -e "$1" ] || [ "$(cat "$1" 2>/dev/null)" = "0" ]; then pass "$2"; else fail "$2 -- $1 = $(cat "$1" 2>/dev/null)"; fi
+}
 assert_empty_file() { # file label
   local n
   n=$(wc -c <"$1" 2>/dev/null || echo missing)

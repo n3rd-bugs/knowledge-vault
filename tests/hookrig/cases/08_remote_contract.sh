@@ -63,7 +63,7 @@ assert_empty_file "$OUT_FILE" "stdout empty despite the 401"
 wait_stub 1 25 || fail "no request reached the stub"
 assert_eq "401" "$(stub_field '.transport=="rest"' '.status')" "server rejected the bearer"
 wait_log "chunk FAILED \\(401\\)" 20 && pass "the 401 is logged with its code" || fail "the 401 is not in the log"
-assert_file_missing "$HOME/.claude/hooks/state/sess-401.offset" "offset NOT advanced on 401"
+assert_offset_not_advanced "$HOME/.claude/hooks/state/sess-401.offset" "offset NOT advanced on 401"
 
 step "EMPTY transcript: the hook refuses to submit at all"
 stub_reset

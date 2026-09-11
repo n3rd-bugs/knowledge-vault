@@ -84,6 +84,6 @@ settle
 assert_eq "1" "$(stub_count '.auth=="bad"')" "the stub rejected the bearer (401)"
 assert_eq "0" "$(stub_count '.tool=="kb_ingest_session"')" "no tool call after a 401"
 assert_file_contains "$LOGF" "FAILED" "the failure is logged"
-assert_file_missing "$HOME/.claude/hooks/state/sess-mcp-bad.offset" "offset NOT advanced on failure"
+assert_offset_not_advanced "$HOME/.claude/hooks/state/sess-mcp-bad.offset" "offset NOT advanced on failure"
 
 finish

@@ -31,7 +31,7 @@ else
 fi
 assert_file_contains "$LOGF" "no mcp session" "the helper's diagnosis reaches the log"
 assert_file_contains "$LOGF" "will resume" "the log says the delta will be retried"
-assert_file_missing "$HOME/.claude/hooks/state/sess-unreach.offset" "offset not advanced, so nothing is lost"
+assert_offset_not_advanced "$HOME/.claude/hooks/state/sess-unreach.offset" "offset not advanced, so nothing is lost"
 
 step "the pre-brief hook SURFACES that failure to the next session"
 stub_reset
@@ -56,7 +56,7 @@ if wait_log "chunk FAILED" 25; then
 else
   fail "the REST failure was SILENT: log=[$(cat "$LOGF" 2>/dev/null)]"
 fi
-assert_file_missing "$HOME/.claude/hooks/state/sess-unreach2.offset" "offset not advanced"
+assert_offset_not_advanced "$HOME/.claude/hooks/state/sess-unreach2.offset" "offset not advanced"
 
 step "a garbage transcript_path is a no-op, not an error"
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "/no/such/transcript.jsonl" "$WORK" sess-x PreCompact)"

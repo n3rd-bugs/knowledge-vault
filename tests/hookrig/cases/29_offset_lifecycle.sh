@@ -272,6 +272,9 @@ mkdir -p "$W7"
 T7="$W7/old.jsonl"
 cp "$T6" "$T7"                      # dated 2020, i.e. before any stamp written now
 step "no stamp + a DATED pre-existing transcript -> refused (stamp created as now)"
+# install.sh (C9) writes the trust stamp at install; this step is the HAND-COPIED-hook box
+# that never ran it, so remove the stamp the installer just wrote.
+rm -f "$HOOKS/state/.checkpoints-trusted-since"
 assert_file_missing "$HOOKS/state/.checkpoints-trusted-since" "precondition: no stamp on this box"
 BEFORE=$(stub_total)
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T7" "$W7" sess-old PreCompact)"

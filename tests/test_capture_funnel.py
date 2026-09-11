@@ -3930,3 +3930,18 @@ def test_the_stop_dispatcher_map_runs_the_flush_gate_then_notify():
     assert list(stop.items()) == [("flush-session-to-kb.sh", 3), ("notify-complete.sh", 11)], (
         f"the Stop dispatcher map changed: {stop}"
     )
+
+
+def test_every_tail_into_head_pipeline_drops_tails_stderr():
+    """uutils coreutils `tail` (Ubuntu 25.10+, the owner box) panics with a Rust
+    backtrace note when its reader (`head -c`) closes the pipe early; the bytes were
+    already delivered, so the hook must never let that note reach the flush log."""
+    for path in (
+        REPO / "contrib/claude/kb-session-flush/flush-session-to-kb.sh",
+        REPO / "src/kbmcp/setup_assets/flush-session-to-kb.sh",
+    ):
+        text = path.read_text()
+        sites = re.findall(r'tail -c \+\$\(\([A-Z]+\+1\)\) "\$T"[^\n]*\| *head', text)
+        assert len(sites) >= 4, f"{path.name}: expected the four window pipelines, found {sites}"
+        for site in sites:
+            assert "2>/dev/null |" in site, f"{path.name}: tail's stderr reaches the log in: {site}"

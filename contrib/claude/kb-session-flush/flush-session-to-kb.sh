@@ -1374,7 +1374,10 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_
       while :; do
         EDGE=$(( LK * CHUNK )); [ "$EDGE" -gt "$SIZE" ] && EDGE=$SIZE
         [ "$CAP1" -gt 0 ] && [ "$EDGE" -gt "$CAP1" ] && EDGE=$CAP1   # retry: the first window ends where the failed one did
-        tail -c +$((OFFSET+1)) "$T" | head -c $((EDGE - OFFSET)) >"$TMPC"
+        # tail feeds a reader that closes early (head); uutils coreutils tail (Ubuntu 25.10+,
+        # the owner box) PANICS on that EPIPE and prints a Rust backtrace note to stderr —
+        # the bytes are already delivered, so its stderr is dropped here (and below).
+        tail -c +$((OFFSET+1)) "$T" 2>/dev/null | head -c $((EDGE - OFFSET)) >"$TMPC"
         BYTES=$(_fsize "$TMPC")
         [ "$BYTES" -gt 0 ] || { HELD=2; break; }
         if [ "$(tail -c1 "$TMPC")" = "" ]; then
@@ -1398,7 +1401,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_
       # last \n <= OFFSET+SEND_MAX; if that leaves nothing, send OFFSET..+SEND_MAX
       # as an unterminated fragment (as today for a line longer than a chunk).
       if [ "$BYTES" -gt "$SEND_MAX" ]; then
-        tail -c +$((OFFSET+1)) "$T" | head -c "$SEND_MAX" >"$TMPC"
+        tail -c +$((OFFSET+1)) "$T" 2>/dev/null | head -c "$SEND_MAX" >"$TMPC"
         BYTES=$(_fsize "$TMPC")
         if [ "$(tail -c1 "$TMPC")" != "" ]; then
           KEEP=$(kb_keep_to_last_nl "$TMPC")
@@ -1630,7 +1633,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       NEWOFF=$((SIZE - KB_CONNECTOR_SESSION_MAX))
       # Realign forward to the next line start so the first relayed chunk is not
       # half a JSONL record.
-      ADV=$(tail -c +$((NEWOFF+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" | head -1 | wc -c | tr -d " ")
+      ADV=$(tail -c +$((NEWOFF+1)) "$T" 2>/dev/null | head -c "$KB_CONNECTOR_CHUNK" | head -1 | wc -c | tr -d " ")
       case "$ADV" in ""|*[!0-9]*) ADV=0 ;; esac
       NEWOFF=$((NEWOFF + ADV))
       [ "$NEWOFF" -gt "$SIZE" ] && NEWOFF="$SIZE"
@@ -1641,7 +1644,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     fi
     while [ "$OFFSET" -lt "$SIZE" ] && [ "$SENT" -lt "$CAP" ]; do
       TMPC=$(mktemp)
-      tail -c +$((OFFSET+1)) "$T" | head -c "$KB_CONNECTOR_CHUNK" >"$TMPC"
+      tail -c +$((OFFSET+1)) "$T" 2>/dev/null | head -c "$KB_CONNECTOR_CHUNK" >"$TMPC"
       BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")
       [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
       if [ "$(tail -c1 "$TMPC")" != "" ]; then

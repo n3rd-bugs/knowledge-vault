@@ -53,9 +53,14 @@ CHECKPOINT_KEY = "extract_checkpoint"
 # text that DID drift is discarded by the fingerprint as always.
 # ``queue_repair.requeue_failed`` preserves this key for the same reason;
 # ``requeue_extracted`` deliberately clears it (re-mining is the point there).
+# Wave S (V2-m5): the row's flush telemetry (``flush``, ``overlap`` — the
+# first-seen stamps of this chunk) rides the same fragment across a legitimate
+# same-project re-arm, so a resubmission cannot wipe what the fleet weekly reads.
 CHECKPOINT_PRESERVE_SQL = (
     f"jsonb_strip_nulls(jsonb_build_object('{CHECKPOINT_KEY}', "
-    f"ingest_queue.meta -> '{CHECKPOINT_KEY}'))"
+    f"ingest_queue.meta -> '{CHECKPOINT_KEY}', "
+    "'flush', ingest_queue.meta -> 'flush', "
+    "'overlap', ingest_queue.meta -> 'overlap'))"
 )
 
 

@@ -219,3 +219,4 @@ def repair_judge_flagged(
 # `import repair_cmds` still wires every repair command.
 from kbcli import repair_audit as _repair_audit  # noqa: E402,F401
 from kbcli import repair_crosstwins as _repair_crosstwins  # noqa: E402,F401
+from kbcli import repair_resend as _repair_resend  # noqa: E402,F401

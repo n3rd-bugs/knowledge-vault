@@ -20,6 +20,7 @@ from kbcore import (
     drainsched,
     enrolment,
     evidence,
+    fleet_flush,
     fleet_health,
     ingest_queue,
     llm,  # noqa: F401 — patch surface: tests patch `consolidate.llm.*`
@@ -511,6 +512,10 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         _run_step(counts, "fleet_degenerate_by_project", fleet_health.degenerate_by_project)
         # ADDED key, never a rename (KB 19663): the same staleness split BY BOX.
         _run_step(counts, "fleet_by_box", fleet_health.fleet_by_box)
+        _run_step(counts, "fleet_flush", fleet_flush.fleet_flush_by_box)  # wave S ADDED keys
+        _run_step(counts, "fleet_silent", fleet_flush.fleet_silent)
+        _run_step(counts, "fleet_stale_hooks", fleet_flush.stale_hook_boxes)
+        _run_step(counts, "resend_summary", fleet_flush.resend_summary)
         counts["disk_pct"] = _disk_pct()
         try:  # host memory telemetry (review #5 ops-3): keys absent on failure
             counts["swap_used_pct"], counts["mem_available_gb"] = _host_memory()

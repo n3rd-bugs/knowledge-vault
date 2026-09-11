@@ -336,7 +336,10 @@ def test_contrib_and_shipped_copies_stay_identical(name: str):
 # both mechanically.
 
 _ASSET_LISTS = {
-    "kbrest allowlist": (REPO / "src/kbrest/server.py", "_SETUP_SCRIPTS"),
+    # The allowlist moved to kbcore.setup_manifest (wave S4, KB 33784) so the nightly
+    # digest can compare a box's hook_version against the CURRENT manifest; the
+    # kbrest routes re-export it (test_fleet_flush pins the two names equal).
+    "kbrest allowlist": (REPO / "src/kbcore/setup_manifest.py", "SETUP_SCRIPTS"),
     "hookrig stub": (REPO / "tests/hookrig/stub_server.py", "SETUP_SCRIPTS"),
 }
 _FETCH_LOOPS = {

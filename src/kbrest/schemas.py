@@ -10,7 +10,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from kbcore.models import CodeRef
+from kbcore.ingest_queue import MAX_CONTENT_BYTES
+from kbcore.models import CodeRef, FlushStamp
 
 
 class ItemCreate(BaseModel):
@@ -70,6 +71,39 @@ class IngestSessionRequest(BaseModel):
     # boxes send nothing, and that absence is itself the signal (fleet_health).
     # Closed shape (a digest is 12 hex); never trusted as anything but a label.
     hook_version: str | None = Field(default=None, max_length=64)
+    # Flush TELEMETRY (wave S item S3, hybrid_v1 §1.3): eight optional, closed-shape,
+    # FLAT fields — flat because the hook's JSON builder is flat and each value is a
+    # number or a slug the rig can assert. Stored under ingest_queue.meta['flush']
+    # by kbcore when consistent; NEVER a refusal, trim or range check (stamps are
+    # telemetry only, proposal_v2 amendment 3). Pre-stamp hooks send nothing; an
+    # older server drops them (plain BaseModel, extra='ignore').
+    flush_offset: int | None = Field(default=None, ge=0)  # byte offset in the transcript
+    flush_bytes: int | None = Field(default=None, ge=0, le=2 * MAX_CONTENT_BYTES)  # RAW length
+    flush_size: int | None = Field(default=None, ge=0)  # transcript size at firing
+    flush_event: str | None = Field(default=None, max_length=16, pattern=r"^[A-Za-z]+$")
+    flush_mtime: int | None = Field(default=None, ge=0)  # epoch seconds; stored ISO UTC
+    flush_box: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    flush_project_by: str | None = Field(default=None, max_length=16, pattern=r"^[a-z-]+$")
+    flush_branch_of: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+
+    def flush_stamp(self) -> FlushStamp | None:
+        """The stamp, ALL-OR-NOTHING: offset + bytes + size present, else ``None``.
+
+        A partial stamp is not an error (a hook mid-upgrade may send a subset); it
+        is simply not telemetry the server can place, so it is dropped whole.
+        """
+        if self.flush_offset is None or self.flush_bytes is None or self.flush_size is None:
+            return None
+        return FlushStamp(
+            offset=self.flush_offset,
+            bytes=self.flush_bytes,
+            size=self.flush_size,
+            event=self.flush_event,
+            mtime=self.flush_mtime,
+            box=self.flush_box,
+            project_by=self.flush_project_by,
+            branch_of=self.flush_branch_of,
+        )
 
 
 class EnrolRequest(BaseModel):

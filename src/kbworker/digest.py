@@ -35,6 +35,7 @@ from typing import Any
 # _fact_lines below keep calling them by their bare names. The RETIRED expiry
 # helper (DIGEST_EXPIRY_HORIZON_DAYS / _expiring_soon, review #6) moved with
 # them in H7 to keep this file under its cap; both names still resolve here.
+from kbworker import digest_fleet_lines
 from kbworker.digest_lines import (  # noqa: F401
     DIGEST_EXPIRY_HORIZON_DAYS,
     NIGHT_ROLLOVER_HOUR,
@@ -80,11 +81,9 @@ def _alert_lines(counts: Mapping[str, Any]) -> list[str]:
     # the untriaged gate they are HELD OPEN, so this is a pile-up warning.
     if expiring_7d := counts.get("untriaged_expiring_7d"):
         lines.append(f"EXPIRY: {expiring_7d} untriaged rows reach expiry age within 7d")
-    stale = _stale_hook_projects(counts.get("fleet_degenerate_by_project"))
-    if stale:
-        # NAMED, not counted: the action is "go update that machine's hooks",
-        # and a bare number does not say which box to walk over to.
-        lines.append(f"STALE HOOKS suspected: {', '.join(stale)}")
+    # Wave S (KB 33784): ONE merged STALE HOOKS line (named boxes + the legacy
+    # no-session-id signal), FLEET SILENT, RESEND GUARD, QUEUE DEPTH.
+    lines += digest_fleet_lines.fleet_alert_lines(counts)
     # An escalation to terminal 'failed' used to be SILENT (review #3 P1 rider);
     # it is the drain's most consequential outcome, so it rides with the alerts.
     if escalations := counts.get("deferral_escalations"):
@@ -184,6 +183,7 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
     # Rerank sidecar probe (review #5 ops-4): only a failure is news.
     if counts.get("rerank_probe") == "failed":
         lines.append("rerank probe: failed")
+    lines += digest_fleet_lines.fleet_fact_lines(counts)  # wave S: `fleet:` first among them
     # Review #6: a step cut short by the stand-down guard was indistinguishable
     # from an idle one on every rendered surface — one line names the cut steps.
     # A battery pause rendered in the alert tier; a deadline-only cut lands here.

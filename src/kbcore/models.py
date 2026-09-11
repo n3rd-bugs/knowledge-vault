@@ -5,7 +5,7 @@ One module so MCP tools and CLI commands validate against the same shapes.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -240,3 +240,51 @@ class RepoScanSummary(BaseModel):
     @property
     def saved(self) -> int:
         return len(self.ingested)
+
+
+class FlushStamp(BaseModel):
+    """The flush hook's TELEMETRY about ONE transcript chunk (wave S item S3).
+
+    Carried flat on the REST body (``flush_*``), assembled by
+    ``IngestSessionRequest.flush_stamp()`` all-or-nothing and stored under
+    ``ingest_queue.meta['flush']`` when :meth:`consistent`. Telemetry ONLY: no
+    refusal, trim or range check is ever based on a stamp (proposal_v2 §7,
+    amendment 3). ``extra='forbid'`` keeps the stored shape closed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    offset: int = Field(ge=0)  # byte offset of this chunk in the transcript
+    bytes: int = Field(ge=0)  # RAW chunk length (stored content is post-scrub)
+    size: int = Field(ge=0)  # transcript size at firing
+    # The closed VALUE shapes live HERE (kbcore is the authority; the REST schema
+    # repeats them), so a non-REST constructor cannot store an arbitrary string.
+    event: str | None = Field(default=None, max_length=16, pattern=r"^[A-Za-z]+$")
+    mtime: int | None = Field(default=None, ge=0)  # epoch seconds; stored ISO UTC
+    box: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    project_by: str | None = Field(default=None, max_length=16, pattern=r"^[a-z-]+$")
+    branch_of: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+
+    def consistent(self, raw_len: int) -> bool:
+        """``offset + bytes`` fits the transcript and ``bytes`` matches the raw content
+        (within :data:`FLUSH_RAW_LEN_SLACK` — the hook measures before the wire)."""
+        return (
+            self.offset + self.bytes <= self.size
+            and abs(self.bytes - int(raw_len)) <= FLUSH_RAW_LEN_SLACK
+        )
+
+    def to_meta(self) -> dict:
+        """The ``meta.flush`` payload: present fields only, ``mtime`` as ISO UTC (Inv 7)."""
+        out: dict = {"offset": self.offset, "bytes": self.bytes, "size": self.size}
+        if self.mtime is not None:
+            out["mtime"] = datetime.fromtimestamp(self.mtime, tz=UTC).isoformat()
+        for key in ("event", "box", "project_by", "branch_of"):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        return out
+
+
+# A stamp whose ``bytes`` differs from the raw content by more than this is
+# inconsistent: the row is stored, the stamp is not (counted + WARNING).
+FLUSH_RAW_LEN_SLACK = 8

@@ -268,6 +268,7 @@ _KB_TEST_TABLES = (
     "projects",
     "session_checkpoints",
     "ingest_queue",
+    "ingest_resend_events",
     "principal_grants",
     "principals",
     "enrolment_codes",

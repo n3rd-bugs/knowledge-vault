@@ -10,9 +10,7 @@ Run: ``python -m kbrest.server``.
 
 from __future__ import annotations
 
-import hashlib
 import logging
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -30,6 +28,7 @@ from kbcore import (
     scope,
     search,
     search_expand,
+    setup_manifest,
     stats,
     supersede,
 )
@@ -56,32 +55,11 @@ from kbrest.schemas import (
     SupersedeRequest,
 )
 
-# Exactly the four files install.sh needs. An allowlist, not a path join,
-# so this route can never become a way to read arbitrary files.
-_SETUP_ASSETS = Path(__file__).resolve().parents[1] / "kbmcp" / "setup_assets"
-_SETUP_SCRIPTS = frozenset(
-    {
-        "install.sh",
-        "flush-session-to-kb.sh",
-        "kb-session-brief.sh",
-        "kb-mcp-call.sh",
-        # Completion notifications (2026-07-31). Optional and inert without a
-        # notify.env, but they must be SERVABLE or a remote box can never get them
-        # — which is precisely why notifications only ever worked on this host.
-        "notify-complete.sh",
-        "turn-start.sh",
-        # The single-hook-per-event dispatcher (2026-08-06). install.sh registers
-        # ONLY this script with Claude Code, so a box that cannot fetch it ends
-        # up with five registered hooks pointing at a file it does not have.
-        "kb-hook-dispatch.sh",
-        # The backfill sweep (2026-08-03). Not a hook, but it is exactly what a
-        # re-onboarded box runs right after install.sh — so it has to be SERVABLE,
-        # or that box can only ever capture sessions started after the install and
-        # everything already on disk stays invisible. Same gap class as notify.
-        "kb-flush-backfill.sh",
-        "update.sh",  # self-update (review #8 H15): manifest-driven fetch + install
-    }
-)
+# The served-asset allowlist and its content-derived version live in
+# kbcore.setup_manifest (wave S4, KB 33784) so the nightly digest can compare a
+# box's hook_version against the CURRENT manifest; the routes re-export them.
+_SETUP_ASSETS = setup_manifest.SETUP_ASSETS
+_SETUP_SCRIPTS = setup_manifest.SETUP_SCRIPTS
 
 log = logging.getLogger("kbrest")
 
@@ -103,6 +81,7 @@ def create_app() -> FastAPI:
     # the exception's MRO, so subclasses of KBError hit their own handler first.
     app.add_exception_handler(NotFound, lambda r, e: _err(404, str(e)))
     app.add_exception_handler(DuplicateContent, lambda r, e: _err(409, str(e)))
+    app.add_exception_handler(ingest_queue.QueueFull, lambda r, e: _err(429, str(e)))
     app.add_exception_handler(InvalidOperation, lambda r, e: _err(400, str(e)))
     app.add_exception_handler(ValueError, lambda r, e: _err(400, str(e)))
     app.add_exception_handler(EmbedderUnavailable, lambda r, e: _err(503, str(e)))
@@ -198,6 +177,7 @@ def _register_write(app: FastAPI) -> None:
             branch=payload.branch,
             commit=payload.commit,
             hook_version=payload.hook_version,  # review #8 H15: fleet version column
+            flush=payload.flush_stamp(),  # wave S: telemetry only, never a refusal
         )
         return {
             "queue_id": res.id,
@@ -306,15 +286,7 @@ def _register_write(app: FastAPI) -> None:
         Cheap enough to call on every session start (one small JSON), and it needs
         the same credential as the scripts themselves.
         """
-        files: dict[str, str] = {}
-        for fname in sorted(_SETUP_SCRIPTS):
-            path = _SETUP_ASSETS / fname
-            if path.exists():
-                files[fname] = hashlib.sha256(path.read_bytes()).hexdigest()
-        combined = hashlib.sha256(
-            "".join(f"{k}:{v}" for k, v in sorted(files.items())).encode()
-        ).hexdigest()
-        return {"version": combined[:12], "files": files, "count": len(files)}
+        return setup_manifest.manifest()
 
     @app.get("/api/setup/{name}", response_class=PlainTextResponse)
     def api_setup_script(name: str) -> str:

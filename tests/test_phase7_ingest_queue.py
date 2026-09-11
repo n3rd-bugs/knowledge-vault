@@ -252,6 +252,25 @@ def test_enqueue_rejects_when_backlog_full(kb, monkeypatch):
         ingest_queue.enqueue("p", "second distinct submission text", kind="session")
 
 
+def test_rest_answers_a_full_backlog_with_a_uniform_429(kb, monkeypatch):
+    """Wave S item S7: QueueFull -> 429 so the hook's retry set can tell 'wait' from
+    'bad request' (a 400 must never be retried; a 429 is retried after a delay)."""
+    monkeypatch.setattr(ingest_queue, "MAX_PENDING", 1)
+    monkeypatch.setattr(settings, "kb_token", TEST_TOKEN)
+    monkeypatch.setattr(settings, "kb_bind", "127.0.0.1")
+    from kbrest.server import build_app
+
+    client = TestClient(build_app())
+    first = {"project": "p", "transcript": "first submission text", "session_uri": "session:q1"}
+    assert client.post("/api/ingest-session", headers=AUTH, json=first).status_code == 202
+    second = {**first, "transcript": "second distinct submission text"}
+    r = client.post("/api/ingest-session", headers=AUTH, json=second)
+    assert r.status_code == 429
+    assert r.json() == {"error": "ingest queue is full; try again after the nightly drain"}
+    # Still an InvalidOperation for every non-REST caller (MCP message unchanged).
+    assert issubclass(ingest_queue.QueueFull, InvalidOperation)
+
+
 # --- large-session chunked flush (owner request: up to 1 GB) -------------------------
 
 

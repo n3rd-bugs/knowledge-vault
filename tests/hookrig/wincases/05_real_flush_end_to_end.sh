@@ -5,6 +5,13 @@
 #       before -f/basename, submit the delta, and checkpoint the offset so the
 #       next firing resumes instead of re-sending. Every one of those steps has
 #       a Windows-specific failure mode the Linux container cannot reach.
+#       Wave C (C5, KB 33784) adds, on the same real box: a drained SessionEnd
+#       KEEPS the offset at the transcript size (never deleted); a closed-gate
+#       Stop makes 0 requests and no log line; an open-gate Stop's PARENT
+#       returns in < 3 s (the dispatcher's Stop budget) while its child drains;
+#       and a drain detached with nohup (Git Bash has no setsid) survives a 1 s
+#       kb_timeout killing its parent. Delta records carry a "timestamp" like
+#       real transcript records.
 . "$RIG_SANDBOX/winlib.sh"
 
 new_home flushe2e
@@ -71,9 +78,11 @@ step "appending new lines submits ONLY the delta"
 SIZE_BEFORE=$(wc -c <"$TRANS")
 "$RIG_PY" - "$TRANS" <<'EOF'
 import json, sys
+from datetime import datetime, timezone
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 with open(sys.argv[1], "a", encoding="utf-8") as fh:
     for i in range(15):
-        fh.write(json.dumps({"type": "user", "tag": "delta", "i": i, "text": f"delta message {i}"}) + "\n")
+        fh.write(json.dumps({"type": "user", "timestamp": ts, "tag": "delta", "i": i, "text": f"delta message {i}"}) + "\n")
 EOF
 DELTA=$(( $(wc -c <"$TRANS") - SIZE_BEFORE ))
 note "appended $DELTA bytes"
@@ -98,5 +107,93 @@ if [ -f "$LOGF" ]; then
 else
   pass "no failure log written"
 fi
+
+# ------------------------------------------------------------- wave C (C5)
+grow() { # <bytes> <tag> -- append timestamped records until the file grew by >= <bytes>
+  "$RIG_PY" - "$TRANS" "$1" "$2" <<'EOF'
+import json, sys
+from datetime import datetime, timezone
+path, want, tag = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+w = i = 0
+with open(path, "a", encoding="utf-8", newline="\n") as fh:
+    while w < want:
+        pad = "x" * (37 + (i * 13) % 91)
+        line = json.dumps({"type": "assistant", "timestamp": ts, "tag": tag, "i": i, "pad": pad}) + "\n"
+        fh.write(line); w += len(line); i += 1
+EOF
+}
+sums() { log_count ' (ok|partial) bytes='; }
+ST="$HOOKS/state"
+OKEY=win-e2e-1
+NOW=$(date +%s)
+# The piggyback sweep is OFF for these steps: on a real box a hook firing may
+# detach `kb-flush-backfill.sh --auto` (C7), whose lines would break the
+# closed-gate "no log line" and "0 requests" bounds below; case 31 pins the
+# trigger itself, this lane pins the gate and the detach on real Git Bash.
+export KB_SWEEP_INTERVAL=0
+
+step "SessionEnd drains and KEEPS the offset file at the transcript size (never deleted)"
+grow 20000 end
+SIZE_END=$(wc -c <"$TRANS" | tr -d ' ')
+SUMS=$(sums)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$TRANS_WIN" "$PROJ_WIN" "$OKEY" SessionEnd)"
+assert_eq "0" "$RC" "SessionEnd exits 0"
+wait_firing "$SUMS" 60 || fail "the SessionEnd drain never completed: $(tail -2 "$LOGF" | tr '\n' '|')"
+if [ -f "$ST/$OKEY.offset" ]; then pass "the offset file SURVIVES a drained SessionEnd"; else fail "the offset file was deleted on SessionEnd"; fi
+assert_eq "$SIZE_END" "$(cat "$ST/$OKEY.offset" 2>/dev/null)" "offset == transcript size after SessionEnd"
+
+step "a closed-gate Stop (nothing pending) makes 0 requests and writes no log line"
+BEFORE=$(stub_total)
+LINES=$(wc -l <"$LOGF" | tr -d ' ')
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$TRANS_WIN" "$PROJ_WIN" "$OKEY" Stop)"
+assert_eq "0" "$RC" "Stop exits 0"
+settle
+settle
+assert_eq "$BEFORE" "$(stub_total)" "zero requests on a closed Stop"
+assert_eq "$LINES" "$(wc -l <"$LOGF" | tr -d ' ')" "no log line on a closed Stop"
+assert_eq "$SIZE_END" "$(cat "$ST/$OKEY.offset")" "offset untouched"
+
+step "an open-gate Stop: the PARENT returns in < 3 s while its child drains the delta"
+grow 70000 aged                                  # >= the 64 KB age floor
+printf '%s' "$((NOW - 1900))" >"$ST/$OKEY.last"  # 30 min since the last drain start
+rm -f "$ST/$OKEY.gate"                           # a real drain always leaves .last >= .gate
+SIZE_OPEN=$(wc -c <"$TRANS" | tr -d ' ')
+SUMS=$(sums)
+T0=$(date +%s%N 2>/dev/null || date +%s)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$TRANS_WIN" "$PROJ_WIN" "$OKEY" Stop)"
+T1=$(date +%s%N 2>/dev/null || date +%s)
+assert_eq "0" "$RC" "the open-gate Stop exits 0"
+case "$T0$T1" in
+  *[!0-9]*) fail "no usable clock for the wall time ([$T0] [$T1])" ;;
+  *)
+    if [ "${#T0}" -gt 12 ]; then MS=$(((T1 - T0) / 1000000)); else MS=$(((T1 - T0) * 1000)); fi
+    note "open-gate Stop parent wall time: ${MS} ms (gate -> cached pin -> token file -> detach; no git, no mint in the parent)"
+    assert_le "$MS" "2999" "the parent finished inside the dispatcher's 3 s Stop budget (${MS} ms)"
+    ;;
+esac
+GATE=$(cat "$ST/$OKEY.gate" 2>/dev/null)
+case "$GATE" in '' | *[!0-9]*) fail ".gate not stamped: [$GATE]" ;; *) pass ".gate stamped by the parent" ;; esac
+wait_firing "$SUMS" 60 || fail "the open-gate drain never completed: $(tail -2 "$LOGF" | tr '\n' '|')"
+assert_eq "$SIZE_OPEN" "$(cat "$ST/$OKEY.offset")" "the child drained to EOF"
+assert_ge "$(cat "$ST/$OKEY.last")" "${GATE:-0}" ".last (written by the child) >= .gate"
+assert_contains "$(tail -1 "$LOGF")" "ev=Stop sid=win-e2e-" "the ok line ends with ev=Stop sid="
+
+step "the nohup'd drain survives a 1 s kb_timeout killing its parent"
+grow 70000 timeout
+printf '%s' "$((NOW - 1900))" >"$ST/$OKEY.last"
+rm -f "$ST/$OKEY.gate"
+SIZE_TO=$(wc -c <"$TRANS" | tr -d ' ')
+SUMS=$(sums)
+flush_event "$TRANS_WIN" "$PROJ_WIN" "$OKEY" Stop >"$HOME/ev.json"
+# kb_timeout comes from the portable block loaded into THIS shell (never inside
+# $(...): it memoises its backend). The wrapper lingers past its 1 s budget on
+# purpose, so the watchdog really fires (rc 124) AFTER the hook has detached.
+kb_timeout 1 bash -c 'bash "$1" <"$2"; sleep 4' _ "$HOOKS/flush-session-to-kb.sh" "$HOME/ev.json" </dev/null >/dev/null 2>&1
+RCW=$?
+assert_eq "124" "$RCW" "the watchdog fired (rc 124) on the wrapper around the hook"
+wait_firing "$SUMS" 60 || fail "the drain did not survive the watchdog: $(tail -2 "$LOGF" | tr '\n' '|')"
+assert_eq "$SIZE_TO" "$(cat "$ST/$OKEY.offset")" "the detached (nohup) drain still reached EOF"
+if grep -q "FAILED\|NOT CONFIGURED\|lock lost" "$LOGF"; then fail "a failure was logged: $(grep -m1 'FAILED\|NOT CONFIGURED\|lock lost' "$LOGF")"; else pass "no failure logged across the wave-C steps"; fi
 
 finish

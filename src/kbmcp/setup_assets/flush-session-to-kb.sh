@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # KB-FLUSH-LINEAGE: never-delete-offsets v2
-# Claude Code PreCompact/SessionEnd hook: flush this session's NEW transcript
-# delta into the Knowledge Vault before compaction. Deltas are cut on an ABSOLUTE
-# 700 KB line-boundary lattice (KB_FLUSH_CHUNK; never above KB_FLUSH_SEND_MAX), the
+# Claude Code PreCompact/SessionEnd/Stop hook: flush this session's NEW
+# transcript delta into the Knowledge Vault. Deltas are cut on an ABSOLUTE 700 KB
+# line-boundary lattice (KB_FLUSH_CHUNK; never above KB_FLUSH_SEND_MAX), the
 # per-session offset advances per accepted chunk and is NEVER deleted (a drained
 # SessionEnd leaves offset==size; resumes continue from there); a transcript with
 # no offset is sent from 0 only when it post-dates the box's checkpoint stamp
 # (else refused as "unseeded"); the project is pinned ONCE per session from the
-# transcript's first git cwd record. Detaches immediately so it never blocks
-# compaction. Config lives in ~/.claude/kb-flush.env:
+# transcript's first git cwd record. Stop fires every turn, so it passes a GATE
+# first (size 4 MB / 5 min, age 30 min / 64 KB, or a due retry marker) and a
+# closed gate costs nothing: no pin, no git, no token, no network, no log line.
+# A failed REST chain leaves <okey>.retry (<epoch> <n> <code> <end>, end = the
+# failed chunk's end byte, <= size) that the gate honours with an exponential
+# back-off; the marker is REST-only (an MCP helper failure takes the plain
+# "will resume" path). Detaches immediately so it never blocks compaction.
+# Config lives in ~/.claude/kb-flush.env:
 #   LOCAL  (KB host): KB_DIR=/path/to/kb-repo   [UV=/path/to/uv]
 #   MCP    (client) : KB_MCP_URL=https://host/mcp   KB_TOKEN=...  (reuses the
 #                     `claude mcp` connector registration — zero extra config)
@@ -262,6 +268,10 @@ kb_json_probe || {
   exit 0
 }
 DETACH="$(kb_detach_cmd)"
+# KB_FLUSH_FOREGROUND=1 (the sweep's synchronous firing, hybrid_v1 s2.1) runs the
+# drain in THIS session and waits for it: `env` is a no-op wrapper in place of
+# setsid/nohup, and each `... &` block is followed by a conditional `wait`.
+[ "${KB_FLUSH_FOREGROUND:-0}" = 1 ] && DETACH=env
 
 # Only ONE drain may own a session's offset file at a time. PreCompact and
 # SessionEnd both detach, and a large transcript keeps a child busy for minutes,
@@ -650,7 +660,7 @@ kb_pin_project() {
     if [ -n "$PROJECT" ] && [ -n "$PROJECT_BY" ]; then
       case "$PROJECT_BY" in
         gitfirst | kbproject) PROJECT_MINTABLE=1 ;;
-        *) kb_firing_mintable && PROJECT_MINTABLE=1 ;;
+        *) [ -n "${KB_FLUSH_NO_MINT:-}" ] || { kb_firing_mintable && PROJECT_MINTABLE=1; } ;; # moot on Stop/SessionEnd: no git call
       esac
       return 0
     fi
@@ -683,7 +693,7 @@ kb_pin_project() {
       PROJECT=$(kb_slugify "$(basename "${CWD:-sessions}")")
     fi
     PROJECT_BY=firing
-    kb_firing_mintable && PROJECT_MINTABLE=1 # never for $HOME/$TMPDIR//tmp or a non-git dir
+    [ -n "${KB_FLUSH_NO_MINT:-}" ] || { kb_firing_mintable && PROJECT_MINTABLE=1; } # never for $HOME/$TMPDIR//tmp or a non-git dir
   fi
   [ -n "$PROJECT" ] || { PROJECT=sessions; PROJECT_BY=firing; PROJECT_MINTABLE=0; }
   if [ "${KB_FLUSH_PROJECT_PIN:-1}" = 1 ]; then
@@ -697,12 +707,18 @@ T=$(printf '%s' "$INPUT" | kb_json_get transcript_path)
 CWD=$(printf '%s' "$INPUT" | kb_json_get cwd)
 SID=$(printf '%s' "$INPUT" | kb_json_get session_id)
 EV=$(printf '%s' "$INPUT" | kb_json_get hook_event_name)
+# The dispatcher passes the event as $1 (kb-hook-dispatch.sh): an event whose
+# stdin arrived EMPTY (the residual Windows bug) still names itself there.
+[ -n "$EV" ] || EV="${1:-}"
 # Native Windows event paths (C:\... or C:/...) must be converted — basename on a
 # backslash path yields the whole drive path (item 496). kb_winpath uses cygpath
 # when present and a pure-shell C:\ -> /c/ fallback when it is not.
 T=$(kb_winpath "$T")
 CWD=$(kb_winpath "$CWD")
 [ -n "$T" ] && [ -f "$T" ] || exit 0
+# Sub-agent transcripts (<project>/<sid>/subagents/<agent>.jsonl) are an EXPLICIT
+# exclusion — nothing at all, on every event — no longer an accident of a glob.
+case "$T" in */subagents/*) exit 0 ;; esac
 
 # The per-session offset key and its state paths. Computed ONCE here (moved up
 # from the transport arms) so the pin cache, the offset writers and the lock all
@@ -711,6 +727,7 @@ CWD=$(kb_winpath "$CWD")
 # funnel, so keep it byte-for-byte.
 STATE="$HOME/.claude/hooks/state"
 mkdir -p "$STATE" 2>/dev/null || true
+LOG="$HOME/.claude/hooks/flush-session.log"
 OKEY=$(printf '%s' "${SID:-$T}" | tr -c 'A-Za-z0-9._-' '_' | tail -c 120)
 OFFF="$STATE/${OKEY:-default}.offset"
 SIDS=$(printf '%s' "${SID:-$OKEY}" | cut -c1-8)
@@ -735,9 +752,144 @@ export KB_FLUSH_BRANCH_SCAN="${KB_FLUSH_BRANCH_SCAN:-1}"
 export KB_FLUSH_LOCK_STALE_MIN="${KB_FLUSH_LOCK_STALE_MIN:-120}"
 export KB_FLUSH_PROJECT_PIN="${KB_FLUSH_PROJECT_PIN:-1}"
 export KB_FLUSH_PIN_SCAN="${KB_FLUSH_PIN_SCAN:-200}"
+# Stage-2 knobs (C5 Stop gate, C6 transport + retry marker, the sweep piggyback).
+export KB_FLUSH_STOP_MIN_BYTES="${KB_FLUSH_STOP_MIN_BYTES:-4000000}"
+export KB_FLUSH_STOP_MIN_INTERVAL="${KB_FLUSH_STOP_MIN_INTERVAL:-300}"
+export KB_FLUSH_STOP_MAX_AGE="${KB_FLUSH_STOP_MAX_AGE:-1800}"
+export KB_FLUSH_STOP_MIN_BYTES_AGED="${KB_FLUSH_STOP_MIN_BYTES_AGED:-65536}"
+export KB_FLUSH_RETRY_BASE="${KB_FLUSH_RETRY_BASE:-300}"
+export KB_FLUSH_RETRY_MAX="${KB_FLUSH_RETRY_MAX:-3600}"
+export KB_FLUSH_RETRY_GIVEUP="${KB_FLUSH_RETRY_GIVEUP:-20}"
+export KB_FLUSH_CURL_MAX="${KB_FLUSH_CURL_MAX:-60}"
+export KB_FLUSH_CURL_RETRY="${KB_FLUSH_CURL_RETRY:-2}"
+export KB_FLUSH_CURL_RETRY_MAX="${KB_FLUSH_CURL_RETRY_MAX:-30}"
+export KB_SWEEP_INTERVAL="${KB_SWEEP_INTERVAL:-1800}"
 # CLAUDE_CONFIG_DIR is the second config root the state sweep probes (C8); export
 # it (possibly empty) so the detached child sees the same value the parent did.
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-}"
+
+kb_now() { # epoch seconds, 0 when date cannot say
+  _kn=$(date +%s 2>/dev/null || echo 0)
+  case "$_kn" in '' | *[!0-9]*) _kn=0 ;; esac
+  printf '%s' "$_kn"
+}
+export -f kb_now
+
+# Retry back-off (C6, Appendix D) for a <okey>.retry marker `<epoch> <n> <code>
+# <end>`: 429/503 mean the server asked us to back off -> the long bound at
+# once (KB_FLUSH_RETRY_MAX, not the exponential schedule: a server that says
+# "slow down" is not a flap to probe every 5 minutes); anything else ->
+# min(KB_FLUSH_RETRY_MAX, KB_FLUSH_RETRY_BASE * 2^(n-1)), i.e. 5, 10, 20, 40,
+# 60, 60 ... minutes.
+kb_retry_backoff() { # <n> <code> -> seconds
+  _rbn="${1:-1}"
+  case "$_rbn" in '' | *[!0-9]* | 0) _rbn=1 ;; esac
+  case "${2:-}" in 429 | 503)
+    printf '%s' "$KB_FLUSH_RETRY_MAX"
+    return 0
+    ;;
+  esac
+  _rbs="$KB_FLUSH_RETRY_BASE"
+  _rbi=1
+  while [ "$_rbi" -lt "$_rbn" ] && [ "$_rbs" -lt "$KB_FLUSH_RETRY_MAX" ]; do
+    _rbs=$((_rbs * 2))
+    _rbi=$((_rbi + 1))
+  done
+  [ "$_rbs" -gt "$KB_FLUSH_RETRY_MAX" ] && _rbs="$KB_FLUSH_RETRY_MAX"
+  printf '%s' "$_rbs"
+}
+
+# THE STOP GATE (C5, hybrid_v1 s2.2, Appendix D). Stop fires on EVERY turn, so
+# the decision is made from two stats and a few cats BEFORE any pin, git, token
+# or mint work: 0 = open (the caller stamps <okey>.gate and detaches a drain),
+# 1 = closed (the caller exits 0 with ZERO network and NO log line).
+#   size path: (SIZE - OFFSET) >= KB_FLUSH_STOP_MIN_BYTES  and  now - .last >= KB_FLUSH_STOP_MIN_INTERVAL
+#   age path : (SIZE - OFFSET) >= KB_FLUSH_STOP_MIN_BYTES_AGED and now - .last >= KB_FLUSH_STOP_MAX_AGE
+#   retry    : a .retry marker whose back-off has elapsed (n < KB_FLUSH_RETRY_GIVEUP)
+# A marker inside its back-off holds EVERY path; at give-up (n >= GIVEUP) the
+# retry and age paths stay shut and only the size path remains (PreCompact,
+# SessionEnd and the sweep ignore the marker entirely). .last is written by the
+# CHILD when its drain starts, so a .gate NEWER than .last means the parent was
+# killed before it could detach (the dispatcher's 3 s budget, rc 124): the gate
+# then stays closed for one interval instead of re-opening on every turn.
+kb_stop_gate() {
+  { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } || return 1 # LOCAL writes no offset; CONNECTOR is usage-metered
+  # A refused (unseeded, pre-stamp) session has no offset and an .unseeded
+  # marker: until the owner seeds it (which creates the offset) every open gate
+  # would only pin, lock, stamp .last and refuse again -- one more stat and it
+  # costs nothing on Stop. PreCompact/SessionEnd still reach the daily line.
+  [ -e "$OFF_UNSEEDED" ] && [ ! -f "$OFFF" ] && return 1
+  _sgn=$(kb_now)
+  _sgs=$(stat -c%s "$T" 2>/dev/null || stat -f%z "$T" 2>/dev/null || echo 0)
+  case "$_sgs" in '' | *[!0-9]*) _sgs=0 ;; esac
+  [ "$_sgs" -gt 0 ] || return 1
+  _sgo=$(cat "$OFFF" 2>/dev/null || echo 0)
+  case "$_sgo" in '' | *[!0-9]*) _sgo=0 ;; esac # the CHILD decides trusted vs unseeded before sending anything
+  _sgd=$((_sgs - _sgo))
+  [ "$_sgd" -gt 0 ] || return 1 # a shrink is the drain's job, not the gate's
+  _sgl=$(cat "$OFF_LAST" 2>/dev/null || echo 0)
+  case "$_sgl" in '' | *[!0-9]*) _sgl=0 ;; esac
+  _sgg=$(cat "$OFF_GATE" 2>/dev/null || echo 0)
+  case "$_sgg" in '' | *[!0-9]*) _sgg=0 ;; esac
+  if [ "$_sgg" -gt "$_sgl" ] && [ "$((_sgn - _sgg))" -lt "$KB_FLUSH_STOP_MIN_INTERVAL" ]; then
+    return 1 # an open gate that never started its drain: back off one interval
+  fi
+  _sgrn=""
+  _sgre=0
+  _sgrc=""
+  if [ -s "$OFF_RETRY" ]; then
+    read -r _sgre _sgrn _sgrc _sgrx <"$OFF_RETRY" 2>/dev/null || true
+    case "$_sgre" in '' | *[!0-9]*) _sgre=0 ;; esac
+    case "$_sgrn" in *[!0-9]*) _sgrn="" ;; esac
+  fi
+  if [ -n "$_sgrn" ]; then
+    [ "$((_sgn - _sgre))" -ge "$(kb_retry_backoff "$_sgrn" "$_sgrc")" ] || return 1 # back-off hold
+    [ "$_sgrn" -lt "$KB_FLUSH_RETRY_GIVEUP" ] && return 0                            # retry due
+    [ "$_sgd" -ge "$KB_FLUSH_STOP_MIN_BYTES" ] && [ "$((_sgn - _sgl))" -ge "$KB_FLUSH_STOP_MIN_INTERVAL" ] && return 0
+    return 1 # given up: the age path is suppressed
+  fi
+  [ "$_sgd" -ge "$KB_FLUSH_STOP_MIN_BYTES" ] && [ "$((_sgn - _sgl))" -ge "$KB_FLUSH_STOP_MIN_INTERVAL" ] && return 0
+  [ "$_sgd" -ge "$KB_FLUSH_STOP_MIN_BYTES_AGED" ] && [ "$((_sgn - _sgl))" -ge "$KB_FLUSH_STOP_MAX_AGE" ] && return 0
+  return 1
+}
+
+# The sweep PIGGYBACK (hybrid_v1 s2.5): from any hook firing on a bearer box, at
+# most once per KB_SWEEP_INTERVAL (0 = off), touch STATE/.sweep.trigger — a
+# CLOSED Stop touches it too, so the sweep can see the box is alive — and, when
+# the installed backfill understands --auto, detach one sweep run. The touch
+# comes BEFORE the detach so the Backfill firings it provokes cannot re-trigger
+# it. Cost on the hot path: one stat. Never from a Backfill firing itself.
+kb_sweep_trigger() {
+  [ "$EV" = Backfill ] && return 0
+  [ "$KB_SWEEP_INTERVAL" -gt 0 ] 2>/dev/null || return 0
+  { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } || return 0
+  _swt="$STATE/.sweep.trigger"
+  _swm=$(stat -c %Y "$_swt" 2>/dev/null || stat -f %m "$_swt" 2>/dev/null || echo 0)
+  case "$_swm" in '' | *[!0-9]*) _swm=0 ;; esac
+  [ "$(($(kb_now) - _swm))" -ge "$KB_SWEEP_INTERVAL" ] || return 0
+  touch "$_swt" 2>/dev/null || return 0
+  _swb="$HOOKDIR/kb-flush-backfill.sh"
+  [ -f "$_swb" ] && grep -q -- '--auto' "$_swb" 2>/dev/null || return 0
+  "$DETACH" bash "$_swb" --auto </dev/null >>"$LOG" 2>&1 &
+  # Never a job of THIS shell: under KB_FLUSH_FOREGROUND=1 (DETACH=env) the
+  # arms' trailing `wait` would otherwise block on the whole sweep run too.
+  disown 2>/dev/null || true
+  return 0
+}
+
+# Stop and SessionEnd never host the token auto-mint (C5): the Stop parent is
+# budgeted at 3 s and a terminal firing is not the moment for a 45 s `uv run`.
+# PreCompact (and Backfill) still mint — in the detached CHILD, never here.
+KB_FLUSH_NO_MINT="${KB_FLUSH_NO_MINT:-}"
+case "$EV" in Stop | SessionEnd) KB_FLUSH_NO_MINT=1 ;; esac
+export KB_FLUSH_NO_MINT
+kb_sweep_trigger
+if [ "$EV" = Stop ]; then
+  kb_stop_gate || exit 0 # closed: zero network, no log line, nothing computed below
+  # Open: stamp .gate BEFORE the detach. The child writes .last when its drain
+  # starts; a .gate left newer than .last is the "killed before detach" signal.
+  printf '%s' "$(kb_now)" >"$OFF_GATE.t" 2>/dev/null && mv "$OFF_GATE.t" "$OFF_GATE" 2>/dev/null || true
+fi
 
 # Project = pinned ONCE per session from the transcript's first cwd record (C4),
 # cached in STATE/<okey>.project. Falls back to the firing-time derivation (the
@@ -746,38 +898,48 @@ export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-}"
 # PROJECT_BY (record|kbproject|gitfirst|firing) and PROJECT_MINTABLE.
 kb_pin_project
 [ -z "$PROJECT" ] && PROJECT=sessions
-PROJECT_MTIME=$(stat -c %Y "$T" 2>/dev/null || stat -f %m "$T" 2>/dev/null || echo 0)
-case "$PROJECT_MTIME" in '' | *[!0-9]*) PROJECT_MTIME=0 ;; esac
-MTIME="$PROJECT_MTIME"
-BOX="${KB_BOX:-$(hostname 2>/dev/null || uname -n 2>/dev/null || echo box)}"
-BOX=$(printf '%s' "$BOX" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)
-# Git context for code_ref anchoring: kb_ingest_session accepts repo/branch/
-# commit and the drain stamps a code_ref from them. Local plumbing reads only
-# (ms-cheap, no network); a non-git CWD degrades silently to empty. The network
-# arg builders append them as extra kb_json_build triples — empty fields are
-# OMITTED entirely (never sent as "").
-REPO=$(git -C "${CWD:-.}" remote get-url origin 2>/dev/null)
-[ -n "$REPO" ] || REPO=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null)
-REPO=${REPO%/}
-REPO=${REPO%.git}
-REPO=${REPO##*/}
-REPO=${REPO##*:}
-BRANCH=$(git -C "${CWD:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null)
-[ "$BRANCH" = "HEAD" ] && BRANCH="" # detached HEAD names no branch
-COMMIT=$(git -C "${CWD:-.}" rev-parse --short HEAD 2>/dev/null)
-# Hook provenance for the fleet: the manifest version install.sh stamped into
-# ~/.claude/hooks/.setup-version rides the REST payload as hook_version, so the
-# queue row's meta can say WHICH shipped assets produced a submission (the same
-# additive-meta pattern as submitted_by; the server ignores the field until it
-# learns it). SHAPE-CHECKED like every other value we put on the wire: the stamp
-# is a 12-hex content digest, and anything else is treated as absent. Absence is
-# itself the signal -- old hook code and unverified installs simply never stamp.
-HOOKVER=$(head -n1 "$HOME/.claude/hooks/.setup-version" 2>/dev/null | tr -d ' \r')
-case "$HOOKVER" in
-  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
-  *) HOOKVER="" ;;
-esac
-LOG="$HOME/.claude/hooks/flush-session.log"
+# THE DRAIN CONTEXT IS COMPUTED IN THE CHILD (C5, DO-NOT-DO s7: no git work in
+# the Stop parent). Every value below rides only the request body, so nothing in
+# the parent needs it; on Git Bash each `git` spawn is 100-300 ms (seconds under
+# Defender or a dead mount) and a Stop parent past its 3 s budget is killed --
+# which leaves .gate newer than .last and backs the gate off for an interval.
+# The names are still EXPORTED from here (empty) so the funnel's export-class
+# guard keeps them in its set: a child that forgot to call kb_drain_context
+# would send no git context rather than a stale one.
+REPO=""; BRANCH=""; COMMIT=""; HOOKVER=""; MTIME=0; BOX=""
+kb_drain_context() { # sets REPO BRANCH COMMIT HOOKVER MTIME BOX from the exported T/CWD
+  MTIME=$(stat -c %Y "$T" 2>/dev/null || stat -f %m "$T" 2>/dev/null || echo 0)
+  case "$MTIME" in '' | *[!0-9]*) MTIME=0 ;; esac
+  BOX="${KB_BOX:-$(hostname 2>/dev/null || uname -n 2>/dev/null || echo box)}"
+  BOX=$(printf '%s' "$BOX" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-64)
+  # Git context for code_ref anchoring: kb_ingest_session accepts repo/branch/
+  # commit and the drain stamps a code_ref from them. Local plumbing reads only
+  # (no network); a non-git CWD degrades silently to empty. The arg builders
+  # append them as extra kb_json_build triples -- empty fields are OMITTED
+  # entirely (never sent as "").
+  REPO=$(git -C "${CWD:-.}" remote get-url origin 2>/dev/null)
+  [ -n "$REPO" ] || REPO=$(git -C "${CWD:-.}" rev-parse --show-toplevel 2>/dev/null)
+  REPO=${REPO%/}
+  REPO=${REPO%.git}
+  REPO=${REPO##*/}
+  REPO=${REPO##*:}
+  BRANCH=$(git -C "${CWD:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  [ "$BRANCH" = "HEAD" ] && BRANCH="" # detached HEAD names no branch
+  COMMIT=$(git -C "${CWD:-.}" rev-parse --short HEAD 2>/dev/null)
+  # Hook provenance for the fleet: the manifest version install.sh stamped into
+  # ~/.claude/hooks/.setup-version rides the REST payload as hook_version, so the
+  # queue row's meta can say WHICH shipped assets produced a submission (the same
+  # additive-meta pattern as submitted_by; the server ignores the field until it
+  # learns it). SHAPE-CHECKED like every other value we put on the wire: the
+  # stamp is a 12-hex content digest, anything else is treated as absent, and
+  # absence is itself the signal -- old hook code and unverified installs never stamp.
+  HOOKVER=$(head -n1 "$HOME/.claude/hooks/.setup-version" 2>/dev/null | tr -d ' \r')
+  case "$HOOKVER" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) : ;;
+    *) HOOKVER="" ;;
+  esac
+}
+export -f kb_drain_context
 # EVERY variable the detached children read must be EXPORTED. The children are
 # `setsid/nohup bash -c '<single-quoted>'` — a FRESH shell that inherits only the
 # environment, so a var set in this parent but not exported expands to EMPTY
@@ -828,18 +990,55 @@ kb_curl_auth_config() { # -> curl config on stdout
 }
 export -f kb_curl_auth_config
 
+# THE REST SUBMISSION (C6, Appendix G). ONE function, used by the first attempt
+# and the script-level retry alike, so the two can never drift apart; it runs in
+# the detached child. `--retry` covers timeouts and 408/429/5xx; KB_CURL_RETRY_ALL
+# (probed in the CHILD: `--retry-all-errors` on curl >= 7.71, else empty) extends
+# it to connection failures — curl (6)/(7), which were 30 of the 36 real failures.
+# `--max-time` resets per retry; `--retry-max-time` bounds the whole chain.
+# RE-POSTING IS SAFE ONLY AGAINST THE DEDUPING /api/ingest-session. Never copy this line to a non-idempotent endpoint.
+# NO connect timeout option: on Git Bash/Schannel it aborts healthy slow requests (KB 1195). NO fail option: 401/403 must not be retried.
+# shellcheck disable=SC2086
+kb_rest_post() { # <body-file> <response-file> -> http code on stdout (000 = no response)
+  kb_curl_auth_config | curl -sS -K - -o "$2" -w "%{http_code}" \
+    --max-time "${KB_FLUSH_CURL_MAX:-60}" --retry "${KB_FLUSH_CURL_RETRY:-2}" --retry-delay 3 \
+    --retry-max-time "${KB_FLUSH_CURL_RETRY_MAX:-30}" $KB_CURL_RETRY_ALL \
+    -X POST "$KB_REST_URL/api/ingest-session" -H "Content-Type: application/json" --data @"$1"
+}
+export -f kb_rest_post
+
+# The retry marker is removed ONLY by a drain whose final offset reached the
+# end the marker recorded (Appendix D; field 4 = the failed chunk's end byte). Re-read at the end of the drain, so a
+# marker another firing wrote meanwhile (a lock-deferred SessionEnd) is judged on
+# ITS size, not on whatever this drain saw when it started.
+kb_retry_clear() { # <final offset>
+  [ -s "$OFF_RETRY" ] || return 0
+  _rcs=$(awk 'NR == 1 { print $4 }' "$OFF_RETRY" 2>/dev/null)
+  case "$_rcs" in '' | *[!0-9]*) _rcs=0 ;; esac
+  [ "${1:-0}" -ge "$_rcs" ] && rm -f "$OFF_RETRY"
+  return 0
+}
+export -f kb_retry_clear
+
 # Opportunistic housekeeping — bound our OWN log growth so a daily-driver machine
-# doesn't accumulate an unrotated multi-MB log. Offsets are NEVER deleted here
+# doesn't accumulate an unrotated multi-MB log. Runs in the detached CHILD (C5:
+# nothing but the gate, the pin and the token file in the Stop parent) and
+# rewrites the log IN PLACE (truncate + refill the same inode): the child's own
+# `>>"$LOG"` descriptor and every sibling's stay valid, where a mv would leave
+# them appending to an unlinked file. Offsets are NEVER deleted here
 # (KB-FLUSH-LINEAGE never-delete-offsets v2): the 30-day `find … -delete` is gone
 # and its job moved to kb_state_sweep (C8) in the detached child, which retires a
 # session's state ONLY once its transcript is gone under both config roots.
-if [ -f "$LOG" ]; then
-  LSIZE=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || wc -c <"$LOG" | tr -d " ")
-  case "$LSIZE" in "" | *[!0-9]*) LSIZE=0 ;; esac
-  if [ "$LSIZE" -gt 1048576 ]; then
-    tail -n 500 "$LOG" >"$LOG.t" 2>/dev/null && mv "$LOG.t" "$LOG" 2>/dev/null || rm -f "$LOG.t" 2>/dev/null
-  fi
-fi
+kb_log_rotate() {
+  [ -f "$LOG" ] || return 0
+  _lrs=$(stat -c%s "$LOG" 2>/dev/null || stat -f%z "$LOG" 2>/dev/null || wc -c <"$LOG" | tr -d " ")
+  case "$_lrs" in "" | *[!0-9]*) _lrs=0 ;; esac
+  [ "$_lrs" -gt 1048576 ] || return 0
+  tail -n 500 "$LOG" >"$LOG.t" 2>/dev/null && cat "$LOG.t" >"$LOG" 2>/dev/null
+  rm -f "$LOG.t" 2>/dev/null
+  return 0
+}
+export -f kb_log_rotate
 
 # ---------------------------------------------------------- per-project token
 # A machine writing several projects should carry one NARROW, revocable
@@ -872,8 +1071,34 @@ PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || tr
 # NEVER auto-mint for a slug that came from $HOME, $TMPDIR, /tmp or a non-git
 # dir (C4): PROJECT_MINTABLE is set by kb_pin_project and is 1 only for a real
 # git-root project. A firing-derived or ephemeral slug must not spawn a token.
-if [ -z "$PROJ_TOKEN" ] && [ -z "${KB_TOKEN:-}" ] && [ -d "${KB_REPO:-/nonexistent}" ] && [ "${PROJECT_MINTABLE:-0}" = 1 ]; then
-  MINTED=$(cd "$KB_REPO" 2>/dev/null && timeout 45 uv run python - "$PROJECT" "$(hostname 2>/dev/null || echo this-machine)" <<'MINTPY' 2>/dev/null
+# THE MINT RUNS IN THE DETACHED CHILD (C5): the 45 s `uv run` used to sit in the
+# hook parent, which is fine under a 300 s PreCompact budget and fatal under the
+# 3 s Stop one. The parent only decides ELIGIBILITY (a bearer transport with no
+# token at all, an owner repo, a mintable slug, and not a Stop/SessionEnd firing);
+# the child mints, stores, then drains with the new token in the same breath.
+MINT_ELIGIBLE=0
+if [ -z "$PROJ_TOKEN" ] && [ -z "${KB_TOKEN:-}" ] && [ -z "${KB_FLUSH_NO_MINT:-}" ] &&
+  [ -d "${KB_REPO:-/nonexistent}" ] && [ "${PROJECT_MINTABLE:-0}" = 1 ] &&
+  { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; }; then
+  MINT_ELIGIBLE=1
+fi
+# The mint is DEFERRED, not refused, when the only thing standing between this
+# firing and a mint is the event: the owner box (repo present), a bearer
+# transport, no token yet, and a Stop/SessionEnd (KB_FLUSH_NO_MINT). The next
+# PreCompact or Backfill firing decides (and mints, or says NEEDS TOKEN); saying
+# NEEDS TOKEN / NOT CONFIGURED here would have the pre-brief tell the owner to
+# mint by hand for a project the hook mints itself. Mintability of the slug is
+# not consulted (it is the mint's own check, skipped under NO_MINT to spare the
+# Stop parent a git call), so a $HOME-launched session gets its NEEDS TOKEN line
+# from that later firing instead of from this one.
+MINT_DEFERRED=0
+if [ -z "$PROJ_TOKEN" ] && [ -z "${KB_TOKEN:-}" ] && [ -n "${KB_FLUSH_NO_MINT:-}" ] && [ -z "${KB_DIR:-}" ] &&
+  [ -d "${KB_REPO:-/nonexistent}" ] && { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; }; then
+  MINT_DEFERRED=1 # never on a LOCAL box (KB_DIR wins the transport choice and needs no token)
+fi
+kb_mint_token() { # -> 0 with KB_TOKEN set (and stored, mode 600); 1 when nothing was minted
+  [ "${MINT_ELIGIBLE:-0}" = 1 ] || return 1
+  _mtd=$(cd "$KB_REPO" 2>/dev/null && kb_timeout 45 uv run python - "$PROJECT" "$(hostname 2>/dev/null || echo this-machine)" <<'MINTPY' 2>/dev/null
 import sys
 project, machine = sys.argv[1], sys.argv[2]
 try:
@@ -883,45 +1108,80 @@ try:
 except Exception:
     sys.exit(1)
 MINTPY
-)
-  if [ -n "$MINTED" ]; then
+  )
+  [ -n "$_mtd" ] || return 1
+  (
     umask 077
     touch "$TOKENS" 2>/dev/null || true
     chmod 600 "$TOKENS" 2>/dev/null || true
     # Replace any stale line: issue() REVOKES the previous credential for this
     # (project, machine), so an old line would shadow the live one with a dead token.
     if [ -f "$TOKENS" ]; then
-      grep -v "^KB_TOKEN_${PROJ_KEY}=" "$TOKENS" > "$TOKENS.t" 2>/dev/null && mv "$TOKENS.t" "$TOKENS"
+      grep -v "^KB_TOKEN_${PROJ_KEY}=" "$TOKENS" >"$TOKENS.t" 2>/dev/null && mv "$TOKENS.t" "$TOKENS"
     fi
-    printf 'KB_TOKEN_%s=%s\n' "$PROJ_KEY" "$MINTED" >> "$TOKENS"
+    printf 'KB_TOKEN_%s=%s\n' "$PROJ_KEY" "$_mtd" >>"$TOKENS"
     chmod 600 "$TOKENS" 2>/dev/null || true
-    PROJ_TOKEN="$MINTED"
-    # The token is NEVER logged — only that one now exists.
-    echo "$(date -Is) flush $PROJECT auto-minted a project token (stored in $TOKENS, mode 600)" >>"$LOG"
-  fi
-fi
+  )
+  KB_TOKEN="$_mtd"
+  export KB_TOKEN
+  # The token is NEVER logged — only that one now exists.
+  echo "$(date -Is) flush $PROJECT auto-minted a project token (stored in $TOKENS, mode 600)" >>"$LOG"
+  return 0
+}
+export -f kb_mint_token
+export TOKENS PROJ_KEY KB_REPO MINT_ELIGIBLE
 
 if [ -n "$PROJ_TOKEN" ]; then
   KB_TOKEN="$PROJ_TOKEN"
-  KB_TOKEN_SOURCE="project token for $PROJECT"
-else
-  KB_TOKEN_SOURCE="shared KB_TOKEN"
 fi
 
 # A machine that has per-project tokens but none for THIS project is not
 # misconfigured in general — it just has not been given access to this one yet.
 # Say exactly that, and exactly how to fix it, rather than failing later with an
-# opaque 403. Rate-limited like the other NOT CONFIGURED lines.
-if [ -z "${KB_TOKEN:-}" ] && [ -f "$TOKENS" ]; then
-  STAMP="$HOME/.claude/hooks/state/.notoken-$PROJECT.stamp"
-  mkdir -p "$HOME/.claude/hooks/state" 2>/dev/null || true
-  NOW=$(date +%s 2>/dev/null || echo 0)
-  LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
-  case "$LAST" in ''|*[!0-9]*) LAST=0 ;; esac
-  if [ "$((NOW - LAST))" -ge 3600 ]; then
-    printf '%s\n' "$NOW" >"$STAMP" 2>/dev/null || true
+# opaque 403. Rate-limited like the other NOT CONFIGURED lines. Returns 1 when
+# there is no token file at all (the generic NOT CONFIGURED notice applies then).
+# Called by the parent when no mint is possible, by the child when one failed.
+kb_no_token_notice() {
+  [ -f "$TOKENS" ] || return 1
+  _nts="$STATE/.notoken-$PROJECT.stamp"
+  mkdir -p "$STATE" 2>/dev/null || true
+  _ntn=$(kb_now)
+  _ntl=$(cat "$_nts" 2>/dev/null || echo 0)
+  case "$_ntl" in '' | *[!0-9]*) _ntl=0 ;; esac
+  if [ "$((_ntn - _ntl))" -ge 3600 ]; then
+    printf '%s\n' "$_ntn" >"$_nts" 2>/dev/null || true
     echo "$(date -Is) flush $PROJECT NEEDS TOKEN: no KB_TOKEN_$PROJ_KEY in $TOKENS and no shared KB_TOKEN, so this session was NOT captured. Ask the KB for one: kb_project_token(project=\"$PROJECT\", machine=\"$(hostname 2>/dev/null || echo this-machine)\") — then add the printed line to $TOKENS" >>"$LOG"
   fi
+  return 0
+}
+export -f kb_no_token_notice
+# NO transport is configured (no KB_DIR, no KB_MCP_URL/KB_REST_URL+KB_TOKEN, no
+# CONNECTOR). Without this the hook fell off the end and exited 0 in SILENCE:
+# the machine captured nothing, forever, with no signal anywhere — and because
+# the SessionStart pre-brief surfaces failures by grepping THIS log, its warning
+# stayed silent too. That breaks the skill's own never-silent-failure guarantee.
+# Found by tests/hookrig case 12. Rate-limited to one line an hour so a
+# deliberately-unconfigured box does not spam the log on every firing.
+kb_notconfigured_notice() {
+  _ncs="$STATE/.notconfigured.stamp"
+  _ncn=$(kb_now)
+  _ncl=$(cat "$_ncs" 2>/dev/null || echo 0)
+  case "$_ncl" in '' | *[!0-9]*) _ncl=0 ;; esac
+  if [ "$((_ncn - _ncl))" -ge 3600 ]; then
+    printf '%s\n' "$_ncn" >"$_ncs" 2>/dev/null || true
+    echo "$(date -Is) flush $PROJECT NOT CONFIGURED: no transport in $CFG (set KB_DIR, or KB_MCP_URL/KB_REST_URL + KB_TOKEN, or KB_CONNECTOR=1) — this session was NOT captured" >>"$LOG"
+  fi
+  return 0
+}
+export -f kb_notconfigured_notice
+if [ "$MINT_DEFERRED" = 1 ]; then
+  # Not a dropped-session token (FAILED / NEEDS TOKEN / NOT CONFIGURED): the
+  # bytes stay pending behind the offset and the next mint-capable firing sends
+  # them. One line per firing; an open Stop gate already rate-limits itself.
+  echo "$(date -Is) flush $PROJECT no token yet: the auto-mint is deferred to the next PreCompact/Backfill firing (never on Stop/SessionEnd) ev=$EV sid=$SIDS" >>"$LOG"
+  exit 0
+fi
+if [ -z "${KB_TOKEN:-}" ] && [ "${MINT_ELIGIBLE:-0}" != 1 ] && kb_no_token_notice; then
   # Stop here rather than falling through to the generic NOT CONFIGURED branch.
   # Both lines are true, but the pre-brief shows the LAST failure, and "you need
   # a token for this project, run this to get one" is the one the user can act
@@ -935,6 +1195,7 @@ if [ -n "${KB_DIR:-}" ]; then
   UV="${UV:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
   export KB_DIR UV
   "$DETACH" bash -c '
+    kb_drain_context; kb_log_rotate   # git context + log bound: CHILD work, never the Stop parent (C5)
     echo "$(date -Is) local $PROJECT $T"
     cd "$KB_DIR" 2>/dev/null || { echo "$(date -Is) local $PROJECT BUG: KB_DIR unreachable ($KB_DIR)"; exit 0; }
     set --   # git-context flags for code_ref — empty values omitted entirely
@@ -953,7 +1214,8 @@ if [ -n "${KB_DIR:-}" ]; then
       echo "$(date -Is) local $PROJECT FAILED: kb ingest-session errored"
     fi
   ' </dev/null >>"$LOG" 2>&1 &
-elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TOKEN:-}" ]; then
+  [ "${KB_FLUSH_FOREGROUND:-0}" = 1 ] && wait
+elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_TOKEN:-}" ] || [ "${MINT_ELIGIBLE:-0}" = 1 ]; }; then
   # MCP or REMOTE: submit the delta over the network, CHUNKED. Large sessions
   # (up to 1 GB) are sent on an ABSOLUTE lattice cut at line boundaries (C2);
   # the per-session byte offset advances after EACH accepted chunk, so a failure
@@ -964,15 +1226,28 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
   HELPER="$HOOKDIR/kb-mcp-call.sh"
   export KB_MCP_URL="${KB_MCP_URL:-}" KB_REST_URL="${KB_REST_URL:-}" KB_TOKEN OFFF OKEY HELPER EV
   "$DETACH" bash -c '
+    kb_drain_context; kb_log_rotate   # git context + log bound: CHILD work, never the Stop parent (C5)
+    # TOKEN AUTO-MINT lives HERE (C5), never in the hook parent. MINT_ELIGIBLE was
+    # decided up top; a failed mint says NEEDS TOKEN / NOT CONFIGURED as before.
+    if [ -z "$KB_TOKEN" ]; then
+      kb_mint_token || { kb_no_token_notice || kb_notconfigured_notice; exit 0; }
+    fi
     CHUNK="$KB_FLUSH_CHUNK"; SEND_MAX="$KB_FLUSH_SEND_MAX"; MAX_PER_FIRING="$KB_FLUSH_MAX"
     [ "$EV" = "SessionEnd" ] && MAX_PER_FIRING=1099511627776   # terminal firing: drain all
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
     # ONE drain at a time. A held lock is NOT a loss any more — the offset is
     # never deleted, so the next Stop/PreCompact or the sweep resumes the delta.
     if ! kb_lock_take "$OKEY"; then
-      [ "$EV" = "SessionEnd" ] && echo "$(date -Is) flush $PROJECT SessionEnd deferred (lock held by a running drain) — the next Stop or the sweep resumes it ev=$EV sid=$SIDS"
+      if [ "$EV" = "SessionEnd" ]; then
+        echo "$(date -Is) flush $PROJECT SessionEnd deferred (lock held by a running drain) — the next Stop or the sweep resumes it ev=$EV sid=$SIDS"
+        # A deferred TERMINAL firing leaves a retry marker (n=0: nothing FAILED,
+        # code=lock) so a resumed session finishes the tail on its first due Stop.
+        [ -s "$OFF_RETRY" ] || { printf "%s 0 lock %s" "$(kb_now)" "$(_fsize "$T")" >"$OFF_RETRY.t" 2>/dev/null && mv "$OFF_RETRY.t" "$OFF_RETRY" 2>/dev/null; }
+      fi
       exit 0
     fi
+    # .last = the Stop gate rate-limit clock, written by ANY drain start (C5).
+    printf "%s" "$(kb_now)" >"$OFF_LAST.t" 2>/dev/null && mv "$OFF_LAST.t" "$OFF_LAST" 2>/dev/null
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
     # SIZE=0 is UNREADABLE, not shrank (V1-m4): a failed stat must never clobber
     # a good checkpoint down to 0. Do not drain, do not write the offset.
@@ -984,8 +1259,30 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     # shrank. A refusal (unseeded pre-stamp transcript) returns 1 -> exit 0.
     BRANCH_OF=""
     kb_decide_offset || exit 0
-    [ "$SIZE" -le "$OFFSET" ] && exit 0
-    SENT=0; DUP=0
+    [ "$SIZE" -le "$OFFSET" ] && { kb_retry_clear "$OFFSET"; exit 0; }
+    SENT=0; DUP=0; FAILED_THIS=0; HELD=0
+    # RETRY MARKER (C6, Appendix D): <epoch> <n> <code> <end>. n counts
+    # consecutive FAILED drains; <end> is where the FAILED chunk ended (its
+    # offset + bytes, never the file size: a size recorded after the file grew
+    # past the cell edge would make the next retry cut a DIFFERENT window and
+    # hand the server a row overlapping the one it may already hold). <end>
+    # caps this drain FIRST window, so a chunk whose 202 was lost on the wire
+    # is re-cut byte-identically and the server answers duplicate:true (the
+    # lattice guarantees the cut for every cell but the EOF one, which the cap
+    # restores). A deferred SessionEnd writes the file size instead (nothing
+    # was cut) -- the HELD-at-EOF clear below covers its trailing partial line.
+    RETRY_N=0; RETRY_END=0
+    if [ -s "$OFF_RETRY" ]; then
+      read -r _re RETRY_N _rc RETRY_END _rx <"$OFF_RETRY" 2>/dev/null || true
+      case "$RETRY_N" in ""|*[!0-9]*) RETRY_N=0 ;; esac
+      case "$RETRY_END" in ""|*[!0-9]*) RETRY_END=0 ;; esac
+    fi
+    CAP1=0; [ "$RETRY_END" -gt "$OFFSET" ] && [ "$RETRY_END" -lt "$SIZE" ] && CAP1="$RETRY_END"
+    # Probed in the CHILD so the parent never pays for it: curl >= 7.71 retries
+    # connection failures only with --retry-all-errors. Safe ONLY because the
+    # endpoint dedupes (see kb_rest_post) — never copy this to another call.
+    KB_CURL_RETRY_ALL=""
+    if [ -z "$KB_MCP_URL" ] && curl --help all 2>/dev/null | grep -q -- --retry-all-errors; then KB_CURL_RETRY_ALL=--retry-all-errors; fi
     set --   # git context, appended to every request body; empty fields omitted
     # THE SESSION IDENTITY. Every chunk of one session must carry the same value
     # or the server cannot tell that 45 rows are one conversation: it then runs
@@ -1022,6 +1319,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
       LK=$(( OFFSET / CHUNK + 1 ))
       while :; do
         EDGE=$(( LK * CHUNK )); [ "$EDGE" -gt "$SIZE" ] && EDGE=$SIZE
+        [ "$CAP1" -gt 0 ] && [ "$EDGE" -gt "$CAP1" ] && EDGE=$CAP1   # retry: the first window ends where the failed one did
         tail -c +$((OFFSET+1)) "$T" | head -c $((EDGE - OFFSET)) >"$TMPC"
         BYTES=$(_fsize "$TMPC")
         [ "$BYTES" -gt 0 ] || { HELD=2; break; }
@@ -1034,10 +1332,13 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           break                                        # trimmed to the last \n < EDGE
         elif [ "$EDGE" -ge "$SIZE" ]; then
           HELD=2; break                                # partial last line at EOF: HELD on EVERY bearer event
+        elif [ "$CAP1" -gt 0 ] && [ "$EDGE" -ge "$CAP1" ]; then
+          CAP1=0                                       # the capped window holds no whole line: drop the cap, cut normally
         else
           LK=$((LK + 1))                               # line at OFFSET straddles the edge: widen one cell
         fi
       done
+      CAP1=0                                           # only the FIRST window of a retry drain is capped
       if [ "$HELD" = 2 ]; then rm -f "$TMPC"; break; fi
       # OVERSIZE (> SEND_MAX): a > 250 KB straddle or a giant line. Trim to the
       # last \n <= OFFSET+SEND_MAX; if that leaves nothing, send OFFSET..+SEND_MAX
@@ -1068,6 +1369,10 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
           rm -f "$TMPC.args" "$TMPC"; break
         fi
+        # CODE=err is deliberately OFF the transient set: the helper folds auth,
+        # transport and tool rejections (bad project, queue full, oversize) into
+        # one failure, so the retry marker and the Stop back-off are REST-only;
+        # an MCP failure is resumed by the next PreCompact/SessionEnd/sweep.
         bash "$HELPER" kb_ingest_session "@$TMPC.args" >/dev/null 2>>"$LOG" && CODE=202 || CODE=err
         rm -f "$TMPC.args"
       else
@@ -1094,13 +1399,21 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           echo "$(date -Is) flush $PROJECT BUG: request body build failed (empty/invalid) at offset $OFFSET — NOT submitted, will retry"
           rm -f "$BODYF" "$TMPC"; break
         fi
-        CODE=$(kb_curl_auth_config | curl -sS -K - -o "$TMPC.resp" -w "%{http_code}" --max-time 30 \
-             -X POST "$KB_REST_URL/api/ingest-session" \
-             -H "Content-Type: application/json" \
-             --data @"$BODYF")
-        # A flaked response read (000) whose body still carries a queue id was
-        # ACCEPTED by the server (KB item 497) — count it as success.
-        case "$CODE" in 2*) : ;; *) grep -q "queue_id" "$TMPC.resp" 2>/dev/null && CODE=202 ;; esac
+        # kb_rest_post holds THE curl line (Appendix G: --max-time/--retry/
+        # --retry-delay/--retry-max-time, no connect timeout, no fail flag). On a
+        # transient answer (000, 5xx, 408, 429, 52x, 530) the SAME body is posted
+        # ONCE more after 5 s — byte-identical, so a 202 that was lost on the
+        # wire comes back duplicate:true. 401/403/4xx are configuration: never
+        # retried, never a marker (Stop must not hammer a misconfigured box).
+        ATTEMPT=0
+        while :; do
+          ATTEMPT=$((ATTEMPT + 1))
+          CODE=$(kb_rest_post "$BODYF" "$TMPC.resp")
+          # A flaked response read (000) whose body still carries a queue id was
+          # ACCEPTED by the server (KB item 497) — count it as success.
+          case "$CODE" in 2*) : ;; *) grep -q "queue_id" "$TMPC.resp" 2>/dev/null && CODE=202 ;; esac
+          case "$CODE" in 000|5??|408|429|52?|530) [ "$ATTEMPT" -lt 2 ] || break; sleep 5 ;; *) break ;; esac
+        done
         # Count chunks the server answered as already-present, for the dup= tally.
         # (Double-quoted pattern: this whole drain is one single-quoted bash -c, so
         # a single-quoted grep pattern with a space/glob would break the quoting.)
@@ -1114,9 +1427,25 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
           # (the holder was reclaimed) means another drain is authoritative now,
           # so it logs "lock lost — stopping" and exits rather than rewinding.
           OFFSET=$((OFFSET + BYTES)); kb_offset_write "$OFFSET"; SENT=$((SENT + BYTES)); kb_lock_touch ;;
-        *) echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume"; break ;;
+        000|5??|408|429|52?|530)
+          # Both chains failed: the marker records this drain (n+1), the code and
+          # the failed chunk END (offset + bytes -- a capped retry that fails
+          # again keeps the SAME end, so every retry re-cuts the same window);
+          # the Stop gate backs off min(RETRY_MAX, BASE * 2^(n-1)), 429/503 the max.
+          FAILED_THIS=1; RETRY_N=$((RETRY_N + 1))
+          printf "%s %s %s %s" "$(kb_now)" "$RETRY_N" "$CODE" "$((OFFSET + BYTES))" >"$OFF_RETRY.t" 2>/dev/null && mv "$OFF_RETRY.t" "$OFF_RETRY" 2>/dev/null
+          echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume retry#$RETRY_N ev=$EV sid=$SIDS"; break ;;
+        *) FAILED_THIS=1; echo "$(date -Is) flush $PROJECT chunk FAILED ($CODE) at offset $OFFSET — will resume ev=$EV sid=$SIDS"; break ;;
       esac
     done
+    # The marker outlives every drain that did not reach the end it recorded. A
+    # drain that stopped only because the trailing partial line is HELD at EOF
+    # has sent every complete line there is: judge it on SIZE, or a marker that
+    # recorded a file size ending mid-line (a deferred SessionEnd) would re-open
+    # the Stop gate every turn until the line completes.
+    if [ "$FAILED_THIS" != 1 ]; then
+      if [ "$HELD" = 2 ]; then kb_retry_clear "$SIZE"; else kb_retry_clear "$OFFSET"; fi
+    fi
     # Truthful summary: only a FULLY drained firing (OFFSET>=SIZE) logs the
     # " ok bytes=" success line the pre-brief matches. A firing that broke early
     # (chunk FAILED, held partial line, or per-firing cap) logs a "partial" line
@@ -1136,6 +1465,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && [ -n "${KB_TO
     kb_lock_release
     kb_state_sweep
   ' </dev/null >>"$LOG" 2>&1 &
+  [ "${KB_FLUSH_FOREGROUND:-0}" = 1 ] && wait
 elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   # CONNECTOR: zero-config — uses the claude.ai KB connector bridged into
   # Claude Code (cloud-held OAuth; nothing local). A headless `claude -p` call
@@ -1159,6 +1489,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
   export KB_CONNECTOR_SESSION_MAX="${KB_CONNECTOR_SESSION_MAX:-2000000}"
   "$DETACH" bash -c '
     export KB_HOOK_GUARD=1   # children (claude -p) must not re-trigger KB hooks
+    kb_drain_context; kb_log_rotate   # git context + log bound: CHILD work, never the Stop parent (C5)
     _fsize() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null || wc -c <"$1" | tr -d " "; }
     # Losing the lock mid-session is fine (the other firing is draining). On the
     # TERMINAL firing it is not: there is no next firing, so whatever the winner
@@ -1337,22 +1668,9 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     kb_lock_release
     kb_state_sweep
   ' </dev/null >>"$LOG" 2>&1 &
+  [ "${KB_FLUSH_FOREGROUND:-0}" = 1 ] && wait
 else
-  # NO transport is configured (no KB_DIR, no KB_MCP_URL/KB_REST_URL+KB_TOKEN, no
-  # CONNECTOR). Without this branch the hook fell off the end and exited 0 in
-  # SILENCE: the machine captured nothing, forever, with no signal anywhere —
-  # and because the SessionStart pre-brief surfaces failures by grepping THIS
-  # log, its warning stayed silent too. That breaks the skill's own
-  # never-silent-failure guarantee. Found by tests/hookrig case 12.
-  # Rate-limited to one line an hour so a deliberately-unconfigured box does not
-  # spam the log on every PreCompact + SessionEnd.
-  STAMP="$STATE/.notconfigured.stamp"
-  NOW=$(date +%s 2>/dev/null || echo 0)
-  LAST=$(cat "$STAMP" 2>/dev/null || echo 0)
-  case "$LAST" in '' | *[!0-9]*) LAST=0 ;; esac
-  if [ "$((NOW - LAST))" -ge 3600 ]; then
-    printf '%s\n' "$NOW" >"$STAMP" 2>/dev/null || true
-    echo "$(date -Is) flush $PROJECT NOT CONFIGURED: no transport in $CFG (set KB_DIR, or KB_MCP_URL/KB_REST_URL + KB_TOKEN, or KB_CONNECTOR=1) — this session was NOT captured" >>"$LOG"
-  fi
+  # NO transport is configured: say so, loudly and rate-limited (case 12).
+  kb_notconfigured_notice
 fi
 exit 0

@@ -100,7 +100,7 @@ print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/nu
 }
 
 # 1. The manifest: {"version":"<12 hex>","files":{"<name>":"<sha256>",...},"count":N}
-MANIFEST=$(kb_curl_auth_config | curl -fsS -K - --connect-timeout 5 --max-time 20 \
+MANIFEST=$(kb_curl_auth_config | curl -fsS -K - --max-time 20 \
   "$BASE/api/setup/manifest.json" 2>/dev/null) || MANIFEST=""
 if [ -z "$MANIFEST" ]; then
   echo "update.sh: could not fetch $BASE/api/setup/manifest.json (server unreachable, or this credential was refused). Nothing changed." >&2
@@ -130,7 +130,7 @@ HAVE_SHA=1
 N=0
 while read -r NAME WANT; do
   [ -n "$NAME" ] || continue
-  if ! kb_curl_auth_config | curl -fsS -K - --connect-timeout 5 --max-time 60 \
+  if ! kb_curl_auth_config | curl -fsS -K - --max-time 60 \
     -o "$STAGE/$NAME" "$BASE/api/setup/$NAME" 2>/dev/null; then
     echo "update.sh: fetch FAILED for $NAME -- aborting, nothing changed." >&2
     exit 1

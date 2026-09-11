@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
-# CASE: kb-flush-backfill.sh -- the whole-box recovery sweep
-# PINS: every transcript ALREADY on a box can still be captured. The flush hook
-#       only ever sees the sessions that fire it, so anything it refused (8 of 22
-#       flushes on 2026-07-31 had no project token) and everything that predates
-#       the install is knowledge sitting on disk that the KB has never been told
-#       about. That recovery was done BY HAND once, hook-firing per transcript;
-#       this case pins the productised version.
-# ALSO PINS the three ways the sweep could quietly do damage:
+# CASE: kb-flush-backfill.sh -- the sweep on OFFSET ACCOUNTING (wave C item C7,
+#       KB 33784; root cause KB 33783). REWRITTEN 2026-09-11: the `.backfill-done`
+#       ledger is gone -- the hook's never-deleted checkpoint is the only record.
+# PINS: what leaves a box under the sweep is EXACTLY the bytes past each
+#       session's checkpoint, and nothing else:
+#         * a SEEDED transcript with a tail (offset 300 of N) -> only the tail
+#           leaves, byte for byte, under its own session identity;
+#         * a transcript with NO checkpoint that the hook's own rule would NOT
+#           send from 0 (here: no timestamp in its records, so undatable against
+#           .checkpoints-trusted-since) is `unknown`: listed, never sent by a
+#           bare --push (an older, offset-deleting hook may already have drained
+#           it) -- `--push --include-unknown` is the explicit, discouraged opt-in
+#           and is the positive control here. (A no-checkpoint transcript whose
+#           first record post-dates the stamp is `ready` at 0 -- case 33 §1c.)
+#         * a FLUSHED transcript (offset == size) sends nothing;
+#         * the old ledger file is INERT: a `.backfill-done` claiming a session
+#           fully accounted for changes nothing, and the sweep never rewrites it;
 #         * DRY RUN BY DEFAULT -- a bare invocation sends NOTHING and moves no
-#           offset, so "let me see what is missing" can never become a 40-session
-#           bulk submission by accident.
-#         * NEVER GUESSED INTO THE WRONG PROJECT -- the cwd comes from the
-#           transcript's OWN records. The directory slug is ambiguous (Claude Code
-#           replaces every '/' with '-', which a directory name containing a dash
-#           makes irreversible), so a transcript whose cwd cannot be recovered is
-#           reported SKIPPED with its reason. Misfiling one client's session under
-#           another's name is the confidentiality failure 'session:' already cost.
-#         * IDEMPOTENT -- the hook owns the offsets, so a second sweep sends
-#           nothing. Re-running a recovery must never duplicate knowledge.
+#           offset; a second --push is a no-op (idempotent, the hook owns the
+#           checkpoints); the hook is fed `hook_event_name=Backfill`, never
+#           SessionEnd (the log line says ev=Backfill);
+#         * NEVER GUESSED INTO THE WRONG PROJECT: a transcript whose cwd cannot
+#           be recovered is `skipped` with its reason;
+#         * --limit / --project keep working for the owner; a bad flag exits 1.
 #       Finally: it is NOT a hook. install.sh installs it and registers no event.
 . /rig/lib.sh
 
@@ -29,6 +34,8 @@ install_hooks >/dev/null
 BF="$HOOKS/kb-flush-backfill.sh"
 PROJDIR="$HOME/.claude/projects"
 WORK="$HOME/work"
+ST="$HOOKS/state"
+mkdir -p "$ST"
 
 slug_of() { printf '%s' "$1" | tr '/' '-'; } # exactly how Claude Code names the dir
 
@@ -61,14 +68,10 @@ count_ingest() { stub_count '.tool=="kb_ingest_session"'; }
 # ---------------------------------------------------------------- installation
 step "install.sh ships the sweep but registers NO hook event for it"
 if [ -x "$BF" ]; then pass "kb-flush-backfill.sh installed at $BF"; else fail "the sweep was not installed"; fi
-# `grep -c` PRINTS 0 and EXITS 1 on no match, so `|| echo 0` would emit "0\n0".
 REGISTERED=$(grep -c 'kb-flush-backfill' "$SETTINGS" 2>/dev/null) || REGISTERED=0
-assert_eq "0" "$REGISTERED" \
-  "settings.json registers no event for it (it is owner-run, not a hook)"
+assert_eq "0" "$REGISTERED" "settings.json registers no event for it (it is owner-run / timer-run, not a hook)"
 
 step "it carries the SAME portable block as the four hook scripts"
-# Case 26 diffs four copies and does not know about a fifth. Shell has no import,
-# so an unchecked copy is a copy that will drift.
 extract_block "$SKILL/install.sh" "$HOME/block.ref"
 extract_block "$BF" "$HOME/block.bf"
 if diff -u "$HOME/block.ref" "$HOME/block.bf" >"$HOME/blockdiff"; then
@@ -78,14 +81,12 @@ else
 fi
 
 # ------------------------------------------------------------------- the fixture
-# Four transcripts covering every state the sweep has to tell apart.
+# Four transcripts covering the states the sweep has to tell apart. Every mtime
+# is far in the past so the quiet window (KB_SWEEP_QUIET_SECONDS) never applies.
 mkdir -p "$WORK/alpha" "$WORK/beta" "$WORK/gamma"
 T_DONE=$(mk_session "$(slug_of "$WORK/alpha")" s-done 12 "$WORK/alpha")
 T_PART=$(mk_session "$(slug_of "$WORK/beta")" s-partial 20 "$WORK/beta")
 T_FRESH=$(mk_session "$(slug_of "$WORK/gamma")" s-fresh 15 "$WORK/gamma")
-# No cwd in ANY record, and a directory slug that decodes to a path which does
-# not exist on this box -> unrecoverable, and therefore skipped rather than
-# guessed.
 T_NOCWD=$(mk_session "-nowhere-under-this-box" s-nocwd 8 "")
 
 SZ_DONE=$(wc -c <"$T_DONE" | tr -d ' ')
@@ -94,36 +95,39 @@ SZ_FRESH=$(wc -c <"$T_FRESH" | tr -d ' ')
 SZ_NOCWD=$(wc -c <"$T_NOCWD" | tr -d ' ')
 REM_PART=$((SZ_PART - 300))
 
-mkdir -p "$HOOKS/state"
-printf '%s' "$SZ_DONE" >"$HOOKS/state/s-done.offset"  # fully flushed already
-printf '300' >"$HOOKS/state/s-partial.offset"         # flushed up to byte 300
+printf '%s' "$SZ_DONE" >"$ST/s-done.offset" # fully flushed already
+printf '300' >"$ST/s-partial.offset"        # flushed up to byte 300 (a line boundary is not required of the fixture)
+# The INERT ledger: claims s-partial is fully accounted for. Must change nothing.
+printf 's-partial\t%s\n' "$SZ_PART" >"$ST/.backfill-done"
+cp "$ST/.backfill-done" "$HOME/ledger.before"
 
-# Oldest first is the sweep order, so give the fixture a deterministic one.
 touch -d @1700000100 "$T_PART"
 touch -d @1700000200 "$T_FRESH"
 touch -d @1700000300 "$T_DONE"
 touch -d @1700000400 "$T_NOCWD"
 
 # ------------------------------------------------------------------- the dry run
-step "a bare invocation TABLES all four and sends nothing"
+step "a bare invocation TABLES all four on offset accounting and sends nothing"
 run_bf
 assert_eq "0" "$RC" "the sweep exits 0"
 assert_eq "alpha s-done $SZ_DONE $SZ_DONE 0 flushed" "$(bf_row s-done)" \
-  "an already-flushed session has no remainder"
+  "offset == size -> flushed, no remainder"
 assert_eq "beta s-partial $SZ_PART 300 $REM_PART ready" "$(bf_row s-partial)" \
-  "a partially flushed session offers only the bytes past its offset"
-assert_eq "gamma s-fresh $SZ_FRESH 0 $SZ_FRESH ready" "$(bf_row s-fresh)" \
-  "an untouched session offers the whole file"
-assert_eq "? s-nocwd $SZ_NOCWD 0 $SZ_NOCWD skipped" "$(bf_row s-nocwd)" \
+  "a seeded session offers ONLY the bytes past its checkpoint (the ledger is ignored)"
+assert_eq "gamma s-fresh $SZ_FRESH - $SZ_FRESH unknown" "$(bf_row s-fresh)" \
+  "no checkpoint and no timestamp (undatable against the trust stamp) -> unknown (never sent by the sweep on its own)"
+assert_eq "? s-nocwd $SZ_NOCWD - $SZ_NOCWD skipped" "$(bf_row s-nocwd)" \
   "an unrecoverable cwd is SKIPPED, not filed under a guessed project"
 assert_file_contains "$HOME/bf.out" "no cwd in the first" "and the skip states its reason"
+assert_file_contains "$HOME/bf.out" "no checkpoint" "the unknown row explains itself"
 assert_contains "$OUT" "DRY RUN" "the default run says it sent nothing"
-assert_contains "$OUT" "2 with unflushed bytes ($((REM_PART + SZ_FRESH)) bytes)" "the totals add up"
+assert_contains "$OUT" "1 with unflushed bytes ($REM_PART bytes)" "the ready total is the seeded tail only"
+assert_contains "$OUT" "1 unknown ($SZ_FRESH bytes, never swept -- see --seed)" "the unknown total is reported apart, with the way out"
 
 settle
 settle
 assert_eq "0" "$(stub_total)" "a DRY RUN made no transport call at all"
-assert_eq "300" "$(cat "$HOOKS/state/s-partial.offset")" "and moved no offset"
+assert_eq "300" "$(cat "$ST/s-partial.offset")" "and moved no offset"
 
 step "--project narrows the sweep to one project"
 run_bf --project beta
@@ -132,60 +136,74 @@ assert_eq "" "$(bf_row s-fresh)" "gamma is not"
 assert_eq "" "$(bf_row s-done)" "alpha is not"
 
 # ---------------------------------------------------------------------- the push
-step "--push flushes EXACTLY the two remainders, oldest transcript first"
+step "--push fires EXACTLY the seeded tail; unknown and flushed send nothing"
 stub_reset
 run_bf --push
 assert_eq "0" "$RC" "the sweep exits 0"
-assert_contains "$OUT" "pushed=2 deferred=0 failed=0" "the summary counts what happened"
-assert_eq "2" "$(count_ingest)" "two submissions, not four"
-assert_eq "beta
-gamma" "$(stub_field '.tool=="kb_ingest_session"' '.project')" \
-  "beta (older) then gamma -- and NOTHING for alpha or the skipped one"
-assert_eq "session:s-partial
-session:s-fresh" "$(stub_field '.tool=="kb_ingest_session"' '.session_uri')" \
-  "each carries its own session identity"
-
-step "the bytes on the wire are the REMAINDER, not the whole transcript"
-assert_eq "$REM_PART" "$(stub_field '.tool=="kb_ingest_session" and .project=="beta"' '.transcript_bytes')" \
+assert_contains "$OUT" "pushed=1 partial=0 failed=0" "the summary counts one push"
+assert_eq "1" "$(count_ingest)" "ONE submission, not four"
+assert_eq "beta" "$(stub_field '.tool=="kb_ingest_session"' '.project')" "beta only -- nothing for alpha, gamma or the skipped one"
+assert_eq "session:s-partial" "$(stub_field '.tool=="kb_ingest_session"' '.session_uri')" "under its own session identity"
+assert_eq "$REM_PART" "$(stub_field '.tool=="kb_ingest_session"' '.transcript_bytes')" \
   "beta sent $REM_PART bytes (size $SZ_PART minus offset 300)"
-assert_eq "$SZ_FRESH" "$(stub_field '.tool=="kb_ingest_session" and .project=="gamma"' '.transcript_bytes')" \
-  "gamma sent its whole $SZ_FRESH bytes"
 tail -c +301 "$T_PART" >"$HOME/expect.beta"
-stub_concat '.tool=="kb_ingest_session" and .project=="beta"' '.transcript' >"$HOME/got.beta"
+stub_concat '.tool=="kb_ingest_session"' '.transcript' >"$HOME/got.beta"
 if cmp -s "$HOME/expect.beta" "$HOME/got.beta"; then
   pass "beta's submission is byte-for-byte the unflushed tail"
 else
   fail "beta's submission is not the unflushed tail (already-ingested bytes were resent?)"
 fi
+assert_file_missing "$ST/s-fresh.offset" "the unknown transcript was not touched (no checkpoint appeared)"
+assert_eq "$SZ_DONE" "$(cat "$ST/s-done.offset")" "the flushed transcript's checkpoint is unchanged"
+assert_eq "$SZ_PART" "$(cat "$ST/s-partial.offset")" "beta's checkpoint advanced to its size"
+if cmp -s "$HOME/ledger.before" "$ST/.backfill-done"; then
+  pass "the inert ledger was neither read (beta still went) nor rewritten"
+else
+  fail "the sweep rewrote .backfill-done -- the ledger is supposed to be inert"
+fi
 
-step "the checkpoints advanced -- nothing is left to send"
+step "the hook was fed a Backfill event, never SessionEnd"
+assert_file_contains "$LOGF" "ev=Backfill sid=s-partia" "the hook's summary line carries ev=Backfill"
+assert_eq "0" "$(log_count 'ev=SessionEnd')" "no SessionEnd was synthesised"
+assert_file_contains "$LOGF" "backfill s-partia beta pushed base=300 size=$SZ_PART sent=$REM_PART" "the sweep's own line: sid8 project verdict base size sent"
+
+step "the checkpoints advanced -- nothing seeded is left to send"
 run_bf
 assert_eq "beta s-partial $SZ_PART $SZ_PART 0 flushed" "$(bf_row s-partial)" "beta is drained"
-assert_eq "gamma s-fresh $SZ_FRESH $SZ_FRESH 0 flushed" "$(bf_row s-fresh)" "gamma is drained"
-assert_contains "$OUT" "0 with unflushed bytes (0 bytes)" "the box has no unflushed remainder left"
+assert_eq "gamma s-fresh $SZ_FRESH - $SZ_FRESH unknown" "$(bf_row s-fresh)" "gamma is still unknown, still listed"
+assert_contains "$OUT" "0 with unflushed bytes (0 bytes)" "no seeded remainder left"
 
-step "re-running the sweep is a NO-OP (a recovery must not duplicate knowledge)"
+step "re-running --push is a NO-OP (a recovery must not duplicate knowledge)"
 stub_reset
 run_bf --push
 assert_eq "0" "$RC" "the second sweep exits 0"
 settle
 settle
 assert_eq "0" "$(stub_total)" "zero requests on the second --push"
-assert_contains "$OUT" "pushed=0 deferred=0 failed=0" "and it says so"
+assert_contains "$OUT" "pushed=0 partial=0 failed=0" "and it says so"
 
-step "the skipped transcript was never submitted, on either run"
-assert_eq "0" "$(stub_count '.tool=="kb_ingest_session" and (.transcript|test("backfill line 0 y+")) and .project=="?"')" \
-  "no submission was filed under a guessed project"
+step "--push --include-unknown is the explicit opt-in: gamma goes from 0, the skipped one still does not"
+stub_reset
+run_bf --push --include-unknown
+assert_eq "0" "$RC" "exits 0"
+assert_eq "1" "$(count_ingest)" "exactly one submission (gamma)"
+assert_eq "gamma" "$(stub_field '.tool=="kb_ingest_session"' '.project')" "gamma"
+assert_eq "$SZ_FRESH" "$(stub_field '.tool=="kb_ingest_session"' '.transcript_bytes')" "sent whole, from 0"
+assert_eq "$SZ_FRESH" "$(cat "$ST/s-fresh.offset" 2>/dev/null)" "gamma now has a checkpoint at its size"
 run_bf
-assert_eq "? s-nocwd $SZ_NOCWD 0 $SZ_NOCWD skipped" "$(bf_row s-nocwd)" \
-  "it is still reported, still skipped, still with its reason"
+assert_eq "gamma s-fresh $SZ_FRESH $SZ_FRESH 0 flushed" "$(bf_row s-fresh)" "gamma reads flushed afterwards"
+assert_eq "? s-nocwd $SZ_NOCWD - $SZ_NOCWD skipped" "$(bf_row s-nocwd)" "the cwd-less transcript is still skipped, still with its reason"
+assert_eq "0" "$(stub_count '.tool=="kb_ingest_session" and (.transcript|test("backfill line 0 y+")) and .project=="?"')" \
+  "no submission was ever filed under a guessed project"
 
 # --------------------------------------------------------------------- the cap
-step "--limit bounds a huge first sweep"
+step "--limit bounds a big sweep, oldest first"
 stub_reset
 mkdir -p "$WORK/delta" "$WORK/epsilon"
 T_D=$(mk_session "$(slug_of "$WORK/delta")" s-delta 9 "$WORK/delta")
 T_E=$(mk_session "$(slug_of "$WORK/epsilon")" s-epsilon 9 "$WORK/epsilon")
+printf 0 >"$ST/s-delta.offset"   # seeded at 0: the owner said "nothing captured yet"
+printf 0 >"$ST/s-epsilon.offset"
 touch -d @1700000500 "$T_D"
 touch -d @1700000600 "$T_E"
 run_bf --push --limit 1
@@ -196,6 +214,12 @@ stub_reset
 run_bf --push
 assert_eq "1" "$(count_ingest)" "the next run picks up exactly the remaining one"
 assert_eq "epsilon" "$(stub_field '.tool=="kb_ingest_session"' '.project')" "epsilon"
+
+step "usage errors exit 1"
+run_bf --bogus-flag
+assert_eq "1" "$RC" "an unknown flag exits 1"
+run_bf --limit x
+assert_eq "1" "$RC" "a non-numeric --limit exits 1"
 
 step "no credential ever reaches the sweep's own output"
 assert_not_contains "$(cat "$HOME/bf.out")" "$RIG_TOKEN" "the report prints no token"

@@ -546,7 +546,7 @@ else
     # sees the project token on a default-enrolled box — and even with nothing
     # resolved it degrades to an unauthenticated 401 instead of killing the
     # subshell on an unbound variable (which is how this warning went dead).
-    _remote=$(kb_curl_auth_config | curl -fsS -K - --connect-timeout 3 --max-time 6 \
+    _remote=$(kb_curl_auth_config | curl -fsS -K - --max-time 6 \
       "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
       | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
     if [ -n "$_remote" ]; then
@@ -672,7 +672,7 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # -4 matches the pinned real call (kb_curl_auth_config emits `ipv4`): a probe
   # testing a different address family than the call it gates is a false gate —
   # exactly the "briefs skip silently" failure of the AAAA-only transient.
-  if curl -sS -4 -o /dev/null --connect-timeout 2 --max-time 3 "$KB_MCP_URL" >/dev/null 2>&1; then
+  if curl -sS -4 -o /dev/null --max-time 3 "$KB_MCP_URL" >/dev/null 2>&1; then
     HELPER="$HOOKDIR/kb-mcp-call.sh"
     # boost_project mirrors LOCAL mode's --boost-project so recall ranking does
     # not silently differ by transport; omitted entirely if PROJECT is empty.
@@ -711,7 +711,7 @@ elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # instead of consuming the full hook budget on the search request. -4 matches
   # the pinned real call below — a probe on the wrong address family is a false
   # gate (see the MCP probe above).
-  if curl -sS -4 -o /dev/null --connect-timeout 2 --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
+  if curl -sS -4 -o /dev/null --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
     ENC=$(printf '%s' "$QUERY" | kb_urlencode)
     # Bearer on STDIN (curl -K -), never on argv — see kb_curl_auth_config.
     # -w puts the status on its own LAST line, because `curl -sS` (no -f, which
@@ -720,7 +720,7 @@ elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
     # formatter finds no rows in, i.e. indistinguishable from an empty KB. That
     # is the fail-silent bug itself. Status FIRST, then parse.
     RAW=$(kb_curl_auth_config \
-      | curl -sS -K - -w '\n%{http_code}' --connect-timeout 3 --max-time "$ST" \
+      | curl -sS -K - -w '\n%{http_code}' --max-time "$ST" \
         "$KB_REST_URL/api/search?q=$ENC&k=$K" 2>/dev/null)
     CRC=$?
     STATUS=$(printf '%s\n' "$RAW" | tail -n 1)

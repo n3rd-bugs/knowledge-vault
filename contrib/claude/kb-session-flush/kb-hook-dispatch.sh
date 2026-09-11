@@ -115,12 +115,16 @@ HOOKDIR="$(cd "$(dirname "$(kb_winpath "$0")")" 2>/dev/null && pwd)"
 # The budgets are set against install.sh's registered per-event timeouts
 # (PreCompact 15 / SessionEnd 15 / SessionStart 35 / UserPromptSubmit 40 /
 # Stop 15) so the dispatcher finishes INSIDE its slot instead of being killed by
-# it: turn-start 5 + brief 34 = 39 < 40; brief 34 < 35; notify 12 < 15. The
-# flush is the deliberate exception: its hook detaches its real work in well
-# under a second, so 300 is a runaway net for a pathological pre-detach hang (a
-# dead mount, a wedged uv) -- it exceeds the 15 s slot on purpose, because the
-# one slow LEGITIMATE path (first-time token auto-mint, bounded at 45 s
-# internally) must never be cut off by its own watchdog.
+# it: turn-start 5 + brief 34 = 39 < 40; brief 34 < 35; on Stop the flush gate
+# 3 + notify 11 = 14 < 15 (the slot is NOT widened: 15 stays 15 on every box).
+# The flush is the deliberate exception on PreCompact/SessionEnd: its hook
+# detaches its real work in well under a second, so 300 is a runaway net for a
+# pathological pre-detach hang (a dead mount, a wedged uv) -- it exceeds the
+# 15 s slot on purpose. On Stop (wave C, C5) the flush runs FIRST under a 3 s
+# budget: a closed gate is two stats and a few cats, an open one only pins the
+# project and detaches, and the 45 s token auto-mint moved into the detached
+# child (never on Stop/SessionEnd), so 3 s is generous. Flush before notify so
+# the `kb <flushed>/<size>` ping reads the freshest offset.
 #
 # ORDER MATTERS on UserPromptSubmit: turn-start.sh is a ~5 ms stamp and
 # must not sit behind the recall's budget, and the recall's stdout is the
@@ -129,7 +133,7 @@ case "$EV" in
   PreCompact | SessionEnd) CHILDREN="flush-session-to-kb.sh:300" ;;
   SessionStart) CHILDREN="kb-session-brief.sh:34" ;;
   UserPromptSubmit) CHILDREN="turn-start.sh:5 kb-session-brief.sh:34" ;;
-  Stop) CHILDREN="notify-complete.sh:12" ;;
+  Stop) CHILDREN="flush-session-to-kb.sh:3 notify-complete.sh:11" ;;
   *)
     # Unknown (or missing) event: run nothing. Still drain stdin so the writer
     # upstream never blocks or takes a SIGPIPE on our account.
@@ -168,14 +172,38 @@ fi
 # carries it -- while a child re-deriving it from the stdin JSON reads nothing at
 # all in exactly that case. Children that do not need it ignore extra argv.
 #
-# `|| true` covers a failing AND a timed-out (rc 124) child: neither may stop a
-# later sibling or the exit code.
+# A failing AND a timed-out (rc 124) child alike never stop a later sibling or
+# the exit code. A timed-out child IS written down, though -- one line per
+# (child, event) per hour, in the log the pre-brief and the sweep read: on Stop
+# the flush hook stamps <okey>.gate BEFORE it detaches, so a parent killed here
+# leaves a .gate newer than .last, the gate backs off one interval, and this
+# line is the only trace of WHY. Wording avoids the pre-brief's dropped-session
+# tokens (FAILED / BUG: / NOT CONFIGURED / NOT CAPTURED / NEEDS TOKEN): a killed
+# gate is a deferred drain, not a lost transcript. ASCII only (KB 12885). The
+# rate limit lives in a BOX-level stamp, state/.dispatch-124-<child>-<event>.stamp
+# (one epoch per child/event, beside .notoken-*.stamp / .notconfigured.stamp):
+# never a per-session file, so the hook's state sweep must never retire it.
 for _kbc in $CHILDREN; do
   _kbn="${_kbc%%:*}"
   _kbb="${_kbc##*:}"
   _kbs="$HOOKDIR/$_kbn"
   [ -f "$_kbs" ] || continue
-  printf '%s' "$INPUT" | kb_timeout "$_kbb" "${BASH:-bash}" "$_kbs" "$EV" || true
+  _kbr=0
+  printf '%s' "$INPUT" | kb_timeout "$_kbb" "${BASH:-bash}" "$_kbs" "$EV" || _kbr=$?
+  if [ "$_kbr" = 124 ]; then
+    _kbl="$HOME/.claude/hooks"
+    _kbst="$_kbl/state/.dispatch-124-${_kbn%.sh}-$EV.stamp"
+    mkdir -p "$_kbl/state" 2>/dev/null || true
+    _kbnow=$(date +%s 2>/dev/null || echo 0)
+    case "$_kbnow" in '' | *[!0-9]*) _kbnow=0 ;; esac
+    _kblast=$(cat "$_kbst" 2>/dev/null || echo 0)
+    case "$_kblast" in '' | *[!0-9]*) _kblast=0 ;; esac
+    if [ "$((_kbnow - _kblast))" -ge 3600 ]; then
+      printf '%s\n' "$_kbnow" >"$_kbst" 2>/dev/null || true
+      printf '%s dispatch %s hit its %ss budget on %s (rc 124) - killed, later children still ran\n' \
+        "$(date -Is 2>/dev/null || LC_ALL=C date)" "$_kbn" "$_kbb" "$EV" >>"$_kbl/flush-session.log" 2>/dev/null || true
+    fi
+  fi
 done
 
 exit 0

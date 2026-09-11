@@ -271,14 +271,14 @@ kb_curl_auth_config() { # -> curl config on stdout
 }
 CT="Content-Type: application/json"
 AC="Accept: application/json, text/event-stream"
-SID=$(kb_curl_auth_config | curl -s -K - -D - -o /dev/null --connect-timeout 3 --max-time 20 -X POST "$KB_MCP_URL" -H "$CT" -H "$AC" \
+SID=$(kb_curl_auth_config | curl -s -K - -D - -o /dev/null --max-time 20 -X POST "$KB_MCP_URL" -H "$CT" -H "$AC" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"kb-hook","version":"1"}}}' |
   awk 'tolower($1)=="mcp-session-id:"{print $2}' | tr -d '\r')
 [ -n "$SID" ] || {
   echo "no mcp session (auth/url?)" >&2
   exit 1
 }
-kb_curl_auth_config | curl -s -K - -o /dev/null --connect-timeout 3 --max-time 20 -X POST "$KB_MCP_URL" -H "$CT" -H "$AC" \
+kb_curl_auth_config | curl -s -K - -o /dev/null --max-time 20 -X POST "$KB_MCP_URL" -H "$CT" -H "$AC" \
   -H "Mcp-Session-Id: $SID" -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
 # Build the request into a FILE (never argv) so chunk-sized payloads work.
 REQF=$(mktemp)
@@ -303,7 +303,7 @@ with open(out, "w", encoding="utf-8") as fh:
                "params": {"name": tool, "arguments": a}}, fh, ensure_ascii=False)
 PY
 fi
-RESP=$(kb_curl_auth_config | curl -s -K - --connect-timeout 3 --max-time 60 -X POST "$KB_MCP_URL" -H "$CT" -H "$AC" \
+RESP=$(kb_curl_auth_config | curl -s -K - --max-time 60 -X POST "$KB_MCP_URL" -H "$CT" -H "$AC" \
   -H "Mcp-Session-Id: $SID" --data @"$REQF")
 rm -f "$REQF"
 # CLOSE THE SESSION. Every chunk opens its own MCP session, and without this the
@@ -311,7 +311,7 @@ rm -f "$REQF"
 # flush leaked 117 server-side transports. Best-effort and never fatal — the
 # submission already succeeded or failed above, and a failed cleanup must not
 # change that verdict or the caller's offset decision.
-[ -n "$SID" ] && kb_curl_auth_config | curl -s -K - -o /dev/null --connect-timeout 2 --max-time 5 \
+[ -n "$SID" ] && kb_curl_auth_config | curl -s -K - -o /dev/null --max-time 5 \
   -X DELETE "$KB_MCP_URL" -H "Mcp-Session-Id: $SID" 2>/dev/null || true
 # isError:true is a tool rejection (queue full, bad project, oversize) surfaced
 # as an HTTP-200 JSON-RPC result — it must FAIL so the caller does NOT advance

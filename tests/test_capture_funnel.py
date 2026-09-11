@@ -522,7 +522,10 @@ def test_the_only_json_the_backfill_builds_is_the_HOOK_EVENT():
     call = " ".join(calls[0].split())
     for field in ("transcript_path", "cwd", "session_id", "hook_event_name"):
         assert f"{field} s " in call, f"the hook event omits {field}: {call}"
-    assert "SessionEnd" in call, "the event is not SessionEnd-shaped"
+    # Wave C (C7, KB 34161): the sweep hands the hook a `Backfill` event — never a synthetic
+    # SessionEnd, which used to make the hook retire the live session's checkpoint.
+    assert "Backfill" in call, "the event is not Backfill-shaped"
+    assert "SessionEnd" not in call, "the sweep must never synthesise SessionEnd (KB 33783)"
     for wire_key in ("project", "transcript ", "kind", "repo", "branch", "commit"):
         assert wire_key not in call, (
             f"the built object carries {wire_key!r} — that is a SUBMISSION, not a hook event"
@@ -2382,7 +2385,9 @@ _DISPATCH_MAP = {
     "SessionEnd": ["FLUSH"],
     "SessionStart": ["BRIEF"],
     "UserPromptSubmit": ["TURN", "BRIEF"],
-    "Stop": ["NOTIFY"],
+    # Wave C (C5): the flush runs FIRST on Stop (its gate is 2 stats + a few cats
+    # under a 3 s budget), then notify reads the freshest offset.
+    "Stop": ["FLUSH", "NOTIFY"],
 }
 
 

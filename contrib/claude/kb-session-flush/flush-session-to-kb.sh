@@ -374,6 +374,49 @@ export -f kb_first_record_field kb_winpath
 # and BRANCH_OF (parent's 8-char id) when a parent is found; BSEED="" otherwise.
 # One cmp per new transcript (stops at the first difference). Runs BEFORE the
 # timestamp rule and BEFORE the shrank restart.
+# Snap a byte count DOWN to the byte after the last newline at or before it.
+# Bounded 1 MB windows walking backwards, so a 200 MB prefix is never read into
+# memory. Counts newlines and takes `head -n <count>` rather than `tail -n1`:
+# uutils coreutils (the owner box) truncates `tail -n1` of a newline-less 1 MB
+# window to 983040 bytes, which put a seed mid-line. THE SAME LOOP as the
+# backfill's bf_snap (kb-flush-backfill.sh) -- keep the arithmetic identical.
+kb_snap_down() { # <transcript> <bytes> -> snapped bytes (0 when no newline precedes)
+  _sm="$2"
+  _snf=$(mktemp) || { printf '0'; return 0; }
+  while [ "$_sm" -gt 0 ]; do
+    _sw=$((_sm > 1048576 ? 1048576 : _sm))
+    head -c "$_sm" "$1" | tail -c "$_sw" >"$_snf"
+    _swb=$(stat -c%s "$_snf" 2>/dev/null || stat -f%z "$_snf" 2>/dev/null || wc -c <"$_snf" | tr -d ' ')
+    case "$_swb" in '' | *[!0-9]*) _swb=0 ;; esac
+    [ "$_swb" -gt 0 ] || break
+    _snl=$(tr -cd '\n' <"$_snf" | wc -c | tr -d ' ')
+    case "$_snl" in '' | *[!0-9]*) _snl=0 ;; esac
+    if [ "$_snl" -gt 0 ]; then
+      _supto=$(head -n "$_snl" "$_snf" | wc -c | tr -d ' ') # bytes through the last newline
+      rm -f "$_snf"
+      printf '%s' "$((_sm - _swb + _supto))"
+      return 0
+    fi
+    _sm=$((_sm - _swb)) # no newline in this window: look further back
+  done
+  rm -f "$_snf"
+  printf '0'
+}
+export -f kb_snap_down
+
+# The chunk loop's last-newline trim: bytes of <file> through its LAST newline
+# (0 when it has none). The SAME arithmetic as kb_snap_down/bf_snap -- count
+# newlines, `head -n N | wc -c` -- never `tail -n1 | wc -c`, which uutils
+# coreutils 0.8.0 prints as 0 for a newline-less 65536-byte window (so an
+# unterminated fragment left as if it ended on a newline) and as 983040 for a
+# 1 MB one (a 64 KiB mid-line cut).
+kb_keep_to_last_nl() { # <file> -> bytes through the last newline (0 when none)
+  _knl=$(tr -cd '\n' <"$1" | wc -c | tr -d ' ')
+  case "$_knl" in '' | *[!0-9]*) _knl=0 ;; esac
+  if [ "$_knl" -gt 0 ]; then head -n "$_knl" "$1" | wc -c | tr -d ' '; else printf '0'; fi
+}
+export -f kb_keep_to_last_nl
+
 kb_branch_seed() {
   BSEED=""
   BRANCH_OF=""
@@ -426,23 +469,11 @@ kb_branch_seed() {
   [ -n "$_parent" ] && [ "$_best" -gt 0 ] || return 0
   # Never seed past our own EOF (a parent longer than this fork).
   [ "${SIZE:-0}" -gt 0 ] && [ "$_best" -gt "$SIZE" ] && _best=$SIZE
-  # Snap the shared-prefix length DOWN to the last newline at or before it, over
-  # a bounded 1 MB tail window (Appendix C) so the arithmetic never reads a
-  # 199 MB prefix into memory. Same last-newline trim the chunk loop uses.
-  _sp=$(mktemp) || return 0
-  head -c "$_best" "$T" | tail -c 1048576 >"$_sp"
-  _wb=$(stat -c%s "$_sp" 2>/dev/null || stat -f%z "$_sp" 2>/dev/null || wc -c <"$_sp" | tr -d ' ')
-  case "$_wb" in '' | *[!0-9]*) _wb=0 ;; esac
-  _base=$((_best > _wb ? _best - _wb : 0))
-  if [ "$(tail -c1 "$_sp")" != "" ]; then
-    _part=$(tail -n1 "$_sp" | wc -c)
-    _after=$((_wb - _part))
-  else
-    _after=$_wb
-  fi
-  rm -f "$_sp"
-  [ "$_after" -ge 0 ] || _after=0
-  BSEED=$((_base + _after))
+  # Snap the shared-prefix length DOWN to the last newline at or before it
+  # (Appendix C) with the SAME arithmetic as the backfill's bf_snap, so a hook
+  # seed and an owner --seed land on the same byte.
+  BSEED=$(kb_snap_down "$T" "$_best")
+  case "$BSEED" in '' | *[!0-9]*) BSEED=0 ;; esac
   # The stamp value is pattern-checked server-side ([A-Za-z0-9._-]): sanitise.
   BRANCH_OF=$(printf '%s' "$_parent" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-8)
   return 0
@@ -471,6 +502,23 @@ export -f kb_offset_write
 # unseeded pre-stamp transcript) — the caller then exits 0 with nothing sent.
 # Order: branch seed FIRST (both on a fresh offset and on a shrink), then the
 # trusted/unseeded timestamp rule, then the shrank restart.
+# THE unseeded refusal, shared by the pre-stamp rule and the corrupt-offset
+# path: ONE line per 24 h per session (rate-limited by the marker's mtime),
+# naming the reason and the --seed procedure, and the <okey>.unseeded marker
+# notify/the brief read. Never writes the offset.
+kb_unseeded_refuse() { # <reason>
+  _now=$(date +%s 2>/dev/null || echo 0)
+  case "$_now" in '' | *[!0-9]*) _now=0 ;; esac
+  _lm=$(stat -c %Y "$OFF_UNSEEDED" 2>/dev/null || stat -f %m "$OFF_UNSEEDED" 2>/dev/null || echo 0)
+  case "$_lm" in '' | *[!0-9]*) _lm=0 ;; esac
+  if [ "$((_now - _lm))" -ge 86400 ]; then
+    echo "$(date -Is) flush $PROJECT unseeded: refusing to send $SIZE from 0 ($1) — seed it: kb-flush-backfill.sh --seed ${SID:-$OKEY} current|$SIZE ev=$EV sid=$SIDS"
+    touch "$OFF_UNSEEDED" 2>/dev/null || true
+  fi
+  return 0
+}
+export -f kb_unseeded_refuse
+
 kb_decide_offset() {
   BRANCH_OF=""
   if [ ! -f "$OFFF" ]; then
@@ -506,27 +554,24 @@ kb_decide_offset() {
       rm -f "$OFF_UNSEEDED"
       return 0
     fi
-    # Refuse — ONE line per 24 h per session, rate-limited by the marker mtime.
-    _now=$(date +%s 2>/dev/null || echo 0)
-    case "$_now" in '' | *[!0-9]*) _now=0 ;; esac
-    _lm=$(stat -c %Y "$OFF_UNSEEDED" 2>/dev/null || stat -f %m "$OFF_UNSEEDED" 2>/dev/null || echo 0)
-    case "$_lm" in '' | *[!0-9]*) _lm=0 ;; esac
-    if [ "$((_now - _lm))" -ge 86400 ]; then
-      echo "$(date -Is) flush $PROJECT unseeded: refusing to send $SIZE from 0 (transcript predates the checkpoint stamp) — seed it: kb-flush-backfill.sh --seed ${SID:-$OKEY} current|$SIZE ev=$EV sid=$SIDS"
-      touch "$OFF_UNSEEDED" 2>/dev/null || true
-    fi
+    kb_unseeded_refuse "transcript predates the checkpoint stamp"
     return 1
   fi
-  # An offset exists: the session is seeded (by us, a branch seed or the owner's
-  # --seed), so a stale unseeded marker must not keep notify saying "unseeded".
-  rm -f "$OFF_UNSEEDED"
   OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
   case "$OFFSET" in
     '' | *[!0-9]*)
-      echo "$(date -Is) flush $PROJECT offset unreadable — restarting from 0 ev=$EV sid=$SIDS"
-      OFFSET=0
+      # A corrupt/empty offset file is NOT a licence to resend from 0 (KB
+      # 33783: a from-0 resend is never automatic). Same refusal as a pre-stamp
+      # transcript -- same marker, same one-line-per-24 h limit -- naming the
+      # reason; the file itself is left untouched for the owner's --seed.
+      kb_unseeded_refuse "offset unreadable: $OFFF"
+      return 1
       ;;
   esac
+  # A numeric offset exists: the session is seeded (by us, a branch seed or the
+  # owner's --seed), so a stale unseeded marker must not keep notify saying
+  # "unseeded".
+  rm -f "$OFF_UNSEEDED"
   if [ "$SIZE" -lt "$OFFSET" ]; then
     kb_branch_seed
     if [ -n "$BSEED" ] && [ "$BSEED" -gt 0 ]; then
@@ -814,16 +859,20 @@ kb_retry_backoff() { # <n> <code> -> seconds
 # then stays closed for one interval instead of re-opening on every turn.
 kb_stop_gate() {
   { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } || return 1 # LOCAL writes no offset; CONNECTOR is usage-metered
-  # A refused (unseeded, pre-stamp) session has no offset and an .unseeded
-  # marker: until the owner seeds it (which creates the offset) every open gate
-  # would only pin, lock, stamp .last and refuse again -- one more stat and it
-  # costs nothing on Stop. PreCompact/SessionEnd still reach the daily line.
-  [ -e "$OFF_UNSEEDED" ] && [ ! -f "$OFFF" ] && return 1
+  # A refused (unseeded) session -- no offset (pre-stamp), or a CORRUPT one --
+  # carries an .unseeded marker: until the owner seeds it (which writes a
+  # numeric offset) every open gate would only pin, lock, stamp .last and
+  # refuse again -- one stat and one cat, so it costs nothing on Stop.
+  # PreCompact/SessionEnd still reach the daily line.
+  _sgo=$(cat "$OFFF" 2>/dev/null || echo 0)
+  if [ -e "$OFF_UNSEEDED" ]; then
+    [ -f "$OFFF" ] || return 1
+    case "$_sgo" in '' | *[!0-9]*) return 1 ;; esac
+  fi
   _sgn=$(kb_now)
   _sgs=$(stat -c%s "$T" 2>/dev/null || stat -f%z "$T" 2>/dev/null || echo 0)
   case "$_sgs" in '' | *[!0-9]*) _sgs=0 ;; esac
   [ "$_sgs" -gt 0 ] || return 1
-  _sgo=$(cat "$OFFF" 2>/dev/null || echo 0)
   case "$_sgo" in '' | *[!0-9]*) _sgo=0 ;; esac # the CHILD decides trusted vs unseeded before sending anything
   _sgd=$((_sgs - _sgo))
   [ "$_sgd" -gt 0 ] || return 1 # a shrink is the drain's job, not the gate's
@@ -1243,6 +1292,11 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_
         # A deferred TERMINAL firing leaves a retry marker (n=0: nothing FAILED,
         # code=lock) so a resumed session finishes the tail on its first due Stop.
         [ -s "$OFF_RETRY" ] || { printf "%s 0 lock %s" "$(kb_now)" "$(_fsize "$T")" >"$OFF_RETRY.t" 2>/dev/null && mv "$OFF_RETRY.t" "$OFF_RETRY" 2>/dev/null; }
+      elif [ "$EV" = "Backfill" ]; then
+        # The sweep waits on this line: its verdict grep is `skipped (lock held)`
+        # (kb-flush-backfill.sh, VERDICT=busy) -- keep the token byte-for-byte.
+        # Stop/PreCompact stay silent here as before (the next firing resumes).
+        echo "$(date -Is) flush $PROJECT Backfill skipped (lock held) ev=$EV sid=$SIDS"
       fi
       exit 0
     fi
@@ -1326,7 +1380,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_
         if [ "$(tail -c1 "$TMPC")" = "" ]; then
           break                                        # window ends in \n: chunk end = B_k
         fi
-        PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
+        KEEP=$(kb_keep_to_last_nl "$TMPC")
         if [ "$KEEP" -gt 0 ]; then
           head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
           break                                        # trimmed to the last \n < EDGE
@@ -1347,7 +1401,7 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_
         tail -c +$((OFFSET+1)) "$T" | head -c "$SEND_MAX" >"$TMPC"
         BYTES=$(_fsize "$TMPC")
         if [ "$(tail -c1 "$TMPC")" != "" ]; then
-          PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
+          KEEP=$(kb_keep_to_last_nl "$TMPC")
           if [ "$KEEP" -gt 0 ]; then
             head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
           fi
@@ -1497,11 +1551,18 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     # read as a fully captured session.
     if ! kb_lock_take "$OKEY"; then
       [ "$EV" = "SessionEnd" ] && echo "$(date -Is) connector $PROJECT NOT CAPTURED: the final firing could not take the session lock (another drain was still running), so any remaining bytes were not relayed — re-ingest $T if this session matters"
+      # Same token the bearer arm logs, so a sweep on a CONNECTOR box reads busy.
+      [ "$EV" = "Backfill" ] && echo "$(date -Is) connector $PROJECT Backfill skipped (lock held) ev=$EV sid=$SIDS"
       exit 0
     fi
     OFFSET=$(cat "$OFFF" 2>/dev/null || echo 0)
-    case "$OFFSET" in ""|*[!0-9]*) OFFSET=0 ;; esac
     SIZE=$(_fsize "$T"); case "$SIZE" in ""|*[!0-9]*) SIZE=0 ;; esac
+    # A corrupt/empty checkpoint is NOT a licence to relay from 0 (KB 33783:
+    # a from-0 resend is never automatic, on ANY arm): the same refusal,
+    # marker and one-line-per-24 h limit as the bearer arm; the file is left
+    # untouched for the owner --seed. A numeric one clears a stale marker.
+    case "$OFFSET" in ""|*[!0-9]*) kb_unseeded_refuse "offset unreadable: $OFFF"; exit 0 ;; esac
+    rm -f "$OFF_UNSEEDED"
     # SIZE=0 is UNREADABLE, not shrank (V1-m4): never clobber a good checkpoint
     # down to 0 on a failed stat. Same writer invariant as the bearer arms.
     if [ "$SIZE" = 0 ]; then
@@ -1584,7 +1645,7 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
       BYTES=$(stat -c%s "$TMPC" 2>/dev/null || wc -c <"$TMPC")
       [ "$BYTES" -gt 0 ] || { rm -f "$TMPC"; break; }
       if [ "$(tail -c1 "$TMPC")" != "" ]; then
-        PART=$(tail -n1 "$TMPC" | wc -c); KEEP=$((BYTES - PART))
+        KEEP=$(kb_keep_to_last_nl "$TMPC")
         if [ "$KEEP" -gt 0 ]; then
           head -c "$KEEP" "$TMPC" >"$TMPC.k" && mv "$TMPC.k" "$TMPC"; BYTES=$KEEP
         elif [ "$BYTES" -lt "$KB_CONNECTOR_CHUNK" ]; then

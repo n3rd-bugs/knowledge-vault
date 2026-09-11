@@ -66,11 +66,21 @@ wait_stub 3 25 || fail "the second session never flushed"
 assert_eq "$SIZE2" "$(stub_field '.tool=="kb_ingest_session"' '.transcript_bytes')" "a new session_id starts from offset 0"
 assert_eq "$SIZE2" "$(cat "$HOME/.claude/hooks/state/sess-other.offset")" "its own checkpoint file"
 
-step "a corrupt offset file restarts from 0 rather than wedging the session"
+# Wave C (KB 33783/34161): a corrupt checkpoint is REFUSED as unseeded — a resend from 0
+# is never automatic — and the owner re-seeds it (here: a numeric checkpoint again).
+step "a corrupt offset file is refused as unseeded, never resent from 0; re-seeding resumes"
 stub_reset
 printf 'garbage' >"$OFFF"
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T" "$WORK" sess-delta PreCompact)"
-wait_stub 3 25 || fail "a corrupt offset wedged the flush"
-assert_eq "$SIZE2" "$(stub_field '.tool=="kb_ingest_session"' '.transcript_bytes')" "corrupt offset -> full resend, no crash"
+settle
+assert_eq "0" "$(stub_total)" "corrupt offset -> nothing sent"
+assert_eq "garbage" "$(cat "$OFFF")" "the corrupt checkpoint is left for the owner, never overwritten"
+assert_eq "1" "$(grep -c 'unseeded: refusing .*offset unreadable.* sid=sess-del' "$LOGF")" "one loud refusal names the unreadable offset"
+[ -e "$HOME/.claude/hooks/state/sess-delta.unseeded" ] && pass "the .unseeded marker is set" || fail "no .unseeded marker beside the corrupt checkpoint"
+printf '%s' "$SIZE2" >"$OFFF"   # the owner re-seeds (kb-flush-backfill.sh --seed <sid> current)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T" "$WORK" sess-delta PreCompact)"
+settle
+assert_eq "$SIZE2" "$(cat "$OFFF")" "a re-seeded checkpoint is honoured (nothing to send at EOF)"
+[ -e "$HOME/.claude/hooks/state/sess-delta.unseeded" ] && fail "the .unseeded marker outlived the re-seed" || pass "the .unseeded marker is cleared once a numeric checkpoint exists"
 
 finish

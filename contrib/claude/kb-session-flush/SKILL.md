@@ -171,11 +171,13 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   command unbounded, and the caller degrades to no recall for that firing.
 - **Reachability probe / no prompt stalls** — because `UserPromptSubmit` recall runs
   synchronously (15 s hook budget), a cheap reachability check runs first: a
-  `curl --connect-timeout 2` connect to the KB (MCP/REMOTE) or a trivial local check
-  (LOCAL). A dead/blackholed KB skips recall in ~2 s instead of stalling the prompt
+  `curl --max-time 3` connect to the KB (MCP/REMOTE) or a trivial local check
+  (LOCAL). A dead/blackholed KB skips recall in ~3 s instead of stalling the prompt
   for the whole budget. All inner search timeouts are kept strictly under the hook
-  budget (recall ≤ ~8 s, connector recall ≤ 12 s), and `kb-mcp-call.sh` curls carry
-  `--connect-timeout 3`.
+  budget (recall ≤ ~8 s, connector recall ≤ 12 s). **No hook curl carries
+  `--connect-timeout`** (KB 1195: on Git Bash/Schannel it aborts healthy slow
+  requests) — every bound is a `--max-time`; the ingest POST additionally carries
+  `--retry`/`--retry-max-time` and never `--fail` (a 401/403 must not be retried).
 - **IPv4 pinned** — every KB curl runs over IPv4: the shared config emitters
   (`kb_curl_auth_config` in the hooks, `setup_auth_config` and the enrolment
   configs in `install.sh`) put `ipv4` in the config they feed `curl -K -`, the
@@ -237,6 +239,10 @@ flush <project> unseeded: refusing to send <bytes> from 0 (transcript predates t
 checkpoint stamp) — seed it: kb-flush-backfill.sh --seed <sid> current|<bytes>
 ```
 
+A **corrupt or empty checkpoint file** takes the very same refusal (same marker,
+same once-a-day line) with the reason `offset unreadable: <path>` — a resend from
+0 is never automatic (KB 33783). The file is left as it is; `--seed` replaces it.
+
 Notifications show `kb ?/199.0MB unseeded`; the pre-brief's `[KB sweep]` line
 counts them. Two clean exits, both owner decisions:
 
@@ -266,14 +272,44 @@ every `KB_SWEEP_INTERVAL` = 1800 s — every box, no scheduler) and, on Linux, a
 `OnUnitActiveSec=<KB_SWEEP_INTERVAL>s`, `Persistent=true`; `KB_SWEEP_TIMER=0`
 opts out, `KB_SWEEP_INTERVAL=0` turns the sweep off, and a backfill that predates
 `--auto` is not scheduled until the next install; the installer prints one `sweep:` line saying which). A sweep never
-touches a session that was active in the last 15 min, holds a trailing half-line
-like the hook, and leaves one line in `state/.sweep-last`. Its health is visible
+touches a transcript modified in the last **5 min** (`KB_SWEEP_QUIET_SECONDS` = 300),
+holds a trailing half-line like the hook, and leaves one line in `state/.sweep-last`.
+The timer runs the sweep with the **`KB_SWEEP_*` defaults**: the unit passes only
+`PATH`, and the sweep never sources `kb-flush.env` — to tune it, edit the unit or
+export the knob in the timer's environment (`systemctl --user edit kb-flush-sweep.service`,
+`[Service] Environment=KB_SWEEP_QUIET_SECONDS=600`). On a **LOCAL** box (`KB_DIR`)
+the hook enqueues whole transcripts and writes no offsets, so the sweep has nothing
+to account for and is a no-op there. When the hook finds a session's lock held on a
+`Backfill` firing it logs `flush <project> Backfill skipped (lock held) …`, which the
+sweep reports as `busy` (a fact, never a failure). Its health is visible
 without opening a log: notifications append `sweep:never` / `sweep:26h stale` /
 `sweep:STALLED n` / `sweep:unknown n` only when something is wrong, and the
 SessionStart pre-brief prints one `[KB sweep]` line with the action (`stalled`
 means nothing has triggered a sweep for over 6 h — the timer is not firing).
 Windows (Git Bash) has the piggyback trigger only; SHARING.md documents an
 optional, manual `schtasks` line.
+
+### State files (`~/.claude/hooks/state/`, proposal_v2 Appendix I)
+
+Per session (`<okey>` = the sanitised session id): `<okey>.offset` (the checkpoint),
+`<okey>.offset.lock` (flock) or `<okey>.offset.lock.d/pid` (the mkdir fallback where
+`flock` is missing — only the lock keeps the `.offset` infix), `<okey>.last` (when a
+drain last started; the Stop gate's clock), `<okey>.gate` (when the Stop gate last
+opened), `<okey>.retry` = `<epoch> <n> <code> <end>` (after a failed REST chain: attempt
+count, HTTP code, and **`<end>` = the failed chunk's END offset, `offset + bytes`,
+always `<= size`**, so the retry re-cuts the same window; a SessionEnd that met a
+held lock leaves `<epoch> 0 lock <size>` — nothing failed, `<end>` is the
+transcript size at deferral — so the resumed session finishes the tail),
+`<okey>.project` (`<slug>\t<how>`, the session pin), `<okey>.unseeded` (refused: pre-stamp
+transcript or unreadable checkpoint), `<okey>.sweep` (the sweep's stall record).
+Box-level: `.checkpoints-trusted-since`, `.sweep.lock`, `.sweep.trigger`, `.sweep-last`,
+`.state-sweep.last`, the hourly rate-limit stamps `.notoken-<project>.stamp`,
+`.notconfigured.stamp`, `.nojson-<tag>.stamp`, `.tripwire.stamp`, and the dispatcher's
+`.dispatch-124-<child>-<EV>.stamp` (one epoch per child/event, e.g.
+`.dispatch-124-flush-session-to-kb-Stop.stamp`: the `dispatch … hit its 3s budget
+(rc 124)` line is logged at most once an hour per child/event). Box-level stamps are
+never per-session files, so the daily state sweep never retires them; `.backfill-done`
+is an inert relic.
 
 ## Keeping the hooks current
 

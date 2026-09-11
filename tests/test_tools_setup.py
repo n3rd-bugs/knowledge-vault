@@ -50,7 +50,9 @@ def test_guide_embeds_all_scripts_when_asked():
     # both hook behaviors named
     assert "PreCompact" in guide and "SessionStart" in guide
     # every script embedded (a distinctive line from each of the four)
-    assert "flush this session's NEW transcript" in guide  # flush hook
+    assert (
+        "KB-FLUSH-LINEAGE: never-delete-offsets" in guide
+    )  # flush hook (wave C lineage marker, line 2)
     assert "per-prompt recall" in guide  # brief/recall hook (SessionStart + UserPromptSubmit)
     assert "Minimal MCP streamable-HTTP client" in guide  # kb-mcp-call.sh helper
     assert "reuses your 'claude mcp' KB registration" in guide  # install.sh MCP branch

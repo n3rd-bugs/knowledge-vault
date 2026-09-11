@@ -1228,18 +1228,18 @@ def test_kb_progress_survives_a_transcript_path_with_spaces(tmp_path):
     assert "kb 4.1/5.2MB" in _notify_message(rec_dir)
 
 
-def test_a_fully_drained_session_reports_synced_from_the_backfill_ledger(tmp_path):
-    """The flush hook DELETES the offset after a terminal SessionEnd drain, so
-    "no offset file" does not mean "nothing was captured". The backfill ledger is
-    the durable record that survives it — a hit for THIS key means fully in."""
+def test_a_fully_drained_session_reports_synced_from_its_kept_offset(tmp_path):
+    """Wave C (KB 33783 / 33784): the flush hook NEVER deletes the offset — a
+    drained SessionEnd leaves it at offset == size, and THAT is the `synced`
+    signal notify reads. The backfill ledger (`.backfill-done`) is an inert
+    relic and is not planted here: a session with a kept checkpoint at its size
+    reports synced with no ledger at all."""
     home, rec_dir, binp = _notify_home(tmp_path)
     work = tmp_path / "proj"
     transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
     state = home / ".claude" / "hooks" / "state"
-    assert not (state / f"{_flush_okey('s-done')}.offset").exists()
-    (state / ".backfill-done").write_text(
-        f"{_flush_okey('s-other')}\t42\n{_flush_okey('s-done')}\t{_KB_SIZE}\n"
-    )
+    (state / f"{_flush_okey('s-done')}.offset").write_text(str(_KB_SIZE))
+    assert not (state / ".backfill-done").exists()
 
     res = _run_notify(
         home,
@@ -1316,6 +1316,45 @@ def test_a_corrupt_offset_file_degrades_to_omission_and_still_exits_zero(tmp_pat
     msg = _notify_message(rec_dir)
     assert "kb" not in msg, f"a corrupt checkpoint was rendered as a figure: {msg!r}"
     assert msg == "Claude finished - proj @ testbox", f"the base message changed: {msg!r}"
+
+
+def test_a_corrupt_offset_beside_the_unseeded_marker_reads_unseeded(tmp_path):
+    """Wave C stage 3 (A1, KB 33783): the hook REFUSES a corrupt checkpoint as
+    unseeded — never a from-0 resend — and leaves `<okey>.unseeded` beside it.
+    Notify then says exactly what it says for a missing checkpoint, `?/<size>
+    unseeded`, instead of the silent omission of the not-yet-ruled case above."""
+    home, rec_dir, binp = _notify_home(tmp_path)
+    work = tmp_path / "proj"
+    transcript = _sized_transcript(work / "t.jsonl", _KB_SIZE)
+    state = home / ".claude" / "hooks" / "state"
+    (state / f"{_flush_okey('s-corrupt')}.offset").write_text("not-a-number\n")
+    (state / f"{_flush_okey('s-corrupt')}.unseeded").touch()
+
+    res = _run_notify(
+        home,
+        binp,
+        rec_dir,
+        {
+            "session_id": "s-corrupt",
+            "cwd": str(work),
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    msg = _notify_message(rec_dir)
+    assert msg.endswith("(kb ?/5.2MB unseeded)"), (
+        f"a refused corrupt checkpoint was not reported: {msg!r}"
+    )
+
+
+def test_the_notify_marker_probe_reads_the_single_appendix_I_spelling():
+    """Both hooks write `<okey>.retry` / `<okey>.unseeded` (proposal_v2 Appendix
+    I); the second-guess `<okey>.offset.<ext>` probe is gone, so a marker can
+    only ever be read from the name the writer uses (rig case 39 plants it)."""
+    fn = _shell_fn(NOTIFY, "kb_marker")
+    assert '"$1/$2.$3"' in fn, "kb_marker no longer probes <okey>.<ext>"
+    assert ".offset.$3" not in fn, "kb_marker still probes the retired <okey>.offset.<ext> spelling"
 
 
 @pytest.mark.parametrize(
@@ -3575,4 +3614,319 @@ def test_every_marked_minter_is_registered_in_MINTED_SECRETS():
         f"functions marked as minting a plaintext secret are MISSING from "
         f"kbcore.scrub.MINTED_SECRETS: {unregistered} — their credential shape "
         "would survive ingest unredacted"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave C stage 3 pins (root cause KB 33783, proposal KB 33784, wave S KB 34161,
+# transport KB 1195): the never-delete lineage, the shared lock / first-record
+# blocks, the transport line, the flush_* telemetry body, the install stamp
+# order and the Stop dispatcher map — each checked on the canonical contrib
+# copy AND the served setup_assets copy where the pin is about what ships.
+# ---------------------------------------------------------------------------
+
+_LINEAGE_MARKER = "# KB-FLUSH-LINEAGE: never-delete-offsets v2"
+# Every served script that invokes curl — DERIVED from what ships (currently
+# install, notify, brief, flush, kb-mcp-call and update.sh), so a new served
+# script cannot dodge the KB 1195 transport pins by not being on a list.
+_CURL_SERVED = sorted(p.name for p in SHIPPED.glob("*.sh") if "curl" in p.read_text())
+_EIGHT_STAMPS = (
+    "flush_offset",
+    "flush_bytes",
+    "flush_size",
+    "flush_event",
+    "flush_mtime",
+    "flush_box",
+    "flush_project_by",
+    "flush_branch_of",
+)
+
+
+def _both_copies(name: str) -> list[Path]:
+    """The canonical contrib copy and the served setup_assets copy of one script."""
+    return [CONTRIB / name, SHIPPED / name]
+
+
+def _copy_id(p: Path) -> str:
+    return f"{p.parent.name}/{p.name}"
+
+
+@pytest.mark.parametrize("path", _both_copies("flush-session-to-kb.sh"), ids=_copy_id)
+def test_line_2_of_the_flush_hook_is_the_never_delete_lineage_marker(path: Path):
+    """KB 33783: every resume re-sent whole transcripts because the old hook
+    DELETED the checkpoint after a drained SessionEnd. The sweep's tripwire
+    (kb-flush-backfill.sh bf_lineage_ok) reads exactly line 2 of the hook it is
+    about to exec and refuses to feed a hook without this marker."""
+    assert path.read_text().splitlines()[1] == _LINEAGE_MARKER, (
+        f"{_copy_id(path)}: line 2 is not the lineage marker the sweep's tripwire greps for"
+    )
+
+
+def _command_lines(text: str) -> list[str]:
+    return [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+# `rm` in command position: line start, after a separator, after a keyword on
+# the same line (`then rm`, `do rm`, `else rm`), by path (`/bin/rm`) or through
+# `command rm` — and the offset file spelled `"$OFFF"` or `"${OFFF}"`.
+_RM_COMMAND = re.compile(r"(^|[;&|({]\s*|\b(?:then|do|else)\s+|/|\bcommand\s+)rm\s")
+_OFFF_ARG = re.compile(r'\$\{?OFFF\}?"')
+
+
+@pytest.mark.parametrize(
+    "path",
+    _both_copies("flush-session-to-kb.sh") + _both_copies("kb-flush-backfill.sh"),
+    ids=_copy_id,
+)
+def test_no_script_ever_removes_the_offset_file(path: Path):
+    """The writer invariant (proposal_v2 Appendix B): value(t+1) is +accepted,
+    0 (shrank, logged), a seed, or a logged CONNECTOR skip — never absent. An
+    `rm` of "$OFFF" anywhere (either bearer arm, the connector arm, the sweep)
+    is the delete lineage coming back; only `$OFFF.t` (the atomic-write temp)
+    may be removed."""
+    offenders = [
+        ln.strip()
+        for ln in _command_lines(path.read_text())
+        if _RM_COMMAND.search(ln.strip()) and _OFFF_ARG.search(ln)
+    ]
+    assert not offenders, f"{_copy_id(path)} removes the offset file: {offenders}"
+
+
+def _named_block(path: Path, name: str) -> str:
+    text = path.read_text()
+    start = text.index(f"# >>> KB {name}")
+    end = text.index(f"# <<< KB {name}")
+    return text[start : end + len(f"# <<< KB {name}")]
+
+
+@pytest.mark.parametrize("name", ["LOCK TRIO v1", "FIRST RECORD v1"])
+def test_the_lock_trio_and_first_record_blocks_are_byte_identical_everywhere(name: str):
+    """ONE function set (kb_lock_take/touch/owned/release; kb_first_record_field)
+    edited in one place and copied verbatim: the hook and the sweep must take the
+    same lock the same way and date a session from the same bytes. Checked
+    across the hook and the backfill, in contrib AND the shipped copies."""
+    copies = _both_copies("flush-session-to-kb.sh") + _both_copies("kb-flush-backfill.sh")
+    blocks = {_copy_id(p): _named_block(p, name) for p in copies}
+    reference = blocks[_copy_id(CONTRIB / "flush-session-to-kb.sh")]
+    assert reference.strip(), f"the {name} block is empty in the contrib flush hook"
+    drifted = [k for k, v in blocks.items() if v != reference]
+    assert not drifted, f"the {name} block drifted in {drifted} — edit it in ONE place and copy it"
+
+
+def _snap_fixture(tmp_path) -> tuple[Path, int, int]:
+    """20 short lines, then ONE 1.3 MB record: a last newline that lies more
+    than a 1 MB snap window before most of the file."""
+    head = b"".join(b'{"type":"user","i":%d,"text":"shared line %d"}\n' % (i, i) for i in range(20))
+    giant = b'{"type":"assistant","i":20,"text":"' + b"G" * 1300000 + b'"}\n'
+    f = tmp_path / "snap.jsonl"
+    f.write_bytes(head + giant)
+    return f, len(head), len(head) + len(giant)
+
+
+def _run_snaps(script: str, offsets: list[int]) -> list[str]:
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert res.returncode == 0, res.stderr
+    out = res.stdout.split()
+    assert len(out) == len(offsets), (offsets, res.stdout, res.stderr)
+    return out
+
+
+def test_the_hook_seed_snap_and_the_backfill_seed_snap_are_the_same_arithmetic(tmp_path):
+    """Wave C stage 3 A2 (KB 33784): kb_snap_down (the hook's branch seed) is a
+    hand-copied twin of bf_snap (the owner's --seed) with different temp-file
+    plumbing, so the byte-identity pin used for the LOCK TRIO cannot cover it.
+    RUN both, source-extracted, on a >1 MB newline-less tail at every offset
+    class — 0, 1, mid-line, exactly / one past the 1 MB window, deep inside the
+    giant record, EOF — and they must agree byte for byte, with every offset
+    inside the giant record snapping BACK to the end of line 20 (never to
+    `offset - 983040`, the uutils `tail -n1` misread the old code made)."""
+    f, head_len, size = _snap_fixture(tmp_path)
+    offsets = [0, 1, head_len + 5, 1048576, 1048577, head_len + 1200000, size - 1, size]
+    calls = " ".join(f"{o}" for o in offsets)
+    hook_script = "\n".join(
+        [
+            _shell_fn(FLUSH, "kb_snap_down"),
+            f'for o in {calls}; do kb_snap_down "{f}" "$o"; printf " "; done',
+        ]
+    )
+    bf_script = "\n".join(
+        [
+            _shell_fn(BACKFILL, "bf_size"),
+            _shell_fn(BACKFILL, "bf_snap"),
+            "BF_TMP=$(mktemp -d); trap 'rm -rf \"$BF_TMP\"' EXIT",
+            f'for o in {calls}; do bf_snap "{f}" "$o"; printf " "; done',
+        ]
+    )
+    hook_out = _run_snaps(hook_script, offsets)
+    bf_out = _run_snaps(bf_script, offsets)
+    assert hook_out == bf_out, f"the two snaps disagree: hook={hook_out} backfill={bf_out}"
+    expected = [0, 0, head_len, head_len, head_len, head_len, head_len, size]
+    assert [int(x) for x in hook_out] == expected, (
+        f"snap results {hook_out} for offsets {offsets}; "
+        f"expected {expected} (head={head_len}, size={size})"
+    )
+
+
+def _logical_lines(text: str) -> str:
+    """The script with backslash-newline continuations joined, so a curl that
+    spans four physical lines is examined as the one command it is."""
+    return re.sub(r"\\\n\s*", " ", text)
+
+
+def _executed_curl_commands(text: str) -> list[str]:
+    return _executed_curl_lines(_logical_lines(text))
+
+
+def test_the_served_curl_set_is_what_this_file_expects():
+    """The derived set must at least cover the five scripts the brief named plus
+    update.sh; if it shrinks, a script stopped shipping or stopped using curl."""
+    assert {
+        "install.sh",
+        "notify-complete.sh",
+        "kb-session-brief.sh",
+        "flush-session-to-kb.sh",
+        "kb-mcp-call.sh",
+        "update.sh",
+    } <= set(_CURL_SERVED), _CURL_SERVED
+
+
+@pytest.mark.parametrize("name", _CURL_SERVED)
+def test_no_executed_curl_in_the_served_scripts_carries_a_connect_timeout(name: str):
+    """KB 1195: on Git Bash/Schannel `--connect-timeout` aborts healthy slow
+    requests (the TLS handshake counts against it), so every bound is a
+    `--max-time`. Executed invocations only, continuations joined, both copies,
+    over EVERY served script that invokes curl (derived, not listed)."""
+    for path in _both_copies(name):
+        offenders = [
+            c for c in _executed_curl_commands(path.read_text()) if "--connect-timeout" in c
+        ]
+        assert not offenders, f"{_copy_id(path)} carries --connect-timeout: {offenders}"
+
+
+@pytest.mark.parametrize("path", _both_copies("flush-session-to-kb.sh"), ids=_copy_id)
+def test_the_ingest_curl_line_is_the_appendix_G_transport_line(path: Path):
+    """The ONE REST submission (kb_rest_post, proposal_v2 Appendix G): bounded per
+    attempt (`--max-time`), a short flap cover (`--retry` + `--retry-max-time`),
+    and NEVER `--fail` — a 401/403 must surface as the code, not be retried.
+    Safe only because /api/ingest-session dedupes; that is why it is one line."""
+    fn = _logical_lines(_shell_fn(path, "kb_rest_post"))
+    cmds = [c for c in _executed_curl_lines(fn) if "/api/ingest-session" in c]
+    assert len(cmds) == 1, f"{_copy_id(path)}: expected one ingest curl, found {cmds}"
+    cmd = cmds[0]
+    for flag in ("--max-time", "--retry ", "--retry-max-time"):
+        assert flag in cmd, f"{_copy_id(path)}: the ingest curl lost {flag.strip()}: {cmd}"
+    assert "--connect-timeout" not in cmd, (
+        f"{_copy_id(path)}: --connect-timeout on the ingest curl (KB 1195)"
+    )
+    assert not re.search(r"(^|\s)(--fail|-f|-fsS|-sSf)(\s|$)", cmd), (
+        f"{_copy_id(path)}: --fail on the ingest curl would retry a 401/403: {cmd}"
+    )
+
+
+def _stamp_lines(text: str) -> list[str]:
+    """The STAMPS construction, lifted VERBATIM from the bearer child."""
+    lines = [
+        ln.strip() for ln in text.splitlines() if re.match(r'\s*(\[ -n "\$\w+" \] && )?STAMPS=', ln)
+    ]
+    assert len(lines) == 5, f"the STAMPS construction changed shape: {lines}"
+    return lines
+
+
+def _rest_body_build_lines(text: str) -> list[str]:
+    lines = [ln.strip() for ln in text.splitlines() if 'kb_json_build "$BODYF"' in ln]
+    assert len(lines) == 2, f"expected the gz and the plaintext REST body builds, found {lines}"
+    return lines
+
+
+@pytest.mark.parametrize("backend", ["jq", "python3"])
+def test_the_rest_body_carries_all_eight_flush_stamps(tmp_path, backend: str):
+    """Wave S accepts eight `flush_*` telemetry stamps (src/kbrest/schemas.py
+    IngestSessionRequest); the hook builds them as extra kb_json_build triples
+    (numbers as `n`, strings as `s`) on the REST body only. RUN, not read: the
+    STAMPS lines and the body-build line are lifted from the source and executed
+    through the hook's own kb_json_build under EACH JSON backend, and the eight
+    keys must land with their types intact."""
+    jq = shutil.which("jq")
+    if backend == "jq" and jq is None:
+        pytest.skip("jq is not installed")
+    text = FLUSH.read_text()
+    gz_line, plain_line = _rest_body_build_lines(text)
+    assert "transcript_gz f" in gz_line and "transcript f" in plain_line, (gz_line, plain_line)
+    for ln in (gz_line, plain_line):
+        assert ln.endswith('"$@" $STAMPS'), (
+            f"the REST body build no longer appends the stamps: {ln}"
+        )
+    chunk = tmp_path / "chunk"
+    chunk.write_text('{"type":"user","text":"x"}\n', encoding="utf-8")
+    body = tmp_path / "body.json"
+    script = "\n".join(
+        [
+            _portable_block(FLUSH),
+            "KB_JSON_PROBED=1",
+            f'KB_JQ_BIN="{jq if backend == "jq" else ""}"',
+            f'KB_PY_BIN="{"" if backend == "jq" else "python3"}"',
+            "PROJECT=proj OFFSET=1400000 BYTES=700000 SIZE=2100000 MTIME=1757500000",
+            "EV=Backfill BOX=box-1 PROJECT_BY=gitfirst BRANCH_OF=abcd1234",
+            f'TMPC="{chunk}" BODYF="{body}"',
+            "set --",
+            *_stamp_lines(text),
+            plain_line,
+        ]
+    )
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert res.returncode == 0, res.stderr
+    doc = json.loads(body.read_text(encoding="utf-8"))
+    assert {k: doc.get(k) for k in _EIGHT_STAMPS} == {
+        "flush_offset": 1400000,
+        "flush_bytes": 700000,
+        "flush_size": 2100000,
+        "flush_event": "Backfill",
+        "flush_mtime": 1757500000,
+        "flush_box": "box-1",
+        "flush_project_by": "gitfirst",
+        "flush_branch_of": "abcd1234",
+    }, f"[{backend}] the REST body's flush_* stamps are wrong or missing: {doc}"
+    assert (
+        doc["project"] == "proj" and doc["kind"] == "session" and doc["transcript"].startswith("{")
+    )
+
+
+def test_install_writes_the_trust_stamp_before_any_hook_is_installed():
+    """The stamp `.checkpoints-trusted-since` is what lets the hook tell a
+    genuinely new session (send from 0) from one an older, offset-deleting hook
+    already captured (refuse as unseeded). If a hook could run before the stamp
+    existed it would create the stamp as `now` itself and refuse every session
+    the install was meant to trust — so the write precedes every `install -m`."""
+    text = INSTALL.read_text()
+    stamp = text.index('STAMP="$STATE/.checkpoints-trusted-since"')
+    write = text.index('>"$STAMP"')
+    first_install = min(
+        m.start() for m in re.finditer(r"^\s*(\[ -f [^\]]*\] && )?install -m ", text, re.M)
+    )
+    assert stamp < write < first_install, (
+        "install.sh installs a hook before it has written .checkpoints-trusted-since"
+    )
+    assert "set -C" in text[stamp:write], "the stamp write is no longer create-only (noclobber)"
+
+
+def test_the_stop_dispatcher_map_runs_the_flush_gate_then_notify():
+    """Wave C (C5): on Stop the flush hook runs FIRST under a 3 s budget (its
+    gate is two stats and a few cats; a closed gate costs nothing), then notify
+    reads the freshest offset under 11 s — 14 s inside the registered 15 s slot.
+    The map is read from the dispatcher that ships, not restated."""
+    stop = _dispatcher_budgets()["Stop"]
+    assert list(stop.items()) == [("flush-session-to-kb.sh", 3), ("notify-complete.sh", 11)], (
+        f"the Stop dispatcher map changed: {stop}"
     )

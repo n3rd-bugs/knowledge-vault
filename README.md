@@ -211,7 +211,11 @@ checkpoint that predates the stamp was captured by an older hook and is **refuse
 in the KB) or `--seed <sid> <bytes>` (captured up to here; seed LOW when in doubt). A sweep
 (`kb-flush-backfill.sh --auto`) picks up sessions that never fired `SessionEnd`; it runs from the
 hooks' own piggyback trigger every 30 min on every box and, on Linux, from the `systemd --user`
-timer `install.sh` renders (`sweep: scheduled …` in its output). Health: the ping appends
+timer `install.sh` renders (`sweep: scheduled …` in its output). It skips transcripts modified in
+the last 5 min (`KB_SWEEP_QUIET_SECONDS` = 300); the timer runs with the `KB_SWEEP_*` defaults
+(the unit passes only `PATH` and the sweep never sources `kb-flush.env` — tune it in the unit);
+LOCAL boxes (`KB_DIR`) write no offsets, so the sweep is a no-op there. A corrupt checkpoint is
+refused like a pre-stamp transcript (`unseeded … offset unreadable`), never resent from 0. Health: the ping appends
 `sweep:never|<age> stale|STALLED n|unknown n` only when unhealthy, the pre-brief prints one
 `[KB sweep]` line with the action. Windows gets the piggyback only (optional `schtasks` line in
 [SHARING.md §2.6](SHARING.md#26-after-install-checkpoints-seeding-and-the-sweep)).

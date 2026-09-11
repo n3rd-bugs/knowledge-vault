@@ -143,4 +143,104 @@ wait_log "flush .* ok bytes=.* sid=orphan-f" 60 || fail "the fork of the now-flu
 assert_eq "1" "$(grep -c 'branch of orphan-p.*: seeded offset=' "$LOGF")" "positive control: with the parent flushed the fork IS seeded"
 assert_eq "$(wc -c <"$OF")" "$(cat "$HOOKS/state/orphan-fork.offset")" "and drained to its EOF"
 
+# ------------------ >1 MB newline-less prefix tail: the snap walks BACK to a newline
+# PIN (wave C stage 3 A2, KB 33784): the seed snap uses the backfill's bf_snap
+# arithmetic (count newlines, `head -n N | wc -c`) over 1 MB windows walking
+# backwards -- never `tail -n1 | wc -c`, which uutils coreutils 0.8.0 (the
+# owner box) truncates to 983040 bytes on a newline-less 1 MB window, landing
+# the seed mid-line; and a single window with NO newline must not seed at its
+# own start either. Parent = 20 lines + one 1.3 MB record; the fork copies the
+# 20 lines and the first 1.2 MB of that record, then diverges. The shared
+# prefix (cmp) therefore ends 1.2 MB past the last newline; the seed must be
+# THAT newline (= PFX, the end of line 20), and everything after it is the
+# fork's own (fragmented on the wire like any >SEND_MAX line).
+step "a shared prefix whose last newline lies >1 MB behind it seeds at THAT newline"
+stub_reset
+W3="$HOME/work/giantproj"
+mkdir -p "$W3"
+GP="$W3/giant-parent.jsonl"
+GF="$W3/giant-fork.jsonl"
+read -r PFX GPSIZE GFSIZE <<<"$("$RIG_PY" - "$GP" "$GF" <<'EOF'
+import json, sys
+gp, gf = sys.argv[1], sys.argv[2]
+head = "".join(json.dumps({"type": "user", "timestamp": "2020-01-01T00:00:00Z", "i": i, "text": "shared line %d" % i}) + "\n" for i in range(20)).encode()
+giant = (json.dumps({"type": "assistant", "i": 20, "text": "G" * 1300000}) + "\n").encode()
+own = "".join(json.dumps({"type": "assistant", "i": 30 + i, "text": "FORK-OWN line %d" % i}) + "\n" for i in range(3)).encode()
+with open(gp, "wb") as fh:
+    fh.write(head + giant)
+fork_giant = giant[:1200000] + b'"}\n'  # the same first 1.2 MB of the record, then it diverges
+with open(gf, "wb") as fh:
+    fh.write(head + fork_giant + own)
+print(len(head), len(head) + len(giant), len(head) + len(fork_giant) + len(own))
+EOF
+)"
+assert_eq "20" "$(head -c $((PFX + 1200000)) "$GF" | tr -cd '\n' | wc -c | tr -d ' ')" "fixture: the only newlines before the divergence are the 20 shared lines (>1 MB of newline-less prefix follows)"
+assert_ge "$((PFX + 1200000 - PFX))" "$((1048576 + 1))" "fixture: the divergence point is more than one 1 MB snap window past the last newline"
+printf '%s' "$GPSIZE" >"$HOOKS/state/giant-parent.offset" # the parent is fully flushed (checkpoint = size)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$GF" "$W3" giant-fork PreCompact)"
+wait_log "flush .* ok bytes=.* sid=giant-fo" 120 || fail "the giant fork never drained: $(tail -3 "$LOGF" | tr '\n' '|')"
+assert_eq "1" "$(grep -c "branch of giant-pa: seeded offset=$PFX " "$LOGF")" "seeded at the newline after line 20 (PFX=$PFX), not mid-line"
+assert_eq "" "$(head -c "$PFX" "$GF" | tail -c1)" "the byte before the seed is a newline"
+GFO=$(stub_field '.session_uri=="session:giant-fork"' '.flush_offset' | head -1)
+assert_eq "$PFX" "$GFO" "flush_offset of the first fork chunk == PFX"
+stub_concat '.session_uri=="session:giant-fork"' '.transcript' >"$HOME/giantgot"
+case "$(head -c 40 "$HOME/giantgot")" in
+  '{"type": "assistant", "i": 20'*) pass "the first fork chunk starts at the giant record's first byte" ;;
+  *) fail "the first fork chunk does not start at the giant record: [$(head -c 60 "$HOME/giantgot")]" ;;
+esac
+GSENT=$(stub_field '.session_uri=="session:giant-fork"' '.transcript_bytes' | awk '{s+=$1} END{print s+0}')
+assert_eq "$((GFSIZE - PFX))" "$GSENT" "exactly the fork's own $((GFSIZE - PFX)) bytes were sent (nothing of the 20 shared lines)"
+assert_eq "0" "$(grep -c 'shared line' "$HOME/giantgot")" "no shared line was resent"
+assert_eq "3" "$(grep -c 'FORK-OWN line' "$HOME/giantgot")" "all 3 own lines arrived"
+assert_eq "$GFSIZE" "$(cat "$HOOKS/state/giant-fork.offset")" "the giant fork drained to its EOF"
+
+# ------------------ a 64 KiB newline-less window: the chunk trim holds it whole
+# PIN (wave C stage 3, KB 33784 -- same defect class as the snap above): the
+# chunk loop's last-newline trim uses the snap arithmetic (count newlines,
+# `head -n N | wc -c`), never `tail -n1 | wc -c`. uutils coreutils 0.8.0 prints
+# 0 bytes for `tail -n1` of a newline-less buffer of exactly 65536 bytes (983040
+# for 1048576), so the old trim read a whole unterminated 64 KiB fragment as
+# ending on a newline and SENT it as if complete. GNU prints the full buffer,
+# so this step is a regression fence that the docker rig can only pass and the
+# owner box (uutils) can fail. Transcript = one complete line + an unterminated
+# record of exactly 65536 bytes: PreCompact sends the line and HOLDS the
+# fragment (offset = the line's end); terminating it makes the next firing send
+# the rest.
+step "an unterminated 65536-byte fragment after one line is HELD, never sent as if complete"
+stub_reset
+# The pre-stamp-parent step above pushed the trust stamp to 2099; restore a past stamp so
+# this fresh transcript is judged post-stamp and actually flows.
+printf '2000-01-01T00:00:00Z\n' >"$HOOKS/state/.checkpoints-trusted-since"
+W4="$HOME/work/fragproj"
+mkdir -p "$W4"
+FT="$W4/frag.jsonl"
+read -r FL FSIZE <<<"$("$RIG_PY" - "$FT" <<'EOF'
+import json, sys
+from datetime import datetime, timedelta, timezone
+ts = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")  # newer than the trust stamp
+line = (json.dumps({"type": "user", "timestamp": ts, "i": 0, "text": "one whole line"}) + "\n").encode()
+pre = b'{"type": "assistant", "i": 1, "text": "'
+frag = pre + b"G" * (65536 - len(pre))
+assert len(frag) == 65536, len(frag)
+with open(sys.argv[1], "wb") as fh:
+    fh.write(line + frag)
+print(len(line), len(line) + len(frag))
+EOF
+)"
+assert_eq "1" "$(tr -cd '\n' <"$FT" | wc -c | tr -d ' ')" "fixture: exactly one newline, then a 65536-byte unterminated fragment"
+assert_eq "$((FSIZE - FL))" "65536" "fixture: the fragment is exactly 65536 bytes"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$FT" "$W4" frag-sess PreCompact)"
+# A held tail is not a fully drained firing: the hook logs `partial bytes=`
+# (will resume), never `ok bytes=`, for it.
+wait_log "flush .* partial bytes=$FL \\(offset $FL/$FSIZE\\) .* sid=frag-ses" 60 || fail "the one whole line never drained as a partial firing: $(tail -3 "$LOGF" | tr '\n' '|')"
+assert_eq "0" "$(grep -c 'ok bytes=.* sid=frag-ses' "$LOGF")" "no ok line: the firing is partial while the fragment is held"
+assert_eq "$FL" "$(cat "$HOOKS/state/frag-sess.offset")" "the offset stops at the end of the one whole line (the fragment is HELD)"
+assert_eq "$FL" "$(stub_field '.session_uri=="session:frag-sess"' '.transcript_bytes' | awk '{s+=$1} END{print s+0}')" "exactly the whole line's bytes were sent -- not the 65536-byte fragment"
+assert_eq "0" "$(stub_concat '.session_uri=="session:frag-sess"' '.transcript' | grep -c 'GGGG')" "no fragment bytes on the wire"
+printf '"}\n' >>"$FT"
+FSIZE2=$(wc -c <"$FT")
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$FT" "$W4" frag-sess PreCompact)"
+wait_log "flush .* ok bytes=$((FSIZE2 - FL)) .* sid=frag-ses" 60 || fail "the terminated record never drained: $(tail -3 "$LOGF" | tr '\n' '|')"
+assert_eq "$FSIZE2" "$(cat "$HOOKS/state/frag-sess.offset")" "once terminated, the record is sent and the offset reaches EOF"
+
 finish

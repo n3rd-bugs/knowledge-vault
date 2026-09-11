@@ -135,13 +135,13 @@ kb_age() { # <epoch> -> "12m" | "3h" | "2d" (ASCII; nothing when unparsable)
   else printf '%sd' "$((_kbd / 86400))"; fi
 }
 
-# A per-session marker the flush hook keeps BESIDE the checkpoint. Both spellings
-# are probed (`<okey>.retry` and `<okey>.offset.retry`) so this reader cannot
-# drift from whichever the hook settles on -- a wrong guess here would be a
-# suffix that silently never appears.
+# A per-session marker the flush hook keeps BESIDE the checkpoint, spelled
+# `<okey>.<ext>` (proposal_v2 Appendix I: <okey>.retry, <okey>.unseeded -- only
+# the lock keeps the .offset infix). ONE spelling, the one both hooks write;
+# tests/hookrig/cases/39 plants exactly these names.
 kb_marker() { # <state> <okey> <ext> -> the marker path when it exists
-  if [ -e "$1/$2.$3" ]; then printf '%s' "$1/$2.$3"
-  elif [ -e "$1/$2.offset.$3" ]; then printf '%s' "$1/$2.offset.$3"; fi
+  [ -e "$1/$2.$3" ] && printf '%s' "$1/$2.$3"
+  return 0
 }
 
 # The sweep's health, appended ONLY when unhealthy (ASCII, KB 12885): the ping
@@ -223,9 +223,20 @@ kb_progress() { # -> "kb <flushed>/<size>[ retry#N]" | "kb <size> synced" | "kb 
   if [ -e "$_off" ]; then
     _flushed=$(cat "$_off" 2>/dev/null || true)
     # A corrupt (non-numeric, or unreadable) checkpoint is NOT reported as zero:
-    # the hook itself treats it as "restart from 0", but printing "0/5.2MB" would
-    # claim nothing is captured when the truth is that we cannot tell. Omit.
-    case "$_flushed" in '' | *[!0-9]*) return 0 ;; esac
+    # printing "0/5.2MB" would claim nothing is captured when the truth is that
+    # we cannot tell. The hook REFUSES such a session as unseeded (never a
+    # from-0 resend, KB 33783) and leaves <okey>.unseeded beside it: say
+    # `?/<size> unseeded` then, exactly as for a missing checkpoint; omit when
+    # the hook has not yet ruled on it.
+    case "$_flushed" in
+      '' | *[!0-9]*)
+        [ -n "$(kb_marker "$_state" "${_okey:-default}" unseeded)" ] || return 0
+        _h=$(kb_human "$_size") || return 0
+        [ -n "$_h" ] || return 0
+        printf 'kb ?/%s unseeded' "$_h"
+        return 0
+        ;;
+    esac
     _sfx=""
     _rt=$(kb_marker "$_state" "${_okey:-default}" retry)
     if [ -n "$_rt" ]; then

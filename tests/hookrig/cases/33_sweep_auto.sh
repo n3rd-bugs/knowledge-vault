@@ -220,6 +220,56 @@ release
 run_bf --auto
 assert_eq "$SZ_B" "$(cat "$ST/s-busy.offset")" "positive control: released -> drained"
 
+# ======================================================= 2b. the HOOK meets the held lock
+# PIN (wave C stage 3 A3, KB 33784): the sweep's own probe runs BEFORE the
+# firing, so a lock taken in between (a Stop drain starting) is met by the HOOK,
+# not the probe. A Backfill firing that finds the session lock held logs ONE
+# `flush <project> Backfill skipped (lock held) ev=Backfill sid=<sid8>` line --
+# the byte-for-byte token the sweep's verdict grep reads as busy -- while
+# PreCompact under the same held lock stays silent and SessionEnd keeps its
+# deferred line. A stand-in hook carrying the lineage marker takes the flock and
+# then runs the REAL hook in the foreground: exactly that race, deterministic.
+step "a Backfill firing that meets a held session lock logs the sweep's busy token, and the sweep reads it"
+mkdir -p "$WORK/lockhk"
+T_LH=$(mk_session "$(slug_of "$WORK/lockhk")" s-lockhk 20 "$WORK/lockhk")
+SZ_LH=$(wc -c <"$T_LH")
+printf 0 >"$ST/s-lockhk.offset"
+cat >"$HOME/heldhook.sh" <<EOF
+#!/usr/bin/env bash
+# KB-FLUSH-LINEAGE: never-delete-offsets v2
+EVJ=\$(cat)
+(
+  exec 9>"$ST/s-lockhk.offset.lock"; flock 9
+  printf '%s' "\$EVJ" | KB_FLUSH_FOREGROUND=1 bash "$HOOKS/flush-session-to-kb.sh" Backfill
+)
+EOF
+chmod +x "$HOME/heldhook.sh"
+: >"$LOGF"
+BEFORE=$(stub_total)
+run_bf --push --hook "$HOME/heldhook.sh" --timeout 20
+assert_eq "0" "$RC" "--push exits 0 around a hook-side busy"
+assert_file_contains "$LOGF" "flush lockhk Backfill skipped (lock held) ev=Backfill sid=s-lockhk" "the hook logged the busy token byte for byte, with ev= and sid="
+assert_eq "1" "$(log_count 'skipped \(lock held\)')" "exactly ONE such line"
+assert_contains "$OUT" "busy (the hook found the session lock held)" "the sweep's verdict is busy, read from the hook's line"
+assert_file_contains "$LOGF" "backfill s-lockhk lockhk busy base=0 size=$SZ_LH sent=0" "the sweep's own line says busy"
+settle
+assert_eq "$BEFORE" "$(stub_total)" "nothing was sent"
+assert_eq "0" "$(cat "$ST/s-lockhk.offset")" "the checkpoint did not move"
+assert_not_contains "$(cat "$LOGF")" "NOT CAPTURED" "hook-side busy is never a NOT CAPTURED"
+assert_file_missing "$ST/s-lockhk.sweep" "hook-side busy never increments the stall counter"
+hold_flock "$ST/s-lockhk.offset.lock"
+KB_SWEEP_INTERVAL=0 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T_LH" "$WORK/lockhk" s-lockhk PreCompact)"
+settle
+assert_eq "1" "$(log_count 'skipped \(lock held\)')" "PreCompact under the same held lock stays SILENT (only Backfill speaks)"
+KB_SWEEP_INTERVAL=0 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T_LH" "$WORK/lockhk" s-lockhk SessionEnd)"
+settle
+assert_file_contains "$LOGF" "SessionEnd deferred (lock held by a running drain)" "SessionEnd under the held lock keeps its deferred line"
+assert_eq "1" "$(log_count 'skipped \(lock held\)')" "...and does not borrow the Backfill token"
+release
+rm -f "$ST/s-lockhk.retry" # the deferred SessionEnd's n=0 marker; the sweep ignores it anyway
+run_bf --auto
+assert_eq "$SZ_LH" "$(cat "$ST/s-lockhk.offset")" "released -> the next --auto drains it"
+
 # ======================================================= 3. the sweep lock
 step "the sweep lock: --auto exits 3 silently, --push exits 3 with one line, --status says HELD"
 hold_flock "$ST/.sweep.lock"
@@ -304,11 +354,14 @@ COMPLETE=$(wc -c <"$T_H")
 printf '{"type":"user","half":' >>"$T_H"
 touch -d @1700000000 "$T_H"
 printf 0 >"$ST/s-half.offset"
+PRE_LINES=$(wc -l <"$LOGF" 2>/dev/null || echo 0)
 run_bf --auto
 assert_eq "$COMPLETE" "$(cat "$ST/s-half.offset")" "the checkpoint stops at the last newline (half line held)"
 stub_concat '.transport=="rest"' '.transcript' >"$HOME/got"
 if grep -q '"half":' "$HOME/got"; then fail "the unterminated half line was sent"; else pass "the half line was NOT sent"; fi
-assert_eq "0" "$(log_count 'ev=SessionEnd')" "no SessionEnd was synthesised by the sweep"
+# Earlier steps fire SessionEnd on purpose; only lines this sweep appended count.
+_se=$(tail -n +$((PRE_LINES + 1)) "$LOGF" | grep -c 'ev=SessionEnd') || true
+assert_eq "0" "${_se:-0}" "no SessionEnd was synthesised by the sweep"
 assert_eq "0" "$(stub_count '.transport=="rest" and .flush_event=="SessionEnd"')" "no request was stamped SessionEnd"
 run_bf
 assert_eq "tail-held" "$(state_of s-half)" "the dry table reads tail-held"
@@ -484,5 +537,41 @@ assert_eq "8" "$(sed -n 's/^fails=\([0-9]*\).*/\1/p' "$ST/s-stall.sweep")" "fail
 assert_eq "1" "$(log_count 'STALLED')" "...without a second STALLED line"
 assert_not_contains "$(cat "$LOGF")" "NOT CAPTURED" "a stall is never a NOT CAPTURED"
 unpin_sweep_clock
+
+# ======================================================= 7. a CORRUPT checkpoint
+# PIN (wave C stage 3 A1, KB 33783): the hook refuses a non-numeric/empty
+# checkpoint as unseeded (never a restart from 0), so the sweep must NOT class
+# it `ready` at 0 -- that fired the hook on every --auto, booked its refusal as
+# `failed`/`no-progress` and walked the session into STALLED (a 6 h back-off and
+# a `sweep:STALLED` suffix in notify) for a file only --seed can fix. It is an
+# `unknown` row: listed with the --seed hint, counted in `unknown=` (the
+# `sweep:unknown n` health suffix), never fired by --auto, no .sweep record.
+step "a corrupt checkpoint reads unknown with the --seed hint; --auto never fires it and leaves no stall record"
+mkdir -p "$WORK/corruptproj"
+T_CR=$(mk_session "$(slug_of "$WORK/corruptproj")" s-corrupt 12 "$WORK/corruptproj")
+SZ_CR=$(wc -c <"$T_CR")
+printf 'not-a-number\n' >"$ST/s-corrupt.offset"
+: >"$LOGF"
+BEFORE=$(stub_total)
+run_bf
+assert_eq "unknown" "$(state_of s-corrupt)" "the dry table reads unknown (not ready at 0)"
+assert_contains "$OUT" "corrupt checkpoint [not-a-number]: the hook refuses it as unseeded -- kb-flush-backfill.sh --seed s-corrupt current|<bytes>" "...with the reason and the --seed hint"
+assert_not_contains "$OUT" "the hook restarts from 0" "the retired 'restarts from 0' reason is gone"
+run_bf --status
+assert_eq "0" "$RC" "--status exits 0"
+assert_contains "$OUT" "corrupt checkpoint [not-a-number]: the hook refuses it as unseeded" "--status says the same"
+run_bf --auto
+assert_eq "0" "$RC" "--auto exits 0"
+settle
+assert_eq "$BEFORE" "$(stub_total)" "--auto sent nothing for it"
+assert_eq "not-a-number" "$(tr -d '\n' <"$ST/s-corrupt.offset")" "the corrupt checkpoint is untouched"
+assert_file_missing "$ST/s-corrupt.sweep" "no stall record: an unknown row is never fired, so it can never be booked no-progress"
+assert_eq "0" "$(log_count 'backfill s-corrup')" "no backfill verdict line for it"
+assert_eq "0" "$(log_count 'unseeded: refusing')" "the hook was not fired, so it did not have to refuse"
+assert_ge "$(sweep_last unknown)" "1" ".sweep-last counts it under unknown= (the sweep:unknown health suffix)"
+"$BF" --seed s-corrupt current >"$HOME/seed.out" 2>&1
+assert_eq "seeded s-corrup offset=$SZ_CR (snapped from $SZ_CR)" "$(cat "$HOME/seed.out")" "--seed current replaces the corrupt checkpoint"
+run_bf
+assert_eq "flushed" "$(state_of s-corrupt)" "...and the row reads flushed"
 
 finish

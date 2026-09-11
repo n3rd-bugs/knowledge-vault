@@ -92,6 +92,30 @@ touch "$ST/s-unseeded.unseeded"
 ping s-unseeded
 assert_contains "$BODY" "(kb ?/$HSIZE unseeded)" "no offset + .unseeded -> unseeded: $BODY"
 
+# PIN (wave C stage 3 A1/D, KB 33783): a CORRUPT checkpoint is refused by the
+# hook as unseeded (never restarted from 0) and leaves <okey>.unseeded beside
+# it; notify says exactly what it says for a missing checkpoint. Without the
+# marker (the hook has not ruled yet) the segment is omitted, never "0/...".
+step "notify: a CORRUPT offset beside an .unseeded marker reads ?/<size> unseeded; alone it is omitted"
+printf 'not-a-number\n' >"$ST/s-corrupt.offset"
+ping s-corrupt
+assert_not_contains "$BODY" "(kb " "corrupt offset, no ruling yet -> no kb segment: $BODY"
+touch "$ST/s-corrupt.unseeded"
+ping s-corrupt
+assert_contains "$BODY" "(kb ?/$HSIZE unseeded)" "corrupt offset + .unseeded -> unseeded: $BODY"
+
+# PIN (wave C stage 3 D, proposal_v2 Appendix I): the marker probe reads the ONE
+# spelling both hooks write -- <okey>.retry / <okey>.unseeded -- and no longer
+# the retired <okey>.offset.retry guess.
+step "notify: the marker probe reads <okey>.retry only, never <okey>.offset.retry"
+printf '%s' "$((SIZE / 2))" >"$ST/s-spell.offset"
+printf '1757500000 2 502 %s\n' "$SIZE" >"$ST/s-spell.offset.retry"
+ping s-spell
+assert_not_contains "$BODY" "retry" "the retired <okey>.offset.retry spelling is NOT read: $BODY"
+mv "$ST/s-spell.offset.retry" "$ST/s-spell.retry"
+ping s-spell
+assert_contains "$BODY" " retry#2)" "<okey>.retry is: $BODY"
+
 step "notify: sweep suffix only when unhealthy"
 NOW=$(date +%s)
 printf 'ts=%s rc=0 ready=0 pushed=0 failed=0 deferred=0 stalled=0 unknown=0 live=1 unflushed=0\n' "$((NOW - 600))" >"$ST/.sweep-last"

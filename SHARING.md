@@ -283,15 +283,29 @@ completion ping reads `kb ?/<size> unseeded`) until the owner seeds it:
 ~/.claude/hooks/kb-flush-backfill.sh --seed <sid> <bytes>    # captured up to here (snapped to a line end)
 ```
 
+A corrupt or empty checkpoint file takes the same refusal (`unseeded: … (offset
+unreadable: <path>)`) — a resend from 0 is never automatic; `--seed` replaces it.
 Seed LOW when unsure (one overlapping chunk at most, deduped server-side); never
 hand-edit or delete an offset file. The sweep (`kb-flush-backfill.sh --auto`)
-drains sessions that never fired `SessionEnd`. It runs from the hooks' piggyback
+drains sessions that never fired `SessionEnd`; it skips a transcript modified in
+the last 5 min (`KB_SWEEP_QUIET_SECONDS` = 300) and reports a session whose lock
+the hook found held as `busy`. It runs from the hooks' piggyback
 trigger (every box, every `KB_SWEEP_INTERVAL` = 1800 s) and, on Linux, from the
 `systemd --user` timer `install.sh` renders when `systemctl --user` answers
 (`~/.config/systemd/user/kb-flush-sweep.{service,timer}`; `KB_SWEEP_TIMER=0`
 opts out, `KB_SWEEP_INTERVAL=0` turns the sweep off, a backfill that predates
 `--auto` is not scheduled until the next install; the install prints one `sweep:`
-line; `loginctl enable-linger` keeps it firing after logout). Its health rides on the completion ping (`sweep:never`,
+line; `loginctl enable-linger` keeps it firing after logout). The timer runs the
+sweep with the `KB_SWEEP_*` DEFAULTS — the unit passes only `PATH`, and the sweep
+never sources `kb-flush.env` — so to tune it edit the unit (`systemctl --user edit
+kb-flush-sweep.service`, `[Service] Environment=KB_SWEEP_QUIET_SECONDS=600`) or
+export the knob in the timer's environment. A LOCAL box (`KB_DIR`) writes no
+offsets, so the sweep is a no-op there. A failed REST chain leaves
+`state/<session>.retry` = `<epoch> <n> <code> <end>`, where `<end>` is the failed
+chunk's END offset (`offset + bytes`, always `<= size`) so the retry re-cuts the
+same window; a SessionEnd that met a held lock leaves `<epoch> 0 lock <size>`
+(nothing failed; `<end>` is the transcript size at deferral) so the resumed
+session finishes the tail. Its health rides on the completion ping (`sweep:never`,
 `sweep:26h stale`, `sweep:STALLED n`, `sweep:unknown n` — only when unhealthy) and
 on the pre-brief's `[KB sweep]` line.
 

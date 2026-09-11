@@ -69,7 +69,14 @@ def _invoked_curl_lines(text: str) -> list[str]:
     """`_executed_curl_lines` minus the lines that only MENTION curl (an emitter
     definition's trailing comment, a `command -v curl` probe): a real invocation
     always passes at least one flag, so require `curl -`."""
-    return [ln for ln in _executed_curl_lines(text) if re.search(r"curl\s+-", ln)]
+    # A `curl --help …` / `curl --version` capability probe (wave C: the
+    # --retry-all-errors probe in the flush child) opens no connection and so
+    # needs no address-family pin.
+    return [
+        ln
+        for ln in _executed_curl_lines(text)
+        if re.search(r"curl\s+-", ln) and not re.search(r"curl\s+--(help|version)\b", ln)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +150,9 @@ def test_the_brief_reachability_probes_pin_the_same_family_as_the_calls_they_gat
     probes = [
         ln
         for ln in _invoked_curl_lines(BRIEF.read_text())
-        if "--connect-timeout 2" in ln and "-K -" not in ln
+        # Wave C (KB 1195): no hook curl carries --connect-timeout; the probes
+        # are the two bare `--max-time 3` GETs against the transport URLs.
+        if re.search(r"--max-time\s+\d+", ln) and "-K -" not in ln
     ]
     assert len(probes) == 2, f"expected the two reachability probes, found: {probes}"
     for ln in probes:

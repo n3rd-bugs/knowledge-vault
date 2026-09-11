@@ -1045,24 +1045,32 @@ for T in "$BF_PROJECTS"/*/*.jsonl; do
       fi
     fi
   else
-    case "$BASE" in '' | *[!0-9]*)
-      REASON="corrupt checkpoint [$(printf '%.20s' "$BASE")]: the hook restarts from 0"
-      BASE=0
-      ;;
+    case "$BASE" in
+      '' | *[!0-9]*)
+        # A corrupt/empty checkpoint: the hook REFUSES it as unseeded (never a
+        # restart from 0, KB 33783), so firing it would only book a refusal and
+        # count towards a stall. An owner decision, like a pre-stamp transcript.
+        STATUS=unknown
+        REASON="corrupt checkpoint [$(printf '%.20s' "$BASE")]: the hook refuses it as unseeded -- kb-flush-backfill.sh --seed $SID current|<bytes>"
+        BASE=0
+        REMAIN=$SIZE
+        ;;
+      *)
+        if [ "$SIZE" -eq 0 ]; then
+          STATUS=flushed
+          REASON="empty transcript (size 0): the hook does not drain it"
+        elif [ "$SIZE" -lt "$BASE" ]; then
+          STATUS=shrank
+          REASON="checkpoint $BASE is past the size: the hook restarts from 0 (reason=shrank)"
+          BASE=0
+          REMAIN=$SIZE
+        elif [ "$SIZE" -eq "$BASE" ]; then
+          STATUS=flushed
+        else
+          REMAIN=$((SIZE - BASE))
+        fi
+        ;;
     esac
-    if [ "$SIZE" -eq 0 ]; then
-      STATUS=flushed
-      REASON="empty transcript (size 0): the hook does not drain it"
-    elif [ "$SIZE" -lt "$BASE" ]; then
-      STATUS=shrank
-      REASON="checkpoint $BASE is past the size: the hook restarts from 0 (reason=shrank)"
-      BASE=0
-      REMAIN=$SIZE
-    elif [ "$SIZE" -eq "$BASE" ]; then
-      STATUS=flushed
-    else
-      REMAIN=$((SIZE - BASE))
-    fi
   fi
 
   # The gates, on FIREABLE rows only (a push-mode probe creates the lock file, so

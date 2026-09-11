@@ -433,7 +433,7 @@ import json, sys
 from datetime import datetime, timedelta, timezone
 path, n, tag, ts = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 if not ts:
-    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    now = datetime.now(timezone.utc) + timedelta(hours=1)  # an hour ahead: never older than a stamp install.sh writes later in the same case
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 with open(path, "w", encoding="utf-8") as fh:
     for i in range(n):
@@ -448,7 +448,7 @@ import json, sys
 from datetime import datetime, timedelta, timezone
 path, target, ts = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 if not ts:
-    now = datetime.now(timezone.utc) + timedelta(seconds=1)
+    now = datetime.now(timezone.utc) + timedelta(hours=1)  # an hour ahead: never older than a stamp install.sh writes later in the same case
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 # byte window NEVER lands on a line boundary by luck
 written, i = 0, 0

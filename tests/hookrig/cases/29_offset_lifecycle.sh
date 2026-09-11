@@ -312,4 +312,122 @@ fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T9" "$W8" sess-new PreComp
 wait_firing 1 60 || fail "the post-stamp transcript never drained"
 assert_eq "$(wc -c <"$T9")" "$(cat "$HOOKS/state/sess-new.offset")" "post-stamp -> sent from 0"
 
+# ------------------------------------------- 8. corrupt / empty offset -> UNSEEDED
+# PIN (wave C stage 3 A1, KB 33783): a non-numeric or empty checkpoint is NEVER a
+# licence to resend from 0 -- the old "offset unreadable — restarting from 0"
+# path is gone. It takes the SAME unseeded refusal as a pre-stamp transcript
+# (same <okey>.unseeded marker, same one-line-per-24 h limit) with the reason
+# `offset unreadable` and the --seed hint; the offset file is never written on
+# that path, the Stop gate stays closed, and only the owner's --seed (or a valid
+# offset) makes the session flow.
+new_home offcorrupt
+stub_reset
+cfg_rest
+install_hooks >/dev/null
+mkdir -p "$HOOKS/state"
+printf '2000-01-01T00:00:00Z\n' >"$HOOKS/state/.checkpoints-trusted-since"
+W9="$HOME/work/corruptproj"
+mkdir -p "$W9"
+# Under the projects dir, so `kb-flush-backfill.sh --seed <sid>` can find it by sid.
+PD9="$HOME/.claude/projects/$(printf '%s' "$W9" | tr '/' '-')"
+mkdir -p "$PD9"
+T10="$PD9/sess-corrupt.jsonl"
+mk_transcript "$T10" 25 corrupt
+S10=$(wc -c <"$T10")
+step "a NON-NUMERIC offset file is refused as unseeded (offset unreadable), never restarted from 0"
+printf 'not-a-number\n' >"$HOOKS/state/sess-corrupt.offset"
+BEFORE=$(stub_total)
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T10" "$W9" sess-corrupt PreCompact)"
+assert_eq "0" "$RC" "hook exits 0"
+settle
+settle
+assert_eq "$BEFORE" "$(stub_total)" "0 stub requests: nothing was resent from 0"
+assert_eq "not-a-number" "$(tr -d '\n' <"$HOOKS/state/sess-corrupt.offset")" "the offset file is UNCHANGED (never written on this path)"
+if [ -f "$HOOKS/state/sess-corrupt.unseeded" ]; then pass "the <okey>.unseeded marker was written"; else fail "no unseeded marker (sess-corrupt.unseeded)"; fi
+assert_eq "1" "$(log_count 'unseeded: refusing')" "exactly one unseeded line"
+assert_file_contains "$LOGF" "unseeded: refusing to send $S10 from 0 (offset unreadable: " "the line names the reason: offset unreadable"
+assert_file_contains "$LOGF" "--seed sess-corrupt current|$S10 ev=PreCompact sid=sess-cor" "...and the --seed hint, ev= and sid="
+assert_not_contains "$(cat "$LOGF")" "restarting from 0" "no 'restarting from 0' for a corrupt offset (the old path is gone)"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T10" "$W9" sess-corrupt PreCompact)"
+settle
+settle
+assert_eq "1" "$(log_count 'unseeded: refusing')" "the refusal is rate-limited by the same marker (one per 24 h)"
+assert_eq "$BEFORE" "$(stub_total)" "still nothing sent"
+step "an EMPTY offset file takes the same refusal"
+: >"$HOOKS/state/sess-corrupt.offset"
+rm -f "$HOOKS/state/sess-corrupt.unseeded" # lift the 24 h rate limit only
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T10" "$W9" sess-corrupt PreCompact)"
+settle
+settle
+assert_eq "$BEFORE" "$(stub_total)" "empty offset: nothing sent"
+assert_empty_file "$HOOKS/state/sess-corrupt.offset" "the empty offset file stays empty (not written)"
+assert_eq "2" "$(log_count 'offset unreadable')" "logged once more (the marker had been lifted)"
+if [ -f "$HOOKS/state/sess-corrupt.unseeded" ]; then pass "the marker is back"; else fail "no unseeded marker after the empty-offset refusal"; fi
+step "Stop stays CLOSED on a corrupt+unseeded session (no .gate, no request)"
+KB_FLUSH_STOP_MIN_BYTES=1 KB_FLUSH_STOP_MIN_INTERVAL=0 KB_SWEEP_INTERVAL=0 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T10" "$W9" sess-corrupt Stop)"
+assert_eq "0" "$RC" "Stop exits 0"
+settle
+assert_file_missing "$HOOKS/state/sess-corrupt.gate" "no .gate stamped: the marker closes the gate"
+assert_eq "$BEFORE" "$(stub_total)" "0 requests on Stop"
+step "--seed via the backfill makes it flow"
+"$HOOKS/kb-flush-backfill.sh" --seed sess-corrupt 0 >"$HOME/seed.out" 2>&1
+SEEDRC=$?
+assert_eq "0" "$SEEDRC" "--seed exits 0 on a corrupt checkpoint"
+assert_eq "seeded sess-cor offset=0 (snapped from 0)" "$(cat "$HOME/seed.out")" "--seed wrote a numeric checkpoint"
+assert_eq "0" "$(cat "$HOOKS/state/sess-corrupt.offset")" "the offset file now reads 0"
+assert_file_missing "$HOOKS/state/sess-corrupt.unseeded" "--seed cleared the unseeded marker"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T10" "$W9" sess-corrupt PreCompact)"
+wait_firing 0 60 || fail "the seeded session never drained: $(tail -3 "$LOGF" | tr '\n' '|')"
+assert_eq "$S10" "$(cat "$HOOKS/state/sess-corrupt.offset")" "seeded at 0 -> drained to EOF"
+assert_eq "1" "$(($(stub_total) - BEFORE))" "exactly one request: the transcript left ONCE, after the owner's seed"
+assert_eq "2" "$(log_count 'unseeded: refusing')" "no further refusal once seeded"
+
+# ------------------------------------------- 9. the CONNECTOR arm: same refusal
+# PIN (wave C stage 3 A1, KB 33783 -- arm-agnostic): `a resend from 0 is never
+# automatic` holds for the usage-metered CONNECTOR arm too. A corrupt/empty
+# checkpoint there used to be silently coerced to 0 and the WHOLE transcript
+# re-relayed through `claude -p` (one model call per 24 KB). It now takes the
+# shared refusal: 0 relay calls, the file untouched, one `unseeded: refusing
+# ... (offset unreadable: ...)` line with the --seed hint, the .unseeded marker;
+# a numeric checkpoint (the owner's --seed) relays only the delta and clears
+# the marker.
+new_home offcorruptconn
+fake_claude_relay
+cfg_connector
+install_hooks >/dev/null
+mkdir -p "$HOOKS/state"
+W10="$HOME/work/connproj"
+mkdir -p "$W10"
+T11="$W10/conn.jsonl"
+mk_transcript "$T11" 25 connc
+S11=$(wc -c <"$T11")
+step "CONNECTOR: a NON-NUMERIC offset file is refused as unseeded, nothing is relayed, the file is untouched"
+printf 'not-a-number\n' >"$HOOKS/state/conn-corrupt.offset"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T11" "$W10" conn-corrupt PreCompact)"
+assert_eq "0" "$RC" "hook exits 0"
+settle
+settle
+assert_eq "0" "$(relay_count)" "0 relay calls: nothing was re-relayed from 0"
+assert_eq "not-a-number" "$(tr -d '\n' <"$HOOKS/state/conn-corrupt.offset")" "the offset file is UNCHANGED"
+if [ -f "$HOOKS/state/conn-corrupt.unseeded" ]; then pass "the <okey>.unseeded marker was written"; else fail "no unseeded marker (conn-corrupt.unseeded)"; fi
+assert_eq "1" "$(log_count 'unseeded: refusing')" "exactly one unseeded line"
+assert_file_contains "$LOGF" "unseeded: refusing to send $S11 from 0 (offset unreadable: " "the line names the reason: offset unreadable"
+assert_file_contains "$LOGF" "--seed conn-corrupt current|$S11 ev=PreCompact sid=conn-cor" "...and the --seed hint, ev= and sid="
+assert_not_contains "$(cat "$LOGF")" "connector connproj ok bytes=" "no relay ok line"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T11" "$W10" conn-corrupt PreCompact)"
+settle
+settle
+assert_eq "1" "$(log_count 'unseeded: refusing')" "rate-limited by the same marker (one per 24 h)"
+assert_eq "0" "$(relay_count)" "still nothing relayed"
+step "CONNECTOR: a numeric checkpoint relays only the delta and clears the marker"
+HALF=$(head -n 12 "$T11" | wc -c | tr -d ' ')
+printf '%s' "$HALF" >"$HOOKS/state/conn-corrupt.offset"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T11" "$W10" conn-corrupt PreCompact)"
+wait_relay 1 30 || fail "the seeded connector session never relayed: $(tail -3 "$LOGF" | tr '\n' '|')"
+wait_log "connector connproj ok bytes=$((S11 - HALF)) " 30 || fail "no ok line for the delta: $(tail -3 "$LOGF" | tr '\n' '|')"
+assert_eq "$S11" "$(cat "$HOOKS/state/conn-corrupt.offset")" "drained from the numeric checkpoint to EOF"
+assert_eq "$((S11 - HALF))" "$(relay_concat | wc -c | tr -d ' ')" "exactly the delta was relayed (nothing from 0)"
+assert_file_missing "$HOOKS/state/conn-corrupt.unseeded" "a numeric checkpoint clears the stale unseeded marker"
+assert_eq "1" "$(log_count 'unseeded: refusing')" "no further refusal"
+
 finish

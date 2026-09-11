@@ -148,6 +148,11 @@ services:
   kb-rest:
     image: kb-app:latest
     container_name: kb-rest
+    # Owner-box hooks talk to REST over loopback (wave S8, KB 33784): the box that holds most
+    # session bytes no longer routes its own flushes out through DNS + the tunnel and back.
+    # Loopback only — no LAN or inbound exposure (CLAUDE.md rule 6 intact).
+    ports:
+      - "127.0.0.1:8322:8322"
     # 401/burst forensics must survive container recreation (review #6 Wave G):
     # json-file logs die with the container, which is how the 08-22 scan burst
     # vanished from its own 7-day window. journald persists on the host.

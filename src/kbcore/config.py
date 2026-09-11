@@ -14,6 +14,7 @@ from pathlib import Path
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from kbcore.config_fleet import FleetSettings
 from kbcore.config_llm import LLMSettings
 from kbcore.config_views import SettingsViews
 
@@ -23,7 +24,7 @@ logger = logging.getLogger("kbcore.config")
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class Settings(SettingsViews, LLMSettings, BaseSettings):
+class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     """Typed view over `.env` (see `.env.example` for the documented template).
 
     The DERIVED properties (db_url, raw, embed_url, …) live in

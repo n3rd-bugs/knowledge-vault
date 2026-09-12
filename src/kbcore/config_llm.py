@@ -48,6 +48,17 @@ class LLMSettings(BaseSettings):
     # 16K-char extraction window with output headroom; KV cost at 16K ≈ +2-3GB (fits beside the
     # resident 14B). Raise only after checking VRAM headroom.
     kb_llm_num_ctx: int = 16384
+    # Malformed-JSON re-ask (incident 2026-09-12): ONE ~900 KB window came back with an unescaped
+    # quote inside a string, extract_items raised, the per-job fallback failed identically and
+    # 151 rows flipped to failed — and the fixed EXTRACT_SEED guaranteed the next two nightlies
+    # would reproduce the same bytes and burn the attempts cap. >0 = re-ask ONCE with seed+1 and
+    # a repair hint before salvaging item-by-item (kbcore.llm_json.recover_items). 0 disables the
+    # re-ask (salvage still runs). Only ever one retry regardless of the value.
+    kb_extract_json_retry: int = 1
+    # Unparseable extractor replies are dumped raw (scrubbed) to $KB_STATE_DIR/extract-failures
+    # for post-mortem — journald cannot carry a 900 KB body. Keep this many newest; 0 disables.
+    # Debug artefacts, not knowledge: rotating them is outside rule 5's scope.
+    kb_extract_failure_dumps: int = 20
     # Quote repair (pipeline v2 WP-B1, owner decision 2026-07-18): an extracted quote that fails
     # the exact substring check gets ONE fuzzy-relocation attempt (kbcore.quote_repair.find_span);
     # the located TRUE span replaces the model's version when the difflib ratio clears this floor,

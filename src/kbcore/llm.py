@@ -2,21 +2,23 @@
 
 The nightly 14B extractor turns a session transcript into a list of grounded
 knowledge items. ``keep_alive`` comes from ``settings.kb_llm_keep_alive`` (FINITE
-seconds, never -1 — CLAUDE.md rule 8, corrected 2026-07-29). Network/format
-failures become an :class:`ExtractorUnavailable` domain error; traces stay in logs.
+seconds, never -1 — CLAUDE.md rule 8, corrected 2026-07-29). Transport failures →
+:class:`ExtractorUnavailable`; malformed JSON is recovered / re-asked / salvaged in
+:mod:`kbcore.llm_json` (incident 2026-09-12). Traces stay in logs.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 from typing import Any
 
 import httpx
 
 from kbcore.config import settings
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
+
+# Documented seam: callers/tests resolve llm.parse_model_json / llm.JSON_COUNTERS.
+from kbcore.llm_json import JSON_COUNTERS, parse_model_json, recover_items  # noqa: F401
 
 # Extractor sampling: pin ONLY a fixed seed — determinism-for-retry comes from the
 # seed, not from greedy decoding. Ollama's seed makes sampling reproducible at
@@ -64,41 +66,6 @@ def _classify_extractor_error(e: httpx.HTTPError) -> Exception:
     if isinstance(e, httpx.TimeoutException) and not isinstance(e, httpx.ConnectTimeout):
         return ExtractionFailed(msg)  # read timeout: THIS row is too heavy — bound it
     return ExtractorUnavailable(msg)  # connect errors and other transport failures
-
-
-# Reasoning models (deepseek-r1, qwen3 with thinking on, ...) may wrap or prefix
-# the answer with a <think>...</think> block, and some models fence the JSON in
-# markdown despite format="json". Strip/recover instead of failing the batch.
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
-
-
-def parse_model_json(content: str) -> Any:
-    """Parse model output into JSON, tolerating reasoning-model wrappers.
-
-    Order: strip <think> blocks → direct parse → fenced ```json``` block →
-    outermost {...} span. Raises ``ValueError`` if no JSON object can be
-    recovered (callers map that to their own failure mode).
-    """
-    text = _THINK_RE.sub("", content).strip()
-    # An UNCLOSED <think> means the model hit its token budget mid-reasoning;
-    # anything after it is reasoning, not an answer — do not mine JSON from it.
-    if text.lstrip().lower().startswith("<think>"):
-        raise ValueError("extractor output is an unterminated <think> block")
-    try:
-        return json.loads(text)
-    except ValueError:
-        pass
-    fence = _FENCE_RE.search(text)
-    if fence:
-        try:
-            return json.loads(fence.group(1))
-        except ValueError:
-            pass
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        return json.loads(text[start : end + 1])  # ValueError propagates
-    raise ValueError("no JSON object found in extractor output")
 
 
 # The 14B can take a while on first-token; generous read timeout, tight connect.
@@ -165,28 +132,40 @@ def extract_items(
             {"role": "user", "content": transcript_text},
         ],
     }
+
+    def ask_again(hint: str) -> str:
+        # The ONE re-ask (llm_json.recover_items): same model/keep_alive/num_ctx, seed+1.
+        retry = {
+            **payload,
+            "options": {**payload["options"], "seed": EXTRACT_SEED + 1},
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT + hint},
+                payload["messages"][1],
+            ],
+        }
+        return _extract_call(retry)
+
+    return recover_items(payload["model"], _extract_call(payload), ask_again)
+
+
+def _extract_call(payload: dict[str, Any]) -> str:
+    """POST one extractor request; return the reply content (unparsed). Transport
+    errors split via :func:`_classify_extractor_error`; a reply without a STRING
+    ``message.content`` is content-deterministic (attempts-bounded, never deferred)."""
     try:
         resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
     except httpx.HTTPError as e:
         raise _classify_extractor_error(e) from e
-
     try:
         content = resp.json()["message"]["content"]
-        data = parse_model_json(content)
+        if not isinstance(content, str):  # null/number/list: never a raw TypeError
+            raise TypeError(f"message.content is {type(content).__name__}")
+        return content
     except (KeyError, ValueError, TypeError) as e:
-        # Deterministic in this row's content (truncated JSON, unterminated <think>,
-        # missing message key): bound it with the attempts cap, don't defer forever.
         raise ExtractionFailed(
             f"extractor returned unparseable output: {e.__class__.__name__}: {e}"
         ) from e
-
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        # {"items": null} / {"items": "x"} / bare non-object → nothing usable.
-        # Coerce to empty rather than letting a TypeError escape (review finding).
-        return []
-    return [it for it in items if isinstance(it, dict)]
 
 
 def _chat(
@@ -299,11 +278,8 @@ def evidence_side(
     a_title: str, a_body: str, b_title: str, b_body: str, c_title: str, c_body: str
 ) -> str:
     """Which side of a contradiction the candidate item supports: 'a'|'b'|'neither'.
-
-    Mirrors :func:`items_contradict`: an unparseable or unexpected answer degrades
-    to 'neither' (never raises on ambiguity); genuine network failures surface as
-    :class:`ExtractorUnavailable` so the nightly step can log and continue.
-    """
+    Mirrors :func:`items_contradict`: an unparseable/unexpected answer degrades to
+    'neither' (never raises); network failures surface as :class:`ExtractorUnavailable`."""
     content = _chat(
         [
             {"role": "system", "content": _EVIDENCE_SYSTEM},
@@ -345,12 +321,9 @@ _CONTRADICT_SYSTEM = (
 
 
 def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bool:
-    """True iff the extractor judges the two items to conflict (§7.3 step 3).
-
-    Never raises on an ambiguous/unparseable answer — defaults to False. Genuine
-    network failures still surface as :class:`ExtractorUnavailable` (via ``_chat``)
-    so the consolidation step logs and continues.
-    """
+    """True iff the extractor judges the two items to conflict (§7.3 step 3). Never
+    raises on an ambiguous/unparseable answer (False); network failures still surface
+    as :class:`ExtractorUnavailable` via ``_chat`` so consolidation logs and continues."""
     content = _chat(
         [
             {"role": "system", "content": _CONTRADICT_SYSTEM},

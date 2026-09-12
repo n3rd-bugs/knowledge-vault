@@ -7,7 +7,7 @@
   "src/kbcore/graph.py": 352,
   "src/kbcore/ingest.py": 462,
   "src/kbcore/items.py": 370,
-  "src/kbcore/llm.py": 538,
+  "src/kbcore/llm.py": 534,
   "src/kbcore/offsite_config.py": 387,
   "src/kbcore/principals.py": 356,
   "src/kbcore/reprocess.py": 309,

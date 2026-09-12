@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 
-from kbcore import ingest_queue
+from kbcore import ingest_queue, llm
 from kbworker import ensemble
 
 logger = logging.getLogger("kbworker.consolidate")
@@ -69,8 +69,16 @@ def reset_cohort_stats(cohort_size: int) -> None:
             # sub-cap content failures stay report-only (they retry tomorrow).
             "content_failures": 0,
             "attempts_cap_retirements": 0,
+            # Malformed-JSON recovery (ADDED 2026-09-12): extractor replies that
+            # parsed only after the seed+1 re-ask, that were salvaged item by
+            # item, and that stayed unparseable (kbcore.llm_json.recover_items).
+            "extract_json_retry_ok": 0,
+            "extract_json_salvaged": 0,
+            "extract_json_failed": 0,
         }
     )
+    for key in llm.JSON_COUNTERS:
+        llm.JSON_COUNTERS[key] = 0
 
 
 def record_deferral_pressure() -> None:
@@ -82,6 +90,8 @@ def record_deferral_pressure() -> None:
     stopped retrying. Swallow-and-count like every piece of bookkeeping here —
     telemetry must never fail the drain it reports on.
     """
+    for key, n in llm.JSON_COUNTERS.items():
+        _COHORT_STATS[f"extract_json_{key}"] = n
     try:
         _COHORT_STATS["groups_near_deferral_cap"] = ingest_queue.near_deferral_cap_groups()
     except Exception:  # noqa: BLE001 — never let bookkeeping fail the drain

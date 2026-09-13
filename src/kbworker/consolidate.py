@@ -19,7 +19,7 @@ from kbcore import (
     documents,
     drainsched,
     enrolment,
-    evidence,
+    evidence,  # noqa: F401 — patch surface: tests patch `consolidate.evidence.*`
     fleet_flush,
     fleet_health,
     ingest_queue,
@@ -30,7 +30,6 @@ from kbcore import (
 )
 from kbcore.config import settings
 from kbcore.db import advisory_lock
-from kbcore.review import auto_resolve_contradiction
 from kbworker import (
     allocator,
     ensemble,
@@ -72,6 +71,13 @@ from kbworker.drainloop import (  # noqa: F401
 # The power guard moved to kbworker.powerguard (mechanical split, 2026-08-21,
 # review #5) — re-imported for the same seam reason: should_stop resolves the
 # global ``_on_battery``, and the test suite patches ``consolidate._on_battery``.
+# Step 3b (_evidence / _evidence_batch) moved to kbworker.evidence_step
+# (mechanical split, 2026-09-13) — re-imported for the same seam reason; the
+# cap, the reserve divisor and the stop log are read back through THIS module.
+from kbworker.evidence_step import (  # noqa: F401
+    _evidence,
+    _evidence_batch,
+)
 from kbworker.powerguard import (  # noqa: F401
     _on_battery,
     _reading_age_seconds,
@@ -227,95 +233,6 @@ def _evidence_pair_cap(now: datetime | None = None) -> int:
     return EVIDENCE_PAIR_CAP_UNBOUNDED if is_unbounded_day(now) else EVIDENCE_PAIR_CAP_WEEKDAY
 
 
-def _evidence_batch(
-    rows: list[tuple[int, int, int, dict[str, Any]]],
-) -> list[tuple[int, int, int, dict[str, Any]]]:
-    """Cap the nightly evidence batch, RESERVING a slice for near-decided rows.
-
-    A row whose last refresh produced a suggestion (``suggestion_streak >= 1``)
-    is ONE more visit away from auto-resolution, but it sorts LAST — the query
-    puts never-enriched rows first — so a cap smaller than the open set starved
-    it forever (12 suggestions stuck at streak=1 against 57 open rows and a cap
-    of 20). Up to ``_evidence_pair_cap() // EVIDENCE_STREAK_RESERVE_DIVISOR`` of
-    those go to the FRONT of the batch, so the stop guard cannot truncate them
-    away either; the rest of the cap keeps the query's never-enriched-first
-    order, which is what stops brand-new contradictions being starved in turn.
-    Cap and divisor are read at call time so a test (or a future knob) can lower
-    the cap and have the reserve follow it.
-    """
-    cap = _evidence_pair_cap()
-    reserve = cap // EVIDENCE_STREAK_RESERVE_DIVISOR
-    hot = [r for r in rows if r[3].get("suggested_resolution") and r[3].get("suggestion_streak")]
-    batch = hot[:reserve]
-    picked = {r[0] for r in batch}
-    for row in rows:
-        if len(batch) >= cap:
-            break
-        if row[0] not in picked:
-            batch.append(row)
-    return batch
-
-
-def _evidence(stop: StopCheck | None = None) -> tuple[int, int]:
-    """Step 3b: refresh evidence for open contradictions; auto-resolve stable ones.
-
-    Counts accumulate night over night as repo seeds and session flushes add
-    corroborating items; never-enriched rows come first (evidence.py ordering)
-    so the cap can't starve brand-new contradictions. A decisive suggestion
-    that holds for AUTO_RESOLVE_STREAK consecutive refreshes is executed
-    (owner V4 refinement; kill switch kb_auto_resolve_evidence). Per-pair
-    isolation. ``stop`` (asked every :data:`STOP_CHECK_EVERY` pairs) bounds the
-    step by wall clock/power as well as by the pair cap; an unreached row
-    is just a row whose evidence is one night older. Returns
-    ``(refreshed, auto_resolved)``.
-    """
-    rows = evidence.open_contradiction_rows()
-    refreshed = 0
-    auto_resolved = 0
-    batch = _evidence_batch(rows)
-    for n, (queue_id, a_id, b_id, prior) in enumerate(batch):
-        if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
-            _note_stop("evidence_refreshed", reason, len(batch) - n)
-            break
-        try:
-            detail = evidence.gather_evidence(a_id, b_id)
-            sugg = detail.get("suggested_resolution")
-            if sugg:
-                prior_sugg = prior.get("suggested_resolution") or {}
-                same = prior_sugg.get("keep") == sugg["keep"] and prior_sugg.get(
-                    "retire"
-                ) == sugg.get("retire")
-                detail["suggestion_streak"] = prior.get("suggestion_streak", 0) + 1 if same else 1
-            else:
-                detail["suggestion_streak"] = 0  # overwrite any stale streak
-            if evidence.update_review_detail(queue_id, detail):
-                refreshed += 1
-            if (
-                sugg
-                and settings.kb_auto_resolve_evidence
-                and detail["suggestion_streak"] >= evidence.AUTO_RESOLVE_STREAK
-            ):
-                auto_resolve_contradiction(queue_id, sugg["keep"], sugg["retire"])
-                auto_resolved += 1
-                logger.info(
-                    "auto-resolved contradiction row %s: keep %s, retire %s (%s, streak %d)",
-                    queue_id,
-                    sugg["keep"],
-                    sugg["retire"],
-                    sugg["rule"],
-                    detail["suggestion_streak"],
-                )
-        except Exception:  # noqa: BLE001 — one bad pair must not abort the step
-            logger.exception("evidence refresh for queue row %s failed", queue_id)
-    if len(rows) > len(batch):
-        logger.info(
-            "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",
-            len(batch),
-            len(rows) - len(batch),
-        )
-    return refreshed, auto_resolved
-
-
 def nightly() -> dict[str, Any]:
     """The UNATTENDED entry point (kb-consolidate.service / ``make consolidate``).
 
@@ -369,6 +286,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             "contradictions_queued": 0,
             "evidence_refreshed": 0,
             "evidence_auto_resolved": 0,
+            "auto_resolve_moot": 0,
             "archived": 0,
             "reembedded": 0,
             "review_expired": 0,
@@ -459,8 +377,9 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # Step 3b AFTER contradictions so rows queued seconds ago get evidence
         # in the same run (open_contradiction_rows orders never-enriched first).
         def _ev() -> int:
-            refreshed, auto_resolved = _evidence(stop)
+            refreshed, auto_resolved, moot = _evidence(stop)
             counts["evidence_auto_resolved"] = auto_resolved
+            counts["auto_resolve_moot"] = moot
             return refreshed
 
         _run_step(counts, "evidence_refreshed", _ev)

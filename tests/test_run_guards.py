@@ -199,7 +199,7 @@ def test_the_evidence_loop_stands_down(monkeypatch):
     )
     consolidate._STOP_LOG.clear()
 
-    assert consolidate._evidence(lambda: "battery") == (0, 0)
+    assert consolidate._evidence(lambda: "battery") == (0, 0, 0)
     assert consolidate._STOP_LOG["evidence_refreshed"] == {"reason": "battery", "deferred": 4}
 
 

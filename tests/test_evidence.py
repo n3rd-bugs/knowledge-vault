@@ -202,7 +202,7 @@ def test_evidence_cap_defers_and_logs(contradiction_pair, monkeypatch, caplog):
     monkeypatch.setattr(consolidate, "EVIDENCE_PAIR_CAP", 1)
     monkeypatch.setattr(llm, "evidence_side", lambda *a: "neither")
     with caplog.at_level("INFO", logger="kbworker.consolidate"):
-        refreshed, _auto = consolidate._evidence()
+        refreshed, _auto, _moot = consolidate._evidence()
     assert refreshed == 1, "cap limits the refresh to one pair"
     assert any("capped" in r.message for r in caplog.records), "deferral is logged"
 
@@ -477,6 +477,98 @@ def test_auto_resolve_flag_off_suggests_but_never_acts(lopsided_pair, monkeypatc
         ).fetchone()[0]
     assert detail["suggestion_streak"] >= 2, "streak accumulates"
     assert detail["suggested_resolution"], "suggestion stays visible"
+
+
+def test_a_second_resolution_of_an_already_retired_item_is_moot(
+    contradiction_pair, monkeypatch, caplog
+):
+    """journald 2026-09-13 05:54:20: two open rows whose stable suggestion
+    retires the SAME item. The first resolution supersedes it; the second hits
+    kbcore's honest AlreadySuperseded — the worker counts it moot with ONE
+    warning, never a traceback, closes the settled row through the kbcore
+    chokepoint, and the first stands."""
+    import logging
+
+    from kbcore.consolidation import record_contradiction
+    from kbworker import consolidate
+
+    ids = contradiction_pair
+    record_contradiction(ids["a"], ids["b"])
+    second = queue_review(ids["b"], "contradiction", {"a_id": ids["b"], "b_id": ids["a"]})
+    sugg = {"keep": ids["a"], "retire": ids["b"], "rule": "test"}
+    with db.connect() as conn:
+        open_ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM review_queue WHERE reason='contradiction' AND resolved=false"
+            )
+        ]
+    assert len(open_ids) == 2 and second in open_ids
+    for qid in open_ids:  # last night's identical suggestion: one refresh from acting
+        evidence.update_review_detail(qid, {"suggested_resolution": sugg, "suggestion_streak": 1})
+    monkeypatch.setattr(evidence, "gather_evidence", lambda a, b: {"suggested_resolution": sugg})
+    monkeypatch.setattr(consolidate, "EVIDENCE_PAIR_CAP", 10)
+
+    with caplog.at_level(logging.INFO, logger="kbworker.consolidate"):
+        refreshed, auto_resolved, moot = consolidate._evidence()
+    assert (refreshed, auto_resolved, moot) == (2, 1, 1)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "moot" in warnings[0].getMessage()
+    assert f"item {ids['b']} is already superseded" in warnings[0].getMessage()
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], "never a traceback"
+    with db.connect() as conn:
+        status, by = conn.execute(
+            "SELECT status, superseded_by FROM items WHERE id = %s", (ids["b"],)
+        ).fetchone()
+        a_status = conn.execute("SELECT status FROM items WHERE id = %s", (ids["a"],)).fetchone()
+        still_open = conn.execute(
+            "SELECT count(*) FROM review_queue WHERE reason='contradiction' AND resolved=false"
+        ).fetchone()[0]
+    assert (status, by, a_status[0]) == ("superseded", ids["a"], "active"), "the first stands"
+    assert still_open == 0, "the moot row is closed, not left open forever (review #9b)"
+    assert "1 row(s) closed" in warnings[0].getMessage()
+
+
+def test_a_wrong_suggestion_is_an_error_never_moot(contradiction_pair, monkeypatch, caplog):
+    """Review #9b: the moot arm catches ONLY AlreadySuperseded. A keep == retire
+    suggestion (nothing superseded) is a plain InvalidOperation from kbcore
+    ('an item cannot supersede itself') and must reach the per-pair ERROR —
+    counted moot 0, no WARNING, the item untouched and the row still open."""
+    import logging
+
+    from kbcore.consolidation import record_contradiction
+    from kbcore.errors import AlreadySuperseded, InvalidOperation
+    from kbworker import consolidate
+
+    assert issubclass(AlreadySuperseded, InvalidOperation), "existing callers keep catching it"
+    ids = contradiction_pair
+    assert record_contradiction(ids["a"], ids["b"]) is True
+    with db.connect() as conn:
+        qid = conn.execute(
+            "SELECT id FROM review_queue WHERE reason='contradiction' AND resolved=false"
+        ).fetchone()[0]
+    sugg = {"keep": ids["a"], "retire": ids["a"], "rule": "test"}
+    evidence.update_review_detail(qid, {"suggested_resolution": sugg, "suggestion_streak": 1})
+    monkeypatch.setattr(evidence, "gather_evidence", lambda a, b: {"suggested_resolution": sugg})
+    monkeypatch.setattr(consolidate, "EVIDENCE_PAIR_CAP", 10)
+
+    with caplog.at_level(logging.INFO, logger="kbworker.consolidate"):
+        assert consolidate._evidence() == (1, 0, 0)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1 and f"queue row {qid} failed" in errors[0].getMessage()
+    assert errors[0].exc_info and isinstance(errors[0].exc_info[1], InvalidOperation)
+    assert not isinstance(errors[0].exc_info[1], AlreadySuperseded)
+    assert not [r for r in caplog.records if "moot" in r.getMessage()]
+    with db.connect() as conn:
+        status = conn.execute("SELECT status FROM items WHERE id = %s", (ids["a"],)).fetchone()[0]
+        row = conn.execute("SELECT resolved FROM review_queue WHERE id = %s", (qid,)).fetchone()
+    assert status == "active" and row[0] is False, "untouched: a human must look at the row"
+
+
+def test_the_nightly_carries_the_moot_count(kb):
+    from kbworker import consolidate
+
+    assert consolidate.main()["auto_resolve_moot"] == 0
 
 
 def test_apply_suggestion_manual_early(lopsided_pair):

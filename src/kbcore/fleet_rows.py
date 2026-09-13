@@ -46,3 +46,14 @@ def sid8(uri: str | None) -> str:
     """The first eight characters of a ``session:<sid>`` uri's sid."""
     tail = (uri or "").partition(":")[2]
     return tail[:8]
+
+
+def host_of(box: str) -> str:
+    """The MACHINE a principal names: the part after the last ``@`` of a
+    per-project token's ``project@host`` (rule 12 identity). A principal with
+    no ``@`` is its own host; ``(unknown)`` stays ``(unknown)``. A finished
+    project going quiet is normal — a host going quiet is the alert (first
+    real week of KB 34161, weekly 2026-09-13)."""
+    if box == "(unknown)" or "@" not in box:
+        return box
+    return box.rpartition("@")[2] or box

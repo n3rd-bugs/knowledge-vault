@@ -161,7 +161,7 @@ def _push_lines(
         lines.append(f"promotes: {promoted_7d} in 7d, {candidates} candidates open")
     if typed_totals is not None:  # the nudge's exposure trigger (H9b), positive-only
         lines.append(_typed_edge_line(typed_totals, typed_diff))
-    lines += weekly_fleet.push_line(reports)  # the pointer below ALWAYS survives the cap
+    lines += weekly_fleet.push_line(reports, now)  # the pointer below ALWAYS survives the cap
     return lines[: PUSH_MAX_LINES - 1] + [f"full table: kb-system item {item_id}"]
 
 
@@ -246,7 +246,7 @@ def _report_body(
         "",
         f"promote uptake: {promoted}; {candidates} candidates open",
     ]
-    lines += _promote_table(promote_rows or []) + weekly_fleet.fleet_block(reports)
+    lines += _promote_table(promote_rows or []) + weekly_fleet.fleet_block(reports, now)
     lines.append(
         f"search-miss retention: {swept} row(s) older than {search_misses.RETENTION_DAYS}d pruned"
     )

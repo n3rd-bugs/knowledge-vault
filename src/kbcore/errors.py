@@ -23,6 +23,16 @@ class InvalidOperation(KBError):
     """Operation violates an invariant (e.g. superseding an already-superseded item)."""
 
 
+class AlreadySuperseded(InvalidOperation):
+    """The OLD item is already superseded — a second resolver's request is moot.
+
+    A narrower InvalidOperation so an automated caller (the nightly evidence
+    step, journald 2026-09-13 05:54:20) can treat exactly this case as "already
+    done" while every OTHER invariant violation (self-supersession, a dead
+    replacement, an inverted interval) still surfaces as the error it is.
+    """
+
+
 class EmbedderUnavailable(KBError):
     """The Ollama embedding endpoint could not be reached or returned an error."""
 

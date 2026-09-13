@@ -26,9 +26,11 @@ from collections.abc import Mapping
 from typing import Any
 
 from kbcore.fleet_health import stale_hook_projects
+from kbcore.fleet_rows import host_of
 from kbcore.ingest_queue import MAX_PENDING
 
-FLEET_LINE_BOXES = 4  # boxes named on the fleet line before "+N"
+FLEET_LINE_BOXES = 4  # boxes/hosts named on the fleet and silent lines before "+N"
+STALE_COLLAPSE_OVER = 2  # more DISTINCT principals of one host than this collapse to "host (N ...)"
 QUEUE_DEPTH_ALERT_SHARE = 0.8  # of ingest_queue.MAX_PENDING
 
 
@@ -69,15 +71,17 @@ def fleet_alert_lines(counts: Mapping[str, Any]) -> list[str]:
 
 def stale_hooks_line(counts: Mapping[str, Any]) -> str | None:
     """ONE merged line: groups (``principal`` or ``principal/label``) whose
-    stamped hook version is not the served manifest (``fleet_stale_hooks``) and
-    projects still submitting rows with no session id (the pre-stamp signal,
-    ``fleet_degenerate_by_project``). The legacy text is kept verbatim when
-    only the legacy signal fires."""
+    stamped hook version is not the served manifest, or that never stamp one
+    (``fleet_stale_hooks``), and projects still submitting rows with no session
+    id (the pre-stamp signal, ``fleet_degenerate_by_project``). Principals of
+    one host with the same verdict collapse past :data:`STALE_COLLAPSE_OVER`
+    (``rm1 (3 principals) unversioned``) so the line stays short. The legacy
+    text is kept verbatim when only the legacy signal fires."""
     suspected = stale_hook_projects(counts.get("fleet_degenerate_by_project"))
     stale = counts.get("fleet_stale_hooks")
     boxes = stale.get("boxes") if isinstance(stale, Mapping) else None
     if isinstance(boxes, Mapping) and boxes:
-        named = ", ".join(f"{b} {v}" for b, v in sorted(boxes.items()))
+        named = ", ".join(collapse_stale(boxes))
         line = f"STALE HOOKS: {named} -- server {stale.get('server', '?')}"
         if suspected:
             line += f"; suspected (no session id): {', '.join(suspected)}"
@@ -87,17 +91,62 @@ def stale_hooks_line(counts: Mapping[str, Any]) -> str | None:
     return None
 
 
+def collapse_stale(boxes: Mapping[Any, Any]) -> list[str]:
+    """``name verdict`` per group, sorted by name; more than
+    :data:`STALE_COLLAPSE_OVER` DISTINCT principals of one host sharing a
+    verdict become ``host (N principals) verdict`` (the host of
+    ``principal/label`` is the principal's). N counts principals, never
+    ``(principal, label)`` groups: three labels of ONE shared credential (the
+    V4-M-6 shape) are one principal and stay named label by label."""
+    by: dict[tuple[str, str], list[str]] = {}
+    for name, verdict in sorted((str(k), str(v)) for k, v in boxes.items()):
+        by.setdefault((host_of(name.partition("/")[0]), verdict), []).append(name)
+    parts: list[str] = []
+    for (host, verdict), names in by.items():
+        principals = {n.partition("/")[0] for n in names}
+        if len(principals) > STALE_COLLAPSE_OVER:
+            parts.append(f"{host} ({len(principals)} principals) {verdict}")
+        else:
+            parts += [f"{n} {verdict}" for n in names]
+    return parts
+
+
+def silent_host(entry: Any) -> str | None:
+    """The name a silent entry renders under: ``host`` (host-keyed silence,
+    weekly 2026-09-13), else the ``name``/``box`` an older report carries;
+    None for a shape with neither."""
+    if not isinstance(entry, Mapping):
+        return None
+    for key in ("host", "name", "box"):
+        v = entry.get(key)
+        if v:
+            return str(v)
+    return None
+
+
+def age_of(entry: Mapping[str, Any]) -> float:
+    """A silent entry's ``age_hours`` as a float (0 for an odd shape) — the sort
+    key both the digest and the weekly push cap by."""
+    v = entry.get("age_hours")
+    return float(v) if is_num(v) else 0.0
+
+
 def fleet_silent_line(silent: Any) -> str | None:
-    """``FLEET SILENT: rm1 (last flush 4.1d ago, 12 sessions/30d)``."""
+    """``FLEET SILENT: rm1 (last flush 4.1d ago, 12 sessions/30d)`` — HOSTS,
+    oldest first, at most :data:`FLEET_LINE_BOXES` then ``+N``."""
     if not isinstance(silent, list):
         return None
+    named = [(h, s) for s in silent if (h := silent_host(s))]
+    named.sort(key=lambda hs: -age_of(hs[1]))
     parts = [
-        f"{s.get('name', s.get('box'))} (last flush {age_label(s.get('age_hours'))} ago, "
+        f"{h} (last flush {age_label(s.get('age_hours'))} ago, "
         f"{int(s.get('sessions_30d') or 0)} sessions/30d)"
-        for s in silent
-        if isinstance(s, Mapping) and (s.get("name") or s.get("box"))
+        for h, s in named[:FLEET_LINE_BOXES]
     ]
-    return f"FLEET SILENT: {', '.join(parts)}" if parts else None
+    if not parts:
+        return None
+    extra = len(named) - len(parts)
+    return f"FLEET SILENT: {', '.join(parts)}" + (f" +{extra}" if extra else "")
 
 
 def _refused(summary: Any) -> tuple[int, float, list[str]]:

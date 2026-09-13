@@ -404,7 +404,7 @@ def test_a_stuck_suggestion_reaches_auto_resolution(kb, monkeypatch):
             "suggested_resolution": sugg if (x, y) == (a, b) else None,
         },
     )
-    refreshed, auto_resolved = consolidate._evidence()
+    refreshed, auto_resolved, _moot = consolidate._evidence()
 
     assert (refreshed, auto_resolved) == (2, 1)
     assert _resolved(stuck) is True, "the streak-2 suggestion was never executed"

@@ -36,6 +36,7 @@ from kbcore.fleet_rows import (  # noqa: F401 — FLEET_FLOOR_DAYS is part of th
     FLEET_FLOOR_DAYS,
     ROWS_SQL,
     floor_at,
+    host_of,
     mb,
     sid8,
 )
@@ -51,8 +52,10 @@ def fleet_flush_by_box(hours: int | None = None) -> dict[str, dict[str, Any]]:
     The population is the 30-day floor (:data:`FLEET_FLOOR_DAYS`): a box whose
     last row is older has LEFT the fleet and is not listed — the same
     population :func:`fleet_silent` reads, so "silent" and "gone" never
-    overlap. Always: ``last_seen`` (ISO UTC; for a box in the population the
-    floor's max(created_at) is its all-time max), ``age_hours``,
+    overlap. Rows stay per PRINCIPAL (rule 12); ``host`` (:func:`host_of`)
+    names the machine the silence surface groups on. Always: ``last_seen``
+    (ISO UTC; for a box in the population the floor's max(created_at) is its
+    all-time max), ``age_hours``, ``host``,
     ``rows``/``mb``/``sessions`` in the tiled window, ``sessions_30d``. Only
     when non-zero/non-empty: ``unstamped`` (window rows with no ``meta.flush``),
     ``labels`` (distinct ``flush.box``), ``last_event``, ``hook_version`` (latest
@@ -95,6 +98,7 @@ def fleet_flush_by_box(hours: int | None = None) -> dict[str, dict[str, Any]]:
         d: dict[str, Any] = {
             "last_seen": last_seen.isoformat(),
             "age_hours": round((now - last_seen).total_seconds() / 3600.0, 1),
+            "host": host_of(box),
             "rows": int(r[2]),
             "mb": mb(r[3]),
             "sessions": int(r[4]),

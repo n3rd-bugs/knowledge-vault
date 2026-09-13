@@ -14,7 +14,7 @@ from psycopg.types.json import Jsonb
 
 from kbcore import scope
 from kbcore.db import connect, transaction
-from kbcore.errors import DuplicateContent, InvalidOperation, NotFound
+from kbcore.errors import AlreadySuperseded, DuplicateContent, InvalidOperation, NotFound
 from kbcore.ingest import _as_utc, ingest_in
 
 logger = logging.getLogger("kbcore.supersede")
@@ -90,7 +90,7 @@ def supersede(
         scope.require_cap(scope.CAP_SAVE)
         scope.assert_writable(project)
         if status == "superseded":
-            raise InvalidOperation(f"item {old_id} is already superseded")
+            raise AlreadySuperseded(f"item {old_id} is already superseded")
 
         # The instant (if any) at which the OLD ROW stops being the current record:
         # a NEW start (explicit override or the new item's own valid_from) when one

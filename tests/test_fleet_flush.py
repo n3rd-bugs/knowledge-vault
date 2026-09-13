@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from psycopg.types.json import Jsonb
 
 from kbcli import queue_cmds
-from kbcore import db, fleet_coverage, fleet_flush, ingest_queue, scope, setup_manifest
+from kbcore import db, fleet_coverage, fleet_flush, fleet_rows, ingest_queue, scope, setup_manifest
 from kbcore.config import settings
 from kbcore.errors import InvalidOperation
 from kbworker import digest, digest_fleet_lines, weekly_fleet, weekly_render
@@ -126,10 +126,13 @@ def test_by_box_fields(kb):
     _row("rm1 unstamped legacy", uri="session:zzzz")
     _row("rm1 swept", uri="session:swept", stamp=_stamp(0, 50, 50, "Backfill", box="lab2"))
     _row("ws older", box="win-laptop", hours_ago=30, stamp=_stamp(0, 10, 10))
+    _row("per-project token", box="docker-mount@usama-server", uri="session:dm")
 
     report = fleet_flush.fleet_flush_by_box()
 
     rm1 = report["rm1"]
+    assert rm1["host"] == "rm1", "a principal with no '@' is its own host"
+    assert report["docker-mount@usama-server"]["host"] == "usama-server", "per-principal rows keep"
     assert rm1["rows"] == 4 and rm1["sessions"] == 3 and rm1["sessions_30d"] == 3
     assert rm1["unstamped"] == 1
     assert rm1["labels"] == ["lab", "lab2"], "one principal, two labels = one credential, two boxes"
@@ -167,28 +170,59 @@ def test_open_tails_at_the_boundary(kb):
 # --- fleet_silent ------------------------------------------------------------
 
 
+def test_host_of():
+    assert fleet_rows.host_of("docker-mount@usama-server") == "usama-server"
+    assert fleet_rows.host_of("i-qemu@rm1") == "rm1"
+    assert fleet_rows.host_of("a@b@rm1") == "rm1", "the part after the LAST '@'"
+    assert fleet_rows.host_of("rm1") == "rm1", "no '@': its own host"
+    assert fleet_rows.host_of("(unknown)") == "(unknown)"
+    assert fleet_rows.host_of("odd@") == "odd@", "a trailing '@' names nothing; keep the principal"
+
+
 def test_silence_at_72h_with_the_30d_floor(kb):
     _row("quiet box", box="quiet", hours_ago=settings.kb_fleet_silent_hours + 1)
     _row("live box", box="live", hours_ago=settings.kb_fleet_silent_hours - 1)
     _row("gone box", box="gone", hours_ago=24 * (fleet_flush.FLEET_FLOOR_DAYS + 1))
 
     silent = fleet_flush.fleet_silent()
-    assert [s["name"] for s in silent] == ["quiet"], "positive-only; the 30 d floor drops 'gone'"
-    assert silent[0]["sessions_30d"] == 1 and silent[0]["label"] is None
+    assert [s["host"] for s in silent] == ["quiet"], "positive-only; the 30 d floor drops 'gone'"
+    assert silent[0]["sessions_30d"] == 1 and silent[0]["principals"] == ["quiet"]
     assert 73 <= silent[0]["age_hours"] <= 73.1
     assert fleet_flush.fleet_silent(hours=200) == []
 
 
-def test_silence_is_keyed_on_principal_and_label(kb):
-    """One credential on two machines: the quiet machine is named by its label,
-    and the principal's pre-stamp (unlabelled) history never counts."""
-    _row("shared A fresh", box="shared", stamp=_stamp(0, 5, 5, box="deskA"))
-    _row("shared B old", box="shared", stamp=_stamp(0, 5, 5, box="deskB"), hours_ago=100)
-    _row("shared prestamp", box="shared", uri="session:old", hours_ago=200)
+def test_silence_is_keyed_on_the_host(kb):
+    """F1: per-project tokens are ``project@host``. Three finished projects
+    gone quiet beside one live one is a LIVE host (never named); a host none of
+    whose principals submitted is silent, with its principals listed."""
+    quiet = settings.kb_fleet_silent_hours + 10
+    _row("live project", box="kb-system@usama-server", uri="session:live", hours_ago=1)
+    for proj in ("docker-mount", "expenses", "old-proj"):
+        _row(f"{proj} done", box=f"{proj}@usama-server", uri=f"session:{proj}", hours_ago=quiet)
+    _row("rm1 qemu", box="i-qemu@rm1", uri="session:q1", hours_ago=quiet)
+    _row("rm1 rewriter", box="i-binary-rewriter@rm1", uri="session:q2", hours_ago=quiet + 5)
 
     silent = fleet_flush.fleet_silent()
-    assert [s["name"] for s in silent] == ["shared/deskB"]
-    assert silent[0]["label"] == "deskB" and silent[0]["box"] == "shared"
+    assert [s["host"] for s in silent] == ["rm1"]
+    assert silent[0]["principals"] == ["i-binary-rewriter@rm1", "i-qemu@rm1"]
+    assert silent[0]["sessions_30d"] == 2
+    assert quiet <= silent[0]["age_hours"] <= quiet + 0.1, "the host's LATEST principal's age"
+
+
+def test_a_labelled_principals_prestamp_rows_never_rescue_its_host(kb):
+    """The pre-stamp (unlabelled) rows of a labelled principal are history or
+    an unstamping transport: a fresh one does not make the host live. The
+    quiet machine is still named ``principal/label`` among the principals."""
+    _row("shared B old", box="shared", stamp=_stamp(0, 5, 5, box="deskB"), hours_ago=100)
+    _row("shared prestamp fresh", box="shared", uri="session:fresh")
+
+    silent = fleet_flush.fleet_silent()
+    assert [s["host"] for s in silent] == ["shared"]
+    assert silent[0]["principals"] == ["shared/deskB"]
+    assert 99.9 <= silent[0]["age_hours"] <= 100.1
+
+    _row("shared A fresh", box="shared", uri="session:a", stamp=_stamp(0, 5, 5, box="deskA"))
+    assert fleet_flush.fleet_silent() == [], "a labelled machine still flushing keeps the host live"
 
 
 # --- stale_hook_boxes --------------------------------------------------------
@@ -200,17 +234,38 @@ def test_stale_hooks_compare_against_the_served_manifest(kb, monkeypatch):
     _row("stale box", box="old", hook_version="4bfd73b21062", stamp=_stamp(0, 1, 1))
     _row("mcp only box", box="mcp")
 
-    stale = {"server": current, "boxes": {"old/lab": "4bfd73b21062"}}
-    assert fleet_flush.stale_hook_boxes() == stale, "a labelled group is named principal/label"
+    _row("idle box, unversioned but outside the window", box="idle", hours_ago=30)
+
+    stale = {"server": current, "boxes": {"old/lab": "4bfd73b21062", "mcp": "unversioned"}}
+    assert fleet_flush.stale_hook_boxes() == stale, (
+        "a labelled group is named principal/label; a group whose window rows never stamp a "
+        "version is 'unversioned' with require-stamps OFF (F2); no window rows = not judged"
+    )
     assert fleet_flush.stale_hook_boxes("4bfd73b21062") == {
         "server": "4bfd73b21062",
-        "boxes": {"cur/lab": current},
+        "boxes": {"cur/lab": current, "mcp": "unversioned"},
     }
     monkeypatch.setattr(settings, "kb_fleet_require_stamps", True)
     assert fleet_flush.stale_hook_boxes()["boxes"] == {
         "old/lab": "4bfd73b21062",
-        "mcp": "unstamped",
-    }
+        "mcp": "unversioned",
+        "idle": "unstamped",
+    }, "the require-stamps arm still names a never-stamping population member"
+
+
+def test_require_stamps_flags_unstamped_flushes_of_a_versioned_group(kb, monkeypatch):
+    """The ``unstamped`` arm is about ``meta.flush``: a current-version group
+    that still submits rows with no flush stamp is flagged only under the knob;
+    the version it stamps is never mistaken for 'unversioned'."""
+    current = setup_manifest.version()
+    _row("stamped", box="mix", hook_version=current, stamp=_stamp(0, 1, 1))
+    _row("no flush stamp", box="mix", uri="session:bare", hook_version=current)
+    assert fleet_flush.stale_hook_boxes() == {}
+    monkeypatch.setattr(settings, "kb_fleet_require_stamps", True)
+    assert fleet_flush.stale_hook_boxes()["boxes"] == {"mix": "unstamped"}, (
+        "the unstamped row is the labelled principal's pre-stamp group, still arriving in the "
+        "window, so the bare principal is named (V4-M-6); the stamped 'mix/lab' group is clean"
+    )
 
 
 def test_staleness_is_keyed_on_principal_and_label(kb):
@@ -414,6 +469,57 @@ def test_digest_alert_and_fact_lines_exact_ascii():
     assert all(ln.isascii() for ln in lines)
 
 
+def test_fleet_silent_line_names_hosts_oldest_first_and_caps():
+    silent = [
+        {"host": f"h{i}", "age_hours": 120.0 + 24 * i, "principals": [f"p@h{i}"], "sessions_30d": i}
+        for i in range(6)
+    ]
+    line = digest_fleet_lines.fleet_silent_line(silent)
+    assert line == (
+        "FLEET SILENT: h5 (last flush 10.0d ago, 5 sessions/30d), "
+        "h4 (last flush 9.0d ago, 4 sessions/30d), h3 (last flush 8.0d ago, 3 sessions/30d), "
+        "h2 (last flush 7.0d ago, 2 sessions/30d) +2"
+    )
+    assert line.isascii() and digest_fleet_lines.FLEET_LINE_BOXES == 4
+    pre_f1 = [{"name": "rm1", "box": "rm1", "age_hours": 98.4, "sessions_30d": 12}]
+    assert digest_fleet_lines.fleet_silent_line(pre_f1) == (
+        "FLEET SILENT: rm1 (last flush 4.1d ago, 12 sessions/30d)"
+    ), "an old report's name/box still renders"
+    assert digest_fleet_lines.fleet_silent_line([{"age_hours": 1}]) is None
+
+
+def test_stale_hooks_line_collapses_principals_of_one_host():
+    stale = {
+        "server": "575fa122d16a",
+        "boxes": {
+            "i-rocket-chip@rm1": "unversioned",
+            "muhammadusama@rm1": "unversioned",
+            "i-qemu@rm1": "unversioned",
+            "docker-mount@usama-server": "unversioned",
+            "lab/desk": "4bfd73b21062",
+            "kb@rm1": "4bfd73b21062",
+        },
+    }
+    assert digest_fleet_lines.stale_hooks_line({"fleet_stale_hooks": stale}) == (
+        "STALE HOOKS: docker-mount@usama-server unversioned, rm1 (3 principals) unversioned, "
+        "kb@rm1 4bfd73b21062, lab/desk 4bfd73b21062 -- server 575fa122d16a"
+    ), "more than two principals of one host with one verdict collapse; two stay named"
+    two = {"a@rm1": "unversioned", "b@rm1": "unversioned"}
+    assert digest_fleet_lines.collapse_stale(two) == ["a@rm1 unversioned", "b@rm1 unversioned"]
+    # ONE shared credential on three desks (V4-M-6) is one principal, not three:
+    # its labelled groups stay named label by label, never "shared (3 principals)".
+    desks = {f"shared/desk{d}": "unversioned" for d in "ABC"}
+    assert digest_fleet_lines.collapse_stale(desks) == [
+        "shared/deskA unversioned",
+        "shared/deskB unversioned",
+        "shared/deskC unversioned",
+    ]
+    # Three DISTINCT principals of one host collapse even when one carries two labels.
+    mixed = {"a@rm1": "unversioned", "b@rm1/x": "unversioned", "b@rm1/y": "unversioned"}
+    mixed["c@rm1"] = "unversioned"
+    assert digest_fleet_lines.collapse_stale(mixed) == ["rm1 (3 principals) unversioned"]
+
+
 def test_stale_hooks_is_one_merged_line():
     both = dict(NIGHT, fleet_degenerate_by_project={"alpha": {"degenerate": 3, "total": 3}})
     lines = digest.digest_lines(both)
@@ -510,28 +616,30 @@ MISS_STATS = {"total": 0, "distinct": 0}
 
 
 def test_weekly_block_and_push_line():
-    block = weekly_fleet.fleet_block(WEEK)
-    assert block[1] == "fleet flush (last nightly's tiled window; last = age of last flush):"
+    block = weekly_fleet.fleet_block(WEEK, NOW)
+    assert block[1] == "fleet flush (window totals; last = age of last flush):"
     assert block[3].startswith("  box4 ")
     rm1 = next(ln for ln in block if ln.startswith("  rm1 "))
+    # 'last' ages from the WEEKLY's now: 9.4h before a report a day old = 33.4h.
     assert rm1.split() == [
         "rm1",
         "2",
         "1.0",
         "1",
         "2.4",
-        "9.4h",
+        "33.4h",
         "2",
         "4bfd73b21062",
         "0",
         "rm1-lab",
     ]
+    assert block[-3] == weekly_fleet.SESS_NOTE
     # PEAK night, never a sum (each night re-reports lifetime tallies): 1000, not 1212.
     assert block[-2] == "  resend refused to date (peak night of 2): 1000 rows / 0.0 MB"
     assert block[-1] == (
         "  duplicate rows on record: 3 (1.5 MB) -> kb repair resend-dups --all --rows-only"
     )
-    assert weekly_fleet.push_line(WEEK) == [
+    assert weekly_fleet.push_line(WEEK, NOW) == [
         "fleet: 5 boxes; silent: rm1 4.1d; stale hooks: 1; resend refused 1000 to date"
     ]
     assert weekly_fleet.fleet_block([]) == [] and weekly_fleet.push_line([]) == []
@@ -539,9 +647,65 @@ def test_weekly_block_and_push_line():
     assert all(ln.isascii() for ln in block)
 
 
+def _night(at: datetime, **box: object) -> tuple[datetime, dict]:
+    return at, {"fleet_flush": {"rm1": dict(box)}}
+
+
+def test_weekly_table_sums_every_fleet_report_and_ages_from_the_max_last_seen():
+    """F3: the table used to read the LAST report carrying fleet_flush; a
+    resumed run (battery pause -> AC-restore) reports a short tiled window and
+    zeroed every box for the week."""
+    first = _night(
+        NOW - timedelta(days=3),
+        last_seen=(NOW - timedelta(days=3, hours=2)).isoformat(),
+        age_hours=2.0,
+        rows=10,
+        mb=4.0,
+        sessions=3,
+        sweep_recovered_mb=1.0,
+        unstamped=2,
+        hook_version="aaaa00000000",
+        tails_open=3,
+        labels=["a"],
+    )
+    second = _night(
+        NOW - timedelta(days=1),
+        last_seen=(NOW - timedelta(hours=30)).isoformat(),
+        age_hours=6.0,
+        rows=5,
+        mb=1.5,
+        sessions=2,
+        hook_version="bbbb00000000",
+        labels=["b"],
+    )
+    resumed = _night(NOW - timedelta(hours=20), age_hours=40.0, rows=0, mb=0.0, sessions=0)
+    block = weekly_fleet.fleet_block([first, second, resumed], NOW)
+    rm1 = next(ln for ln in block if ln.startswith("  rm1 ")).split()
+    assert rm1 == ["rm1", "15", "5.5", "5", "1.0", "30.0h", "0", "bbbb00000000", "2", "a,b"], (
+        "sums over every report; last = max last_seen aged from now; hook_ver = latest "
+        "non-empty; tails from the last report; a zero-row resumed report zeroes nothing"
+    )
+    assert weekly_fleet.push_line([first, second, resumed], NOW) == ["fleet: 1 boxes"]
+    # No now: ages from the last fleet-carrying report (pure, deterministic).
+    alone = next(ln for ln in weekly_fleet.fleet_block([first]) if ln.startswith("  rm1 "))
+    assert alone.split()[5] == "2.0h"
+
+
+def test_weekly_push_line_names_silent_hosts_oldest_first_and_caps():
+    """fleet_silent() returns hosts in NAME order; the push must cap in AGE
+    order like the digest line, so '+N' never hides the quietest machine."""
+    silent = [{"host": f"h{i}", "age_hours": 120.0 + 24 * i, "principals": []} for i in range(6)]
+    night = (NOW, {"fleet_flush": FLEET, "fleet_silent": silent})
+    assert weekly_fleet.push_line([night], NOW) == [
+        "fleet: 5 boxes; silent: h5 10.0d, h4 9.0d, h3 8.0d, h2 7.0d +2"
+    ]
+    push = weekly_render._push_lines(NOW, [night], MISS_STATS, [], 0, None, 7)
+    assert len(push) < weekly_render.PUSH_MAX_LINES and all(ln.isascii() for ln in push)
+
+
 def test_weekly_render_carries_the_block_and_the_push_stays_short():
     body = weekly_render._report_body(NOW, WEEK, MISS_STATS, [], 0, 0, None, 0, [])
-    assert "fleet flush (last nightly's tiled window" in body
+    assert "fleet flush (window totals; last = age of last flush):" in body
     assert "kb repair resend-dups --all --rows-only" in body
     push = weekly_render._push_lines(NOW, WEEK, MISS_STATS, [], 0, None, 42)
     assert push[-2] == (

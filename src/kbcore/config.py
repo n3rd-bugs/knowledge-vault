@@ -40,6 +40,10 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     )
 
     kb_db_url: str = "postgresql://kb@127.0.0.1:5433/kb"
+    # Seconds kbcore.db.connect keeps retrying a REFUSED connection (2 s apart) before it
+    # raises: a daemon restart (2026-09-13 09:03, `apt upgrade` restarted dockerd and every
+    # container for ~10 s) used to kill a six-hour nightly mid-step. 0 = fail at once (tests).
+    kb_db_connect_retry_secs: float = 60.0
     kb_db_password: str = "change-me"
     kb_db_schema: str = "public"  # tests point this at kb_test (CLAUDE.md §Code style)
     kb_token: str = "change-me-long-random"

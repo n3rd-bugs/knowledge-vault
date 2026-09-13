@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -28,6 +29,42 @@ logger = logging.getLogger("kbcore.db")
 # the live corpus twice. The variable is NEVER set in production, so the public
 # fast path below is byte-for-byte unchanged for the app.
 _GUARD_ENV = "KB_TEST_GUARD"
+
+
+# A REFUSED connection is retried for a bounded window; every other operational
+# error (auth, DNS, a bad URL) raises at once. Why: on 2026-09-13 09:03 an
+# `apt upgrade` restarted dockerd and with it kb-db for ~10 s, and the running
+# nightly died at review_triaged_topup -> eval sentinel -> exit 1 with the whole
+# tail (report, digest, weekly rider) never written. Ten seconds of patience is
+# cheaper than a night. Budget = settings.kb_db_connect_retry_secs (0 = no retry).
+_RETRYABLE_CONNECT = (
+    "Connection refused",
+    "the database system is starting up",
+    "could not connect",
+)
+_CONNECT_RETRY_SLEEP = 2.0
+
+
+def _connect_retrying(url: str, **kw: object) -> psycopg.Connection:
+    budget = float(settings.kb_db_connect_retry_secs)
+    deadline = time.monotonic() + budget
+    warned = False
+    while True:
+        try:
+            return psycopg.connect(url, **kw)  # type: ignore[arg-type]
+        except psycopg.OperationalError as e:
+            msg = str(e)
+            retryable = any(t in msg for t in _RETRYABLE_CONNECT)
+            if budget <= 0 or not retryable or time.monotonic() >= deadline:
+                raise
+            if not warned:
+                logger.warning(
+                    "database refused the connection; retrying for up to %ss: %s",
+                    int(budget),
+                    msg.splitlines()[0],
+                )
+                warned = True
+            time.sleep(_CONNECT_RETRY_SLEEP)
 
 
 def connect(schema: str | None = None, *, allow_public: bool = False) -> psycopg.Connection:
@@ -58,8 +95,8 @@ def connect(schema: str | None = None, *, allow_public: bool = False) -> psycopg
                 "tests must operate on kb_test (live-data protection). If this is "
                 "genuine kb_test setup DDL, pass allow_public=True."
             )
-        return psycopg.connect(settings.db_url)
-    conn = psycopg.connect(settings.db_url, options=f"-c search_path={resolved},public")
+        return _connect_retrying(settings.db_url)
+    conn = _connect_retrying(settings.db_url, options=f"-c search_path={resolved},public")
     # current_schema() returns the FIRST EXISTING schema in the search_path, so it
     # equals the configured schema exactly when that schema exists, and reads
     # 'public' precisely when it is missing — the case we must reject loudly.

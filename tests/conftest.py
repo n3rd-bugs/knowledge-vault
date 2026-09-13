@@ -24,6 +24,9 @@ from kbcore.migrate import migrate
 # live corpus twice via the schema-pointer window). Only the kb_test setup DDL
 # below is allowed to touch public, and it only creates/drops the kb_test schema.
 os.environ["KB_TEST_GUARD"] = "1"
+# A refused connection must fail FAST in tests (the DB_UP probe, a deliberately closed
+# port): the production retry budget (kbcore.db._connect_retrying) is a nightly courtesy.
+settings.kb_db_connect_retry_secs = 0.0
 
 
 def _db_available() -> bool:

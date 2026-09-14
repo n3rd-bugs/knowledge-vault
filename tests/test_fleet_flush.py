@@ -253,6 +253,23 @@ def test_stale_hooks_compare_against_the_served_manifest(kb, monkeypatch):
     }, "the require-stamps arm still names a never-stamping population member"
 
 
+def test_only_hook_traffic_can_be_unversioned(kb):
+    """A memory/document submission over MCP is not hook traffic: on 2026-09-14 one
+    owner-token kb_ingest_session row (kind memory, uri claude-code:...) named the
+    OWNER principal 'unversioned'. Only kind=session rows with a session: uri —
+    what flush-session-to-kb.sh sends — can carry the verdict."""
+    with _as_box("owner"):
+        res = ingest_queue.enqueue(
+            PROJECT, "an mcp memory note", kind="memory", source_uri="claude-code:d7d07bd3"
+        )
+    assert res.id
+    assert fleet_flush.stale_hook_boxes() == {}, "no hook traffic -> nobody is unversioned"
+    _row("a hook flush with no version", box="owner", uri="session:0011223344556677")
+    assert fleet_flush.stale_hook_boxes()["boxes"] == {"owner": "unversioned"}, (
+        "the same principal IS unversioned once it flushes session rows without a hook_version"
+    )
+
+
 def test_require_stamps_flags_unstamped_flushes_of_a_versioned_group(kb, monkeypatch):
     """The ``unstamped`` arm is about ``meta.flush``: a current-version group
     that still submits rows with no flush stamp is flagged only under the knob;

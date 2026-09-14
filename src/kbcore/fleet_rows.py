@@ -20,7 +20,7 @@ FLEET_FLOOR_DAYS = 30
 # labels is one credential on two machines.
 ROWS_SQL = """
     WITH rows30 AS (
-        SELECT id, project, status, created_at,
+        SELECT id, project, kind, status, created_at,
                octet_length(content) AS bytes,
                coalesce(nullif(btrim(meta->>'submitted_by'), ''), '(unknown)') AS box,
                nullif(btrim(meta->>'source_uri'), '') AS uri,

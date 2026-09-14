@@ -44,6 +44,8 @@ _GROUPS_SQL = (
            count(*) FILTER (WHERE created_at > %(start)s AND flush IS NULL) AS unstamped_w,
            count(*) FILTER (WHERE created_at > %(start)s AND hook_version IS NOT NULL)
                AS versioned_w,
+           count(*) FILTER (WHERE created_at > %(start)s AND kind = 'session'
+                              AND uri LIKE 'session:%%') AS hook_rows_w,
            (array_agg(hook_version ORDER BY created_at DESC, id DESC)
               FILTER (WHERE hook_version IS NOT NULL))[1] AS hook_version
       FROM rows30
@@ -64,6 +66,7 @@ class FleetGroup:
     rows_window: int  # rows in the tiled window
     unstamped_window: int  # window rows with no ``meta.flush``
     versioned_window: int  # window rows that stamp a ``hook_version``
+    hook_rows_window: int  # window rows the FLUSH HOOK sent (kind session, uri session:)
     hook_version: str | None  # the group's LATEST stamped hook version
     prestamp: bool  # the UNLABELLED rows of a principal that also has labelled rows
 
@@ -96,10 +99,21 @@ def fleet_groups(hours: int | None = None, now: datetime | None = None) -> list[
             rows_window=int(rows_w),
             unstamped_window=int(unstamped_w),
             versioned_window=int(versioned_w),
+            hook_rows_window=int(hook_rows_w),
             hook_version=str(hv) if hv else None,
             prestamp=(not label) and str(box) in labelled,
         )
-        for box, label, last_seen, sessions, rows_w, unstamped_w, versioned_w, hv in rows
+        for (
+            box,
+            label,
+            last_seen,
+            sessions,
+            rows_w,
+            unstamped_w,
+            versioned_w,
+            hook_rows_w,
+            hv,
+        ) in rows
     ]
 
 
@@ -170,7 +184,10 @@ def stale_hook_boxes(manifest_version: str | None = None) -> dict[str, Any]:
             continue
         if g.hook_version and g.hook_version != manifest_version:
             boxes[g.name] = g.hook_version
-        elif g.rows_window and not g.versioned_window:
+        # Only the FLUSH HOOK's own traffic can be unversioned: a memory or document
+        # submission over MCP (2026-09-14: one owner-token kb_ingest_session row named
+        # the OWNER 'unversioned') carries no hook at all.
+        elif g.hook_rows_window and not g.versioned_window:
             boxes[g.name] = "unversioned"
         elif require and (not g.hook_version or g.unstamped_window):
             boxes[g.name] = "unstamped"

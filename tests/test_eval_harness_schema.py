@@ -12,12 +12,14 @@ match always outscores a vector-only straggler (2/(60+r) vs 1/(60+r)), and the
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-from kbcore import db, eval_harness
+from kbcore import db, eval_criteria, eval_harness, supersede
 from kbcore.ingest import ingest
+from kbworker import eval_composition, eval_sentinel, eval_trust
 
 pytestmark = pytest.mark.usefixtures("kb")
 
@@ -249,6 +251,105 @@ def test_legacy_substr_only_metrics_unchanged():
     assert results[0].passed and results[0].rank == 1
     assert not results[1].passed and results[1].rank is None
     assert hit5 == 0.5 and mrr == 0.5  # identical to the pre-extension harness
+
+
+# --- expect_item_id_raw (E1, review #8 H5, KB 31857) --------------------------
+
+
+def _superseded_pair() -> tuple[int, int]:
+    """An OLD revision (status superseded) and the live head that replaced it."""
+    old = ingest(project="alpha", type="note", title="widget limits v1", body="ZOLDREV77 legacy.")
+    new = supersede.supersede(old, new_body="ZNEWREV88 current limits.", reason="revised")
+    return old, new
+
+
+def test_expect_item_id_raw_asserts_the_superseded_revision_itself_present():
+    """Transaction time: the OLD id, unresolved, is retrievable WITH the flag —
+    the rank is reported and the pin is NOT chain-resolved."""
+    old, _new = _superseded_pair()
+    case = {"q": "ZOLDREV77", "expect_item_id_raw": old, "kwargs": {"include_superseded": True}}
+    results, hit5, mrr = eval_harness.evaluate(golden=[case])
+
+    r = results[0]
+    assert r.passed and r.rank == 1 and r.chain_resolved is False
+    assert [(c.name, c.ok) for c in r.criteria] == [("expect_item_id_raw", True)]
+    assert r.criteria[0].detail == f"raw item {old} at rank 1"
+    assert hit5 == 1.0 and mrr == 1.0, "the raw pin owns the case: counted in n_positive"
+
+
+def test_expect_item_id_raw_fails_without_include_superseded():
+    old, _new = _superseded_pair()
+    case = {"q": "ZOLDREV77", "expect_item_id_raw": old}
+    results, hit5, mrr = eval_harness.evaluate(golden=[case])
+
+    r = results[0]
+    assert not r.passed and r.rank is None and r.chain_resolved is False
+    assert r.criteria[0].detail == f"raw item {old} absent from top-{eval_harness.K}"
+    assert hit5 == 0.0 and mrr == 0.0
+
+
+def test_expect_item_id_still_chain_resolves_to_the_head():
+    old, new = _superseded_pair()
+    results, _, _ = eval_harness.evaluate(golden=[{"q": "ZNEWREV88", "expect_item_id": old}])
+
+    r = results[0]
+    assert r.passed and r.chain_resolved is True
+    assert f"chain-resolved {old}->{new}" in r.criteria[0].detail
+
+
+def test_expect_item_id_raw_honours_expect_rank_le():
+    old, _new = _superseded_pair()
+    case = {
+        "q": "ZOLDREV77",
+        "expect_item_id_raw": old,
+        "expect_rank_le": 1,
+        "kwargs": {"include_superseded": True},
+    }
+    results, hit5, _ = eval_harness.evaluate(golden=[case])
+    assert results[0].passed and hit5 == 1.0
+    assert {c.name: c.ok for c in results[0].criteria} == {
+        "expect_item_id_raw": True,
+        "expect_rank_le": True,
+    }
+
+
+def test_both_id_criteria_in_one_case_is_rejected_naming_the_case():
+    case = {"q": "which-pin", "expect_item_id": 1, "expect_item_id_raw": 1}
+    with pytest.raises(ValueError, match="'which-pin'.*mutually exclusive"):
+        eval_harness.evaluate(golden=[case])
+    assert "expect_item_id_raw" in eval_harness._CRITERIA_KEYS
+    assert eval_criteria.has_positive({"expect_item_id_raw": 1})
+
+
+def _stub_hit(item_id: int, title: str, type_: str = "note", trust: str = "unverified"):
+    return SimpleNamespace(item_id=item_id, title=title, snippet="", type=type_, trust=trust)
+
+
+def test_composition_matching_credits_the_raw_id_as_satisfier(monkeypatch):
+    """The satisfier rider scores a raw pin on the id ITSELF (no chain walk):
+    the raw case is satisfied by hit 2 — 'verified' — and the ids name it."""
+    hits = [_stub_hit(1, "Gamma summary", "summary"), _stub_hit(2, "Gamma note", trust="verified")]
+    matched = eval_composition._matching_hits({"expect_item_id_raw": 2}, hits)
+    assert [h.item_id for h in matched] == [2]
+    assert eval_composition._matching_hits({"expect_item_id_raw": 3}, hits) == []
+
+    monkeypatch.setattr(eval_sentinel, "search", lambda q, k, tool: list(hits))
+    monkeypatch.setattr(eval_trust, "verified_lift", lambda share, n: {})
+    golden = [
+        {"q": "gamma", "expect_item_id_raw": 2},  # satisfied by the verified note
+        {"q": "gamma", "expect_item_id_raw": 3},  # absent from the replay: unsatisfied
+        {"q": "gamma", "forbid_item_id": 3},  # forbid-only: skipped
+    ]
+    result = eval_composition._trust_composition(golden)
+    assert result["eval_satisfier_status"] == "ok"
+    assert result["eval_satisfier_types"] == {
+        "summary": 0,
+        "verified": 1,
+        "unverified": 0,
+        "unsatisfied": 1,
+    }
+    assert result["eval_satisfier_ids"] == [2]
+    assert result["eval_summary_only_cases"] == 0
 
 
 # --- usage mining (`kb eval mine`) -------------------------------------------

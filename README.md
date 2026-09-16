@@ -314,6 +314,10 @@ failure never aborts the rest:
 
 The pass also runs a **search-quality sentinel**: it replays the golden retrieval eval and flags any
 hit@5/MRR regression versus the prior run (kill switch `KB_EVAL_IN_CONSOLIDATION=false` skips it).
+The golden set is versioned in **eval epochs**: every report carries the golden set's hash, and
+the week-over-week baseline resets whenever `eval/golden.yaml` changes, so a night is only ever
+compared with runs of the same case set. Golden changes land batched at a review boundary, and the
+hit@5/MRR floors are re-anchored per epoch in `eval/EPOCHS.md`.
 
 Both auto-resolution tiers have kill-switch flags in `.env`
 (`KB_AUTO_SUPERSEDE_DOC_REFRESH`, `KB_AUTO_RESOLVE_EVIDENCE`); with them off the KB reverts to

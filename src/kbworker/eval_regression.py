@@ -17,6 +17,17 @@ ADDED key ``eval_regression_measurement`` and never enqueued as a
 ``search_regression`` row; nor does such a night auto-resolve an open row
 (a contaminated HIGH is not evidence of recovery either). ``eval_regression``
 keeps its meaning: True only for a fallback-free trip.
+
+EVAL EPOCH (E1, KB 31857 / KB 32942): the baseline read is confined to reports
+measured on tonight's golden set (``counts['eval_golden_hash']``, see
+``kbcore.eval_epoch``). The first night of a new epoch therefore has NO prior
+— recorded under the ADDED key ``eval_epoch_reset`` when older-epoch reports
+were walked over and NO same-epoch report exists yet, so the digest can say
+so — and the anchored floors alone gate it; the second night compares against
+the first, as ever. A same-epoch night that fell back is walked over as
+``skipped_fallback`` (never as an epoch skip: ``read_baseline`` applies the
+epoch filter first), so the night after it has no clean prior either — floors
+only — but it is NOT the epoch's first night and must not re-print the reset.
 """
 
 from __future__ import annotations
@@ -45,11 +56,31 @@ def _tonights_fallbacks(counts: Mapping[str, Any]) -> int:
 
 
 def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> None:
-    prior = eval_baseline.previous_eval_metrics()
+    golden_hash = counts.get("eval_golden_hash")
+    prior, skips = eval_baseline.read_baseline(golden_hash)
     open_row = review_mod.open_review_by_reason(REVIEW_REASON)
     floor_h = settings.kb_eval_min_hit5
     floor_m = settings.kb_eval_min_mrr
     fallbacks = _tonights_fallbacks(counts)
+    if prior is None and skips["skipped_epoch"] > 0 and skips["skipped_fallback"] == 0:
+        # First night of a new eval epoch (module docstring): every prior eval was
+        # measured on a different golden set, so there is no WoW baseline tonight.
+        # skipped_fallback > 0 means a SAME-epoch report exists (it fell back), so
+        # tonight is a later night of the epoch — no clean prior, but no reset.
+        counts["eval_epoch_reset"] = {
+            "golden_hash": golden_hash,
+            "queries": counts.get("eval_queries"),
+            "skipped_epoch": skips["skipped_epoch"],
+        }
+        logger.info(
+            "eval epoch %s (n=%s): first night — %d prior report(s) measured on another golden "
+            "set skipped, WoW baseline reset; the anchored floors %.2f/%.2f still apply",
+            golden_hash,
+            counts.get("eval_queries"),
+            skips["skipped_epoch"],
+            floor_h,
+            floor_m,
+        )
 
     # Two independent trips: (1) a drop beyond epsilon vs the previous run, and
     # (2) an ANCHORED ABSOLUTE floor. The floor catches a gradual sub-epsilon drift

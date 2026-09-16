@@ -27,9 +27,12 @@ records WHICH hit satisfied each golden case:
   diff names the item behind a single-quantum MRR move).
 
 Matching follows the harness's own semantics — ``expect_item_id`` chain-resolved
-and owning the case, else ANY-of ``expect_substr`` over title+snippet+body — but
-against THIS pass's PRODUCTION-DEFAULT replay (no per-case kwargs), so a
-kwargs-pinned case is scored on what an ordinary agent query surfaces. Its own
+and owning the case, ``expect_item_id_raw`` the item ITSELF (E1, KB 31857: the
+transaction-time pin, never resolved) and owning it likewise, else ANY-of
+``expect_substr`` over title+snippet+body — but against THIS pass's
+PRODUCTION-DEFAULT replay (no per-case kwargs), so a kwargs-pinned case is
+scored on what an ordinary agent query surfaces (a raw pin on a superseded
+revision reads 'unsatisfied' here by design: default search hides it). Its own
 guard: a broken rider costs ``eval_satisfier_status='error'``, never the
 composition shares.
 
@@ -47,7 +50,7 @@ from collections.abc import Mapping
 from types import ModuleType
 from typing import Any
 
-from kbcore import eval_harness, rerank
+from kbcore import eval_criteria, eval_harness, rerank
 from kbcore.items import get_item
 from kbworker import eval_cases, eval_trust
 
@@ -176,12 +179,16 @@ def _matching_hits(case: Mapping[str, Any], hits: list[Any]) -> list[Any]:
     """The top-K hits that satisfy the case's POSITIVE criterion, harness semantics.
 
     ``expect_item_id`` owns the case (chain-resolved exactly like the harness,
-    so a doc-refresh head still counts); otherwise ANY-of ``expect_substr``
-    over title + snippet + full body, case-insensitive. Order preserved, so
-    ``[0]`` is the rank-first satisfier.
+    so a doc-refresh head still counts); ``expect_item_id_raw`` owns it too but
+    UNRESOLVED (the harness's transaction-time pin); otherwise ANY-of
+    ``expect_substr`` over title + snippet + full body, case-insensitive. Order
+    preserved, so ``[0]`` is the rank-first satisfier.
     """
     if "expect_item_id" in case:
         want = eval_harness._chain_head(int(case["expect_item_id"]))
+        return [h for h in hits if h.item_id == want]
+    if "expect_item_id_raw" in case:
+        want = int(case["expect_item_id_raw"])
         return [h for h in hits if h.item_id == want]
     expected = [str(s).lower() for s in (case.get("expect_substr") or [])]
     if not expected:
@@ -204,7 +211,7 @@ def _satisfier_telemetry(per_case: list[tuple[dict, list[Any]]]) -> dict[str, An
     summary_only = 0
     ids: set[int] = set()
     for case, hits in per_case:
-        if not any(k in case for k in ("expect_item_id", "expect_substr")):
+        if not eval_criteria.has_positive(case):
             continue
         matching = _matching_hits(case, hits)
         if not matching:

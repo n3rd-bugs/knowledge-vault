@@ -36,11 +36,15 @@ keyed by query (``kbworker.eval_cases`` — E1's per-case diff prerequisite).
 
 MRR QUANTUM: MRR is a mean of 1/rank over the positive-criterion cases, so ONE
 golden case slipping rank 1 -> 2 moves it by exactly (1 - 1/2) / n_positive =
-0.5/52 = 0.0096 on today's set — or an equivalent decomposition (two cases
-slipping 2 -> 3 and 3 -> 4 read the same). The 08-29 step 0.9365 -> 0.9269 was
-exactly one quantum of corpus composition (661 new summaries + doc-refresh
-churn, 22/22 top-5 ids swapped). A single-quantum move is a PER-CASE read at
-the eval epoch, never drift; REGRESSION_EPSILON (0.05) is ~5 quanta away.
+0.5/n — 0.5/52 = 0.0096 on the pre-E1 set, 0.5/59 = 0.0085 after (59
+positive-criterion cases of the 61 in all) — or an equivalent decomposition
+(two cases slipping 2 -> 3 and 3 -> 4 read the same).
+The 08-29 step 0.9365 -> 0.9269 was exactly one quantum of corpus composition
+(661 new summaries + doc-refresh churn, 22/22 top-5 ids swapped). A
+single-quantum move is a PER-CASE read at the eval epoch, never drift;
+REGRESSION_EPSILON (0.05) is ~5 quanta away. The epoch itself is recorded per
+run as ``eval_golden_hash`` (kbcore.eval_epoch): the baseline read and the
+weekly series never compare nights measured on different golden sets.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from kbcore import eval_harness, search_expand
+from kbcore import eval_epoch, eval_harness, search_expand
 from kbcore.config import settings
 
 # `search` is the composition instrument's patch surface (tests patch
@@ -133,6 +137,7 @@ def _run(counts: dict[str, Any]) -> None:
     counts["eval_hit_at_5"] = round(hit_at_5, 4)
     counts["eval_mrr"] = round(mrr, 4)
     counts["eval_queries"] = len(golden)
+    counts["eval_golden_hash"] = eval_epoch.golden_hash()  # E1: the eval EPOCH this n belongs to
     counts["eval_regression"] = False
     # Chain-resolution telemetry (review #5 ret-eval-1): how many id pins the
     # harness followed to a live chain head tonight — doc-refresh churn becomes

@@ -373,3 +373,124 @@
   # rank 2 = 11084, rank 3 = 11327.
   expect_substr: ["ignored_statement_rows"]
   expect_rank_le: 3
+
+# =============================================================================
+# E1 EVAL EPOCH — 2026-09-16 (review #8 "E1 contents" KB 31857; the 297/294
+# decision KB 31855; review #9a clean-baseline rules KB 32942). Ledger:
+# eval/EPOCHS.md. THE EVAL-EPOCH RULE: golden.yaml and ranking changes land only
+# at a review boundary, BATCHED into one commit with a new EPOCHS.md entry —
+# never dribbled between reviews. This block is E1: nine cases, seven positive
+# (n_positive 52 -> 59; MRR quantum 0.5/59 = 0.0085, was 0.0096), two forbid-
+# only. Every rank below was observed by the owner on 2026-09-16 with the local
+# harness (k=5, tool=None, expand unset -> hops 0 — exactly what `make eval`
+# replays); bound = observed rank + 2, capped at K=5. Nothing else in this file
+# moved: the KNOWN-RED canary ("have we hit SPI problems anywhere") stays
+# untouched and known-red.
+#
+# E1 PER-CASE DIFF vs the review #9a clean baseline MRR 0.9269 (48.2/52),
+# tonight 0.9077 (report 38163) — the two named slips, neither a case change:
+#   (i)  "qpm_dnp_index_for_reg quantum_dnp_pointmap.c" rank 1 -> 2 in nightlies
+#        since 2026-09-10 (report 33788): a near-tie at the top between 22247
+#        (verified rm3 docs/DNP3/README.md, carries the symbol) and 33761
+#        ("Summary — quantum", rm3-tester consolidation summary created 09-09,
+#        no symbol). A daytime replay on 09-16 read rank 1 again. Bound (<=3)
+#        holds. THE one watch item for the review #9 summaries verdict.
+#   (ii) "UART RX ring buffer ISR overrun fix" 985 rank 1 -> 2 since 2026-09-12
+#        (report 37343): 35627 (repeater note "UART RX overflow fix", unverified,
+#        created 2026-09-12; ord-0 cosine 0.68 to 985 — NOT a twin, no fold
+#        applies; 0.865 to its own-project sibling 2998) outranks the verified
+#        motor-ctl fix. Corpus composition from the fleet pushes; bound (<=3)
+#        holds.
+#   (iii) the 09-06..09-09 dip (0.9038 / 0.8814 / 0.8542 / 0.8638, fallback-
+#        free) fully recovered by 09-09 report 33421 — transient, coincided
+#        with the resend-flood extraction nights, not analysed further at E1.
+# IDENTIFIER-MASS GO/NO-GO (satisfier types, 18 nights 08-29..09-16):
+# 33 verified / 17 unverified / 1 summary / 1 unsatisfied every night;
+# summary-only cases 0 x18, while summaries' top-5 slot share rose 0.1577 ->
+# 0.2115 (55/260) — summaries fill slots WITHOUT displacing satisfiers.
+# Verdict: NO-GO on identifier-mass demotion at E1; the qpm near-tie above is
+# the one watch item.
+# =============================================================================
+
+# --- BITEMPORAL 1: transaction time (include_superseded) ----------------------
+- q: "mTLS fleet agent deferred config-sync"
+  # Default search hides superseded revisions: the rm3 fleet-agent README
+  # revision 101 (superseded by 473 on 2026-07-07) must never surface unasked.
+  # forbid-only: no MRR contribution (hit@5 counts it as a pass). 2026-09-16: 101 absent from
+  # the default top-5.
+  forbid_item_id: 101
+- q: "mTLS fleet agent deferred config-sync"
+  # Transaction time (Invariant 5 — everything stays retrievable WITH a flag):
+  # asked for, the superseded revision IS retrievable. expect_item_id would
+  # resolve 101 to its live chain head (473); expect_item_id_raw (E1 harness
+  # key) skips _chain_head and asserts 101 ITSELF. 2026-09-16 under the flag:
+  # 101 rank 1, 473 rank 3. Bound = 1 + 2.
+  expect_item_id_raw: 101
+  expect_rank_le: 3
+  kwargs: {include_superseded: true}
+
+# --- BITEMPORAL 2: valid time (as_of) exclusion pair ---------------------------
+# golden.yaml's older as_of case proves NULL-bounded facts stay visible; this
+# pair is the missing half — a fact with valid_to in the PAST is FOUND as-of
+# before it and HIDDEN as-of after it (the live twin of
+# tests/test_eval_harness_schema.py::test_as_of_kwarg_filters_valid_time_end_to_end).
+- q: "validation sentinel 0.98 eval floor incorrectly implemented"
+  # 22480 = the verified data-server bug "Validation sentinel's '0.98 eval
+  # floor' was incorrectly implemented", valid_to 2026-08-15. 2026-09-16:
+  # rank 1 as-of 2026-08-10. Bound = 1 + 2. Note: WITHOUT as_of the default
+  # search also shows it — valid time filters only when asked.
+  expect_item_id: 22480
+  expect_rank_le: 3
+  kwargs: {as_of: "2026-08-10"}
+- q: "validation sentinel 0.98 eval floor incorrectly implemented"
+  # Same fact, as-of AFTER its valid_to: hidden. 2026-09-16 top-5 as-of
+  # 2026-09-01: 21833, 37329, 30246, 21331, 30501 — 22480 absent. forbid-only.
+  forbid_item_id: 22480
+  kwargs: {as_of: "2026-09-01"}
+
+# --- 297 <-> 294: both ADR alternatives survive the fold (KB 31855) -----------
+# The manual 2026-07-27 alternative_to edge 297 -> 294 is CORRECT ADR-
+# alternatives knowledge (ord-0 cosine 0.374 — nowhere near the linker's 0.93
+# twin threshold); the defect was search_rank.collapse_alternatives folding
+# EVERY cross-project alternative_to pair as if it were a cross-twin-linker
+# twin. E1 lands the twin discriminator (computed at rank time — relations has
+# no meta column) and THIS pair as its must-not-fold regression guard. Both
+# cases share one query so the fold is exercised in ONE result set; two cases
+# because a case carries one positive id. Never unlink, never delete the row,
+# never flip KB_COLLAPSE_ALTERNATIVES.
+- q: "lanyard LoRa alert design decisions: BLE-only alert build option; SF7 BW250 to SF9 BW500 certification path"
+  # 297 = lanyard's verified BLE_ONLY_ALERT build-option ADR. 2026-09-16 with
+  # type=decision: rank 1. Bound = 1 + 2.
+  expect_item_id: 297
+  expect_rank_le: 3
+  kwargs: {type: "decision"}
+- q: "lanyard LoRa alert design decisions: BLE-only alert build option; SF7 BW250 to SF9 BW500 certification path"
+  # 294 = punchrescue's verified SF9/BW500 certification-path ADR. 2026-09-16
+  # with the fold OFF: rank 4 (un-folded top-5: 297, 16097, 3444, 294, 14757 —
+  # 3444 and 14757 are unverified re-captures of 294's title, 16097 of 297's);
+  # with today's fold ON it is folded into 297 and ABSENT. Green only once the
+  # discriminator lands. Bound = 4 + 2 capped at K=5.
+  expect_item_id: 294
+  expect_rank_le: 5
+  kwargs: {type: "decision"}
+
+# --- IDENTIFIER-LEG 2 + MINED ------------------------------------------------
+- q: "ingest_resend_events chunk_key"
+  # Identifier leg: two rare identifiers, id-dominant so the rare-identifier
+  # leg arms. 34161 = the verified kb-system runbook "Wave S landed
+  # 2026-09-11". 2026-09-16: rank 2 behind 33784 (the verified proposal);
+  # summaries 37023 / 34105 / 34104 fill ranks 3-5. Bound = 2 + 2.
+  expect_item_id: 34161
+  expect_rank_le: 4
+- q: "KB_RERANK_USE_CHUNK chunk evidence rerank enable A/B decision"
+  # MINED by `kb eval mine`: 6 search->get confirmations, last 2026-08-21.
+  # 6495 = the verified data-server decision "Retrieval A/B outcomes: expansion
+  # stays opt-in, rerank chunk evidence enabled". 2026-09-16: rank 2 behind
+  # 29044 (an unverified session extraction). Bound = 2 + 2.
+  expect_item_id: 6495
+  expect_rank_le: 4
+- q: "offgrid_match OFFGRID_CONSECUTIVE_ROWS"
+  # Identifier leg 2: power-rules symbols. 32942 = the verified review #9a
+  # record. 2026-09-16: rank 1. Bound = 1 + 2.
+  expect_item_id: 32942
+  expect_rank_le: 3

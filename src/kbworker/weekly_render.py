@@ -26,6 +26,7 @@ from typing import Any
 from kbcore import search_misses
 from kbworker import weekly_fleet
 from kbworker.digest_lines import window_bounds
+from kbworker.eval_epoch_lines import epoch_clean, epoch_suffix
 from kbworker.weekly_instruments import (  # noqa: F401
     FB_NOTE,
     _calibration_line,
@@ -125,11 +126,11 @@ def _push_lines(
             f"saved {_sum(reports, 'queued_items_saved')}, "
             f"triaged {_sum(reports, 'review_triaged')}"
         ),
-        # Review #9a EV-1: the two primary-replay series read fallback-free
-        # reports only (a stalled sidecar measures the fused order); the
+        # Review #9a EV-1 + E1: the two primary-replay series read fallback-free
+        # reports of the LATEST golden epoch only (kbworker.eval_epoch_lines); the
         # composition-pass lines below are clean by construction, unfiltered.
-        f"eval hit@5: {_trend(_series(clean_reports(reports), 'eval_hit_at_5'))}",
-        f"eval mrr: {_trend(_series(clean_reports(reports), 'eval_mrr'))}",
+        f"eval hit@5: {_trend(_series(epoch_clean(reports), 'eval_hit_at_5'))}",
+        f"eval mrr: {_trend(_series(epoch_clean(reports), 'eval_mrr'))}{epoch_suffix(reports, tz)}",
         f"top5 unverified: {_trend(_series(reports, 'eval_top5_unverified_share'))}",
         # The lift never renders alone (review #6): ~90% of one week's climb was
         # corpus-denominator decay, so its components ride the same line.

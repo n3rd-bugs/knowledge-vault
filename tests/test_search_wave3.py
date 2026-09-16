@@ -39,6 +39,20 @@ def _blind(item_id: int) -> int:
     return item_id
 
 
+def _twins(a: int, b: int) -> None:
+    """Make the linked pair a LINKER twin (E1, KB 31855): the collapse fold now
+    reads only pairs whose ord-0 chunks sit strictly above kb_xtwin_threshold on
+    the current model, and the conftest fake embedder gives two different bodies
+    ~orthogonal vectors — so copy a's ord-0 embedding onto b (cosine 1.0).
+    Test-only chunks UPDATE in kb_test, like _blind."""
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE chunks SET embedding = (SELECT embedding FROM chunks "
+            "WHERE item_id = %s AND ord = 0) WHERE item_id = %s AND ord = 0",
+            (a, b),
+        )
+
+
 # --- (1) include_duplicate ----------------------------------------------------
 
 
@@ -224,6 +238,7 @@ def test_cross_project_alternative_twins_collapse_under_the_flag(monkeypatch):
     a = ingest("alpha", "note", "widget approach A", "the widgetsync approach A body text")
     b = ingest("beta", "note", "widget approach B", "the widgetsync approach B body text alt")
     graph.link(a, "alternative_to", b)  # cross-project edge
+    _twins(a, b)
     q = "widgetsync approach"
 
     # PIN the off phase: the box's .env carries KB_COLLAPSE_ALTERNATIVES=true
@@ -249,6 +264,7 @@ def test_collapse_prefers_the_verified_twin_in_a_near_tie():
     v = ingest("alpha", "note", "verified twin", "twin body v", trust="verified")
     u = ingest("beta", "note", "unverified twin", "twin body u", trust="unverified")
     graph.link(v, "alternative_to", u)
+    _twins(v, u)
     hi = 2.0 / (RRF_K + 1)
     near = hi - 0.001  # the review's observed gap — a near-tie
 
@@ -263,6 +279,7 @@ def test_collapse_verified_twin_loses_only_when_clearly_outscored():
     v = ingest("alpha", "note", "verified twin 2", "twin body v2", trust="verified")
     u = ingest("beta", "note", "unverified twin 2", "twin body u2", trust="unverified")
     graph.link(v, "alternative_to", u)
+    _twins(v, u)
     lo = 2.0 / (RRF_K + 1)
     hi = lo + 2 * search_rank.COLLAPSE_TRUST_EPSILON  # beyond the near-tie window
 
@@ -278,6 +295,7 @@ def test_collapse_same_trust_near_tie_keeps_the_higher_score():
     x = ingest("alpha", "note", "same trust x", "twin body x", trust="unverified")
     y = ingest("beta", "note", "same trust y", "twin body y", trust="unverified")
     graph.link(x, "alternative_to", y)
+    _twins(x, y)
     hi = 2.0 / (RRF_K + 1)
 
     with db.connect() as conn:
@@ -296,6 +314,7 @@ def test_collapse_needs_both_the_flag_and_a_cross_project_edge(monkeypatch):
     e = ingest("omega", "note", "widget approach E", "the widgetsync approach E body")
     f = ingest("omega", "note", "widget approach F", "the widgetsync approach F body")
     graph.link(e, "alternative_to", f)  # SAME project → not a cross-project twin
+    _twins(e, f)  # even as true twins: the project wall still holds
 
     monkeypatch.setattr(settings, "kb_collapse_alternatives", True)
     ids = [h.item_id for h in search("widgetsync approach", k=20)]

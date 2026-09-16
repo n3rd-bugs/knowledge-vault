@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from kbcore.config import settings
 from kbcore.search_legs import CANDIDATES, RRF_K
+from kbcore.search_twins import linker_twin_pairs
 
 # A rare-token identifier row enters fusion at this rank OFFSET: the strongest
 # (rank-1) rare row scores 1/(RRF_K + OFFSET + 1) which, with OFFSET = CANDIDATES,
@@ -207,6 +208,15 @@ def collapse_alternatives(
     verified sibling. The kept score is still the pair MAX either way — the
     tie-break decides which item SURVIVES, never what it scores — and a clearly
     outscored verified twin (gap > epsilon) still loses.
+
+    LINKER-TWIN DISCRIMINATOR (E1, KB 31855): only edges that are twins by the
+    linker's own definition fold — both ord-0 chunks on the current embed model,
+    cosine STRICTLY above kb_xtwin_threshold (kbcore.search_twins, which holds
+    the full rationale). A manual ADR-alternatives edge (297->294, ord-0 cosine
+    0.374) is a real ``alternative_to`` edge the old fold wrongly hid; it now
+    renders both sides. An edge whose lead embeddings are missing or lag a model
+    swap is unprovable and likewise renders both. No edge surviving the predicate
+    is the same no-op as no edge at all.
     """
     if len(fused) < 2:
         return fused, {}
@@ -230,10 +240,10 @@ def collapse_alternatives(
         (ids, ids),
     ).fetchall()
     scores = {item_id: s for item_id, s, _snip in fused}
-    pairs = sorted(
-        ((a, b) for a, b in edges if a != b and proj.get(a) != proj.get(b)),
-        key=lambda ab: max(scores[ab[0]], scores[ab[1]]),
-        reverse=True,
+    candidates = [(a, b) for a, b in edges if a != b and proj.get(a) != proj.get(b)]
+    pairs = sorted(  # strongest first; id tie-break (the predicate returns a set)
+        linker_twin_pairs(conn, candidates),
+        key=lambda ab: (-max(scores[ab[0]], scores[ab[1]]), ab),
     )
     collapsed: dict[int, int] = {}  # loser id -> winner id
     folded: dict[int, list[int]] = {}

@@ -179,6 +179,7 @@ def test_eval_cells_come_from_the_nights_last_fallback_free_run_and_fb_counts_th
     stalled = _rep(
         datetime(2026, 9, 5, 1, 57, tzinfo=UTC),
         run_secs=21420,
+        eval_status="ok",
         eval_hit_at_5=0.9808,
         eval_mrr=0.9103,
         eval_rerank_tally={"active": 29, "fallback": 22, "off": 1},
@@ -186,6 +187,7 @@ def test_eval_cells_come_from_the_nights_last_fallback_free_run_and_fb_counts_th
     clean = _rep(
         datetime(2026, 9, 5, 5, 0, tzinfo=UTC),
         run_secs=1680,
+        eval_status="ok",
         eval_hit_at_5=0.9808,
         eval_mrr=0.9269,
         eval_rerank_tally={"active": 51, "fallback": 0, "off": 1},
@@ -211,6 +213,7 @@ def test_eval_cells_come_from_the_nights_last_fallback_free_run_and_fb_counts_th
     # composition lines are not filtered (clean by construction).
     high = _rep(
         datetime(2026, 9, 4, 0, 45, tzinfo=UTC),
+        eval_status="ok",
         eval_hit_at_5=1.0,
         eval_mrr=0.9423,
         eval_top5_unverified_share=0.5,

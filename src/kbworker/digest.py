@@ -52,6 +52,7 @@ from kbworker.digest_lines import (  # noqa: F401
     _trust_watch_line,
     night_of,
 )
+from kbworker.eval_epoch_lines import eval_epoch_line  # E1: first night of a golden epoch
 
 logger = logging.getLogger("kbworker.tail_steps")
 
@@ -175,6 +176,8 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
         lines.append(f"promote-worthy: {promotable}")
     if promote_runs := _promote_runs_line(counts):  # H13c: uptake costs one paste
         lines.append(promote_runs)
+    if epoch := eval_epoch_line(counts):  # E1: tonight's eval has no WoW prior — say so
+        lines.append(epoch)
     # The rerank tally on a clean night is a routine fact (H7a: rendered
     # verbatim either way; a fallback night carried it in the alert tier).
     tally = counts.get("eval_rerank_tally")

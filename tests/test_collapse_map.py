@@ -44,13 +44,37 @@ def client(kb, monkeypatch):
     return TestClient(build_app())
 
 
-def _linked_twins() -> tuple[int, int]:
-    """Cross-project 'alternative_to' twins that both match the Q query."""
+def _twin_embed(a: int, b: int, *, model: str | None = None) -> None:
+    """Make ``b`` a LINKER twin of ``a``: copy a's ord-0 embedding onto b's ord-0
+    chunk (cosine 1.0 > kb_xtwin_threshold). The conftest fake embedder is
+    content-hash seeded, so two different bodies are ~orthogonal and would NOT
+    pass the E1 twin predicate (KB 31855). A direct chunks UPDATE in kb_test is a
+    test-only shortcut; production code never edits embeddings this way.
+    ``model`` overrides b's ``embed_model`` stamp (the model-swap lag case)."""
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE chunks SET embedding = (SELECT embedding FROM chunks "
+            "WHERE item_id = %s AND ord = 0), embed_model = COALESCE(%s, embed_model) "
+            "WHERE item_id = %s AND ord = 0",
+            (a, model, b),
+        )
+
+
+def _linked_pair(twins: bool = True) -> tuple[int, int]:
+    """Cross-project 'alternative_to' pair that both match the Q query; a true
+    linker twin pair by default, a DISSIMILAR (ADR-alternatives, 297/294-class)
+    pair when ``twins`` is False."""
     a = ingest("alpha", "note", "widget approach A", "the widgetfold approach A body text")
     b = ingest("beta", "note", "widget approach B", "the widgetfold approach B body text alt")
     assert a is not None and b is not None
     graph.link(a, "alternative_to", b)
+    if twins:
+        _twin_embed(a, b)
     return a, b
+
+
+def _linked_twins() -> tuple[int, int]:
+    return _linked_pair(twins=True)
 
 
 def _winner_loser(a: int, b: int) -> tuple[int, int]:
@@ -159,3 +183,56 @@ def test_the_eval_replay_still_logs_nothing(monkeypatch):
     search(Q, k=10, tool=None)
 
     assert _access_rows(a) == [] and _access_rows(b) == []
+
+
+# --- E1 (KB 31855): only LINKER twins fold; ADR alternatives render both ------
+
+
+def test_a_dissimilar_linked_pair_is_not_folded(monkeypatch):
+    """The 297/294 class: a correct manual alternative_to edge between two ADR
+    alternatives (ord-0 cosine far below kb_xtwin_threshold) is NOT a twin — both
+    hits survive, no collapse map, no parity access rows."""
+    a, b = _linked_pair(twins=False)
+    monkeypatch.setattr(settings, "kb_collapse_alternatives", True)
+
+    hits = search(Q, k=10)
+
+    assert {a, b} <= {h.item_id for h in hits}, "both ADR alternatives render"
+    assert all(h.collapsed == [] for h in hits), "no fold, no map"
+    assert _access_rows(a) == [("search", Q)] and _access_rows(b) == [("search", Q)], (
+        "exactly one ordinary row each — an unfolded pair logs like any two hits"
+    )
+
+
+@pytest.mark.parametrize("lag", ["null", "other-model"])
+def test_a_pair_whose_lead_embedding_lags_is_not_folded(monkeypatch, lag):
+    """An identical pair whose loser's ord-0 chunk is NULL or stamped with
+    another embed_model is unprovable under the current model and renders both
+    (embeddings lagging a model swap must never hide an item)."""
+    a, b = _linked_twins()
+    if lag == "null":
+        with db.transaction() as conn:
+            conn.execute("UPDATE chunks SET embedding = NULL WHERE item_id = %s", (b,))
+    else:
+        _twin_embed(a, b, model="stale")  # the same lead vector, stamped with another model
+    monkeypatch.setattr(settings, "kb_collapse_alternatives", True)
+
+    hits = search(Q, k=10)
+
+    assert {a, b} <= {h.item_id for h in hits}
+    assert all(h.collapsed == [] for h in hits)
+    assert _access_rows(a) == [("search", Q)] and _access_rows(b) == [("search", Q)]
+
+
+def test_the_twin_threshold_is_strict(monkeypatch):
+    """Mirrors twin_probe: cosine EQUAL to kb_xtwin_threshold is not a twin. With
+    identical lead vectors (cosine 1.0) a threshold of 1.0 refuses the fold and
+    anything below it accepts — the same single knob the linker reads."""
+    a, b = _linked_twins()
+    monkeypatch.setattr(settings, "kb_collapse_alternatives", True)
+
+    monkeypatch.setattr(settings, "kb_xtwin_threshold", 1.0)
+    assert {a, b} <= {h.item_id for h in search(Q, k=10, tool=None)}, "1.0 > 1.0 is false"
+
+    monkeypatch.setattr(settings, "kb_xtwin_threshold", 0.93)
+    assert len({a, b} & {h.item_id for h in search(Q, k=10, tool=None)}) == 1, "folded"

@@ -18,7 +18,7 @@ scalar never does.
 | Epoch | Since | Cases (positive) | Quantum | Clean baseline hit@5 / MRR | Floors hit@5 / MRR | Golden hash |
 |-------|-------|------------------|---------|----------------------------|--------------------|-------------|
 | E0 | wave F (`9c7ab4e`) | 52 (52) | 0.5/52 = 0.0096 | 0.9808 / 0.9269 (review #9a, KB 32942) | 0.97 / 0.90 | n/a (key lands with E1) |
-| E1 | 2026-09-16 | 61 (59) | 0.5/59 = 0.0085 | 0.9836 / 0.8975 (daytime replay 2026-09-16, fallback-free; expected first clean night 0.9836 / 0.889 — see below) | 0.97 / 0.87 | `f687077853bd` |
+| E1 | 2026-09-16 | 61 (59) | 0.5/59 = 0.0085 | 0.9836 / 0.8975 (daytime replay 2026-09-16, fallback-free; expected first clean night 0.9836 / 0.889 — see below) | 0.97 / 0.86 (MRR re-anchored 2026-09-17, see night 1) | `f687077853bd` |
 
 ## E0 — the 52-case set (wave F, `9c7ab4e`, through 2026-09-16)
 
@@ -87,12 +87,27 @@ known-red.
   0.8975 (52.95/59) with the qpm case at rank 1, but every nightly since 09-10 has read that case
   at rank 2 (the near-tie above), so the expected nightly value is 0.8975 − 0.0085 = 0.889;
   0.889 − 0.017 = 0.872 → **0.870**. The first clean night is recorded below when it lands; the
-  floor is NOT re-tuned on it unless it reads more than two quanta away from 0.889.
+  floor is NOT re-tuned on it unless it reads more than two quanta away from 0.889. **Applied
+  2026-09-17:** night 1 read 3.3 quanta away (below), 1.3 of them structural, so the expected clean
+  baseline is now 0.8777 and the floor moved to **0.860** (0.8777 − 0.017 = 0.8607, rounded down).
 
 | Post-E1 field | Value |
 |---------------|-------|
 | Post-E1 daytime replay 2026-09-16 (fallback-free: rerank active 60 / off 1) | hit@5 0.9836 (60/61) / MRR 0.8975 (52.95/59); new positives: 101-raw 1, 22480 1, 297 1, 294 4, 34161 2, 6495 2, 32942 1 |
 | Expected first clean night | 0.9836 / 0.889 (qpm at rank 2) |
-| First clean night, measured | TBD — recorded on the first fallback-free nightly after the commit |
+| First clean night, measured | 2026-09-17 01:00 run (report 38551; the 23:16 boot catch-up, report 38206, read the same): hit@5 0.9672 (59/61) / MRR 0.8607, fallback-free — BOTH floors tripped. Per case: raw-101 at rank 3 (structural: the rm3 doc refresh minted fleet-agent README revision 38195 at 11:55 on 09-16, so 101 now trails 473 and 38195; bound ≤3 holds), `service dies at boot…` MISS (window-edge flapper, below); every other case at its E1 rank |
 | Golden hash (`eval_golden_hash`) | `f687077853bd` |
-| Applied `KB_EVAL_MIN_MRR` | 0.87 (`.env`, owner box, set with the commit; `KB_EVAL_MIN_HIT5` stays 0.97) |
+| Applied `KB_EVAL_MIN_MRR` | 0.87 with the commit → **0.86 on 2026-09-17** per the rule above (`.env`, owner box); `KB_EVAL_MIN_HIT5` stays 0.97 |
+
+**Night 1 read (2026-09-17).** The miss is a *window-edge flapper*: with reranking off,
+`service dies at boot but starts fine manually afterwards` sits at fused rank 19 of the 20-item
+rerank window (`kb_rerank_top_n`), and only the reranker lifts it to rank 1 — a query-vector
+difference of order 1e-4 puts it at fused rank 21, outside the window, and it misses outright.
+Measured on 09-17: the preferred embed host (`KB_EMBED_URL`, the owner's desktop GPU, Ollama
+0.32.5) returns bit-identical vectors while its model stays loaded (cosine 1.000000 over repeated
+calls) but differs across model reloads (0.999837 between two loads), and differs from the local
+GPU by 0.999717; the case hit at rank 1 in six replays at 10:35 and missed in every replay from
+10:47, on the same host. Its E0 history (09-06..09-09 ranks 1 → 2 → 3 → miss → 4 → 1) is the same
+behaviour. hit@5 trips on any flap night by design (a second miss). Nothing in the golden set or
+the ranking moves before review #9; E2 decides among widening the case's expectation, the rerank
+window, the floor semantics, and pinning the embedder to one always-warm host (the Orin plan).

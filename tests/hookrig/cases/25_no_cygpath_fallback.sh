@@ -18,6 +18,20 @@
 #       block extracted out of the installed hook -- upper and lower drive
 #       letters, forward- and backslash forms, spaces, and the pass-through of
 #       an already-POSIX path.
+# ALSO PINS (wave C.1, KB 40411 fix set item 3): the fallback is PURE BASH. The
+#       old one was `cut | tr '\\' '/'`, and on the raw Windows spawn PATH a
+#       NATIVE tr answers first while MSYS rewrites its lone `/` argument to
+#       `C:/Program Files/Git/`: every backslash became a `C` and the transcript
+#       path came out as /cCUsersC... (usama-home, two weeks of silent exits).
+#       The last step sources the block from install.sh with that tr FIRST on
+#       PATH (lib.sh fake_msys_tr) and $OSTYPE unset, so the block's own
+#       /usr/bin prepend does NOT fire and only a tr-free fallback can pass.
+#       RED on today's hooks (HEAD b2b37a3) -- expected FAIL lines:
+#         "C:\Users\x\a b.jsonl -> /c/Users/x/a b.jsonl -- expected [/c/Users/x/a b.jsonl], got [/cCUsersCxCa b.jsonl]"
+#         "mixed separators -- expected [/d/mixed/sep/f], got [/dCmixed/sepCf]"
+#         "the fallback never called tr -- expected [0], got [6]"
+#       `c:/mixed/p`, the UNC pass-through and the POSIX pass-through pass on
+#       both (they never hand tr a backslash); GREEN after the fix.
 . /rig/lib.sh
 
 new_home nocygpath
@@ -99,5 +113,45 @@ assert_eq "relative/path" "$(kb_winpath 'relative/path')" "a relative path passe
 if kb_is_windows; then pass "kb_is_windows agrees with the faked uname"; else fail "kb_is_windows said no on MINGW"; fi
 assert_eq "bash.exe" "$(kb_nativepath /usr/bin/bash)" "kb_nativepath falls back to the bare exe name"
 assert_eq "nohup" "$(kb_detach_cmd)" "kb_detach_cmd picks nohup with no setsid"
+
+# ------------------------------------ the fallback under an MSYS-converted tr
+step "kb_winpath's no-cygpath fallback is pure bash: a native tr first on PATH changes nothing (KB 40411)"
+TRBIN="$HOME/trbin"
+fake_msys_tr "$TRBIN"
+extract_block "$SKILL/install.sh" "$HOME/install-block.sh"
+if [ -s "$HOME/install-block.sh" ]; then pass "the portable block extracted from install.sh"; else fail "no block in install.sh"; fi
+# Every conversion runs in its own subshell: $OSTYPE unset (so the block's
+# msys*/cygwin* /usr/bin prepend cannot fire), the converting tr FIRST on PATH,
+# no cygpath anywhere. The tr stand-in records each call to $HOME/tr.calls.
+wp_raw() { # <native path> -> kb_winpath's answer under the converting tr
+  (
+    unset OSTYPE
+    PATH="$TRBIN:$PATH"
+    # shellcheck disable=SC1091
+    . "$HOME/install-block.sh"
+    kb_winpath "$1"
+  )
+}
+rm -f "$HOME/tr.calls"
+if (unset OSTYPE; PATH="$TRBIN:$PATH"; [ "$(command -v tr)" = "$TRBIN/tr" ]); then
+  pass "precondition: the converting tr is the one on PATH"
+else
+  fail "precondition: the converting tr is not first on PATH"
+fi
+if (unset OSTYPE; PATH="$TRBIN:$PATH"; ! command -v cygpath >/dev/null 2>&1); then
+  pass "precondition: no cygpath, so the fallback is what runs"
+else
+  fail "precondition: a cygpath is on PATH"
+fi
+assert_eq "aCb" "$(PATH="$TRBIN:$PATH"; printf '%s' 'a\b' | tr '\\' '/')" \
+  "precondition: the stand-in turns tr '\\\\' '/' into a backslash->C map (MSYS rewrote the lone /)"
+rm -f "$HOME/tr.calls"
+assert_eq "/c/Users/x/a b.jsonl" "$(wp_raw 'C:\Users\x\a b.jsonl')" 'C:\Users\x\a b.jsonl -> /c/Users/x/a b.jsonl'
+assert_eq "/c/mixed/p" "$(wp_raw 'c:/mixed/p')" "c:/mixed/p -> /c/mixed/p"
+assert_eq "/d/mixed/sep/f" "$(wp_raw 'D:\mixed/sep\f')" "mixed separators: D:\\mixed/sep\\f -> /d/mixed/sep/f"
+assert_eq '\\srv\share\f' "$(wp_raw '\\srv\share\f')" "a UNC \\\\srv\\share\\f passes through unchanged"
+assert_eq "/c/already/posix" "$(wp_raw '/c/already/posix')" "/c/already/posix passes through unchanged"
+_trn=$(grep -c . "$HOME/tr.calls" 2>/dev/null) || true
+assert_eq "0" "${_trn:-0}" "the fallback never called tr"
 
 finish

@@ -322,6 +322,12 @@ MSYS_NO_PATHCONV=1 schtasks //Create //F //TN "KB Flush Sweep" //SC MINUTE //MO 
   //TR "\"C:\Program Files\Git\usr\bin\bash.exe\" -l -c \"~/.claude/hooks/kb-flush-backfill.sh --auto\""
 ```
 
+Since wave C.1 (KB 40411) the hooks repair their own PATH under `$OSTYPE=msys`,
+so the `-l` here is belt-and-braces rather than load-bearing, and `install.sh`
+registers Git's launcher `C:\Program Files\Git\bin\bash.exe` for the five hook
+events when it exists. Run `update.sh` from a LOGIN Git Bash (Start menu "Git
+Bash"): the updater itself still uses sed/cut/tr/curl unguarded.
+
 Why a code rather than the credential: `kb_setup` answers into a chat
 transcript, and the session hooks flush transcripts **into the KB**, which is
 then backed up off-site. A live bearer sent that way is durable in three places

@@ -156,6 +156,19 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   PATH. Paths with SPACES are the norm there, so every path expansion in the
   four scripts is quoted (`tests/hookrig/cases/24` drives install + flush +
   recall through a `HOME` and a project dir that both contain spaces).
+  **Wave C.1 (KB 40411, cases 40-44):** Claude Code spawns the registered
+  `bash.exe` as a NON-login shell on the bare Windows PATH, so the dispatcher
+  and the shared block put `/usr/bin:/mingw64/bin` back first, gated on bash's
+  own `$OSTYPE` (`msys*`/`cygwin*`) — `uname` is itself one of the missing
+  binaries, so it cannot be the guard; `kb_is_windows` reads `$OSTYPE` first.
+  The `kb_winpath` fallback is pure bash (a native `tr` had its lone `/`
+  argument rewritten by MSYS, garbling every transcript path). The installer
+  registers Git's LAUNCHER `<git root>\bin\bash.exe` when it exists (it sets
+  MSYSTEM and PATH before bash starts), else today's value. A named-but-missing
+  transcript logs one hourly `BUG: transcript not found` line instead of exiting
+  in silence; a CRLF-written pin is read CR-stripped; a rate-limited NEEDS TOKEN
+  refusal is labelled `refused`; and the `[KB sweep]` line names each stalled
+  session with its remedy (verdict `refused` + a `.notoken` stamp only).
 - **macOS / BSD / Windows** — the brief+recall hook wraps every bounded search in a
   portable `kb_timeout`: it uses GNU `timeout` when present (Linux — unchanged),
   else `gtimeout` (Homebrew coreutils), else a built-in perl watchdog (perl ships

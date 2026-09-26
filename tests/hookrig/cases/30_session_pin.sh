@@ -17,6 +17,17 @@
 #   * STATE/<okey>.project caches "<slug>\t<how>"; a tab-less cache line is a
 #     miss (re-derived), never "how=<slug>".
 #   * KB_FLUSH_PROJECT_PIN=0 restores today's per-firing derivation (no cache).
+#   * a CRLF-written pin (`repeater\tkbproject\r\n` -- Notepad, or any Windows
+#     editor, on the KB 40411 recovery path) is read with its CR STRIPPED:
+#     flush_project_by goes out as `kbproject`, never `kbproject\r`, which the
+#     REST schema (`^[a-z-]+$`, stub_contract.py) refuses with 422 on EVERY
+#     chunk (wave C.1, KB 40411 fix set item 5). The LF pin is the positive
+#     control. RED on today's hooks (HEAD b2b37a3) -- expected FAIL lines:
+#     "no chunk of the CRLF-pinned session was refused 422 -- expected [0], got [1]",
+#     "flush_project_by is exactly kbproject (no CR) -- 0 < 1",
+#     "no chunk FAILED (422) line for sid=sess-crl -- expected [0], got [1]",
+#     "the CRLF-pinned session drained -- expected [<size>], got [0]".
+#     GREEN once the pin read strips CR; the project stays `repeater` on both.
 # NOTE: the transcript's records carry a `cwd` (Claude Code writes one); the
 #       fixtures build real git repos so `git rev-parse --show-toplevel` resolves.
 #       install.sh in this tree does not create $HOOKS/state, hence the mkdirs.
@@ -190,5 +201,37 @@ KB_FLUSH_PROJECT_PIN=0 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T5"
 wait_firing 0 60 || fail "PIN=0 firing never completed"
 assert_eq "beta" "$(stub_field '.transport=="rest"' '.project' | tail -1)" "PIN=0 files under the EVENT cwd (beta), not the record cwd (alpha)"
 assert_file_missing "$HOOKS/state/sess-off.project" "PIN=0 writes no pin cache"
+
+# ------------------------------------------ 7. a CRLF pin never ships a CR
+new_home pincrlf
+stub_reset
+install_hooks >/dev/null
+mkdir -p "$HOOKS/state"
+printf '2000-01-01T00:00:00Z\n' >"$HOOKS/state/.checkpoints-trusted-since"
+cfg_rest
+mkrepo "$HOME/work/rep"
+step "POSITIVE CONTROL: an LF pin 'repeater<TAB>kbproject' ships flush_project_by=kbproject"
+printf 'repeater\tkbproject\n' >"$HOOKS/state/sess-lf.project"
+TL="$HOME/work/rep/lf.jsonl"
+mktx "$TL" "$HOME/work/rep"
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$TL" "$HOME/work/rep" sess-lf PreCompact)"
+wait_log "(ok bytes=|chunk FAILED).* sid=sess-lf\$" 60 || fail "the LF-pinned firing never finished"
+assert_eq "repeater" "$(stub_field '.session_uri=="session:sess-lf"' '.project' | sort -u)" "the LF pin files under repeater"
+assert_ge "$(stub_count '.session_uri=="session:sess-lf" and .status==202 and .flush_project_by=="kbproject"')" "1" \
+  "the LF pin ships flush_project_by=kbproject and is accepted"
+step "a CRLF pin 'repeater<TAB>kbproject<CR><LF>' ships flush_project_by=kbproject, never kbproject<CR>"
+printf 'repeater\tkbproject\r\n' >"$HOOKS/state/sess-crlf.project"
+if grep -q $'\r' "$HOOKS/state/sess-crlf.project"; then pass "fixture: the pin really carries a CR"; else fail "fixture: no CR in the pin"; fi
+TC="$HOME/work/rep/crlf.jsonl"
+mktx "$TC" "$HOME/work/rep"
+SZ_C=$(wc -c <"$TC" | tr -d ' ')
+fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$TC" "$HOME/work/rep" sess-crlf PreCompact)"
+wait_log "(ok bytes=|chunk FAILED).* sid=sess-crl\$" 60 || fail "the CRLF-pinned firing never finished"
+assert_eq "repeater" "$(stub_field '.session_uri=="session:sess-crlf"' '.project' | sort -u)" "the CRLF pin still files under repeater (cut -f1 never saw the CR)"
+assert_eq "0" "$(stub_count '.session_uri=="session:sess-crlf" and .status==422')" "no chunk of the CRLF-pinned session was refused 422"
+assert_ge "$(stub_count '.session_uri=="session:sess-crlf" and .status==202 and .flush_project_by=="kbproject"')" "1" \
+  "flush_project_by is exactly kbproject (no CR)"
+assert_eq "0" "$(log_count 'chunk FAILED \(422\).* sid=sess-crl$')" "no chunk FAILED (422) line for sid=sess-crl"
+assert_eq "$SZ_C" "$(cat "$HOOKS/state/sess-crlf.offset" 2>/dev/null)" "the CRLF-pinned session drained"
 
 finish

@@ -4,9 +4,16 @@
 # PINS: kb-system item 1153 (Windows/REMOTE) and item 496. The skill has carried
 #       Windows-specific code for a long time and NONE of it was ever executed by
 #       a test -- it was field folklore. Everything below is now executable:
-#   1. `uname -s` = MINGW*/MSYS*/CYGWIN* is the ONE platform switch, centralised
-#      in the shared portable block (kb_is_windows), identical in all four
-#      scripts. This case fakes uname; nothing else selects the Windows path.
+#   1. kb_is_windows, in the shared portable block (byte-identical across its
+#      five carriers), is the platform switch, and it reads $OSTYPE FIRST
+#      (msys*/cygwin* -- bash's own variable, which survives the raw Windows
+#      spawn PATH where uname itself is missing), `uname -s` = MINGW*/MSYS*/
+#      CYGWIN* SECOND (wave C.1, KB 40411). This case fakes uname for the
+#      install/flush flow below; its last step sources the block and asserts
+#      OSTYPE=msys alone selects Windows while uname still says Linux -- RED on
+#      today's hooks ("kb_is_windows is true under OSTYPE=msys -- expected
+#      [yes], got [no]", and the same for OSTYPE=cygwin), GREEN once the OSTYPE
+#      gate lands; the OSTYPE=linux-gnu control passes on both.
 #   2. Claude Code on Windows spawns a hook as exe+args, NOT through a shell, so
 #      a bare .sh command never runs. install.sh must register bash.exe as the
 #      command with the dispatcher as args[0] and the event as args[1] -- for ALL FIVE events (KB 14508).
@@ -112,5 +119,28 @@ if [ -f "$HOME/win-timeout.calls" ]; then
 else
   pass "the Win32 timeout was not invoked at all"
 fi
+
+# ------------------------------------------- 1. $OSTYPE first, uname second
+step "kb_is_windows reads \$OSTYPE first: OSTYPE=msys is Windows even when uname says Linux (KB 40411)"
+extract_block "$HOOKS/flush-session-to-kb.sh" "$HOME/block23.sh"
+if [ -s "$HOME/block23.sh" ]; then pass "the portable block extracted from the installed hook"; else fail "no block in the installed hook"; fi
+# The REAL uname (the faked one lives in $HOME/bin, which this PATH leaves out).
+is_win() { # <OSTYPE value> -> "<uname -s>|yes|no"
+  (
+    OSTYPE="$1"
+    PATH=/usr/local/bin:/usr/bin:/bin
+    # shellcheck disable=SC1091
+    . "$HOME/block23.sh"
+    printf '%s|' "$(uname -s)"
+    if kb_is_windows; then printf yes; else printf no; fi
+  )
+}
+R=$(is_win msys)
+assert_eq "Linux" "${R%%|*}" "precondition: uname -s says Linux for this probe"
+assert_eq "yes" "${R##*|}" "kb_is_windows is true under OSTYPE=msys"
+R=$(is_win cygwin)
+assert_eq "yes" "${R##*|}" "...and under OSTYPE=cygwin"
+R=$(is_win linux-gnu)
+assert_eq "no" "${R##*|}" "CONTROL: OSTYPE=linux-gnu + uname Linux is not Windows"
 
 finish

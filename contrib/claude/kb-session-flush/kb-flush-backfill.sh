@@ -120,12 +120,32 @@ unset KB_HOOK_GUARD
 # Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
 # detach command, and a JSON backend chain -- jq on PATH, a jq co-located with the
 # hooks, $KB_JQ, then python3 -- plus the loud, sudo-free failure when none exist.
+
+# Git Bash/MSYS/Cygwin spawned as a NON-login shell (Claude Code running a raw
+# usr\bin\bash.exe) inherits the WINDOWS PATH: no /usr/bin, no /mingw64/bin, a
+# native GnuWin32 tr first -- so uname, cut, tr, awk and grep miss or misbehave
+# (KB 40411). Put the MSYS dirs back first. $OSTYPE is bash's own, so this needs
+# no external binary; on Linux/macOS it is a no-op.
+case "${OSTYPE:-}" in msys* | cygwin*)
+  for _kbpd in /usr/bin /mingw64/bin; do [ -d "$_kbpd" ] && PATH="$_kbpd:$PATH"; done
+  export PATH
+  ;;
+esac
 KB_UNAME=$(uname -s 2>/dev/null || echo unknown)
-kb_is_windows() { case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# $OSTYPE first: uname is itself a /usr/bin binary, so under that PATH it was
+# missing and KB_UNAME read `unknown` -- a uname-only test is circular there.
+kb_is_windows() {
+  case "${OSTYPE:-}" in msys* | cygwin*) return 0 ;; esac
+  case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac
+}
 
 # Native Windows path (C:\x or C:/x) -> POSIX. cygpath when it exists, else a
-# pure-shell fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
-# Bash without cygpath still resolves event paths. Anything else passes through.
+# PURE-BASH fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
+# Bash without cygpath still resolves event paths. Anything else (a UNC
+# \\server\share, an already-POSIX /c/x) passes through. No cut/tr: MSYS
+# rewrites a native tr's lone `/` argument to `C:/Program Files/Git/`, which
+# garbled every transcript path (KB 40411). ${x,} is bash 4+ -- Git Bash ships
+# 5.x, and only a drive-letter path ever reaches that line.
 kb_winpath() {
   case "${1:-}" in [A-Za-z]:\\* | [A-Za-z]:/*) ;; *)
     printf '%s' "${1:-}"
@@ -135,7 +155,9 @@ kb_winpath() {
   _kbp=""
   if command -v cygpath >/dev/null 2>&1; then _kbp=$(cygpath -u "$1" 2>/dev/null) || _kbp=""; fi
   if [ -z "$_kbp" ]; then
-    _kbp="/$(printf '%s' "$1" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$1" | cut -c3- | tr '\\' '/')"
+    _kbp=${1//\\//}
+    _kbp=${_kbp,}
+    _kbp="/${_kbp:0:1}${_kbp:2}"
   fi
   printf '%s' "$_kbp"
 }
@@ -693,7 +715,7 @@ bf_slug_cwd() { # <project directory name> -> an EXISTING directory, or nothing
 # pins authoritatively, so a drift here can mislead a human, never misfile.
 bf_project_of() { # <okey> <cwd> -> project slug
   if [ -s "$STATE/$1.project" ]; then
-    _bfc=$(cut -f1 "$STATE/$1.project" 2>/dev/null | head -n1)
+    _bfc=$(cut -f1 "$STATE/$1.project" 2>/dev/null | head -n1 | tr -d '\r')
     [ -n "$_bfc" ] && {
       printf '%s' "$_bfc"
       return 0
@@ -776,6 +798,19 @@ bf_snap() { # <transcript> <bytes> -> snapped bytes (0 when no newline precedes)
     _sm=$((_sm - _swb)) # no newline in this window: look further back
   done
   printf '0'
+}
+
+# The hook's per-project NEEDS TOKEN stamp (flush-session-to-kb.sh
+# kb_no_token_notice: state/.notoken-<slug>.stamp, one epoch, hourly) is fresh.
+bf_notoken_fresh() { # <slug> -> 0 when the stamp is younger than 3600 s
+  [ -n "${1:-}" ] && [ "$1" != "?" ] || return 1
+  _bnt=$(cat "$STATE/.notoken-$1.stamp" 2>/dev/null || echo)
+  case "$_bnt" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$((NOW - _bnt))" -lt 3600 ]
+}
+# The token NAME's key, exactly as the hook derives PROJ_KEY (never a value).
+bf_proj_key() { # <slug> -> PROJ_KEY
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'
 }
 
 # The per-session stall record: state/<okey>.sweep = `fails=<n> last=<epoch> verdict=<w>`
@@ -1366,6 +1401,12 @@ while IFS="$SEP" read -r MT STATUS PROJ SID SIZE BASE REMAIN OKEY CWD T REASON <
   elif printf '%s\n' "$SEG" | grep -qE "lock lost .* sid=$SIDS\$"; then
     VERDICT=failed
     DETAIL="the drain lost its lock and stopped"
+  elif bf_notoken_fresh "$PROJ"; then
+    # The hook's NEEDS TOKEN line is hourly (.notoken-<slug>.stamp) and the sweep
+    # half-hourly, so every other run saw a SILENT refusal and called it
+    # no-progress (KB 40411). A fresh stamp IS that refusal: say so, by NAME.
+    VERDICT=refused
+    DETAIL="NEEDS TOKEN (rate-limited): no KB_TOKEN_$(bf_proj_key "$PROJ") on this box; see $BF_LOG"
   else
     VERDICT=no-progress
     DETAIL="the hook logged nothing for this session and moved no checkpoint (a rate-limited refusal? check $BF_LOG)"

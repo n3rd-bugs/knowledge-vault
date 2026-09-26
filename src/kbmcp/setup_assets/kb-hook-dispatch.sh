@@ -33,6 +33,19 @@
 set -u
 
 EV="${1:-}"
+# Git Bash/MSYS/Cygwin: Claude Code spawns a registered raw usr\bin\bash.exe as
+# a NON-login shell with the WINDOWS PATH -- no /usr/bin, no /mingw64/bin, and a
+# native GnuWin32 tr ahead of everything (KB 40411). Every coreutils call in the
+# children (cat, cut, tr, awk, grep, date) would then miss or hit a native look-
+# alike whose arguments MSYS rewrites. Put the MSYS dirs back FIRST, before any
+# child runs. Bash-only ($OSTYPE is set by bash itself; uname is one of the
+# missing /usr/bin binaries, so it cannot be the guard), and a no-op on
+# Linux/macOS. Exported, so every child inherits the repaired PATH.
+case "${OSTYPE:-}" in msys* | cygwin*)
+  for _kbpd in /usr/bin /mingw64/bin; do [ -d "$_kbpd" ] && PATH="$_kbpd:$PATH"; done
+  export PATH
+  ;;
+esac
 
 # Native Windows path (C:\x or C:/x) -> POSIX. A trimmed copy of the portable
 # block's kb_winpath: this script deliberately carries NO JSON backend (it never
@@ -47,7 +60,12 @@ kb_winpath() {
   _kbp=""
   if command -v cygpath >/dev/null 2>&1; then _kbp=$(cygpath -u "$1" 2>/dev/null) || _kbp=""; fi
   if [ -z "$_kbp" ]; then
-    _kbp="/$(printf '%s' "$1" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$1" | cut -c3- | tr '\\' '/')"
+    # PURE BASH, no cut/tr: a native tr's lone `/` argument is rewritten by MSYS
+    # to `C:/Program Files/Git/` (KB 40411). C:\a\b -> C:/a/b -> c:/a/b -> /c/a/b
+    # (${x,} is bash 4+: Git Bash ships 5.x, and only a drive path gets here).
+    _kbp=${1//\\//}
+    _kbp=${_kbp,}
+    _kbp="/${_kbp:0:1}${_kbp:2}"
   fi
   printf '%s' "$_kbp"
 }

@@ -400,6 +400,46 @@ EOF
   chmod +x "$HOME/bin/flock"
 }
 
+# ------------------------------------------ the RAW Windows spawn PATH (wave C.1)
+# KB 40411: Claude Code runs a registered `...\usr\bin\bash.exe` as a NON-login
+# MSYS bash that inherits the WINDOWS PATH -- no Git /usr/bin, no /mingw64/bin,
+# and a NATIVE (GnuWin32) tr ahead of anything MSYS. MSYS argument-converts a
+# lone `/` handed to a native exe into `C:/Program Files/Git/`, so the old
+# fallback's `tr '\\' '/'` ran as `tr '\\' 'C:/Program Files/Git/'` and every
+# backslash became a `C` (C:\Users\rig\t.jsonl -> /cCUsersCrigCt.jsonl).
+# These fakes model exactly that, in a directory the CASE names -- deliberately
+# NOT $HOME/bin: this file's own assertions use grep/tr, so the directory is
+# prepended only to the firing under test (`env PATH="$dir:$PATH" ...`).
+# Every call is recorded ($HOME/tr.calls, $HOME/rawpath.calls) so a case can
+# prove the fixed hooks never reach them.
+fake_msys_tr() { # <dir> -- a native `tr` whose lone `/` argument MSYS rewrites
+  mkdir -p "$1"
+  cat >"$1/tr" <<'EOF'
+#!/usr/bin/env bash
+# Rig stand-in for a native Windows tr reached through MSYS argument conversion.
+{ printf 'tr'; printf ' [%s]' "$@"; printf '\n'; } >>"$HOME/tr.calls"
+a=()
+for x in "$@"; do
+  if [ "$x" = / ]; then a+=("C:/Program Files/Git/"); else a+=("$x"); fi
+done
+exec /usr/bin/tr "${a[@]}"
+EOF
+  chmod +x "$1/tr"
+}
+fake_raw_windows_path() { # <dir> -- fake_msys_tr + `command not found` (127) for grep/awk/perl/cygpath
+  fake_msys_tr "$1"
+  for _t in grep awk perl cygpath; do
+    cat >"$1/$_t" <<'EOF'
+#!/usr/bin/env bash
+# Rig stand-in: this tool is NOT on the raw Windows spawn PATH.
+echo "${0##*/} $*" >>"$HOME/rawpath.calls"
+echo "${0##*/}: command not found" >&2
+exit 127
+EOF
+    chmod +x "$1/$_t"
+  done
+}
+
 # --------------------------------------------------------------- sweep clock
 # kb-flush-backfill.sh (stage 2, item C7) reads KB_BACKFILL_NOW -- epoch seconds
 # -- instead of `date +%s` when it is set, so a case can pin "now" and assert the

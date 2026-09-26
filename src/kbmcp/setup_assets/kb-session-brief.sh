@@ -38,12 +38,32 @@ CFG="$HOME/.claude/kb-flush.env"
 # Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
 # detach command, and a JSON backend chain -- jq on PATH, a jq co-located with the
 # hooks, $KB_JQ, then python3 -- plus the loud, sudo-free failure when none exist.
+
+# Git Bash/MSYS/Cygwin spawned as a NON-login shell (Claude Code running a raw
+# usr\bin\bash.exe) inherits the WINDOWS PATH: no /usr/bin, no /mingw64/bin, a
+# native GnuWin32 tr first -- so uname, cut, tr, awk and grep miss or misbehave
+# (KB 40411). Put the MSYS dirs back first. $OSTYPE is bash's own, so this needs
+# no external binary; on Linux/macOS it is a no-op.
+case "${OSTYPE:-}" in msys* | cygwin*)
+  for _kbpd in /usr/bin /mingw64/bin; do [ -d "$_kbpd" ] && PATH="$_kbpd:$PATH"; done
+  export PATH
+  ;;
+esac
 KB_UNAME=$(uname -s 2>/dev/null || echo unknown)
-kb_is_windows() { case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# $OSTYPE first: uname is itself a /usr/bin binary, so under that PATH it was
+# missing and KB_UNAME read `unknown` -- a uname-only test is circular there.
+kb_is_windows() {
+  case "${OSTYPE:-}" in msys* | cygwin*) return 0 ;; esac
+  case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac
+}
 
 # Native Windows path (C:\x or C:/x) -> POSIX. cygpath when it exists, else a
-# pure-shell fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
-# Bash without cygpath still resolves event paths. Anything else passes through.
+# PURE-BASH fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
+# Bash without cygpath still resolves event paths. Anything else (a UNC
+# \\server\share, an already-POSIX /c/x) passes through. No cut/tr: MSYS
+# rewrites a native tr's lone `/` argument to `C:/Program Files/Git/`, which
+# garbled every transcript path (KB 40411). ${x,} is bash 4+ -- Git Bash ships
+# 5.x, and only a drive-letter path ever reaches that line.
 kb_winpath() {
   case "${1:-}" in [A-Za-z]:\\* | [A-Za-z]:/*) ;; *)
     printf '%s' "${1:-}"
@@ -53,7 +73,9 @@ kb_winpath() {
   _kbp=""
   if command -v cygpath >/dev/null 2>&1; then _kbp=$(cygpath -u "$1" 2>/dev/null) || _kbp=""; fi
   if [ -z "$_kbp" ]; then
-    _kbp="/$(printf '%s' "$1" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$1" | cut -c3- | tr '\\' '/')"
+    _kbp=${1//\\//}
+    _kbp=${_kbp,}
+    _kbp="/${_kbp:0:1}${_kbp:2}"
   fi
   printf '%s' "$_kbp"
 }
@@ -613,6 +635,51 @@ else
     _sw_un=$(sed -n 's/.* unknown=\([0-9]*\).*/\1/p' "$_sw_last" 2>/dev/null | head -1)
     if [ -n "$_sw_st" ] && [ "$_sw_st" -gt 0 ]; then
       _sw_line="${_sw_line:+$_sw_line; }$_sw_st transcript(s) STALLED after repeated failures -- see ~/.claude/hooks/flush-session.log"
+      # NAME them, on this SAME line (KB 40411): a bare count sent the owner
+      # hunting through the log for which session, which project, and why. Per
+      # state/<okey>.sweep at or past the sweep's stall threshold:
+      # ` <slug> (<sid8>) <verdict>`, plus the kb_project_token remedy ONLY where
+      # the verdict is refused AND the hook left state/.notoken-<slug>.stamp --
+      # the token NAME's inputs, never a value. Capped at 3 so the line stays a line.
+      _sw_runs="${KB_SWEEP_STALL_RUNS:-6}"
+      case "$_sw_runs" in '' | *[!0-9]*) _sw_runs=6 ;; esac
+      _sw_n=0
+      _sw_more=0
+      _sw_host=""
+      for _sw_f in "$_sw_state"/*.sweep; do
+        [ -f "$_sw_f" ] || continue
+        # `fails=<n> last=<epoch> verdict=<w>` (kb-flush-backfill.sh), read with
+        # the builtin: one fork per .sweep file would add seconds on Windows.
+        _sw_rec=""
+        read -r _sw_rec <"$_sw_f" 2>/dev/null || [ -n "$_sw_rec" ] || continue
+        _sw_fails="${_sw_rec#fails=}"
+        _sw_fails="${_sw_fails%% *}"
+        case "$_sw_rec" in fails=*) ;; *) continue ;; esac
+        case "$_sw_fails" in '' | *[!0-9]*) continue ;; esac
+        [ "$_sw_fails" -ge "$_sw_runs" ] || continue
+        if [ "$_sw_n" -ge 3 ]; then
+          _sw_more=$((_sw_more + 1))
+          continue
+        fi
+        _sw_ok="${_sw_f##*/}"
+        _sw_ok="${_sw_ok%.sweep}"
+        _sw_vd=""
+        case "$_sw_rec" in *" verdict="*) _sw_vd="${_sw_rec##* verdict=}" ;; esac
+        _sw_vd="${_sw_vd%% *}"
+        _sw_vd="${_sw_vd//$'\r'/}"
+        _sw_sl=$(cut -f1 "$_sw_state/$_sw_ok.project" 2>/dev/null | head -n1 | tr -d '\r')
+        [ "$_sw_n" = 0 ] && _sw_line="$_sw_line:" || _sw_line="$_sw_line,"
+        _sw_n=$((_sw_n + 1))
+        _sw_line="$_sw_line ${_sw_sl:-?} (${_sw_ok:0:8}) ${_sw_vd:-?}"
+        # Gate on the VERDICT too: the hook never removes a .notoken stamp, so a
+        # stale one beside a transport stall (verdict=failed) must not send the
+        # owner to mint a token that already exists.
+        if [ "$_sw_vd" = refused ] && [ -n "$_sw_sl" ] && [ -f "$_sw_state/.notoken-$_sw_sl.stamp" ]; then
+          [ -n "$_sw_host" ] || _sw_host=$(hostname 2>/dev/null || echo this-machine)
+          _sw_line="$_sw_line -- kb_project_token(project=\"$_sw_sl\", machine=\"$_sw_host\")"
+        fi
+      done
+      [ "$_sw_more" -gt 0 ] && _sw_line="$_sw_line, +$_sw_more more"
     fi
     if [ -n "$_sw_un" ] && [ "$_sw_un" -gt 0 ]; then
       _sw_line="${_sw_line:+$_sw_line; }$_sw_un unseeded transcript(s) need an owner decision: kb-flush-backfill.sh (the table), then kb-flush-backfill.sh --seed <sid> <bytes|current>"

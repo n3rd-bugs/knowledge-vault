@@ -19,12 +19,32 @@ set -euo pipefail
 # Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
 # detach command, and a JSON backend chain -- jq on PATH, a jq co-located with the
 # hooks, $KB_JQ, then python3 -- plus the loud, sudo-free failure when none exist.
+
+# Git Bash/MSYS/Cygwin spawned as a NON-login shell (Claude Code running a raw
+# usr\bin\bash.exe) inherits the WINDOWS PATH: no /usr/bin, no /mingw64/bin, a
+# native GnuWin32 tr first -- so uname, cut, tr, awk and grep miss or misbehave
+# (KB 40411). Put the MSYS dirs back first. $OSTYPE is bash's own, so this needs
+# no external binary; on Linux/macOS it is a no-op.
+case "${OSTYPE:-}" in msys* | cygwin*)
+  for _kbpd in /usr/bin /mingw64/bin; do [ -d "$_kbpd" ] && PATH="$_kbpd:$PATH"; done
+  export PATH
+  ;;
+esac
 KB_UNAME=$(uname -s 2>/dev/null || echo unknown)
-kb_is_windows() { case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# $OSTYPE first: uname is itself a /usr/bin binary, so under that PATH it was
+# missing and KB_UNAME read `unknown` -- a uname-only test is circular there.
+kb_is_windows() {
+  case "${OSTYPE:-}" in msys* | cygwin*) return 0 ;; esac
+  case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac
+}
 
 # Native Windows path (C:\x or C:/x) -> POSIX. cygpath when it exists, else a
-# pure-shell fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
-# Bash without cygpath still resolves event paths. Anything else passes through.
+# PURE-BASH fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
+# Bash without cygpath still resolves event paths. Anything else (a UNC
+# \\server\share, an already-POSIX /c/x) passes through. No cut/tr: MSYS
+# rewrites a native tr's lone `/` argument to `C:/Program Files/Git/`, which
+# garbled every transcript path (KB 40411). ${x,} is bash 4+ -- Git Bash ships
+# 5.x, and only a drive-letter path ever reaches that line.
 kb_winpath() {
   case "${1:-}" in [A-Za-z]:\\* | [A-Za-z]:/*) ;; *)
     printf '%s' "${1:-}"
@@ -34,7 +54,9 @@ kb_winpath() {
   _kbp=""
   if command -v cygpath >/dev/null 2>&1; then _kbp=$(cygpath -u "$1" 2>/dev/null) || _kbp=""; fi
   if [ -z "$_kbp" ]; then
-    _kbp="/$(printf '%s' "$1" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$1" | cut -c3- | tr '\\' '/')"
+    _kbp=${1//\\//}
+    _kbp=${_kbp,}
+    _kbp="/${_kbp:0:1}${_kbp:2}"
   fi
   printf '%s' "$_kbp"
 }
@@ -572,10 +594,35 @@ fi
 [ -f "$SETTINGS" ] || echo '{}' >"$SETTINGS"
 # Windows/Git Bash (KB item 496): Claude Code spawns hooks as exe+args, not via
 # a shell, so a bare .sh path never runs — register bash.exe as the command with
-# the script as its argument. kb_nativepath falls back to $EXEPATH, then to a
-# bare "bash.exe" (resolved through the Windows PATH), when cygpath is absent.
+# the script as its argument.
+#
+# WHICH bash.exe (KB 40411). Git's LAUNCHER, <git root>\bin\bash.exe, when it
+# exists: it sets MSYSTEM and puts /mingw64/bin:/usr/bin on PATH before starting
+# bash. The raw MSYS usr\bin\bash.exe (what `cygpath -w "$(command -v bash)"`
+# names) starts a NON-login shell on the bare WINDOWS PATH, where uname/cut/tr/
+# awk/grep are missing or native look-alikes -- every hook then garbled its
+# transcript path and exited in silence. The root comes from `cygpath -w /`,
+# else Git Bash's $EXEPATH. The existence test uses the DRIVE form (/c/...), not
+# cygpath -u: cygpath maps a path under the MSYS root through the mount table,
+# where /bin IS /usr/bin, so it would call a launcher present on a standalone
+# MSYS2 that has none. No launcher => today's value: kb_nativepath, which falls
+# back to $EXEPATH\usr\bin\bash.exe, then to a bare "bash.exe" (resolved
+# through the Windows PATH), when cygpath is absent.
 BASHW=""
-if kb_is_windows; then BASHW="$(kb_nativepath "$(command -v bash)")"; fi
+if kb_is_windows; then
+  BASHW="$(kb_nativepath "$(command -v bash)")"
+  _kbroot=""
+  if command -v cygpath >/dev/null 2>&1; then _kbroot=$(cygpath -w / 2>/dev/null) || _kbroot=""; fi
+  [ -n "$_kbroot" ] || _kbroot="${EXEPATH:-}"
+  _kblaunch="${_kbroot%\\}\\bin\\bash.exe"
+  case "$_kblaunch" in [A-Za-z]:\\*)
+    _kbldrv=${_kblaunch//\\//}
+    _kbldrv=${_kbldrv,}
+    _kbldrv="/${_kbldrv:0:1}${_kbldrv:2}"
+    if [ -x "$_kbldrv" ]; then BASHW="$_kblaunch"; fi
+    ;;
+  esac
+fi
 
 # Register the DISPATCHER, and ONLY the dispatcher, once per event (idempotent:
 # any prior copy removed first) while preserving other hooks the user has. The

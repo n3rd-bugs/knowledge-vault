@@ -36,12 +36,32 @@ CFG="$HOME/.claude/kb-flush.env"
 # Provides: platform detection, native-path conversion, a TRUSTWORTHY timeout, a
 # detach command, and a JSON backend chain -- jq on PATH, a jq co-located with the
 # hooks, $KB_JQ, then python3 -- plus the loud, sudo-free failure when none exist.
+
+# Git Bash/MSYS/Cygwin spawned as a NON-login shell (Claude Code running a raw
+# usr\bin\bash.exe) inherits the WINDOWS PATH: no /usr/bin, no /mingw64/bin, a
+# native GnuWin32 tr first -- so uname, cut, tr, awk and grep miss or misbehave
+# (KB 40411). Put the MSYS dirs back first. $OSTYPE is bash's own, so this needs
+# no external binary; on Linux/macOS it is a no-op.
+case "${OSTYPE:-}" in msys* | cygwin*)
+  for _kbpd in /usr/bin /mingw64/bin; do [ -d "$_kbpd" ] && PATH="$_kbpd:$PATH"; done
+  export PATH
+  ;;
+esac
 KB_UNAME=$(uname -s 2>/dev/null || echo unknown)
-kb_is_windows() { case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+# $OSTYPE first: uname is itself a /usr/bin binary, so under that PATH it was
+# missing and KB_UNAME read `unknown` -- a uname-only test is circular there.
+kb_is_windows() {
+  case "${OSTYPE:-}" in msys* | cygwin*) return 0 ;; esac
+  case "$KB_UNAME" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac
+}
 
 # Native Windows path (C:\x or C:/x) -> POSIX. cygpath when it exists, else a
-# pure-shell fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
-# Bash without cygpath still resolves event paths. Anything else passes through.
+# PURE-BASH fallback (C:\Users\First Last\p -> /c/Users/First Last/p) so a Git
+# Bash without cygpath still resolves event paths. Anything else (a UNC
+# \\server\share, an already-POSIX /c/x) passes through. No cut/tr: MSYS
+# rewrites a native tr's lone `/` argument to `C:/Program Files/Git/`, which
+# garbled every transcript path (KB 40411). ${x,} is bash 4+ -- Git Bash ships
+# 5.x, and only a drive-letter path ever reaches that line.
 kb_winpath() {
   case "${1:-}" in [A-Za-z]:\\* | [A-Za-z]:/*) ;; *)
     printf '%s' "${1:-}"
@@ -51,7 +71,9 @@ kb_winpath() {
   _kbp=""
   if command -v cygpath >/dev/null 2>&1; then _kbp=$(cygpath -u "$1" 2>/dev/null) || _kbp=""; fi
   if [ -z "$_kbp" ]; then
-    _kbp="/$(printf '%s' "$1" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$1" | cut -c3- | tr '\\' '/')"
+    _kbp=${1//\\//}
+    _kbp=${_kbp,}
+    _kbp="/${_kbp:0:1}${_kbp:2}"
   fi
   printf '%s' "$_kbp"
 }
@@ -252,6 +274,34 @@ kb_nojson_warn() { # <tag: flush|brief|mcp-call>
     "$(date -Is 2>/dev/null || date)" "${1:-hook}" "$_kbh" >>"$_kbh/flush-session.log" 2>/dev/null || true
 }
 # <<< END KB PORTABLE BLOCK v1 <<<
+
+# The event named a transcript that is not a regular file. Beside kb_nojson_warn
+# (same shape, same hourly box-level stamp) but OUTSIDE the shared block: only
+# this hook reads a transcript. It used to be a SILENT `exit 0`, reached BEFORE
+# LOG/STATE exist and before the sweep piggyback -- so when a raw usr\bin\bash.exe
+# spawn garbled every path conversion (KB 40411) a Windows box captured nothing
+# for two weeks with not one line anywhere. `BUG:` is a token the pre-brief's
+# failure scanner lifts into the next session. Never fails the hook.
+kb_badpath_warn() { # <path> <event> <sid8>
+  _kbh="$HOME/.claude/hooks"
+  mkdir -p "$_kbh/state" 2>/dev/null || true
+  _kbs="$_kbh/state/.badpath.stamp"
+  _kbn=$(date +%s 2>/dev/null || echo 0)
+  case "$_kbn" in '' | *[!0-9]*) _kbn=0 ;; esac
+  _kbl=$(cat "$_kbs" 2>/dev/null || echo 0)
+  case "$_kbl" in '' | *[!0-9]*) _kbl=0 ;; esac
+  # No readable clock (the very PATH that broke things may lack date): log now,
+  # fail OPEN, and leave the stamp alone -- a silent hook is the defect.
+  if [ "$_kbn" != 0 ]; then
+    [ "$((_kbn - _kbl))" -ge 3600 ] || return 0
+    printf '%s\n' "$_kbn" >"$_kbs" 2>/dev/null || true
+  fi
+  _kbt=${1//[$'\r\n']/ } # one path, one line
+  printf '%s flush BUG: transcript not found: %s (path conversion?) ev=%s sid=%s\n' \
+    "$(date -u -Is 2>/dev/null || date -u 2>/dev/null)" "$_kbt" "${2:-}" "${3:-}" \
+    >>"$_kbh/flush-session.log" 2>/dev/null || true
+  return 0
+}
 
 # Windows/Git Bash (KB item 496): a co-located jq (installer drops one next to
 # the hooks) must resolve even when Claude Code inherited a PATH without it.
@@ -700,8 +750,10 @@ kb_pin_project() {
   PROJECT_MINTABLE=0
   _pc="$OFF_PROJECT"
   if [ "${KB_FLUSH_PROJECT_PIN:-1}" = 1 ] && [ -s "$_pc" ]; then
-    PROJECT=$(cut -f1 "$_pc" 2>/dev/null)
-    PROJECT_BY=$(cut -s -f2 "$_pc" 2>/dev/null) # -s: a tab-less line is a MISS, not how=<slug>
+    # tr -d '\r': a CRLF-written pin (Notepad, a Windows editor) must never ship
+    # `kbproject\r` as flush_project_by -- the REST schema 422s every chunk.
+    PROJECT=$(cut -f1 "$_pc" 2>/dev/null | tr -d '\r')
+    PROJECT_BY=$(cut -s -f2 "$_pc" 2>/dev/null | tr -d '\r') # -s: a tab-less line is a MISS, not how=<slug>
     if [ -n "$PROJECT" ] && [ -n "$PROJECT_BY" ]; then
       case "$PROJECT_BY" in
         gitfirst | kbproject) PROJECT_MINTABLE=1 ;;
@@ -760,10 +812,17 @@ EV=$(printf '%s' "$INPUT" | kb_json_get hook_event_name)
 # when present and a pure-shell C:\ -> /c/ fallback when it is not.
 T=$(kb_winpath "$T")
 CWD=$(kb_winpath "$CWD")
-[ -n "$T" ] && [ -f "$T" ] || exit 0
+[ -n "$T" ] || exit 0
 # Sub-agent transcripts (<project>/<sid>/subagents/<agent>.jsonl) are an EXPLICIT
 # exclusion — nothing at all, on every event — no longer an accident of a glob.
+# Checked BEFORE the file test so a purged sub-agent transcript never logs.
 case "$T" in */subagents/*) exit 0 ;; esac
+# A NAMED transcript that is not a file is never a quiet exit (KB 40411): the
+# literal-path BUG line above is the only trace, since LOG/STATE come later.
+[ -f "$T" ] || {
+  kb_badpath_warn "$T" "$EV" "${SID:0:8}"
+  exit 0
+}
 
 # The per-session offset key and its state paths. Computed ONCE here (moved up
 # from the transport arms) so the pin cache, the offset writers and the lock all

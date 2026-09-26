@@ -496,6 +496,13 @@ def test_the_backfill_never_puts_anything_on_the_wire_itself():
     """No socket, no credential, no request body. If any of these ever appear,
     the sweep has grown its own transport and the guarantees above are void."""
     text = _backfill_code()
+    # The ONE sanctioned mention (KB 40411, wave C.1): a fresh NEEDS TOKEN stamp
+    # is reported as `refused`, NAMING the missing token so the owner knows what
+    # to ask for. It is a message built from the slug, never a read of a value;
+    # exactly this spelling is exempt, once, and nothing else.
+    named = 'no KB_TOKEN_$(bf_proj_key "$PROJ") on this box'
+    assert text.count(named) == 1, "the refused verdict no longer names the missing token"
+    text = text.replace(named, "")
     assert not _executed_curl_lines(text), "the backfill invokes curl directly"
     for forbidden in (
         "KB_TOKEN",

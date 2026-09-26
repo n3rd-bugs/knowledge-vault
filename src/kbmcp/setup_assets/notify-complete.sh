@@ -102,8 +102,10 @@ kb_posixpath() { # JSON-escaped native Windows path -> POSIX; anything else pass
   # the doubled backslashes (the flush hook never sees them — its jq/python3
   # backend unescapes during parsing). Collapse them, then map the drive path
   # the way flush-session-to-kb.sh's kb_winpath does: cygpath when it exists,
-  # else the pure-shell C:\x -> /c/x fallback. Non-drive paths pass through
-  # untouched, so a Linux path containing a backslash is never corrupted.
+  # else the PURE-BASH C:\x -> /c/x fallback (no cut/tr: MSYS rewrites a native
+  # tr's lone `/` argument, KB 40411; ${x,} is bash 4+, reached only on a drive
+  # path). Non-drive paths pass through untouched, so a Linux path containing a
+  # backslash is never corrupted.
   case "${1:-}" in [A-Za-z]:*) ;; *)
     printf '%s' "${1:-}"
     return 0
@@ -115,7 +117,11 @@ kb_posixpath() { # JSON-escaped native Windows path -> POSIX; anything else pass
   else
     _kbw=""
   fi
-  [ -n "$_kbw" ] || _kbw="/$(printf '%s' "$_kbp" | cut -c1 | tr '[:upper:]' '[:lower:]')$(printf '%s' "$_kbp" | cut -c3- | tr '\\' '/')"
+  if [ -z "$_kbw" ]; then
+    _kbw=${_kbp//\\//}
+    _kbw=${_kbw,}
+    _kbw="/${_kbw:0:1}${_kbw:2}"
+  fi
   printf '%s' "$_kbw"
 }
 

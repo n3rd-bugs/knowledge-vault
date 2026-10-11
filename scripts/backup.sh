@@ -106,7 +106,7 @@ if ! zstd -t -q "${OUT}"; then
 fi
 
 # --- count sidecar (review #6 Wave G): the restore drill's ground truth -------
-# The 04:30 drill races the 01:00 drain (~190-280 items/h), so comparing the
+# The 04:30 drill races the 01:30 drain (~190-280 items/h), so comparing the
 # RESTORED counts against the LIVE DB blew the 1% budget on 5 of 8 recent
 # nights — a false "backup broken" page waiting to happen. The truth about a
 # dump is the dump: one decode pass counts the COPY rows the artifact actually

@@ -169,6 +169,37 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   in silence; a CRLF-written pin is read CR-stripped; a rate-limited NEEDS TOKEN
   refusal is labelled `refused`; and the `[KB sweep]` line names each stalled
   session with its remedy (verdict `refused` + a `.notoken` stamp only).
+- **A session resumed from another directory** (KB 49064) leaves TWO transcripts
+  with ONE session id — the frozen copy in the old project dir and the live one
+  in the new — sharing one checkpoint. A transcript behind that checkpoint while
+  another copy of its session reaches it is the stale copy, never a shrink: the
+  hook skips it (nothing sent, offset untouched, one `stale copy:` line a day),
+  the sweep lists it as `stale-copy` and never fires it, and `--seed` seeds from
+  the largest copy. That silent skip covers only a copy that is a pure
+  byte-PREFIX of the session (its tail matches the covering copy). A copy
+  behind the checkpoint whose tail DIFFERS (`diverged`), or one frozen behind it
+  with no newer copy on the box (`behind`: last modified before the checkpoint's
+  last write, or already named by a marker), is REFUSED — nothing sent, no
+  restart — and surfaced: marker `state/<okey>.diverged` / `state/<okey>.behind`,
+  the notification's `kb ?/<size> diverged|behind`, the sweep's `diverged=` /
+  `behind=` fields and table states, and the session brief. A path a marker
+  names stays refused at ANY size, even once it grows past the checkpoint
+  (that checkpoint is another copy's: a drain from it would start mid-record).
+  The owner decides: `kb-flush-backfill.sh --seed <sid> …` settles a `behind`
+  copy (once it was resumed, at the marker's `frozen=` size, which its line
+  and the table name — never `current`), or a `diverged` one that no copy
+  reaches (`current` there ACCEPTS the loss of its unsent records). A copy that
+  another copy still covers is settled only by moving it out of
+  `~/.claude/projects`: a `--seed` is undone by the next sweep or firing.
+  Resuming the session from that directory later is safe: the file Claude Code
+  writes there carries the live copy's prefix, and the `diverged` marker naming
+  that path releases itself (a content check of the 4 KB below the checkpoint,
+  one `marker cleared: … which now carries the checkpoint holder's prefix`
+  line), so the new records drain from the checkpoint as usual. The markers
+  clear when the copy is gone, when that release applies, on `--seed`, or with
+  the offset. Only a transcript modified AFTER the checkpoint's last write, with no
+  copy reaching the checkpoint and no marker naming it, is a genuine rewrite and
+  still restarts from 0 (KB 49064).
 - **macOS / BSD / Windows** — the brief+recall hook wraps every bounded search in a
   portable `kb_timeout`: it uses GNU `timeout` when present (Linux — unchanged),
   else `gtimeout` (Homebrew coreutils), else a built-in perl watchdog (perl ships
@@ -282,9 +313,33 @@ session whose terminal was killed, whose IDE crashed, or whose laptop slept thro
 every `KB_SWEEP_INTERVAL` = 1800 s — every box, no scheduler) and, on Linux, a
 `systemd --user` timer `install.sh` renders into
 `~/.config/systemd/user/kb-flush-sweep.{service,timer}` (`OnBootSec=10min`,
-`OnUnitActiveSec=<KB_SWEEP_INTERVAL>s`, `Persistent=true`; `KB_SWEEP_TIMER=0`
-opts out, `KB_SWEEP_INTERVAL=0` turns the sweep off, and a backfill that predates
-`--auto` is not scheduled until the next install; the installer prints one `sweep:` line saying which). A sweep never
+`OnStartupSec=10min` — re-arms it when a Linger=no user manager restarts at login,
+`OnActiveSec=10min` — re-bases it on every start/restart, so an update that changes
+the units (and restarts the timer) re-arms it on a manager that has been up for weeks,
+`OnUnitActiveSec=<KB_SWEEP_INTERVAL>s`, `Persistent=true`; a backfill that predates
+`--auto` is not scheduled until the next install; the installer prints one `sweep:`
+line saying which). **The off switches:** `KB_SWEEP_INTERVAL=0` in
+`~/.claude/kb-flush.env` stops the piggyback (the hooks source that file) AND, at the
+next `install.sh`/`update.sh`, keeps the timer off — the installer greps the file
+(never sources it), and if the timer is enabled or active it runs
+`systemctl --user disable --now kb-flush-sweep.timer`; the `sweep:` line then reads
+`not scheduled (KB_SWEEP_INTERVAL=0 in kb-flush.env; the sweep is off …)` — every
+`not scheduled` line names an interval of 0 this way, never "the piggyback still
+runs". A non-numeric interval (`off`, `no`, `false`, …) is OFF too — the hooks'
+piggyback stops on it, so the installer does not fall back to 1800: it names it
+`<non-numeric>` (never echoing the file) and disables the timer the same way. An
+interval of 1–59 is NOT off: the timer is not scheduled (60 s is its floor, and a
+running one is disabled), but the piggyback still sweeps every N s, and the line
+says `… is under the timer's 60s floor; the hooks' piggyback trigger still runs the
+sweep every Ns`. `KB_SWEEP_TIMER=0` (in the file, or exported for one install) turns off only the
+timer — the piggyback still runs; any value but `1` is off, a word such as `off` in the
+file included. An exported value always wins over the file, through `update.sh` too
+(it restores the caller's `KB_SWEEP_*` after sourcing the file). With no user bus the
+installer cannot disable anything: if the timer's `timers.target.wants` link is still
+there it prints one `hint:` line — run `systemctl --user disable --now
+kb-flush-sweep.timer` from a login session. Until the next install/update the
+file line does not touch a timer that is already running (the timer never reads
+`kb-flush.env`): disable it by hand to stop it at once. A sweep never
 touches a transcript modified in the last **5 min** (`KB_SWEEP_QUIET_SECONDS` = 300),
 holds a trailing half-line like the hook, and leaves one line in `state/.sweep-last`.
 The timer runs the sweep with the **`KB_SWEEP_*` defaults**: the unit passes only
@@ -314,7 +369,18 @@ always `<= size`**, so the retry re-cuts the same window; a SessionEnd that met 
 held lock leaves `<epoch> 0 lock <size>` — nothing failed, `<end>` is the
 transcript size at deferral — so the resumed session finishes the tail),
 `<okey>.project` (`<slug>\t<how>`, the session pin), `<okey>.unseeded` (refused: pre-stamp
-transcript or unreadable checkpoint), `<okey>.sweep` (the sweep's stall record).
+transcript or unreadable checkpoint), `<okey>.sweep` (the sweep's stall record),
+`<okey>.stalecopy` (the stale-copy line's 24 h rate-limit stamp),
+`<okey>.diverged` / `<okey>.behind` (KB 49064: ONE line `<iso> <path> size=<n>
+checkpoint=<n>[ cover=<copy>] frozen=<n>` naming the refused copy; `frozen=` is
+its size when first named, kept on every rewrite — where a resumed copy's unsent
+records begin; written by the hook on each refusing firing and by the sweep's
+`--push`/`--auto` (`<marker>.t` is the atomic-write temp), cleared only by
+`--seed`, by a firing or sweep pass that finds the named path gone, with the
+offset by the state sweep, or — `.diverged` only — by the hook, under the session
+lock, once the named path again carries the checkpoint holder's bytes just below the
+checkpoint it drains from (a session resumed there after the copy was moved out)) and their 24 h log rate-limit stamps
+`<okey>.diverged.stamp` / `<okey>.behind.stamp`.
 Box-level: `.checkpoints-trusted-since`, `.sweep.lock`, `.sweep.trigger`, `.sweep-last`,
 `.state-sweep.last`, the hourly rate-limit stamps `.notoken-<project>.stamp`,
 `.notconfigured.stamp`, `.nojson-<tag>.stamp`, `.tripwire.stamp`, and the dispatcher's

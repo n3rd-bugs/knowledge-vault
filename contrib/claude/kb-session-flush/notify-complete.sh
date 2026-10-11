@@ -200,7 +200,7 @@ kb_sweep_note() { # <state> -> " sweep:<...>" | nothing
   elif [ -n "$_swun" ] && [ "$_swun" -gt 0 ]; then printf ' sweep:unknown %s' "$_swun"; fi
 }
 
-kb_progress() { # -> "kb <flushed>/<size>[ retry#N]" | "kb <size> synced" | "kb ?/<size> unseeded" | nothing
+kb_progress() { # -> "kb <flushed>/<size>[ retry#N]" | "kb <size> synced" | "kb ?/<size> unseeded|diverged|behind" | nothing
   _tp=$(printf '%s' "$INPUT" | grep -o '"transcript_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
   _tp=$(kb_posixpath "$_tp")
   # No transcript in the event, or a path this shell cannot open (a deleted
@@ -243,6 +243,23 @@ kb_progress() { # -> "kb <flushed>/<size>[ retry#N]" | "kb <size> synced" | "kb 
         return 0
         ;;
     esac
+    # A copy of this session BEHIND its shared checkpoint (KB 49064): the hook
+    # refused it and left <okey>.diverged (a resumed copy kept growing after the
+    # other carried the checkpoint past it -- its new records were NOT sent) or
+    # <okey>.behind (a frozen copy no copy reaches: an owner --seed decision).
+    # Either way the checkpoint no longer says what this session's capture is,
+    # so never `synced`: `?/<size> diverged|behind` until the copy's removal,
+    # the owner's --seed or the 30-day state sweep clears the marker. A --seed
+    # settles a behind copy, or a diverged one no copy reaches; a diverged copy
+    # another copy still covers is marked again by the next sweep or firing, so
+    # only moving it out of ~/.claude/projects settles that one.
+    for _mk in diverged behind; do
+      [ -n "$(kb_marker "$_state" "${_okey:-default}" "$_mk")" ] || continue
+      _h=$(kb_human "$_size") || return 0
+      [ -n "$_h" ] || return 0
+      printf 'kb ?/%s %s' "$_h" "$_mk"
+      return 0
+    done
     _sfx=""
     _rt=$(kb_marker "$_state" "${_okey:-default}" retry)
     if [ -n "$_rt" ]; then

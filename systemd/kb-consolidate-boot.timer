@@ -8,7 +8,7 @@ Description=Knowledge Vault catch-up drain after an unclean shutdown
 
 [Timer]
 # Persistent=true on the nightly timer only covers a MISSED window. It does not
-# cover a run that STARTED and was killed: systemd counts 01:00 as having run,
+# cover a run that STARTED and was killed: systemd counts 01:30 as having run,
 # so the interrupted work waits a full day. Power was lost at 04:02 on
 # 2026-07-30 with the drain 32 minutes in, which is exactly that case.
 #

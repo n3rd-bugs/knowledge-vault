@@ -451,6 +451,53 @@ pin_sweep_clock() { # <epoch-seconds>
 }
 unpin_sweep_clock() { unset KB_BACKFILL_NOW; }
 
+# ------------------------------------------------- stale copies (wave C.2)
+# KB 49064: resuming a session from ANOTHER directory leaves TWO transcripts
+# named <sid>.jsonl under ~/.claude/projects -- the frozen STALE one (a byte-
+# PREFIX of the live file) and the live one -- and both share ONE checkpoint,
+# state/<sid>.offset, because the hooks key it by session id.
+mk_prefix_copy() { # <src> <dst> <bytes> -- dst = the first <bytes> of src (dirs made)
+  mkdir -p "$(dirname "$2")"
+  head -c "$3" "$1" >"$2"
+}
+# Same SIZE, different TAIL: swap the case of every ASCII letter on the LAST
+# line, in place. Length is preserved byte for byte and the line stays valid
+# JSON as long as it holds no true/false/null literal (the rig's fixtures hold
+# none), so the copy stops being a byte-prefix of its source exactly where a
+# tail check looks, while its first line (the branch/identity probe) is untouched.
+diverge_last_line() { # <file>
+  "$RIG_PY" - "$1" <<'EOF'
+import sys
+path = sys.argv[1]
+data = open(path, "rb").read()
+body = data[:-1] if data.endswith(b"\n") else data
+cut = body.rfind(b"\n") + 1
+last = data[cut:]
+new = last.swapcase()
+assert len(new) == len(last) and new != last, "the last line has no ASCII letter to diverge"
+open(path, "wb").write(data[:cut] + new)
+EOF
+}
+
+# The sweep's dry-run table (kb-flush-backfill.sh): `PROJECT SESSION SIZE OFFSET
+# REMAINING STATE`, each row optionally followed by one `-- <reason>` line. Two
+# rows can carry the SAME session id (the stale copy and the live one), so a row
+# is picked by session id AND size. Read from a file holding the table output.
+sweep_row_count() { # <table-file> <sid> -> how many rows carry that session id
+  awk -v s="$2" '$2 == s { n++ } END { print n + 0 }' "$1"
+}
+sweep_row_state() { # <table-file> <sid> <size> -> that row's STATE ('' when absent)
+  awk -v s="$2" -v z="$3" '$2 == s && $3 == z { print $6; exit }' "$1"
+}
+sweep_row_remain() { # <table-file> <sid> <size> -> that row's REMAINING bytes ('' when absent)
+  awk -v s="$2" -v z="$3" '$2 == s && $3 == z { print $5; exit }' "$1"
+}
+sweep_row_reason() { # <table-file> <sid> <size> -> that row's `-- reason` text ('' when none)
+  awk -v s="$2" -v z="$3" '
+    hit { if ($1 == "--") { sub(/^[ \t]*-- /, ""); print }; exit }
+    $2 == s && $3 == z { hit = 1 }' "$1"
+}
+
 # Extract the shared portable block out of a skill script so its helpers can be
 # unit-tested directly (and diffed across the four copies).
 extract_block() { # script-path outfile

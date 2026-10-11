@@ -547,11 +547,346 @@ kb_offset_write() { # <value> [noclobber]
 }
 export -f kb_offset_write
 
+# >>> KB SESSION COPIES v1
+# The OTHER transcripts of one session (KB 49064). Resuming a session from
+# another directory leaves TWO files with ONE session id -- the frozen copy in
+# the old project dir and the live one in the new -- and both share the
+# session's checkpoint (state/<okey>.offset). A copy is "<root>/*/<sid>.jsonl"
+# under the projects roots the hooks know: $HOME/.claude/projects,
+# ${CLAUDE_CONFIG_DIR}/projects when that is set (the two kb_state_sweep
+# probes) and an optional extra root (the sweep passes its --projects dir);
+# one directory level, the judged transcript itself excluded. A glob and a
+# stat per match. Copied BYTE-IDENTICAL into kb-flush-backfill.sh and pinned by
+# tests/test_hook_stale_copy.py, so the hook and the sweep can never disagree
+# about what a copy is.
+kb_session_copies() { # <sid> <judged transcript> [extra root] -> "<size> <path>" per copy
+  case "${1:-}" in '' | *[!A-Za-z0-9._-]*) return 0 ;; esac
+  _ksr2=""
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] && _ksr2="${CLAUDE_CONFIG_DIR%/}/projects"
+  _ksseen="|"
+  for _ksr in "$HOME/.claude/projects" "$_ksr2" "${3:-}"; do
+    [ -n "$_ksr" ] && [ -d "$_ksr" ] || continue
+    case "$_ksseen" in *"|$_ksr|"*) continue ;; esac
+    _ksseen="$_ksseen$_ksr|"
+    for _ksc in "$_ksr"/*/"$1.jsonl"; do
+      [ -f "$_ksc" ] || continue
+      [ "$_ksc" = "${2:-}" ] && continue
+      [ "$_ksc" -ef "${2:-}" ] && continue
+      _kss=$(stat -c%s "$_ksc" 2>/dev/null || stat -f%z "$_ksc" 2>/dev/null || wc -c <"$_ksc" | tr -d ' ')
+      case "$_kss" in '' | *[!0-9]*) continue ;; esac
+      printf '%s %s\n' "$_kss" "$_ksc"
+    done
+  done
+  return 0
+}
+# The LARGEST copy whose size reaches <offset>: "<size> <path>"; status 1 when
+# none does. A copy that reaches the checkpoint is the one whose flushes carried
+# it there, so a transcript BEHIND that checkpoint is the frozen copy -- never a
+# shrink to restart from 0.
+kb_stale_cover() { # <sid> <judged transcript> <offset> [extra root]
+  _kcbs=-1
+  _kcbp=""
+  while IFS= read -r _kcl; do
+    _kcs="${_kcl%% *}"
+    case "$_kcs" in '' | *[!0-9]*) continue ;; esac
+    [ "$_kcs" -ge "${3:-0}" ] && [ "$_kcs" -gt "$_kcbs" ] && {
+      _kcbs=$_kcs
+      _kcbp="${_kcl#* }"
+    }
+  done <<KBCOPIES
+$(kb_session_copies "${1:-}" "${2:-}" "${4:-}")
+KBCOPIES
+  [ -n "$_kcbp" ] || return 1
+  printf '%s %s' "$_kcbs" "$_kcbp"
+}
+# Is <stale> a byte-prefix of <copy>? Judged cheaply: its last min(4096, size)
+# bytes against the copy's bytes at the same position. Neither file is read
+# whole -- `tail -c N` seeks from the end, `tail -c +K` seeks to K on a regular
+# file and `head -c` stops it after N bytes (the EPIPE that ends tail is
+# expected: uutils' tail panics on it, so its stderr is dropped). cksum is
+# POSIX: GNU, uutils, BSD/macOS and Git Bash all carry it.
+kb_tail_matches() { # <stale> <stale size> <copy> -> 0 when the tails agree
+  case "${2:-}" in '' | *[!0-9]* | 0) return 1 ;; esac
+  _ktn=$(($2 < 4096 ? $2 : 4096))
+  _kta=$(tail -c "$_ktn" "$1" 2>/dev/null | cksum 2>/dev/null)
+  _ktb=$(tail -c +"$(($2 - _ktn + 1))" "${3:-}" 2>/dev/null | head -c "$_ktn" 2>/dev/null | cksum 2>/dev/null)
+  # cksum prints "<crc> <bytes>": both sides must have read the FULL window, or a
+  # pair of failed/short reads (cksum of nothing == cksum of nothing) would agree.
+  case "$_kta" in *" $_ktn") ;; *) return 1 ;; esac
+  [ "$_kta" = "$_ktb" ]
+}
+# Does <t> carry <copy>'s bytes just below <pos>? The window [pos-n, pos),
+# n = min(4096, pos), of each file by cksum: the same seek-and-cut as
+# kb_tail_matches (tail's EPIPE stderr dropped), neither file read whole. A
+# CONTENT check, never an inode one (inodes are unreliable on Git Bash): a
+# copy that diverged below <pos> differs inside that window.
+kb_window_matches() { # <t> <pos> <copy> -> 0 when both hold the same bytes in [pos-n, pos)
+  case "${2:-}" in '' | *[!0-9]* | 0) return 1 ;; esac
+  [ -f "${1:-}" ] && [ -f "${3:-}" ] || return 1
+  _kwn=$(($2 < 4096 ? $2 : 4096))
+  _kwa=$(tail -c +"$(($2 - _kwn + 1))" "$1" 2>/dev/null | head -c "$_kwn" 2>/dev/null | cksum 2>/dev/null)
+  _kwb=$(tail -c +"$(($2 - _kwn + 1))" "$3" 2>/dev/null | head -c "$_kwn" 2>/dev/null | cksum 2>/dev/null)
+  case "$_kwa" in *" $_kwn") ;; *) return 1 ;; esac # a full window, never a short read
+  [ "$_kwa" = "$_kwb" ]
+}
+# Epoch mtime of <file> in whole seconds; NOTHING (status 1) when it cannot be
+# read. GNU/uutils `stat -c %Y`, BSD/macOS `stat -f %m`, then `date -r`.
+kb_mtime_s() { # <file> -> epoch seconds
+  _kms=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || date -r "$1" +%s 2>/dev/null)
+  case "$_kms" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s' "$_kms"
+}
+# FROZEN behind its checkpoint: <transcript> was last modified strictly BEFORE
+# <offset file> was last written (whole seconds) -- the checkpoint moved after
+# this file last changed, so it is a frozen copy, not a rewritten transcript.
+# 0 = frozen, 1 = modified at/after that write (a genuine rewrite), 2 = an mtime
+# could not be read (the caller keeps the shrink rules and says so).
+kb_frozen_behind() { # <transcript> <offset file>
+  _kfa=$(kb_mtime_s "$1") || return 2
+  _kfb=$(kb_mtime_s "$2") || return 2
+  [ "$_kfa" -lt "$_kfb" ]
+}
+# The per-session markers <okey>.diverged / <okey>.behind are ONE line:
+#   <iso-utc> <path> size=<SIZE> checkpoint=<OFFSET>[ cover=<copy>] frozen=<F>
+# frozen= is the size the path had when a marker FIRST named it, carried
+# forward by every rewrite that names the same path (a marker written before
+# the field existed lends its size=): where a resumed copy's UNSENT records
+# begin, so the owner's seed is exact. It is the LAST field, so a reader that
+# cuts the path at ' size=' is unchanged.
+kb_marker_write() { # <marker file> <path> <size> <checkpoint> [cover]
+  _kmf=$3
+  if _kmo=$(kb_marker_path "$1") && { [ "$_kmo" = "$2" ] || [ "$_kmo" -ef "$2" ]; }; then
+    _kmf=$(kb_marker_frozen "$1") || _kmf=$3
+  fi
+  printf '%s %s size=%s checkpoint=%s%s frozen=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+    "$2" "$3" "$4" "${5:+ cover=$5}" "$_kmf" >"$1.t" 2>/dev/null && mv "$1.t" "$1" 2>/dev/null ||
+    rm -f "$1.t" 2>/dev/null
+  return 0
+}
+kb_marker_frozen() { # <marker file> -> its frozen= bytes (a pre-frozen marker: size=); status 1: none
+  [ -f "$1" ] || return 1
+  _kmz=""
+  IFS= read -r _kmz <"$1" 2>/dev/null || [ -n "$_kmz" ] || return 1
+  _kmq=""
+  case "$_kmz" in *" frozen="*) _kmq="${_kmz##* frozen=}" ;; esac
+  case "$_kmq" in '' | *[!0-9]*)
+    _kmq="${_kmz##* size=}"
+    _kmq="${_kmq%% *}"
+    ;;
+  esac
+  case "$_kmq" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s' "$_kmq"
+}
+kb_marker_path() { # <marker file> -> the transcript path it names (status 1: none)
+  [ -f "$1" ] || return 1
+  _kmp=""
+  IFS= read -r _kmp <"$1" 2>/dev/null || [ -n "$_kmp" ] || return 1
+  _kmp="${_kmp#* }"
+  _kmp="${_kmp%% size=*}"
+  [ -n "$_kmp" ] || return 1
+  printf '%s' "$_kmp"
+}
+kb_marker_names() { # <state dir> <okey> <transcript> -> diverged | behind (status 1: neither)
+  for _kmk in diverged behind; do
+    _kmn=$(kb_marker_path "$1/$2.$_kmk") || continue
+    if [ "$_kmn" = "$3" ] || [ "$_kmn" -ef "$3" ]; then
+      printf '%s' "$_kmk"
+      return 0
+    fi
+  done
+  return 1
+}
+# THE SHRINK VERDICT for a transcript BEHIND its session's checkpoint
+# (0 < SIZE < OFFSET), one function so the hook and the sweep always agree.
+# Sets KB_SV and KB_SV_WHY / KB_SV_COVER:
+#   stale-copy  a copy reaches the checkpoint and this file is its byte-prefix
+#   diverged    a copy reaches it but the tails differ (WHY=cover), or no copy
+#               does and <okey>.diverged names this file (WHY=marker)
+#   behind      no copy reaches it and <okey>.behind names this file
+#               (WHY=marker), or the file is FROZEN (WHY=frozen)
+#   shrank      none of these (WHY=none, or mtime-unreadable when the frozen
+#               check could not run): the shrink rules apply unchanged
+# A path a marker names is never restarted from 0, even after it is resumed,
+# and never drained from the shared checkpoint once it grows past it (the
+# callers refuse a marked path at ANY size: that checkpoint is another copy's)
+# -- unless a .diverged path now carries the checkpoint holder's prefix
+# (kb_window_matches: the owner moved that copy out and the session was later
+# resumed there, so the file at that path is the live transcript again).
+kb_shrink_verdict() { # <sid> <transcript> <size> <offset> <offset file> <state dir> <okey> [extra root]
+  KB_SV=shrank
+  KB_SV_WHY=none
+  KB_SV_COVER=""
+  if _ksv=$(kb_stale_cover "${1:-}" "${2:-}" "${4:-0}" "${8:-}"); then
+    KB_SV_COVER="${_ksv#* }"
+    KB_SV_WHY=cover
+    KB_SV=diverged
+    kb_tail_matches "${2:-}" "${3:-}" "$KB_SV_COVER" && KB_SV=stale-copy
+    return 0
+  fi
+  if _ksm=$(kb_marker_names "${6:-}" "${7:-}" "${2:-}"); then
+    KB_SV=$_ksm
+    KB_SV_WHY=marker
+    return 0
+  fi
+  kb_frozen_behind "${2:-}" "${5:-}"
+  case $? in
+    0)
+      KB_SV=behind
+      KB_SV_WHY=frozen
+      ;;
+    2) KB_SV_WHY=mtime-unreadable ;;
+  esac
+  return 0
+}
+# <<< KB SESSION COPIES v1
+export -f kb_session_copies kb_stale_cover kb_tail_matches kb_window_matches kb_mtime_s \
+  kb_frozen_behind kb_marker_write kb_marker_frozen kb_marker_path kb_marker_names kb_shrink_verdict
+
+# A once-per-24 h log line, rate-limited by <stamp>'s MTIME: 0 (and the stamp
+# touched) when the last line is a day old or there never was one.
+kb_daily_due() { # <stamp file>
+  _kdn=$(date +%s 2>/dev/null || echo 0)
+  case "$_kdn" in '' | *[!0-9]*) _kdn=0 ;; esac
+  _kdm=$(kb_mtime_s "$1") || _kdm=0
+  [ "$((_kdn - _kdm))" -ge 86400 ] || return 1
+  touch "$1" 2>/dev/null || true
+  return 0
+}
+export -f kb_daily_due
+
+# THE REFUSAL of a diverged / behind copy (KB 49064): KB_SV / KB_SV_WHY /
+# KB_SV_COVER come from kb_shrink_verdict (SIZE < OFFSET) or from
+# kb_decide_offset for a path a marker names at ANY size (WHY=marker: grown to
+# the checkpoint or past it, that checkpoint is ANOTHER copy's -- draining from
+# it would start mid-record and lose the records between the marker's frozen=
+# size and the checkpoint). The owner-visible state/<okey>.<kind> marker is
+# (re)written on EVERY firing, frozen= carried forward; ONE line per 24 h per
+# kind (<okey>.<kind>.stamp). Nothing is sent, the offset is NOT written. A
+# behind copy resumed since it was marked (SIZE > frozen) is never offered
+# `current`: its line names the exact seed, --seed <sid> <frozen>.
+kb_refuse_marked() {
+  _sck="${OKEY:-default}"
+  kb_marker_write "$STATE/$_sck.$KB_SV" "$T" "$SIZE" "$OFFSET" "$KB_SV_COVER"
+  kb_daily_due "$STATE/$_sck.$KB_SV.stamp" || return 0
+  _scp="is behind the checkpoint $OFFSET"
+  case "$KB_SV_WHY" in
+    cover) _scw="a newer copy reaches it ($KB_SV_COVER) but its tail differs" ;;
+    marker)
+      _scw="no copy reaches it and state/$_sck.$KB_SV names this file"
+      if [ "$SIZE" -ge "$OFFSET" ]; then
+        _scp="has grown to the checkpoint $OFFSET or past it"
+        _scw="state/$_sck.$KB_SV names this file and that checkpoint is another copy's (draining from it would start mid-record)"
+      fi
+      ;;
+    *) _scw="no copy reaches it and the checkpoint moved after this file last changed" ;;
+  esac
+  if [ "$KB_SV" = diverged ]; then
+    echo "$(date -Is) flush $PROJECT stale copy: $T ($SIZE) $_scp; $_scw reason=stale-copy-diverged — refused, nothing sent, no restart: records past the shared prefix may be unflushed (state/$_sck.diverged) ev=$EV sid=$SIDS"
+    return 0
+  fi
+  _scf=$(kb_marker_frozen "$STATE/$_sck.behind") || _scf=$SIZE
+  _sco="an owner decision, seed it: kb-flush-backfill.sh --seed ${SID:-$_sck} current|<bytes>"
+  [ "$SIZE" -gt "$_scf" ] &&
+    _sco="resumed since it was marked: its records past $_scf were NOT sent -- kb-flush-backfill.sh --seed ${SID:-$_sck} $_scf sends exactly them"
+  echo "$(date -Is) flush $PROJECT stale copy: $T ($SIZE) $_scp; $_scw reason=behind — refused, nothing sent, no restart: $_sco (state/$_sck.behind) ev=$EV sid=$SIDS"
+  return 0
+}
+export -f kb_refuse_marked
+
+# THE STALE COPY (KB 49064). Called when SIZE < OFFSET, BEFORE the branch seed
+# and the shrank restart, on every arm; the verdict is kb_shrink_verdict's, the
+# SAME function the sweep tables with. 0 = refuse: nothing is sent, the offset
+# is NOT written, quiet exit 0 (rm1, 2026-10-08: a sweep restarted a frozen
+# copy, 282 MB re-sent, ~3,750 duplicate items):
+#   stale-copy  a byte-prefix of a copy that reaches the checkpoint -- skipped
+#               silently; one line per 24 h (<okey>.stalecopy stamp)
+#   diverged    behind the checkpoint but NOT a prefix of the copy that reaches
+#               it (the copy kept GROWING after the other carried the shared
+#               checkpoint past it: its new records were never sent and a
+#               restart would resend the rest) -- refused (kb_refuse_marked),
+#               the owner-visible <okey>.diverged marker (re)written on EVERY
+#               firing, one line per 24 h (<okey>.diverged.stamp)
+#   behind      no copy reaches the checkpoint and the file is frozen (older
+#               than the checkpoint's last write) or a marker names it --
+#               refused (kb_refuse_marked), <okey>.behind (re)written, one line
+#               per 24 h naming the --seed procedure (<okey>.behind.stamp)
+# Each kind has its OWN stamp, so a silent stale-copy day never mutes a
+# diverged/behind line. 1 = a shrink: the caller's branch seed / restart apply.
+kb_stale_copy_skip() {
+  kb_shrink_verdict "${SID:-}" "$T" "$SIZE" "$OFFSET" "$OFFF" "$STATE" "${OKEY:-default}"
+  case "$KB_SV" in
+    stale-copy)
+      kb_daily_due "$STATE/${OKEY:-default}.stalecopy" &&
+        echo "$(date -Is) flush $PROJECT stale copy: $T ($SIZE) is behind the checkpoint $OFFSET; a newer copy covers it ($KB_SV_COVER) reason=stale-copy — skipped, no restart ev=$EV sid=$SIDS"
+      return 0
+      ;;
+    diverged | behind)
+      kb_refuse_marked
+      return 0
+      ;;
+  esac
+  [ "$KB_SV_WHY" = mtime-unreadable ] &&
+    echo "$(date -Is) flush $PROJECT shrink check skipped: an mtime could not be read ($T or $OFFF) — the frozen-copy check did not run, the shrink rules apply ev=$EV sid=$SIDS"
+  return 1
+}
+export -f kb_stale_copy_skip
+
+# A marker that names a path which no longer exists (the owner moved or removed
+# that copy) is cleared by the next firing of the session, with ONE line. The
+# only other clearers are kb_state_sweep (with the offset), the owner's --seed
+# and, for a .diverged marker whose path now carries the checkpoint holder's
+# prefix, kb_marker_prefix_release. Two `[ -f ]` tests when there is no marker.
+kb_marker_gone_clear() {
+  for _kgk in diverged behind; do
+    [ -f "$STATE/${OKEY:-default}.$_kgk" ] || continue
+    _kgp=$(kb_marker_path "$STATE/${OKEY:-default}.$_kgk") || continue
+    [ -e "$_kgp" ] && continue
+    rm -f "$STATE/${OKEY:-default}.$_kgk" "$STATE/${OKEY:-default}.$_kgk.stamp"
+    echo "$(date -Is) flush $PROJECT marker cleared: state/${OKEY:-default}.$_kgk named $_kgp, which no longer exists ev=$EV sid=$SIDS"
+  done
+  return 0
+}
+export -f kb_marker_gone_clear
+
+# A .diverged marker RELEASED by content (KB 49064, review 3). The owner moved
+# the diverged copy out (the remedy) and the session was later resumed from
+# that directory, so Claude Code wrote the LIVE transcript at the marked path
+# again: a new file there that carries the checkpoint holder's prefix. Judged
+# by CONTENT -- [OFFSET-4096, OFFSET) of this file against the copy that
+# reaches OFFSET (kb_window_matches) -- never by inode (unreliable on Git
+# Bash). A genuinely diverged copy diverged below OFFSET (at its frozen= size
+# or before), so it differs inside that window and stays refused. 0 = released:
+# marker + stamp removed, ONE line, the caller drains from OFFSET as usual.
+# .behind is never released here (no copy reaches the checkpoint there).
+kb_marker_prefix_release() {
+  _kpc=$(kb_stale_cover "${SID:-}" "$T" "$OFFSET") || return 1
+  kb_window_matches "$T" "$OFFSET" "${_kpc#* }" || return 1
+  _kpp=$(kb_marker_path "$STATE/${OKEY:-default}.diverged") || _kpp=$T
+  rm -f "$STATE/${OKEY:-default}.diverged" "$STATE/${OKEY:-default}.diverged.stamp"
+  echo "$(date -Is) flush $PROJECT marker cleared: state/${OKEY:-default}.diverged named $_kpp, which now carries the checkpoint holder's prefix ev=$EV sid=$SIDS"
+  return 0
+}
+# Does a diverged/behind marker still hold <T> (SIZE >= OFFSET)? 0 with _kmk =
+# its kind; a .diverged one is first offered kb_marker_prefix_release, and a
+# released path is judged again (a .behind marker naming it still holds it).
+kb_marker_holds() {
+  _kmk=$(kb_marker_names "$STATE" "${OKEY:-default}" "$T") || return 1
+  [ "$_kmk" = diverged ] && kb_marker_prefix_release || return 0
+  _kmk=$(kb_marker_names "$STATE" "${OKEY:-default}" "$T")
+}
+export -f kb_marker_prefix_release kb_marker_holds
+
 # Decide OFFSET before the first send, UNDER the lock (V1-m8 writer invariant).
 # Sets OFFSET (and BRANCH_OF). Returns 1 when the firing must refuse (an
-# unseeded pre-stamp transcript) — the caller then exits 0 with nothing sent.
-# Order: branch seed FIRST (both on a fresh offset and on a shrink), then the
-# trusted/unseeded timestamp rule, then the shrank restart.
+# unseeded pre-stamp transcript), 2 when the transcript is a STALE COPY of a
+# resumed session, a diverged copy or a frozen one BEHIND the checkpoint
+# (kb_stale_copy_skip), or a path a marker names at ANY size (kb_refuse_marked)
+# — the caller then exits 0 with nothing sent either way.
+# Order: branch seed FIRST on a fresh offset; on a shrink the shrink verdict
+# first (stale-copy / diverged / behind refuse BEFORE anything may seed or
+# restart: a branch seed rewinds the shared checkpoint too), then the branch
+# seed, then the shrank restart; the trusted/unseeded timestamp rule for a
+# transcript with no offset at all.
 # THE unseeded refusal, shared by the pre-stamp rule and the corrupt-offset
 # path: ONE line per 24 h per session (rate-limited by the marker's mtime),
 # naming the reason and the --seed procedure, and the <okey>.unseeded marker
@@ -622,7 +957,26 @@ kb_decide_offset() {
   # owner's --seed), so a stale unseeded marker must not keep notify saying
   # "unseeded".
   rm -f "$OFF_UNSEEDED"
+  kb_marker_gone_clear
+  # A path a diverged/behind marker names is refused at ANY size (KB 49064):
+  # grown to the checkpoint or past it, that checkpoint is ANOTHER copy's, so a
+  # drain from it would start mid-record and lose [frozen=, checkpoint) for
+  # good -- unless a .diverged path now carries the checkpoint holder's prefix
+  # (kb_marker_holds releases it: the live transcript recreated there). Below
+  # the checkpoint the cover-first verdict still runs (so a restored live copy
+  # turns a marked prefix copy back into a silent stale copy).
+  if [ "$SIZE" -ge "$OFFSET" ] && kb_marker_holds; then
+    KB_SV=$_kmk
+    KB_SV_WHY=marker
+    KB_SV_COVER=""
+    kb_refuse_marked
+    return 2
+  fi
   if [ "$SIZE" -lt "$OFFSET" ]; then
+    # A copy of a resumed session behind the checkpoint its other copy advanced
+    # (stale, diverged) or a frozen one no copy covers any more (behind): refuse
+    # BEFORE anything may seed or restart (KB 49064).
+    kb_stale_copy_skip && return 2
     kb_branch_seed
     if [ -n "$BSEED" ] && [ "$BSEED" -gt 0 ]; then
       kb_offset_write "$BSEED"
@@ -672,7 +1026,9 @@ kb_state_sweep() {
       # dir, when this box uses one, is ours now and kb_lock_release removes it.
       rm -f "$STATE/$_k.offset" "$STATE/$_k.offset.lock" "$STATE/$_k.offset.t" \
         "$STATE/$_k.last" "$STATE/$_k.gate" "$STATE/$_k.retry" "$STATE/$_k.project" \
-        "$STATE/$_k.unseeded" "$STATE/$_k.sweep"
+        "$STATE/$_k.unseeded" "$STATE/$_k.sweep" "$STATE/$_k.stalecopy" \
+        "$STATE/$_k.diverged" "$STATE/$_k.diverged.stamp" "$STATE/$_k.diverged.t" \
+        "$STATE/$_k.behind" "$STATE/$_k.behind.stamp" "$STATE/$_k.behind.t"
       kb_lock_release
       echo "$(date -Is) flush state sweep: retired sid=$_k transcript gone$_loss"
     )
@@ -1369,7 +1725,8 @@ elif { [ -n "${KB_MCP_URL:-}" ] || [ -n "${KB_REST_URL:-}" ]; } && { [ -n "${KB_
       exit 0
     fi
     # Decide OFFSET under the lock: branch seed, then trusted/unseeded, then
-    # shrank. A refusal (unseeded pre-stamp transcript) returns 1 -> exit 0.
+    # stale copy / shrank. A refusal (unseeded pre-stamp transcript) returns 1
+    # and a stale copy of a resumed session returns 2 -> exit 0, nothing sent.
     BRANCH_OF=""
     kb_decide_offset || exit 0
     [ "$SIZE" -le "$OFFSET" ] && { kb_retry_clear "$OFFSET"; exit 0; }
@@ -1625,12 +1982,24 @@ elif [ "${KB_CONNECTOR:-0}" = "1" ] && [ -n "${CLAUDE_BIN:-}" ]; then
     # untouched for the owner --seed. A numeric one clears a stale marker.
     case "$OFFSET" in ""|*[!0-9]*) kb_unseeded_refuse "offset unreadable: $OFFF"; exit 0 ;; esac
     rm -f "$OFF_UNSEEDED"
+    kb_marker_gone_clear
     # SIZE=0 is UNREADABLE, not shrank (V1-m4): never clobber a good checkpoint
     # down to 0 on a failed stat. Same writer invariant as the bearer arms.
     if [ "$SIZE" = 0 ]; then
       [ -f "$OFFF" ] && echo "$(date -Is) connector $PROJECT size unreadable ($SIZE) — not draining ev=$EV sid=$SIDS"
       exit 0
     fi
+    # A path a marker names is refused at ANY size, as on the bearer arm: that
+    # checkpoint belongs to another copy, so a relay from it would start mid-record
+    # (a .diverged path that now carries the checkpoint holder prefix is released).
+    _kmk=""   # the kind kb_marker_holds sets (a function of this shell: no subshell)
+    if [ "$SIZE" -ge "$OFFSET" ] && kb_marker_holds; then
+      KB_SV=$_kmk; KB_SV_WHY=marker; KB_SV_COVER=""; kb_refuse_marked; exit 0
+    fi
+    # A copy of a resumed session behind the checkpoint is never a shrink (KB
+    # 49064): the same stale-copy / diverged / behind refusal as the bearer arm
+    # -- nothing relayed, the offset untouched, the markers written.
+    if [ "$SIZE" -lt "$OFFSET" ] && kb_stale_copy_skip; then exit 0; fi
     if [ "$SIZE" -lt "$OFFSET" ]; then
       echo "$(date -Is) connector $PROJECT transcript shrank ($SIZE < offset $OFFSET) reason=shrank — restarting from 0 ev=$EV sid=$SIDS"
       kb_lock_owned || { echo "$(date -Is) connector $PROJECT lock lost — stopping ev=$EV sid=$SIDS"; exit 0; }

@@ -21,6 +21,28 @@
 #     whatever happened; kb-flush.env is never edited.
 #   * with NO systemctl (this container) the install completes with a
 #     `not scheduled` reason and renders nothing.
+#   * the timer carries OnStartupSec=10min beside OnBootSec=10min (wave C.2,
+#     KB 49064): on a Linger=no box the user manager restarts at every login,
+#     where OnBootSec is long past and OnUnitActiveSec has no base, so rm1's
+#     timer sat `elapsed` (NEXT n/a) from 2026-09-29 -- piggyback-only sweeps.
+#     RED on today's install.sh (HEAD 809dea7), one FAIL line in part 2 (c):
+#     "user-manager startup anchor ... -- [OnStartupSec=10min] not in
+#     /home/tester/timer_render/.config/systemd/user/kb-flush-sweep.timer".
+#   * the timer ALSO carries OnActiveSec=10min (wave C.2 review, must-fix 6):
+#     with Persistent=true a past OnBootSec/OnStartupSec is a spent one-shot on
+#     a long-running manager and OnUnitActiveSec has no base until the service
+#     itself ran (the piggyback never runs it), so update.sh left rm1's NEXT at
+#     n/a while printing `scheduled`; OnActiveSec re-bases on every start or
+#     restart. RED on the C.2 template, one FAIL line in part 2 (c): "timer
+#     activation anchor ... -- [OnActiveSec=10min] not in
+#     /home/tester/timer_render/.config/systemd/user/kb-flush-sweep.timer";
+#     GREEN after.
+#   * the OFF switch in kb-flush.env reaches the installer (wave C.2 review):
+#     a `KB_SWEEP_INTERVAL=0` line there -- read by grep, never sourced -- is
+#     reported `not scheduled (KB_SWEEP_INTERVAL=0 in kb-flush.env; ...` and an
+#     enabled timer is `disable --now`ed, so an update no longer re-enables a
+#     contained box (rm1, KB 49064). RED on the C.2 install.sh (the line names
+#     no kb-flush.env and nothing is disabled); GREEN after.
 # The timer-path steps (part 2) need a served kb-flush-backfill.sh that
 # carries `--auto` (wave C item C7). Until it lands the installer refuses to
 # schedule a unit that would exit 2 every tick, and part 2 reports itself
@@ -155,6 +177,33 @@ else
   pass "no timer rendered with the sweep off"
 fi
 
+step "KB_SWEEP_INTERVAL=0 in kb-flush.env: never sourced, an enabled timer is disabled"
+cat >"$HOME/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+echo "systemctl $*" >>"$HOME/systemctl.calls"
+case "$*" in
+  *is-system-running*) echo degraded; exit 1 ;;
+  *is-enabled*) echo enabled ;;
+  *is-active*) echo active ;;
+esac
+exit 0
+EOF
+chmod +x "$HOME/bin/systemctl"
+printf 'KB_SWEEP_INTERVAL=$(touch %s/pwned)\nexport KB_SWEEP_INTERVAL="0"\n' "$HOME" >>"$CFG"
+CFG_BEFORE=$(cat "$CFG")
+: >"$HOME/systemctl.calls"
+run_install
+assert_eq "0" "$RC_I" "install.sh exits 0"
+assert_eq "1" "$(sweep_lines)" "one sweep: line"
+assert_contains "$(sweep_line)" "not scheduled (KB_SWEEP_INTERVAL=0 in kb-flush.env" "the file's OFF switch is honoured and named"
+assert_contains "$(sweep_line)" "disabled now)" "...and the line says the running timer was disabled"
+CALLS=$(cat "$HOME/systemctl.calls" 2>/dev/null)
+assert_contains "$CALLS" "--user disable --now kb-flush-sweep.timer" "disable --now was issued"
+assert_not_contains "$CALLS" "--user enable --now" "nothing was enabled"
+assert_file_missing "$HOME/pwned" "the file was grepped, never sourced"
+assert_not_contains "$OUT_I" "$RIG_TOKEN" "the token in kb-flush.env never reaches the output"
+assert_eq "$CFG_BEFORE" "$(cat "$CFG")" "kb-flush.env untouched"
+
 step "a backfill without --auto: the unit is refused, the install completes"
 SKILL_NOAUTO="$RIG_HOMEBASE/skill-noauto"
 rm -rf "$SKILL_NOAUTO"
@@ -220,6 +269,8 @@ assert_not_contains "$(cat "$UNITD/kb-flush-sweep.service")" "Documentation=" "n
 assert_file_contains "$UNITD/kb-flush-sweep.service" "Type=oneshot" "oneshot service"
 assert_file_contains "$UNITD/kb-flush-sweep.service" "KillMode=process" "a drain holding its lock is not killed at unit exit"
 assert_file_contains "$UNITD/kb-flush-sweep.timer" "OnBootSec=10min" "boot trigger"
+assert_file_contains "$UNITD/kb-flush-sweep.timer" "OnStartupSec=10min" "user-manager startup anchor (a restarted manager re-arms the timer, KB 49064)"
+assert_file_contains "$UNITD/kb-flush-sweep.timer" "OnActiveSec=10min" "timer activation anchor (every start/restart re-bases it, so an update's restart re-arms a long-running manager's timer)"
 assert_file_contains "$UNITD/kb-flush-sweep.timer" "OnUnitActiveSec=1800s" "default cadence = KB_SWEEP_INTERVAL 1800"
 assert_file_contains "$UNITD/kb-flush-sweep.timer" "Persistent=true" "missed windows fire at the next boot"
 assert_file_contains "$UNITD/kb-flush-sweep.timer" "Unit=kb-flush-sweep.service" "the timer names its service"

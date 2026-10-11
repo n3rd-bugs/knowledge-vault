@@ -17,7 +17,7 @@ flowchart TB
     Q["ingest_queue<br/>scrubbed · deduped · ≤1 MB rows<br/>coalesced by (project, session)"]
   end
 
-  subgraph NIGHTLY["3 · Nightly (01:00, backup 00:30 first)"]
+  subgraph NIGHTLY["3 · Nightly (01:30, backup 00:30 first)"]
     D["DRAIN — refill loop, oldest-first<br/>cohort 30 · token-fitted windows<br/>ensemble extract → quote gate →<br/>cluster → corroborate/judge → ingest"]
     T["TAIL (3 h reserved)<br/>triage 500 · auto-apply rejects ·<br/>contradictions · summaries · evidence ·<br/>dedupe · doc-refresh · expiry · re-embed ·<br/>eval + digest → ntfy"]
   end
@@ -125,7 +125,7 @@ stale.
 | Judge (factored) | `qwen3:14b` | (same) | local | verifies non-primary singletons; fail-closed |
 | Triage / contradictions / evidence | `qwen3:14b` | (same) | local | tail steps, capped per night |
 | Embedder | `qwen3-embedding:0.6b` | 0.6 B · ~2.4 GB | **remote RTX 5080** (local fallback + 90 s breaker) | 1024-d; **query prefix required** (hit@5 0.759 vs 0.724 without) |
-| Reranker | `Qwen3-Reranker-0.6B` | 0.6 B GGUF | sidecar (llama-server :8324) | official GGUF only — community conversions score garbage; chunk-evidence fed (hit@5 0.86 → 0.89) |
+| Reranker | `Qwen3-Reranker-0.6B` | 0.6 B GGUF | sidecar (llama-server :8324) | official GGUF only — community conversions score garbage; chunk-evidence fed (hit@5 0.86 → 0.89); host-RAM prompt cache OFF (`LLAMA_ARG_CACHE_RAM=0` drop-in, 2026-10-11: RSS 9.4 GB → 1.8 GB, scores bit-identical after warm-up) |
 | Window budgeter | `cl100k` (tiktoken, vendored) | — | in-process, offline | counts tokens for window fitting; 1.15× margin covers the qwen-tokenizer mismatch |
 
 GPU rules: **one model slot** (`OLLAMA_MAX_LOADED_MODELS=1`), finite keep-alive

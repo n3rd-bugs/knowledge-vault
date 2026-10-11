@@ -125,8 +125,13 @@ printf '2000-01-01T00:00:00Z\n' >"$HOOKS/state/.checkpoints-trusted-since"
 W3="$HOME/work/shrproj"
 mkdir -p "$W3"
 T3="$W3/t.jsonl"
-mk_transcript "$T3" 40 big
+# The stale offset is planted BEFORE the transcript is written: a transcript last
+# modified strictly before its checkpoint's last write is a FROZEN copy (`behind`,
+# refused -- wave C.2 review, KB 49064), so the old order flaked into a refusal
+# whenever a second boundary fell between the two writes. Written after it, the
+# transcript is a genuine rewrite (mtime >= the checkpoint's) on every run.
 printf '999999' >"$HOOKS/state/sess-shr.offset"   # a stale offset past EOF
+mk_transcript "$T3" 40 big
 step "0 < SIZE < offset restarts from 0 with reason=shrank"
 fire "$HOOKS/flush-session-to-kb.sh" "$(flush_event "$T3" "$W3" sess-shr PreCompact)"
 wait_firing 0 60 || fail "shrank drain never completed"

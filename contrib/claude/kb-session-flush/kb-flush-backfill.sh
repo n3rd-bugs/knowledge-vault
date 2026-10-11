@@ -60,7 +60,42 @@
 #              this off here exactly as it does in the hook)
 #   unknown    no checkpoint AND (first record predates the trust stamp, or no
 #              timestamp, or no stamp): never sent by --auto or a bare --push
-#   shrank     0 < SIZE < offset: the hook restarts from 0 (logged reason=shrank)
+#   stale-copy 0 < SIZE < offset AND another transcript of the SAME session id
+#              (<root>/*/<sid>.jsonl: a session resumed from another directory,
+#              KB 49064) is at least offset long and this file is a byte-prefix
+#              of it (tail check) -- the frozen copy whose checkpoint the live
+#              copy's flushes carried past it. NEVER fired and never restarted
+#              (the hook skips it too); not counted as unflushed. The reason
+#              names the covering copy's directory
+#   diverged   0 < SIZE < offset, a copy reaches the checkpoint but this file's
+#              tail DIFFERS from it (the copy kept growing after the other
+#              carried the shared checkpoint past it) -- or no copy reaches it
+#              and state/<okey>.diverged names this file -- or that marker names
+#              it at ANY size (grown to the checkpoint or past it: the
+#              checkpoint is another copy's, a drain from it would start
+#              mid-record). Its records past the shared prefix were never sent
+#              and the shared checkpoint cannot carry them: NEVER fired, never
+#              restarted, counted as unflushed (REMAIN is the whole file -- the
+#              unique bytes are unknown without a full compare). The reason
+#              names what the owner can do: while another copy reaches the
+#              checkpoint only moving this copy out settles it (a --seed is
+#              undone by the next pass); with none, --seed current ACCEPTS the
+#              loss -- it never means the records were sent. A marked path
+#              that now carries the checkpoint holder's prefix (moved out,
+#              then the session resumed there) is RELEASED, not diverged: it
+#              tables ready/flushed, and --push/--auto clear the marker
+#   behind     0 < SIZE < offset, no copy reaches the checkpoint, and the file
+#              is FROZEN (last modified before the checkpoint's last write) or
+#              state/<okey>.behind names it -- or that marker names it at ANY
+#              size -- the frozen copy of a session whose live copy is gone,
+#              never a rewrite. NEVER fired, never restarted; an OWNER decision
+#              (--seed), own count. REMAIN = SIZE - the marker's frozen= (0
+#              while frozen; a copy RESUMED since it was marked holds that many
+#              unsent bytes, counted as unflushed, and its reason names the
+#              exact seed --seed <sid> <frozen> -- never `current`)
+#   shrank     0 < SIZE < offset, no copy covers it, no marker names it and the
+#              file was modified after the checkpoint's last write (a genuine
+#              rewrite): the hook restarts from 0 (logged reason=shrank)
 #   flushed    offset >= SIZE: nothing to send
 #   busy       the session lock is held (a drain is running right now)
 #   live       modified within KB_SWEEP_QUIET_SECONDS -- someone is typing
@@ -85,7 +120,28 @@
 # an OLD-hook box (relative lattice) seed only at a logged chunk end or at
 # `current`; on a NEW-hook box (absolute lattice) a low seed costs at most one
 # extra row -- the server refuses on-lattice resends. Refused while the session
-# lock is held, when <bytes> exceeds the size, and under --auto.
+# lock is held, when <bytes> exceeds the size, and under --auto. A session with
+# several transcripts (resumed from another directory, KB 49064) is seeded from
+# its LARGEST copy, named on stdout -- never from a stale one. A seed is the
+# owner's decision for the WHOLE session: it clears the session's diverged /
+# behind markers (and their log stamps), said on stdout. It settles a `behind`
+# copy (seeded at the marker's frozen= size once that copy was resumed) or a
+# `diverged` one that NO copy reaches. A diverged copy that another copy still
+# covers is judged from the files, not the marker: the next sweep pass or
+# firing marks it again, so the seed prints a `note:` line -- only moving that
+# copy out of ~/.claude/projects settles it.
+#
+# MARKERS (KB 49064). state/<okey>.diverged and state/<okey>.behind, ONE line
+# `<iso-utc> <path> size=<SIZE> checkpoint=<OFFSET>[ cover=<copy>] frozen=<F>`,
+# written by the hook on every refusing firing and by --push/--auto for the
+# rows they table diverged/behind (a dry run or --status writes nothing).
+# frozen= (LAST) is the path's size when a marker FIRST named it, carried by
+# every rewrite naming the same path (a marker without it lends its size=):
+# where a resumed copy's unsent records begin. The path a marker names is
+# refused by the hook at ANY size and never fired here. notify and the brief
+# surface them. Cleared ONLY by the hook's 30-day state sweep (with the
+# offset), by --seed for that session, and by a hook firing or a --push/--auto
+# pass that finds the path the marker names gone (one log line).
 #
 # KNOBS (ENVIRONMENT only, all optional -- this script never sources
 # ~/.claude/kb-flush.env, and the rendered timer unit passes nothing but PATH, so
@@ -481,6 +537,199 @@ for line in sys.stdin:
 }
 # <<< KB FIRST RECORD v1
 
+# >>> KB SESSION COPIES v1
+# The OTHER transcripts of one session (KB 49064). Resuming a session from
+# another directory leaves TWO files with ONE session id -- the frozen copy in
+# the old project dir and the live one in the new -- and both share the
+# session's checkpoint (state/<okey>.offset). A copy is "<root>/*/<sid>.jsonl"
+# under the projects roots the hooks know: $HOME/.claude/projects,
+# ${CLAUDE_CONFIG_DIR}/projects when that is set (the two kb_state_sweep
+# probes) and an optional extra root (the sweep passes its --projects dir);
+# one directory level, the judged transcript itself excluded. A glob and a
+# stat per match. Copied BYTE-IDENTICAL into kb-flush-backfill.sh and pinned by
+# tests/test_hook_stale_copy.py, so the hook and the sweep can never disagree
+# about what a copy is.
+kb_session_copies() { # <sid> <judged transcript> [extra root] -> "<size> <path>" per copy
+  case "${1:-}" in '' | *[!A-Za-z0-9._-]*) return 0 ;; esac
+  _ksr2=""
+  [ -n "${CLAUDE_CONFIG_DIR:-}" ] && _ksr2="${CLAUDE_CONFIG_DIR%/}/projects"
+  _ksseen="|"
+  for _ksr in "$HOME/.claude/projects" "$_ksr2" "${3:-}"; do
+    [ -n "$_ksr" ] && [ -d "$_ksr" ] || continue
+    case "$_ksseen" in *"|$_ksr|"*) continue ;; esac
+    _ksseen="$_ksseen$_ksr|"
+    for _ksc in "$_ksr"/*/"$1.jsonl"; do
+      [ -f "$_ksc" ] || continue
+      [ "$_ksc" = "${2:-}" ] && continue
+      [ "$_ksc" -ef "${2:-}" ] && continue
+      _kss=$(stat -c%s "$_ksc" 2>/dev/null || stat -f%z "$_ksc" 2>/dev/null || wc -c <"$_ksc" | tr -d ' ')
+      case "$_kss" in '' | *[!0-9]*) continue ;; esac
+      printf '%s %s\n' "$_kss" "$_ksc"
+    done
+  done
+  return 0
+}
+# The LARGEST copy whose size reaches <offset>: "<size> <path>"; status 1 when
+# none does. A copy that reaches the checkpoint is the one whose flushes carried
+# it there, so a transcript BEHIND that checkpoint is the frozen copy -- never a
+# shrink to restart from 0.
+kb_stale_cover() { # <sid> <judged transcript> <offset> [extra root]
+  _kcbs=-1
+  _kcbp=""
+  while IFS= read -r _kcl; do
+    _kcs="${_kcl%% *}"
+    case "$_kcs" in '' | *[!0-9]*) continue ;; esac
+    [ "$_kcs" -ge "${3:-0}" ] && [ "$_kcs" -gt "$_kcbs" ] && {
+      _kcbs=$_kcs
+      _kcbp="${_kcl#* }"
+    }
+  done <<KBCOPIES
+$(kb_session_copies "${1:-}" "${2:-}" "${4:-}")
+KBCOPIES
+  [ -n "$_kcbp" ] || return 1
+  printf '%s %s' "$_kcbs" "$_kcbp"
+}
+# Is <stale> a byte-prefix of <copy>? Judged cheaply: its last min(4096, size)
+# bytes against the copy's bytes at the same position. Neither file is read
+# whole -- `tail -c N` seeks from the end, `tail -c +K` seeks to K on a regular
+# file and `head -c` stops it after N bytes (the EPIPE that ends tail is
+# expected: uutils' tail panics on it, so its stderr is dropped). cksum is
+# POSIX: GNU, uutils, BSD/macOS and Git Bash all carry it.
+kb_tail_matches() { # <stale> <stale size> <copy> -> 0 when the tails agree
+  case "${2:-}" in '' | *[!0-9]* | 0) return 1 ;; esac
+  _ktn=$(($2 < 4096 ? $2 : 4096))
+  _kta=$(tail -c "$_ktn" "$1" 2>/dev/null | cksum 2>/dev/null)
+  _ktb=$(tail -c +"$(($2 - _ktn + 1))" "${3:-}" 2>/dev/null | head -c "$_ktn" 2>/dev/null | cksum 2>/dev/null)
+  # cksum prints "<crc> <bytes>": both sides must have read the FULL window, or a
+  # pair of failed/short reads (cksum of nothing == cksum of nothing) would agree.
+  case "$_kta" in *" $_ktn") ;; *) return 1 ;; esac
+  [ "$_kta" = "$_ktb" ]
+}
+# Does <t> carry <copy>'s bytes just below <pos>? The window [pos-n, pos),
+# n = min(4096, pos), of each file by cksum: the same seek-and-cut as
+# kb_tail_matches (tail's EPIPE stderr dropped), neither file read whole. A
+# CONTENT check, never an inode one (inodes are unreliable on Git Bash): a
+# copy that diverged below <pos> differs inside that window.
+kb_window_matches() { # <t> <pos> <copy> -> 0 when both hold the same bytes in [pos-n, pos)
+  case "${2:-}" in '' | *[!0-9]* | 0) return 1 ;; esac
+  [ -f "${1:-}" ] && [ -f "${3:-}" ] || return 1
+  _kwn=$(($2 < 4096 ? $2 : 4096))
+  _kwa=$(tail -c +"$(($2 - _kwn + 1))" "$1" 2>/dev/null | head -c "$_kwn" 2>/dev/null | cksum 2>/dev/null)
+  _kwb=$(tail -c +"$(($2 - _kwn + 1))" "$3" 2>/dev/null | head -c "$_kwn" 2>/dev/null | cksum 2>/dev/null)
+  case "$_kwa" in *" $_kwn") ;; *) return 1 ;; esac # a full window, never a short read
+  [ "$_kwa" = "$_kwb" ]
+}
+# Epoch mtime of <file> in whole seconds; NOTHING (status 1) when it cannot be
+# read. GNU/uutils `stat -c %Y`, BSD/macOS `stat -f %m`, then `date -r`.
+kb_mtime_s() { # <file> -> epoch seconds
+  _kms=$(stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || date -r "$1" +%s 2>/dev/null)
+  case "$_kms" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s' "$_kms"
+}
+# FROZEN behind its checkpoint: <transcript> was last modified strictly BEFORE
+# <offset file> was last written (whole seconds) -- the checkpoint moved after
+# this file last changed, so it is a frozen copy, not a rewritten transcript.
+# 0 = frozen, 1 = modified at/after that write (a genuine rewrite), 2 = an mtime
+# could not be read (the caller keeps the shrink rules and says so).
+kb_frozen_behind() { # <transcript> <offset file>
+  _kfa=$(kb_mtime_s "$1") || return 2
+  _kfb=$(kb_mtime_s "$2") || return 2
+  [ "$_kfa" -lt "$_kfb" ]
+}
+# The per-session markers <okey>.diverged / <okey>.behind are ONE line:
+#   <iso-utc> <path> size=<SIZE> checkpoint=<OFFSET>[ cover=<copy>] frozen=<F>
+# frozen= is the size the path had when a marker FIRST named it, carried
+# forward by every rewrite that names the same path (a marker written before
+# the field existed lends its size=): where a resumed copy's UNSENT records
+# begin, so the owner's seed is exact. It is the LAST field, so a reader that
+# cuts the path at ' size=' is unchanged.
+kb_marker_write() { # <marker file> <path> <size> <checkpoint> [cover]
+  _kmf=$3
+  if _kmo=$(kb_marker_path "$1") && { [ "$_kmo" = "$2" ] || [ "$_kmo" -ef "$2" ]; }; then
+    _kmf=$(kb_marker_frozen "$1") || _kmf=$3
+  fi
+  printf '%s %s size=%s checkpoint=%s%s frozen=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" \
+    "$2" "$3" "$4" "${5:+ cover=$5}" "$_kmf" >"$1.t" 2>/dev/null && mv "$1.t" "$1" 2>/dev/null ||
+    rm -f "$1.t" 2>/dev/null
+  return 0
+}
+kb_marker_frozen() { # <marker file> -> its frozen= bytes (a pre-frozen marker: size=); status 1: none
+  [ -f "$1" ] || return 1
+  _kmz=""
+  IFS= read -r _kmz <"$1" 2>/dev/null || [ -n "$_kmz" ] || return 1
+  _kmq=""
+  case "$_kmz" in *" frozen="*) _kmq="${_kmz##* frozen=}" ;; esac
+  case "$_kmq" in '' | *[!0-9]*)
+    _kmq="${_kmz##* size=}"
+    _kmq="${_kmq%% *}"
+    ;;
+  esac
+  case "$_kmq" in '' | *[!0-9]*) return 1 ;; esac
+  printf '%s' "$_kmq"
+}
+kb_marker_path() { # <marker file> -> the transcript path it names (status 1: none)
+  [ -f "$1" ] || return 1
+  _kmp=""
+  IFS= read -r _kmp <"$1" 2>/dev/null || [ -n "$_kmp" ] || return 1
+  _kmp="${_kmp#* }"
+  _kmp="${_kmp%% size=*}"
+  [ -n "$_kmp" ] || return 1
+  printf '%s' "$_kmp"
+}
+kb_marker_names() { # <state dir> <okey> <transcript> -> diverged | behind (status 1: neither)
+  for _kmk in diverged behind; do
+    _kmn=$(kb_marker_path "$1/$2.$_kmk") || continue
+    if [ "$_kmn" = "$3" ] || [ "$_kmn" -ef "$3" ]; then
+      printf '%s' "$_kmk"
+      return 0
+    fi
+  done
+  return 1
+}
+# THE SHRINK VERDICT for a transcript BEHIND its session's checkpoint
+# (0 < SIZE < OFFSET), one function so the hook and the sweep always agree.
+# Sets KB_SV and KB_SV_WHY / KB_SV_COVER:
+#   stale-copy  a copy reaches the checkpoint and this file is its byte-prefix
+#   diverged    a copy reaches it but the tails differ (WHY=cover), or no copy
+#               does and <okey>.diverged names this file (WHY=marker)
+#   behind      no copy reaches it and <okey>.behind names this file
+#               (WHY=marker), or the file is FROZEN (WHY=frozen)
+#   shrank      none of these (WHY=none, or mtime-unreadable when the frozen
+#               check could not run): the shrink rules apply unchanged
+# A path a marker names is never restarted from 0, even after it is resumed,
+# and never drained from the shared checkpoint once it grows past it (the
+# callers refuse a marked path at ANY size: that checkpoint is another copy's)
+# -- unless a .diverged path now carries the checkpoint holder's prefix
+# (kb_window_matches: the owner moved that copy out and the session was later
+# resumed there, so the file at that path is the live transcript again).
+kb_shrink_verdict() { # <sid> <transcript> <size> <offset> <offset file> <state dir> <okey> [extra root]
+  KB_SV=shrank
+  KB_SV_WHY=none
+  KB_SV_COVER=""
+  if _ksv=$(kb_stale_cover "${1:-}" "${2:-}" "${4:-0}" "${8:-}"); then
+    KB_SV_COVER="${_ksv#* }"
+    KB_SV_WHY=cover
+    KB_SV=diverged
+    kb_tail_matches "${2:-}" "${3:-}" "$KB_SV_COVER" && KB_SV=stale-copy
+    return 0
+  fi
+  if _ksm=$(kb_marker_names "${6:-}" "${7:-}" "${2:-}"); then
+    KB_SV=$_ksm
+    KB_SV_WHY=marker
+    return 0
+  fi
+  kb_frozen_behind "${2:-}" "${5:-}"
+  case $? in
+    0)
+      KB_SV=behind
+      KB_SV_WHY=frozen
+      ;;
+    2) KB_SV_WHY=mtime-unreadable ;;
+  esac
+  return 0
+}
+# <<< KB SESSION COPIES v1
+
 MODE=dry
 ONLY=""
 LIMIT=0
@@ -504,6 +753,7 @@ remainder into the Knowledge Vault, through the flush hook installed on this box
                       On an OLD-hook box seed at a logged chunk end or `current`;
                       on a NEW-hook box a low seed costs at most one extra row.
                       Refused under a held session lock, past the size, under --auto.
+                      Several copies of one session: seeds from the largest.
   --status            the table plus sweep health (last run, stalls, trigger, lock)
   --project <slug>    only transcripts that land in this project
   --limit <n>         --push: fire at most n transcripts this run
@@ -808,6 +1058,112 @@ bf_notoken_fresh() { # <slug> -> 0 when the stamp is younger than 3600 s
   case "$_bnt" in '' | *[!0-9]*) return 1 ;; esac
   [ "$((NOW - _bnt))" -lt 3600 ]
 }
+# The hook's once-per-24 h stamps (flush-session-to-kb.sh kb_stale_copy_skip:
+# state/<okey>.stalecopy, <okey>.diverged.stamp, <okey>.behind.stamp -- their
+# MTIME) are fresh by the real clock -- a firing the hook refused silently
+# because it said so already today.
+bf_stamp_fresh() { # <stamp file> -> 0 when it is younger than 86400 s
+  [ -e "$1" ] || return 1
+  _bsc=$(($(date +%s 2>/dev/null || echo 0) - $(bf_mtime "$1")))
+  [ "$_bsc" -ge 0 ] && [ "$_bsc" -lt 86400 ]
+}
+bf_stalecopy_fresh() { bf_stamp_fresh "$STATE/$1.stalecopy"; } # <okey>
+# Which refusal did the hook make of THIS firing (it moved no byte and left the
+# shared checkpoint above the transcript)? Its stale-copy line in SEG names it;
+# a rate-limited (silent) one is read from that kind's fresh stamp. Sets KIND
+# to stale-copy | diverged | behind; status 1 when it was none of them.
+bf_stale_kind() { # <okey> <sid8> <transcript>
+  KIND=""
+  _bsk=$(printf '%s\n' "$SEG" | grep -E "stale copy: .* sid=$2\$" | sed -n '$p')
+  case "$_bsk" in
+    *" reason=stale-copy-diverged "*) KIND=diverged ;;
+    *" reason=behind "*) KIND=behind ;;
+    *" reason=stale-copy "*) KIND=stale-copy ;;
+  esac
+  [ -n "$KIND" ] && return 0
+  _bsn=$(kb_marker_names "$STATE" "$1" "$3") || _bsn=""
+  if [ -n "$_bsn" ] && bf_stamp_fresh "$STATE/$1.$_bsn.stamp"; then
+    KIND=$_bsn
+  elif bf_stalecopy_fresh "$1"; then
+    KIND=stale-copy
+  fi
+  [ -n "$KIND" ]
+}
+# A row tabled diverged/behind gets its marker (re)written by --push/--auto:
+# nothing ever FIRES such a row, so without this a frozen copy would carry no
+# marker and a later resume of it (mtime now newer) would read as a rewrite.
+# A dry run and --status never write state.
+bf_mark() { # <kind> <okey> <transcript> <size> <checkpoint> [cover]
+  case "$MODE" in push | auto) ;; *) return 0 ;; esac
+  kb_marker_write "$STATE/$2.$1" "$3" "$4" "$5" "${6:-}"
+}
+# Does a diverged/behind marker still hold <transcript> at <checkpoint> or past
+# it? Prints its kind. A .diverged marker whose path now carries the checkpoint
+# holder's prefix is RELEASED, exactly as the hook releases it
+# (kb_marker_prefix_release): the owner moved the diverged copy out and the
+# session was later resumed from that directory, so the file there is the live
+# transcript again -- judged by CONTENT, [checkpoint-4096, checkpoint) against
+# the copy that reaches the checkpoint (kb_window_matches). --push/--auto
+# remove the marker and its stamp with ONE line; a dry run and --status only
+# table the row as it will be after that, never writing state. A released path
+# is judged again (a .behind marker naming it still holds it).
+bf_marker_holds() { # <okey> <sid> <transcript> <checkpoint> -> diverged | behind (status 1: none)
+  _bmh=$(kb_marker_names "$STATE" "$1" "$3") || return 1
+  if [ "$_bmh" = diverged ] && _bmhc=$(kb_stale_cover "$2" "$3" "$4" "$BF_PROJECTS") &&
+    kb_window_matches "$3" "$4" "${_bmhc#* }"; then
+    # The sweep RELEASES (removes the marker) only at the hook's own post-drain
+    # state -- the transcript ends exactly at <checkpoint> -- and only under
+    # --push/--auto. Anywhere else it merely TABLES the row as the release would
+    # leave it and the marker stays for the hook, which re-judges the window under
+    # the session lock at the OFFSET it actually drains from: a discovery-time
+    # release (no lock, at BASE) followed by a gated row (live/busy/budget) let the
+    # next firing drain from a checkpoint another fork had moved -- mid-record.
+    if { [ "$MODE" = push ] || [ "$MODE" = auto ]; } && [ "$(bf_size "$3")" = "$4" ]; then
+      _bmhp=$(kb_marker_path "$STATE/$1.diverged") || _bmhp=$3
+      rm -f "$STATE/$1.diverged" "$STATE/$1.diverged.stamp" 2>/dev/null
+      bf_log "$(bf_sid8 "$2") ${PROJ:-?} marker cleared: state/$1.diverged named $_bmhp, which now carries the checkpoint holder's prefix"
+    fi
+    _bmh=$(kb_marker_path "$STATE/$1.behind") && { [ "$_bmh" = "$3" ] || [ "$_bmh" -ef "$3" ]; } || return 1
+    _bmh=behind
+  fi
+  printf '%s' "$_bmh"
+}
+# Where a behind copy's UNSENT records begin: the frozen= of state/<okey>.behind
+# when it names <transcript>, else <size> (a copy frozen right now: none).
+bf_frozen_of() { # <okey> <transcript> <size> -> bytes
+  _bfz=$(kb_marker_path "$STATE/$1.behind" 2>/dev/null) &&
+    { [ "$_bfz" = "$2" ] || [ "$_bfz" -ef "$2" ]; } &&
+    _bfz=$(kb_marker_frozen "$STATE/$1.behind") && {
+    printf '%s' "$_bfz"
+    return 0
+  }
+  printf '%s' "$3"
+}
+# The owner's remedy for a behind copy. `current` ("its bytes were sent") is
+# offered ONLY while the copy still holds exactly its frozen bytes: resumed
+# since it was marked, a seed at `current` would skip the records it wrote
+# after the resume -- the exact seed is the marker's frozen= size.
+bf_behind_owner() { # <sid> <size> <frozen>
+  if [ "$2" -gt "$3" ]; then
+    printf 'resumed since it was marked: its records past %s were NOT sent -- kb-flush-backfill.sh --seed %s %s sends exactly them' "$3" "$1" "$3"
+  else
+    printf 'Owner decision: kb-flush-backfill.sh --seed %s current (its bytes were sent: accept) or --seed %s 0 (re-send it from 0)' "$1" "$1"
+  fi
+}
+# The owner's remedy for a diverged copy. While ANOTHER copy reaches the
+# checkpoint no --seed can settle it: the verdict reads the files, not the
+# marker, so the next pass or firing marks it again (and a lower seed re-sends
+# the live copy). With no such copy, `current` is never "sent": it ACCEPTS the
+# loss of the records past the divergence point. A session later resumed from
+# the moved copy's directory needs no owner step: the file written there
+# carries the live copy's prefix and the marker releases itself (bf_marker_holds).
+bf_diverged_owner() { # <sid> <checkpoint> <cover path or empty>
+  if [ -n "$3" ]; then
+    printf 'Owner: a --seed cannot settle this while a copy reaches the checkpoint (the next --push/--auto or firing marks it again, and a seed below %s re-sends the live copy). To accept the loss, move this copy out of ~/.claude/projects (the marker then clears); to keep its records, leave it in place until the per-path checkpoint wave. Resuming the session from that directory later is safe: the file Claude Code writes there carries the live copy'"'"'s prefix, and the marker releases itself' "$2"
+  else
+    printf 'Owner: kb-flush-backfill.sh --seed %s current ACCEPTS the loss of those records (it clears the marker; it does not mean they were sent), or --seed %s <bytes> re-sends this copy from <bytes> (anything below the divergence point is sent twice)' "$1" "$1"
+  fi
+}
 # The token NAME's key, exactly as the hook derives PROJ_KEY (never a value).
 bf_proj_key() { # <slug> -> PROJ_KEY
   printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_'
@@ -918,6 +1274,22 @@ if [ "$MODE" = seed ]; then
   set -- "$BF_PROJECTS"/*/"$SEED_SID.jsonl"
   [ "$#" -gt 0 ] || set -- "$BF_PROJECTS"/*/"$SEED_SID"*.jsonl
   shopt -u nullglob
+  # COPIES OF ONE SESSION (KB 49064): several matches that all carry the SAME
+  # file name are one session resumed from different directories, not an
+  # ambiguous prefix. Seed from the LARGEST (the live copy; a stale one is a
+  # prefix of it) -- never from whichever the glob listed first.
+  if [ "$#" -gt 1 ]; then
+    _sdn=$(basename "$1")
+    _sdbig="$1"
+    for _sdm in "$@"; do
+      [ "$(basename "$_sdm")" = "$_sdn" ] || {
+        _sdbig=""
+        break
+      }
+      [ "$(bf_size "$_sdm")" -gt "$(bf_size "$_sdbig")" ] && _sdbig="$_sdm"
+    done
+    [ -n "$_sdbig" ] && set -- "$_sdbig"
+  fi
   if [ "$#" -ne 1 ]; then
     if [ "$#" -eq 0 ]; then
       printf 'kb-flush-backfill: --seed refused: no transcript %s.jsonl under %s\n' "$SEED_SID" "$BF_PROJECTS" >&2
@@ -931,6 +1303,23 @@ if [ "$MODE" = seed ]; then
   OKEY=$(bf_okey "$SID")
   SIDS=$(bf_sid8 "$SID")
   SIZE=$(bf_size "$T")
+  # ...and the copies under the hook's own roots (kb_session_copies): the
+  # checkpoint is the SESSION's, so it is seeded from its largest transcript.
+  _sdcnt=1
+  _sdall="$T"
+  while IFS= read -r _sdl; do
+    _sds="${_sdl%% *}"
+    case "$_sds" in '' | *[!0-9]*) continue ;; esac
+    _sdcnt=$((_sdcnt + 1))
+    [ "$_sds" -gt "$SIZE" ] && {
+      SIZE=$_sds
+      T="${_sdl#* }"
+    }
+  done <<KBSEED
+$(kb_session_copies "$SID" "$_sdall" "$BF_PROJECTS")
+KBSEED
+  [ "$_sdcnt" -gt 1 ] &&
+    printf 'copies: %s transcripts carry session %s -- seeding from the largest, %s (%s bytes); a smaller copy is a stale one (KB 49064)\n' "$_sdcnt" "$SIDS" "$T" "$SIZE"
   if [ "$SEED_AT" = current ]; then
     AT="$SIZE"
   else
@@ -969,7 +1358,25 @@ if [ "$MODE" = seed ]; then
   PROJ=$(bf_project_of "$OKEY" "$(kb_first_record_field "$T" cwd)")
   [ -n "$PROJ" ] || PROJ="?"
   printf 'seeded %s offset=%s (snapped from %s)\n' "$SIDS" "$SNAP" "$AT"
-  bf_log "$SIDS $PROJ seed offset=$SNAP (was $OLD) size=$SIZE"
+  # The seed IS the owner's decision for this session (KB 49064): its diverged
+  # / behind markers and their log stamps go with it, said here.
+  _sdclr=""
+  for _sdk in diverged behind; do
+    if [ -e "$STATE/$OKEY.$_sdk" ]; then
+      _sdp=$(kb_marker_path "$STATE/$OKEY.$_sdk") || _sdp='?'
+      printf 'cleared: state/%s.%s (it named %s) -- the seed is the owner decision for this session\n' \
+        "$OKEY" "$_sdk" "$_sdp"
+      _sdclr="$_sdclr $_sdk"
+      # MUST-FIX 2 (review 2): a diverged copy ANOTHER copy still covers is
+      # judged from the files, not the marker -- the next pass re-marks it.
+      if [ "$_sdk" = diverged ] && [ -f "$_sdp" ] && [ "$(bf_size "$_sdp")" -lt "$SNAP" ] &&
+        kb_stale_cover "$SID" "$_sdp" "$SNAP" "$BF_PROJECTS" >/dev/null; then
+        printf 'note: %s is still behind the checkpoint and another copy reaches it -- the next sweep or firing marks it again; move it out of ~/.claude/projects to accept the loss\n' "$_sdp"
+      fi
+    fi
+    rm -f "$STATE/$OKEY.$_sdk" "$STATE/$OKEY.$_sdk.stamp" 2>/dev/null
+  done
+  bf_log "$SIDS $PROJ seed offset=$SNAP (was $OLD) size=$SIZE${_sdclr:+ cleared:$_sdclr}"
   exit 0
 fi
 
@@ -1006,6 +1413,22 @@ if [ "$MODE" = push ] || [ "$MODE" = auto ]; then
     say "kb-flush-backfill: another sweep holds $STATE/.sweep.lock -- exiting 3"
     exit 3
   fi
+fi
+
+# A diverged/behind marker whose named path no longer exists (the owner moved
+# or removed that copy) is cleared by a --push/--auto pass, ONE log line each
+# (KB 49064; the hook's own firings and --seed are the other clearers).
+if [ "$MODE" = push ] || [ "$MODE" = auto ]; then
+  for _bmk in "$STATE"/*.diverged "$STATE"/*.behind; do
+    [ -f "$_bmk" ] || continue
+    _bmp=$(kb_marker_path "$_bmk") || continue
+    [ -e "$_bmp" ] && continue
+    _bmx="${_bmk##*.}"
+    _bmo=$(basename "$_bmk" ".$_bmx")
+    rm -f "$_bmk" "$_bmk.stamp" 2>/dev/null
+    _bmj=$(bf_project_of "$_bmo" "")
+    bf_log "$(bf_sid8 "$_bmo") ${_bmj:-?} marker cleared: state/$_bmo.$_bmx named $_bmp, which no longer exists"
+  done
 fi
 
 IDX="$BF_TMP/index"
@@ -1095,10 +1518,77 @@ for T in "$BF_PROJECTS"/*/*.jsonl; do
           STATUS=flushed
           REASON="empty transcript (size 0): the hook does not drain it"
         elif [ "$SIZE" -lt "$BASE" ]; then
-          STATUS=shrank
-          REASON="checkpoint $BASE is past the size: the hook restarts from 0 (reason=shrank)"
-          BASE=0
-          REMAIN=$SIZE
+          # BEHIND THE CHECKPOINT (KB 49064): the hook's own verdict function,
+          # so the table and the firing can never disagree. A session resumed
+          # from another directory keeps its frozen transcript beside the live
+          # one, and the live one's flushes carried the SHARED checkpoint past
+          # it; a restart from 0 would re-send what was already sent (rm1,
+          # 2026-10-08: 282 MB, ~3,750 duplicate items). Only a transcript
+          # modified after the checkpoint's last write is a genuine shrink.
+          kb_shrink_verdict "$SID" "$T" "$SIZE" "$BASE" "$STATE/$OKEY.offset" "$STATE" "$OKEY" "$BF_PROJECTS"
+          case "$KB_SV" in
+            stale-copy)
+              STATUS=stale-copy
+              REASON="stale copy: checkpoint $BASE is past the size, and a copy of this session in $(dirname "$KB_SV_COVER") ($(bf_size "$KB_SV_COVER") bytes) covers it -- a byte-prefix of that copy; no restart, never fired"
+              REMAIN=0
+              ;;
+            diverged)
+              STATUS=diverged
+              REMAIN=$SIZE
+              if [ "$KB_SV_WHY" = cover ]; then
+                REASON="diverged copy: checkpoint $BASE is past the size and a copy of this session in $(dirname "$KB_SV_COVER") ($(bf_size "$KB_SV_COVER") bytes) reaches it, but this file's tail differs: its records past the shared prefix were NOT sent and the shared checkpoint cannot carry them (REMAIN is the whole file: the unique bytes are unknown without a full compare). Never fired, never restarted. $(bf_diverged_owner "$SID" "$BASE" "$KB_SV_COVER")"
+              else
+                REASON="diverged copy: checkpoint $BASE is past the size, no copy reaches it now and state/$OKEY.diverged names this file: its records past the shared prefix were NOT sent (REMAIN is the whole file). Never fired, never restarted. $(bf_diverged_owner "$SID" "$BASE" "")"
+              fi
+              bf_mark diverged "$OKEY" "$T" "$SIZE" "$BASE" "$KB_SV_COVER"
+              ;;
+            behind)
+              STATUS=behind
+              # 0 for a copy still frozen; a copy resumed since it was marked
+              # holds SIZE - frozen= bytes that were never sent (unflushed).
+              _bhf=$SIZE
+              [ "$KB_SV_WHY" = marker ] && _bhf=$(bf_frozen_of "$OKEY" "$T" "$SIZE")
+              REMAIN=$((SIZE - _bhf))
+              [ "$REMAIN" -ge 0 ] || REMAIN=0
+              _bhw="the file is frozen (last modified before the checkpoint's last write)"
+              [ "$KB_SV_WHY" = marker ] && _bhw="state/$OKEY.behind names this file"
+              if [ "$SIZE" -gt "$_bhf" ]; then
+                REASON="behind: checkpoint $BASE is past the size, no copy of this session reaches it, and $_bhw -- never restarted from 0, never fired; $(bf_behind_owner "$SID" "$SIZE" "$_bhf")"
+              else
+                REASON="behind: checkpoint $BASE is past the size, no copy of this session reaches it, and $_bhw -- a frozen copy whose live copy is gone, never restarted from 0, never fired. $(bf_behind_owner "$SID" "$SIZE" "$_bhf")"
+              fi
+              bf_mark behind "$OKEY" "$T" "$SIZE" "$BASE"
+              ;;
+            *)
+              STATUS=shrank
+              REASON="checkpoint $BASE is past the size: the hook restarts from 0 (reason=shrank) -- the file changed after the checkpoint's last write (a rewrite, not a frozen copy)"
+              [ "$KB_SV_WHY" = mtime-unreadable ] &&
+                REASON="checkpoint $BASE is past the size: the hook restarts from 0 (reason=shrank) -- the frozen-copy check was skipped: an mtime could not be read"
+              BASE=0
+              REMAIN=$SIZE
+              ;;
+          esac
+        elif _bmk=$(bf_marker_holds "$OKEY" "$SID" "$T" "$BASE"); then
+          # A path a marker names, grown to the checkpoint or past it (KB 49064):
+          # that checkpoint is ANOTHER copy's, so the hook refuses this path at
+          # any size -- a drain from it would start mid-record and lose the
+          # records between the marker's frozen= size and the checkpoint. Never
+          # fireable; the marker is rewritten (frozen= kept) by --push/--auto.
+          # A .diverged path that now carries the checkpoint holder's prefix is
+          # released instead (bf_marker_holds) and tables ready / flushed below.
+          STATUS=$_bmk
+          _bmc=""
+          _bmv=$(kb_stale_cover "$SID" "$T" "$BASE" "$BF_PROJECTS") && _bmc="${_bmv#* }"
+          if [ "$_bmk" = diverged ]; then
+            REMAIN=$SIZE
+            REASON="diverged copy: state/$OKEY.diverged names this file and it has grown to checkpoint $BASE or past it -- that checkpoint is another copy's, so a drain from it would start mid-record: its records past the shared prefix were NOT sent (REMAIN is the whole file). Never fired, never restarted. $(bf_diverged_owner "$SID" "$BASE" "$_bmc")"
+          else
+            _bhf=$(bf_frozen_of "$OKEY" "$T" "$SIZE")
+            REMAIN=$((SIZE - _bhf))
+            [ "$REMAIN" -ge 0 ] || REMAIN=0
+            REASON="behind: state/$OKEY.behind names this file and it has grown to checkpoint $BASE or past it -- that checkpoint is another copy's, so a drain from it would start mid-record: never fired, never restarted from 0; $(bf_behind_owner "$SID" "$SIZE" "$_bhf")"
+          fi
+          bf_mark "$_bmk" "$OKEY" "$T" "$SIZE" "$BASE"
         elif [ "$SIZE" -eq "$BASE" ]; then
           STATUS=flushed
         else
@@ -1163,6 +1653,9 @@ N_LIVE=0
 N_BUSY=0
 N_STALLED=0
 N_OTHER=0
+N_STALE=0
+N_DIVERGED=0
+N_BEHIND=0
 B_REMAIN=0
 B_UNKNOWN=0
 B_UNFLUSHED=0
@@ -1196,6 +1689,15 @@ while IFS="$SEP" read -r MT STATUS PROJ SID SIZE BASE REMAIN OKEY CWD T REASON; 
       N_OTHER=$((N_OTHER + 1))
       B_UNFLUSHED=$((B_UNFLUSHED + REMAIN))
       ;;
+    stale-copy) N_STALE=$((N_STALE + 1)) ;; # a newer copy holds its bytes: never unflushed
+    diverged) # its unique records were never sent: unflushed (REMAIN = the whole file)
+      N_DIVERGED=$((N_DIVERGED + 1))
+      B_UNFLUSHED=$((B_UNFLUSHED + REMAIN))
+      ;;
+    behind) # an owner --seed decision; REMAIN = what a copy resumed since it was marked holds past frozen= (0 while frozen)
+      N_BEHIND=$((N_BEHIND + 1))
+      B_UNFLUSHED=$((B_UNFLUSHED + REMAIN))
+      ;;
     *) N_OTHER=$((N_OTHER + 1)) ;;
   esac
   [ "$MODE" = auto ] && continue
@@ -1204,7 +1706,7 @@ while IFS="$SEP" read -r MT STATUS PROJ SID SIZE BASE REMAIN OKEY CWD T REASON; 
 done <"$IDX"
 
 say ""
-say "$N_TOTAL transcript(s): $N_READY with unflushed bytes ($B_REMAIN bytes), $N_FLUSHED flushed, $N_UNKNOWN unknown ($B_UNKNOWN bytes, never swept -- see --seed), $((N_LIVE + N_BUSY + N_STALLED + N_OTHER)) other (live/busy/tail-held/stalled/skipped)"
+say "$N_TOTAL transcript(s): $N_READY with unflushed bytes ($B_REMAIN bytes), $N_FLUSHED flushed, $N_UNKNOWN unknown ($B_UNKNOWN bytes, never swept -- see --seed), $((N_LIVE + N_BUSY + N_STALLED + N_OTHER)) other (live/busy/tail-held/stalled/skipped)$([ "$N_STALE" -gt 0 ] && printf ', %s stale copy(ies) (a newer copy of the session covers them -- never restarted)' "$N_STALE")$([ "$N_DIVERGED" -gt 0 ] && printf ', %s diverged copy(ies) (records past a shared checkpoint were not sent -- never fired; see the reason)' "$N_DIVERGED")$([ "$N_BEHIND" -gt 0 ] && printf ', %s behind the checkpoint (frozen, no copy reaches it -- never restarted; an owner --seed decision)' "$N_BEHIND")"
 
 bf_age() { # <epoch> -> 12m | 3h | 2d
   _ba=$((NOW - $1))
@@ -1301,6 +1803,9 @@ LIMITED=0
 BYTES=0
 SPENT=0
 FIRED=0
+P_STALE=0
+P_DIVERGED=0
+P_BEHIND=0
 T_START=$(date +%s 2>/dev/null || echo 0)
 case "$T_START" in '' | *[!0-9]*) T_START=0 ;; esac
 say ""
@@ -1374,13 +1879,55 @@ while IFS="$SEP" read -r MT STATUS PROJ SID SIZE BASE REMAIN OKEY CWD T REASON <
   SENT=$((CUR - BASE))
   [ "$SENT" -ge 0 ] || SENT=0
   DETAIL=""
+  KIND=""
+  TSIZE=$(bf_size "$T")
+  # UNMOVED: the checkpoint is still the one this firing started from AND above
+  # the file -- a shrank row's hook stopped before it decided (NEEDS TOKEN, a
+  # failed mint, the lock held). CUR-BASE is then the OLD checkpoint, never
+  # bytes sent: SENT=0, never `pushed`, never charged -- the busy / NEEDS TOKEN
+  # / no-progress greps below name the firing.
+  UNMOVED=0
+  if [ "$TSIZE" -lt "$CUR" ] && [ "$CUR" = "$OFF0RAW" ]; then
+    UNMOVED=1
+    SENT=0
+  fi
   if [ "$(bf_offset_raw "$OKEY")" = none ] && [ "$OFF0RAW" != none ]; then
     VERDICT=failed
     DETAIL="BUG: offset file disappeared during a drain"
   elif [ "$TIMED_OUT" = 1 ]; then
     VERDICT=timeout
     DETAIL="no completion within ${BF_TIMEOUT}s (hook exit $HRC); the drain may still be running -- the next run resumes from its checkpoint"
-  elif [ "$CUR" -ge "$SIZE" ] && [ "$CUR" -gt 0 ]; then
+  elif { [ "$TSIZE" -lt "$CUR" ] || bf_marker_holds "$OKEY" "$SID" "$T" "$CUR" >/dev/null; } &&
+    bf_stale_kind "$OKEY" "$SIDS" "$T"; then
+    # The hook REFUSED this transcript as behind the shared checkpoint (KB
+    # 49064) -- typically covered by the live copy between discovery and this
+    # firing -- or as a path a marker names (marked by a race, at any size).
+    # The checkpoint it left is the OTHER copy's, so `CUR -ge SIZE` must not
+    # read as pushed and CUR-BASE (the whole checkpoint for a shrank row) was
+    # never sent: SENT=0, never charged to the budget.
+    SENT=0
+    case "$KIND" in
+      stale-copy)
+        VERDICT=skipped
+        DETAIL="reason=stale-copy: the hook skipped a stale copy of this session (a newer copy covers checkpoint $CUR) -- nothing sent, no restart"
+        ;;
+      diverged)
+        VERDICT=refused
+        _pkw="behind checkpoint $CUR and its tail differs from the copy that reaches it"
+        [ "$TSIZE" -lt "$CUR" ] || _pkw="state/$OKEY.diverged names this copy and checkpoint $CUR is another copy's"
+        DETAIL="reason=stale-copy-diverged: $_pkw -- nothing sent, no restart; records past the shared prefix may be unflushed (state/$OKEY.diverged)"
+        ;;
+      *)
+        VERDICT=refused
+        _pkw="a frozen copy behind checkpoint $CUR that no copy reaches"
+        [ "$TSIZE" -lt "$CUR" ] || _pkw="state/$OKEY.behind names this copy and checkpoint $CUR is another copy's"
+        _pkf=$(bf_frozen_of "$OKEY" "$T" "$TSIZE")
+        _pko="an owner decision: kb-flush-backfill.sh --seed $SID current|<bytes>"
+        [ "$TSIZE" -gt "$_pkf" ] && _pko=$(bf_behind_owner "$SID" "$TSIZE" "$_pkf")
+        DETAIL="reason=behind: $_pkw -- nothing sent, no restart; $_pko (state/$OKEY.behind)"
+        ;;
+    esac
+  elif [ "$UNMOVED" = 0 ] && [ "$CUR" -ge "$SIZE" ] && [ "$CUR" -gt 0 ]; then
     VERDICT=pushed
   elif [ "$SENT" -gt 0 ]; then
     VERDICT=partial
@@ -1412,20 +1959,32 @@ while IFS="$SEP" read -r MT STATUS PROJ SID SIZE BASE REMAIN OKEY CWD T REASON <
     DETAIL="the hook logged nothing for this session and moved no checkpoint (a rate-limited refusal? check $BF_LOG)"
   fi
 
-  case "$VERDICT" in
-    pushed)
+  case "$KIND:$VERDICT" in
+    stale-copy:*)
+      P_STALE=$((P_STALE + 1))
+      say "$VERDICT ($DETAIL)"
+      ;;
+    diverged:*)
+      P_DIVERGED=$((P_DIVERGED + 1))
+      say "$VERDICT ($DETAIL)"
+      ;;
+    behind:*)
+      P_BEHIND=$((P_BEHIND + 1))
+      say "$VERDICT ($DETAIL)"
+      ;;
+    :pushed)
       PUSHED=$((PUSHED + 1))
       say "ok"
       ;;
-    partial)
+    :partial)
       PARTIAL=$((PARTIAL + 1))
       say "partial ($DETAIL)"
       ;;
-    busy)
+    :busy)
       BUSY=$((BUSY + 1))
       say "busy ($DETAIL)"
       ;;
-    timeout)
+    :timeout)
       say "timeout ($DETAIL)"
       ;;
     *)
@@ -1433,17 +1992,22 @@ while IFS="$SEP" read -r MT STATUS PROJ SID SIZE BASE REMAIN OKEY CWD T REASON <
       say "FAILED ($VERDICT: $DETAIL)"
       ;;
   esac
-  BYTES=$((BYTES + SENT))
-  SPENT=$((SPENT + SENT))
+  # A stale-copy / diverged / behind firing sent nothing: never charged.
+  if [ -z "$KIND" ]; then
+    BYTES=$((BYTES + SENT))
+    SPENT=$((SPENT + SENT))
+  fi
   bf_log "$SIDS $PROJ $VERDICT base=$BASE size=$SIZE sent=$SENT took=${TOOK}s${DETAIL:+ -- $DETAIL}"
 
   # Stall accounting (state/<okey>.sweep): progress resets, a no-progress run
   # increments, busy/timeout leave it alone. Crossing KB_SWEEP_STALL_RUNS logs
   # ONE `STALLED` line -- deliberately none of the brief's failure tokens, and
   # never again for the same stall (the count keeps rising past it).
-  case "$VERDICT" in
-    pushed | partial) _fails=0 ;;
-    failed | refused | no-progress) _fails=$(($(bf_stall_fails "$OKEY") + 1)) ;;
+  # A stale-copy / diverged / behind refusal is no stall: the next run tables
+  # the row as such and never fires it again.
+  case "$KIND:$VERDICT" in
+    :pushed | :partial) _fails=0 ;;
+    :failed | :refused | :no-progress) _fails=$(($(bf_stall_fails "$OKEY") + 1)) ;;
     *) _fails="" ;;
   esac
   if [ -n "$_fails" ]; then
@@ -1463,15 +2027,23 @@ for _sw in "$STATE"/*.sweep; do
   [ "$(bf_stall_fails "$(basename "$_sw" .sweep)")" -ge "$BF_STALL_RUNS" ] && N_STALLED=$((N_STALLED + 1))
 done
 
+# The rows that ended behind a shared checkpoint (KB 49064): tabled so, plus
+# the ones the hook refused at fire time (covered between discovery and firing).
+T_STALE=$((N_STALE + P_STALE))
+T_DIVERGED=$((N_DIVERGED + P_DIVERGED))
+T_BEHIND=$((N_BEHIND + P_BEHIND))
+
 say ""
-say "kb-flush-backfill: pushed=$PUSHED partial=$PARTIAL failed=$FAILED deferred=$DEFERRED busy=$BUSY skipped=$((N_TOTAL - N_READY - N_UNKNOWN)) bytes=$BYTES"
+say "kb-flush-backfill: pushed=$PUSHED partial=$PARTIAL failed=$FAILED deferred=$DEFERRED busy=$BUSY skipped=$((N_TOTAL - N_READY - N_UNKNOWN)) bytes=$BYTES stale=$T_STALE diverged=$T_DIVERGED behind=$T_BEHIND"
 [ "$LIMITED" -gt 0 ] && say "$LIMITED transcript(s) left for the next run by --limit $LIMIT."
 
 # One line per COMPLETED sweep (--auto and the owner's explicit --push alike:
 # on a timer-less box a hand sweep is the only thing that would ever refresh
 # it), overwritten, read by notify-complete.sh and the brief.
-printf 'ts=%s rc=0 mode=%s ready=%s pushed=%s failed=%s deferred=%s stalled=%s unknown=%s live=%s unflushed=%s busy=%s partial=%s\n' \
-  "$NOW" "$MODE" "$N_READY" "$PUSHED" "$FAILED" "$((DEFERRED + LIMITED))" "$N_STALLED" "$N_UNKNOWN" "$N_LIVE" "$B_UNFLUSHED" "$((N_BUSY + BUSY))" "$PARTIAL" \
+# `stale=`, `diverged=` and `behind=` (KB 49064) are LAST and purely additive:
+# every reader keys on its own ` <name>=` (` stalled=` cannot match ` stale=`).
+printf 'ts=%s rc=0 mode=%s ready=%s pushed=%s failed=%s deferred=%s stalled=%s unknown=%s live=%s unflushed=%s busy=%s partial=%s stale=%s diverged=%s behind=%s\n' \
+  "$NOW" "$MODE" "$N_READY" "$PUSHED" "$FAILED" "$((DEFERRED + LIMITED))" "$N_STALLED" "$N_UNKNOWN" "$N_LIVE" "$B_UNFLUSHED" "$((N_BUSY + BUSY))" "$PARTIAL" "$T_STALE" "$T_DIVERGED" "$T_BEHIND" \
   >"$STATE/.sweep-last.t" 2>/dev/null && mv "$STATE/.sweep-last.t" "$STATE/.sweep-last" 2>/dev/null || rm -f "$STATE/.sweep-last.t" 2>/dev/null
 if [ "$MODE" = auto ]; then
   # The piggyback trigger is consumed so the firings this run provoked cannot
@@ -1480,7 +2052,7 @@ if [ "$MODE" = auto ]; then
   # a day would rotate the 500-line log past the brief's scan window).
   rm -f "$STATE/.sweep.trigger" 2>/dev/null
   if [ "$N_READY" -gt 0 ] || [ "$FAILED" -gt 0 ] || [ "$N_STALLED" -gt 0 ] || [ "$N_UNKNOWN" -gt 0 ]; then
-    bf_log "run: ready=$N_READY pushed=$PUSHED partial=$PARTIAL failed=$FAILED deferred=$((DEFERRED + LIMITED)) busy=$((N_BUSY + BUSY)) stalled=$N_STALLED unknown=$N_UNKNOWN live=$N_LIVE unflushed=$B_UNFLUSHED"
+    bf_log "run: ready=$N_READY pushed=$PUSHED partial=$PARTIAL failed=$FAILED deferred=$((DEFERRED + LIMITED)) busy=$((N_BUSY + BUSY)) stalled=$N_STALLED unknown=$N_UNKNOWN live=$N_LIVE unflushed=$B_UNFLUSHED stale=$T_STALE diverged=$T_DIVERGED behind=$T_BEHIND"
   fi
 fi
 exit 0

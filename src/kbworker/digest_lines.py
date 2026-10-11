@@ -64,7 +64,7 @@ def night_of(at: datetime, tz: tzinfo | None = None) -> date:
     ``at`` is the run's START (review #9a INS-1: keyed on the finish, a nightly
     overrunning the rollover filed under the NEXT night — the Sep 5 06:57
     finish split its own night in two). The rollover is NOON, decided
-    deliberately: the 01:00 nightly, a grid-restore resume at 07:10 or 09:32
+    deliberately: the 01:30 nightly, a grid-restore resume at 07:10 or 09:32
     and a 10:00 boot catch-up are all continuations of the night they finish,
     so they land on ONE row; a run starting after noon opens the coming night.
     """

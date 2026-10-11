@@ -337,6 +337,46 @@ def test_the_compose_file_does_not_set_a_project_name_of_its_own():
         assert not re.match(r"^name:", line), "compose declares its own project name"
 
 
+# --- no stale schedule in the present tense -----------------------------------
+
+
+def _live_schedules() -> set[str]:
+    """Every HH:MM some repo timer actually fires at."""
+    live = {
+        m.group(1)
+        for t in TIMERS
+        for cal in values(t, "Timer", "OnCalendar")
+        if (m := re.search(r"(\d{2}:\d{2})", cal))
+    }
+    assert live, "no OnCalendar found in the timers — this check would be vacuous"
+    return live
+
+
+@pytest.mark.parametrize(
+    "rel", ["systemd/kb-consolidate.service", "docs/DATA_FLOW.md", "scripts/backup.sh"]
+)
+def test_files_that_state_the_schedule_name_only_live_times(rel):
+    """kb-consolidate.service said the backup ran 'at 03:00' for two months after
+    it moved to 00:30, and DATA_FLOW.md kept the 01:00 nightly after the 2026-10-11
+    move to 01:30. These files carry no dated history, so every HH:MM in them must
+    be a time a timer really fires at. (A file that narrates dated history is
+    deliberately NOT listed — its old times are correct as history.)"""
+    named = set(re.findall(r"\b(\d{2}:\d{2})\b", (REPO / rel).read_text()))
+    assert named <= _live_schedules(), f"{rel} names dead schedules: {named - _live_schedules()}"
+
+
+def test_the_restore_drill_names_the_live_drain_start():
+    """restore_test.sh also names non-schedule times (its 04:30 PKT = 23:30 UTC
+    month bug), so it cannot take the blanket check above; its present-tense claim
+    — which drain the drill races — must name kb-consolidate.timer's real start."""
+    start = re.search(r"(\d{2}:\d{2})", values("kb-consolidate.timer", "Timer", "OnCalendar")[0])
+    assert start
+    for rel in ("scripts/restore_test.sh", "scripts/backup.sh"):
+        drains = re.findall(r"\b(\d{2}:\d{2}) drain\b", (REPO / rel).read_text())
+        assert drains, f"{rel} no longer names the drain it races — update this pin"
+        assert set(drains) == {start.group(1)}, f"{rel} names a dead drain start: {drains}"
+
+
 # --- hygiene ------------------------------------------------------------------
 
 

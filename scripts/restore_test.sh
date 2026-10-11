@@ -148,7 +148,7 @@ R_NULLEMB="$(docker exec "${CONT}" psql -U kb -d kb -tAc \
 # --- sidecar exact-match (review #6 Wave G): the drill's ground truth ---------
 # backup.sh derives ${dump}.counts from the ARTIFACT (one decode pass over the
 # COPY blocks), so restored-vs-sidecar is exact by construction. The old
-# restored-vs-LIVE 1% check raced the 01:00 drain (~190-280 items/h) and would
+# restored-vs-LIVE 1% check raced the 01:30 drain (~190-280 items/h) and would
 # have false-FAILED 5 of 8 recent nights at 04:30 — it is now ADVISORY only.
 SIDECAR="${KB_BACKUPS}/$(basename "${NEWEST}").counts"
 [[ "${MODE}" == "local" ]] && SIDECAR="${NEWEST}.counts"

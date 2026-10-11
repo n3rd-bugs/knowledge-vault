@@ -19,7 +19,8 @@ describes the same rows.
 Module map (the 300-line cap): the shared row CTE lives in
 :mod:`kbcore.fleet_rows`; silence and hook staleness — keyed on ``(principal,
 label)`` — in :mod:`kbcore.fleet_stale`; ``queue_coverage`` in
-:mod:`kbcore.fleet_coverage`. All are re-exported here under the brief's names.
+:mod:`kbcore.fleet_coverage`; the RESEND ALERT query (``overlap_alerts``) in
+:mod:`kbcore.fleet_overlap`. All are re-exported here under the brief's names.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from kbcore.config import settings
 from kbcore.db import connect
 from kbcore.fleet_coverage import queue_coverage  # noqa: F401 — the brief's import path
 from kbcore.fleet_health import window_start
+from kbcore.fleet_overlap import OVERLAP_ALERTS_KEPT, overlap_alerts  # noqa: F401 — re-exports
 from kbcore.fleet_rows import (  # noqa: F401 — FLEET_FLOOR_DAYS is part of the surface
     FLEET_FLOOR_DAYS,
     ROWS_SQL,
@@ -179,7 +181,9 @@ def resend_summary(hours: int | None = None) -> dict[str, Any]:
     ``duplicate_rows``/``duplicate_mb`` (status 'duplicate', all time — the
     repair's trail). An inconsistent stamp leaves NO row marker (the guard
     only counts it in-process), so there is no ``stamp_inconsistent`` key.
-    Positive-only: zero keys are omitted, ``{}`` when nothing happened.
+    ``overlap_alerts`` (wave C.2, KB 49064): the sessions over the RESEND ALERT
+    threshold (:func:`overlap_alerts`). Positive-only: zero keys are omitted,
+    ``{}`` when nothing happened.
     """
     start = window_start(hours)
     with connect() as conn:
@@ -205,6 +209,7 @@ def resend_summary(hours: int | None = None) -> dict[str, Any]:
             "SELECT count(*), coalesce(sum(octet_length(content)), 0) "
             "FROM ingest_queue WHERE status = 'duplicate'"
         ).fetchone()
+        alerts = overlap_alerts(conn, start)
     out: dict[str, Any] = {}
     if led:
         out["refused_rows"] = int(sum(r[1] for r in led))
@@ -217,4 +222,6 @@ def resend_summary(hours: int | None = None) -> dict[str, Any]:
     if int(dup_rows):
         out["duplicate_rows"] = int(dup_rows)
         out["duplicate_mb"] = mb(dup_bytes)
+    if alerts:
+        out["overlap_alerts"] = alerts
     return out

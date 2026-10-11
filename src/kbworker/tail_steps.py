@@ -158,7 +158,7 @@ def review_triaged_topup(counts: dict[str, Any], stop: StopCheck | None = None) 
 
     SLICES, NOT ONE BIG BATCH, and that is the whole design: the run holds
     ``pg_advisory_lock(42)`` end to end, so a 1000-row batch (~2.9 h) admitted at
-    22:59 would still be running at the next 01:00 firing and make that WHOLE RUN
+    22:59 would still be running at the next 01:30 firing and make that WHOLE RUN
     skip — the top-up would have eaten the night it was meant to add to. A
     ``kb_triage_topup_slice``-sized slice bounds the overshoot past the cutoff to
     one slice (~35 min at 200 rows), which leaves the report, the digest and the

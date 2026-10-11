@@ -66,7 +66,7 @@ def _tally(outcomes: Sequence[twin_audit.AuditOutcome]) -> str:
 
 def _refuse_while_nightly_runs() -> None:
     """TRY-AND-RELEASE probe of the consolidation lock — acquired and dropped in
-    one breath, never HELD (holding it would make the 01:00 nightly skip its whole
+    one breath, never HELD (holding it would make the nightly skip its whole
     night). The key is schema-scoped inside ``advisory_lock``; a literal
     ``pg_try_advisory_lock(42)`` would never see the nightly's lock."""
     from kbcore.db import advisory_lock

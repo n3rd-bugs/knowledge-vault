@@ -897,18 +897,105 @@ fi
 # across runs (copied only when they differ) so a re-install never churns
 # them. Paths inside the unit are double-quoted -- systemd's Exec= quoting --
 # so a HOME with a space (rig case 24) does not word-split at run time.
-# Rendered AFTER the .setup-version stamp, and this block never touches
+# Rendered AFTER the .setup-version stamp, and this block never WRITES
 # kb-flush.env. Exactly ONE `sweep:` line is printed.
+#
+# THE OFF SWITCH LIVES IN kb-flush.env TOO. The hooks source that file, so a
+# `KB_SWEEP_INTERVAL=0` line there already stopped the piggyback -- but this
+# installer (and update.sh, which execs it) read only the environment, so an
+# update silently re-enabled a timer the owner had contained (rm1, KB 49064).
+# A knob UNSET in the environment is therefore read from $CFG -- by GREP, NEVER
+# by sourcing: the file holds bearer tokens, and a line such as
+# `KB_SWEEP_INTERVAL=$(cmd)` must not run here. Accepted: `KEY=N`,
+# `export KEY=N`, optional matching quotes, a trailing ` # comment`; the LAST
+# assignment wins; a non-numeric value warns once without echoing it. Nothing
+# from the file is printed but the digits parsed. A non-numeric INTERVAL
+# (off/no/false/disabled...) is OFF -- the hooks' piggyback already stops on
+# one (`[ off -gt 0 ]` fails), so a default of 1800 here re-enabled a timer the
+# box had switched off -- and so is a non-numeric TIMER: only `1` turns the
+# timer on, from either source. Either is named `<non-numeric>`, never echoed:
+# a contained box must never fail OPEN on a word. The environment
+# always wins over the file (update.sh, which sources the file before exec'ing
+# this, saves and restores the caller's KB_SWEEP_* around that source).
 SWEEP_INTERVAL="${KB_SWEEP_INTERVAL:-1800}"
-case "$SWEEP_INTERVAL" in '' | *[!0-9]*) SWEEP_INTERVAL=1800 ;; esac
+kb_cfg_knob() { # KEY -> KB_CFG_KNOB=<digits from ${CFG}'s last KEY= line> | '', KB_CFG_NAN=1 if non-numeric
+  KB_CFG_KNOB=""
+  KB_CFG_NAN=0
+  [ -n "${CFG:-}" ] && [ -f "$CFG" ] && [ -r "$CFG" ] || return 0
+  _kbl=$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$CFG" 2>/dev/null | tail -n 1 2>/dev/null | tr -d '\r' || true)
+  [ -n "$_kbl" ] || return 0
+  _kbv=${_kbl#*"$1="}
+  _kbv=$(printf '%s' "$_kbv" | sed -e 's/[[:space:]][[:space:]]*#.*$//' -e 's/[[:space:]]*$//' 2>/dev/null || true)
+  case "$_kbv" in
+    \"*\") _kbv=${_kbv#\"} && _kbv=${_kbv%\"} ;;
+    \'*\') _kbv=${_kbv#\'} && _kbv=${_kbv%\'} ;;
+  esac
+  case "$_kbv" in
+    '') ;;
+    *[!0-9]*) KB_CFG_NAN=1 ;;
+    *) KB_CFG_KNOB=$_kbv ;;
+  esac
+}
+SWEEP_SRC_I=""
+if [ -z "${KB_SWEEP_INTERVAL:-}" ]; then
+  kb_cfg_knob KB_SWEEP_INTERVAL
+  if [ "$KB_CFG_NAN" = 1 ]; then
+    echo "warning:  KB_SWEEP_INTERVAL in kb-flush.env is not a whole number -- treated as OFF (0 is the off switch; seconds set the cadence)" >&2
+    SWEEP_INTERVAL="<non-numeric>"
+    SWEEP_SRC_I=" in kb-flush.env"
+  elif [ -n "$KB_CFG_KNOB" ]; then
+    SWEEP_INTERVAL=$KB_CFG_KNOB
+    SWEEP_SRC_I=" in kb-flush.env"
+  fi
+fi
+# Exported, a word is OFF too (the hooks see the same value); never echoed.
+case "$SWEEP_INTERVAL" in *[!0-9]*) SWEEP_INTERVAL="<non-numeric>" ;; esac
+SWEEP_TIMER="${KB_SWEEP_TIMER:-1}"
+SWEEP_SRC_T=""
+if [ -z "${KB_SWEEP_TIMER:-}" ]; then
+  kb_cfg_knob KB_SWEEP_TIMER
+  if [ "$KB_CFG_NAN" = 1 ]; then
+    echo "warning:  KB_SWEEP_TIMER in kb-flush.env is not a whole number -- treated as OFF (only 1 turns the timer on)" >&2
+    SWEEP_TIMER="<non-numeric>"
+    SWEEP_SRC_T=" in kb-flush.env"
+  elif [ -n "$KB_CFG_KNOB" ]; then
+    SWEEP_TIMER=$KB_CFG_KNOB
+    SWEEP_SRC_T=" in kb-flush.env"
+  fi
+fi
 SWEEP_UNITD="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 SWEEP_STATE=""
+SWEEP_OFF=0
+# KB_SWEEP_INTERVAL=0 (or a non-numeric value) turns the PIGGYBACK off too
+# (the hooks read the same knob), so no line may then claim "the piggyback
+# still runs the sweep" -- the Windows and KB_SWEEP_TIMER reasons name the
+# interval instead (rm1 prints the KB_SWEEP_TIMER=0 line during its rollout
+# with KB_SWEEP_INTERVAL=0 in the file). 1-59 is NOT off: the timer is not
+# scheduled (60 s is its floor) and is disabled if running, but the hooks'
+# piggyback still fires a sweep every N s -- the line says exactly that.
+SWEEP_OFFTXT=""
+SWEEP_LOWTXT=""
+if [ "$SWEEP_INTERVAL" = "<non-numeric>" ] || [ "$SWEEP_INTERVAL" -eq 0 ] 2>/dev/null; then
+  SWEEP_OFFTXT="KB_SWEEP_INTERVAL=$SWEEP_INTERVAL${SWEEP_SRC_I}; the sweep is off -- 0 disables it, the floor is 60s"
+elif [ "$SWEEP_INTERVAL" -lt 60 ] 2>/dev/null; then
+  SWEEP_LOWTXT="KB_SWEEP_INTERVAL=$SWEEP_INTERVAL${SWEEP_SRC_I} is under the timer's 60s floor; the hooks' piggyback trigger still runs the sweep every ${SWEEP_INTERVAL}s"
+fi
 if kb_is_windows; then
-  SWEEP_NOTE="not scheduled (Windows: the hooks' piggyback trigger runs the sweep; see SHARING.md for the optional schtasks line)"
-elif [ "${KB_SWEEP_TIMER:-1}" != "1" ]; then
-  SWEEP_NOTE="not scheduled (KB_SWEEP_TIMER=${KB_SWEEP_TIMER}; the hooks' piggyback trigger still runs the sweep)"
-elif [ "$SWEEP_INTERVAL" -lt 60 ]; then
-  SWEEP_NOTE="not scheduled (KB_SWEEP_INTERVAL=$SWEEP_INTERVAL; the sweep is off -- 0 disables it, the floor is 60s)"
+  if [ -n "$SWEEP_OFFTXT" ]; then
+    SWEEP_NOTE="not scheduled (Windows; $SWEEP_OFFTXT)"
+  else
+    SWEEP_NOTE="not scheduled (Windows: the hooks' piggyback trigger runs the sweep; see SHARING.md for the optional schtasks line)"
+  fi
+elif [ "$SWEEP_TIMER" != "1" ]; then
+  SWEEP_OFF=1
+  if [ -n "$SWEEP_OFFTXT$SWEEP_LOWTXT" ]; then
+    SWEEP_NOTE="not scheduled (KB_SWEEP_TIMER=${SWEEP_TIMER}${SWEEP_SRC_T}; $SWEEP_OFFTXT$SWEEP_LOWTXT)"
+  else
+    SWEEP_NOTE="not scheduled (KB_SWEEP_TIMER=${SWEEP_TIMER}${SWEEP_SRC_T}; the hooks' piggyback trigger still runs the sweep)"
+  fi
+elif [ -n "$SWEEP_OFFTXT$SWEEP_LOWTXT" ]; then
+  SWEEP_OFF=1
+  SWEEP_NOTE="not scheduled ($SWEEP_OFFTXT$SWEEP_LOWTXT)"
 elif ! command -v systemctl >/dev/null 2>&1; then
   SWEEP_NOTE="not scheduled (no systemctl on this box; the hooks' piggyback trigger runs the sweep)"
 else
@@ -928,8 +1015,19 @@ else
       _swrender=1
       # KillMode=process: a drain still holding its session lock at unit exit
       # is not killed mid-chunk. Persistent=true: a missed window fires at the
-      # next boot (proposal_v2 C9). PATH carries ~/.local/bin so an owner-box
-      # `uv` mint resolves; a fleet box simply falls to NEEDS TOKEN as today.
+      # next boot (proposal_v2 C9). OnStartupSec=10min anchors the timer to the
+      # USER MANAGER's own start: on a Linger=no box the manager stops at
+      # logout and restarts at the next login, where OnBootSec is long past and
+      # OnUnitActiveSec has no base, so the timer sat 'elapsed' with NEXT n/a
+      # (rm1, 2026-09-29 -> 10-11, KB 49064). OnActiveSec=10min anchors it to
+      # the TIMER's own activation, which systemd re-bases on every start and
+      # restart -- the only anchor a long-running manager still honours: with
+      # Persistent=true the timer loads its last trigger from the stamp file, so
+      # a past OnBootSec / OnStartupSec counts as a spent one-shot, and
+      # OnUnitActiveSec has no base until kb-flush-sweep.service itself has run
+      # in this manager (the piggyback runs the script, never the service).
+      # PATH carries ~/.local/bin so an owner-box `uv` mint resolves; a fleet
+      # box simply falls to NEEDS TOKEN.
       { cat >"$_swdir/kb-flush-sweep.service" <<EOF
 [Unit]
 Description=KB session-flush sweep (kb-flush-backfill.sh --auto)
@@ -950,6 +1048,8 @@ Description=KB session-flush sweep every ${SWEEP_INTERVAL}s
 
 [Timer]
 OnBootSec=10min
+OnStartupSec=10min
+OnActiveSec=10min
 OnUnitActiveSec=${SWEEP_INTERVAL}s
 RandomizedDelaySec=120
 AccuracySec=1min
@@ -975,6 +1075,17 @@ EOF
       _swen=0
       systemctl --user enable --now kb-flush-sweep.timer >/dev/null 2>&1 || _swen=$?
       if [ "$_swen" = 0 ]; then
+        # A CHANGED unit pair gets a restart: `enable --now` is a no-op on a
+        # timer that is already active (an 'elapsed' one stays elapsed), and a
+        # unit edit takes effect only when the timer is started again. The
+        # restart re-bases OnActiveSec, so the timer next fires ~10 min after
+        # this install (plus RandomizedDelaySec) even on a manager that has
+        # been up for weeks -- what an update adding OnActiveSec relies on. A
+        # first `enable --now` starts it, which re-bases it the same way. The
+        # change test is the byte compare above: any new line is a change.
+        if [ "$_swchanged" = 1 ]; then
+          systemctl --user restart kb-flush-sweep.timer >/dev/null 2>&1 || true
+        fi
         SWEEP_NOTE="scheduled (kb-flush-sweep.timer every ${SWEEP_INTERVAL}s, user manager $SWEEP_STATE$([ "$_swchanged" = 1 ] && printf '; unit files rendered' || printf '; unit files unchanged'))"
       else
         SWEEP_NOTE="not scheduled (systemctl --user enable --now kb-flush-sweep.timer failed rc=$_swen; unit files rendered in $SWEEP_UNITD -- re-run that command by hand; the hooks' piggyback trigger runs the sweep meanwhile)"
@@ -993,7 +1104,40 @@ EOF
     fi
   fi
 fi
+# A switch that says OFF must leave the timer off, not merely un-enabled: an
+# earlier install (or a hand `enable`) left it running while this line said
+# `not scheduled`, and an update is exactly when a contained box gets here.
+# Only the off switches (KB_SWEEP_TIMER != 1, KB_SWEEP_INTERVAL 0 or non-numeric,
+# from the environment or kb-flush.env) and an interval under the timer's 60 s
+# floor reach this; a timer that is neither enabled nor
+# active is not touched, so a box that never had one sees no systemctl change.
+# With NO answer (no user bus, or no systemctl) nothing can be disabled here;
+# if the timer's enablement link is still on disk, one `hint:` line says so
+# rather than letting `not scheduled` read as "the timer is off".
+_swie=""
+_swia=""
+SWEEP_HINT=""
+if [ "$SWEEP_OFF" = 1 ] && command -v systemctl >/dev/null 2>&1; then
+  _swie=$(systemctl --user is-enabled kb-flush-sweep.timer 2>/dev/null | head -n1 | tr -cd 'a-z-' || true)
+  _swia=$(systemctl --user is-active kb-flush-sweep.timer 2>/dev/null | head -n1 | tr -cd 'a-z-' || true)
+  case "$_swie:$_swia" in
+    enabled*:* | *:active | *:activating | *:reloading)
+      _swdis=0
+      systemctl --user disable --now kb-flush-sweep.timer >/dev/null 2>&1 || _swdis=$?
+      if [ "$_swdis" = 0 ]; then
+        SWEEP_NOTE="${SWEEP_NOTE%)}; kb-flush-sweep.timer was ${_swie:-?}/${_swia:-?} -- disabled now)"
+      else
+        SWEEP_NOTE="${SWEEP_NOTE%)}; systemctl --user disable --now kb-flush-sweep.timer failed rc=$_swdis -- run it by hand)"
+      fi
+      ;;
+  esac
+fi
+if [ "$SWEEP_OFF" = 1 ] && [ -z "$_swie" ] && [ -z "$_swia" ] &&
+  { [ -e "$SWEEP_UNITD/timers.target.wants/kb-flush-sweep.timer" ] || [ -L "$SWEEP_UNITD/timers.target.wants/kb-flush-sweep.timer" ]; }; then
+  SWEEP_HINT="hint:     kb-flush-sweep.timer is still enabled ($SWEEP_UNITD/timers.target.wants) and systemctl --user did not answer -- run 'systemctl --user disable --now kb-flush-sweep.timer' from a login session"
+fi
 echo "sweep:    $SWEEP_NOTE"
+[ -z "$SWEEP_HINT" ] || echo "$SWEEP_HINT"
 
 # Discover the notification channel from the KB host. The owner should never
 # have to paste a token into a chat: a credential typed into a session is

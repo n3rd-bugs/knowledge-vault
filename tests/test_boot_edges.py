@@ -131,7 +131,7 @@ def test_the_guard_is_started_only_by_the_boot_timer():
 
 
 def test_the_guard_does_not_disturb_the_nightly_path():
-    """The nightly at 01:00 starts kb-consolidate.service directly; the guard is
+    """The nightly at 01:30 starts kb-consolidate.service directly; the guard is
     reachable only from the boot timer, so it can add no extra backup there."""
     assert _values("kb-consolidate.timer", "Timer", "Unit") == ["kb-consolidate.service"]
 
@@ -321,8 +321,11 @@ def test_the_new_units_install_by_glob():
 
 @pytest.mark.parametrize("name", [BOOT_TIMER, "kb-backup.timer"])
 def test_no_boot_or_backup_timer_still_names_the_old_0300_window(name):
-    """The timers moved to 00:30/01:00 on 2026-08-01. A comment naming 03:00/03:30
-    is how the next reader gets misled (the notifier has the same guard)."""
+    """The timers moved to 00:30/01:00 on 2026-08-01 and the nightly to 01:30 on
+    2026-10-11. A comment naming 03:00/03:30/01:00 is how the next reader gets
+    misled (the notifier has the same guard). Neither file narrates dated history,
+    so a bare dead time in either can only be a stale present-tense claim."""
     text = (UNIT_DIR / name).read_text()
     assert "03:30" not in text, f"{name} still names the dead 03:30 nightly"
     assert "03:00" not in text, f"{name} still names the dead 03:00 backup"
+    assert "01:00" not in text, f"{name} still names the dead 01:00 nightly"

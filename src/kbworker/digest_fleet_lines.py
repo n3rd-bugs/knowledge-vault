@@ -11,7 +11,9 @@ a relocation fails loudly at import time instead of silently deleting an alert.
 
 ALERT tier (:func:`fleet_alert_lines`, rendered where the old stale-hook line
 stood): ONE merged ``STALE HOOKS`` line, ``FLEET SILENT``, ``RESEND GUARD``
-above ``KB_RESEND_ALERT_PER_NIGHT``, ``QUEUE DEPTH`` at 80% of the cap.
+above ``KB_RESEND_ALERT_PER_NIGHT``, ``RESEND ALERT`` per session over the
+overlap threshold (:mod:`kbworker.digest_resend_alert`), ``QUEUE DEPTH`` at 80%
+of the cap.
 FACT tier (:func:`fleet_fact_lines`): the ``fleet:`` age line FIRST, then the
 resend fact (when it is not already an alert), open tails, sweep recovery.
 
@@ -28,6 +30,7 @@ from typing import Any
 from kbcore.fleet_health import stale_hook_projects
 from kbcore.fleet_rows import host_of
 from kbcore.ingest_queue import MAX_PENDING
+from kbworker.digest_resend_alert import resend_alert_lines
 
 FLEET_LINE_BOXES = 4  # boxes/hosts named on the fleet and silent lines before "+N"
 STALE_COLLAPSE_OVER = 2  # more DISTINCT principals of one host than this collapse to "host (N ...)"
@@ -57,16 +60,18 @@ def _by_box(counts: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
 
 def fleet_alert_lines(counts: Mapping[str, Any]) -> list[str]:
     """The fleet lines that must survive a truncated phone preview."""
-    lines: list[str] = []
-    for line in (
-        stale_hooks_line(counts),
-        fleet_silent_line(counts.get("fleet_silent")),
-        resend_guard_alert(counts.get("resend_summary")),
-        queue_depth_line(counts.get("ingest_queue_pending")),
-    ):
-        if line:
-            lines.append(line)
-    return lines
+    summary = counts.get("resend_summary")
+    return [
+        ln
+        for ln in (
+            stale_hooks_line(counts),
+            fleet_silent_line(counts.get("fleet_silent")),
+            resend_guard_alert(summary),
+            *resend_alert_lines(summary),
+            queue_depth_line(counts.get("ingest_queue_pending")),
+        )
+        if ln
+    ]
 
 
 def stale_hooks_line(counts: Mapping[str, Any]) -> str | None:

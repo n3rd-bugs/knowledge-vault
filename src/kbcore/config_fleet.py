@@ -37,6 +37,14 @@ class FleetSettings(BaseSettings):
     # Digest alert threshold: refused resend rows per night above which the digest shouts
     # (a box on the old hook resending from byte 0 costs wire, never rows — but say so).
     kb_resend_alert_per_night: int = 50
+    # RESEND ALERT (wave C.2, KB 49064): one session whose stamped rows in the digest
+    # window re-sent at least this many MB of bytes the same principal had ALREADY
+    # covered (sum of meta.overlap.bytes), or at least this many such rows — either
+    # trips. A value <= 0 DISABLES that criterion alone; both <= 0 disables the alert
+    # (kbcore.fleet_overlap skips its query; the quiet 'overlap rows N' fact stays).
+    # Telemetry only (proposal_v2 amendment 3): nothing refuses on it.
+    kb_resend_alert_mb: float = 10.0
+    kb_resend_alert_rows: int = 20
     # Median MB the nightly extracts per night (measured 2026-09: 6-86, median ~28); the
     # repair prints "GPU-nights reclaimed" with it. Reporting only.
     kb_repair_mb_per_gpu_night: int = 28

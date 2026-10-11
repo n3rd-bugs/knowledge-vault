@@ -21,7 +21,10 @@ flips. Rows listed in a ``--rows-file`` that neither path can touch are reported
 The flip is ``status='duplicate'`` + ``error`` + ``meta.repair = {at, by, reason,
 prev_status, prev_error}`` — NEVER ``processed_at`` (the reaper's progress signal
 and the per-day attempt boundary read it). ``'extracted'`` rows are never flipped.
-The reverse lives in :mod:`kbcore.resend_repair_undo`.
+A row carrying a tier-3 REPLAY marker (``meta.repair.mode = 'replay'``, e.g. one
+requeued after the replay ran) is never flipped either — the flip would overwrite
+the marker the replay's ``--undo`` is keyed on; it is counted ``keep: other
+marker``. The reverse lives in :mod:`kbcore.resend_repair_undo`.
 """
 
 from __future__ import annotations
@@ -43,6 +46,8 @@ PARKED_LIKE = "parked %"
 IGNORED_MARKED = "not a marked pending duplicate"
 IGNORED_AS_RESEND = "not pending/parked"
 IGNORED_UNKNOWN = "unknown queue id"
+OTHER_MARKER = "other marker"  # a replay-marked row: never flipped (marker kept)
+_REPLAY_SQL = "(meta->'repair'->>'mode' IS NOT DISTINCT FROM 'replay')"
 
 
 def _group_totals(conn, keys: list[tuple[str, str]]) -> dict[tuple[str, str], tuple[int, list]]:
@@ -69,17 +74,20 @@ def _discover_marked(conn, sel: RepairSelector) -> tuple[list[GroupPlan], set[in
     rows = conn.execute(
         f"""
         SELECT project, btrim(meta->>'source_uri') AS uri,
-               count(*) FILTER (WHERE status = 'pending'),
+               count(*) FILTER (WHERE flippable),
                count(*) FILTER (WHERE status = 'extracted'),
                coalesce(sum(octet_length(content)), 0),
-               coalesce(sum(octet_length(content)) FILTER (WHERE status = 'pending'), 0),
+               coalesce(sum(octet_length(content)) FILTER (WHERE flippable), 0),
                coalesce(sum(octet_length(content)) FILTER (WHERE status = 'extracted'), 0),
-               array_agg(id ORDER BY id) FILTER (WHERE status = 'pending'),
-               array_agg(duplicate_of ORDER BY id) FILTER (WHERE status = 'pending'),
+               array_agg(id ORDER BY id) FILTER (WHERE flippable),
+               array_agg(duplicate_of ORDER BY id) FILTER (WHERE flippable),
                array_agg(DISTINCT duplicate_of),
-               array_agg(id) FILTER (WHERE status = 'extracted')
-          FROM ingest_queue
-         WHERE {SESSION_ROWS_SQL} AND duplicate_of IS NOT NULL AND ({where})
+               array_agg(id) FILTER (WHERE status = 'extracted'),
+               array_agg(id) FILTER (WHERE status = 'pending' AND replay)
+          FROM (SELECT *, {_REPLAY_SQL} AS replay,
+                       status = 'pending' AND NOT {_REPLAY_SQL} AS flippable
+                  FROM ingest_queue
+                 WHERE {SESSION_ROWS_SQL} AND duplicate_of IS NOT NULL AND ({where})) q
          GROUP BY 1, 2
          ORDER BY 2, 1
         """,  # noqa: S608 — constant fragments + parameterised selector
@@ -87,24 +95,25 @@ def _discover_marked(conn, sel: RepairSelector) -> tuple[list[GroupPlan], set[in
     ).fetchall()
     plans: list[GroupPlan] = []
     seen: set[int] = set()
-    for project, uri, pend, extr, nbytes, fbytes, ebytes, pend_ids, pend_canon, cids, eids in rows:
-        flip = dict(zip(pend_ids or [], pend_canon or [], strict=True))
-        seen |= set(flip) | {int(i) for i in (eids or [])}
-        plans.append(
-            GroupPlan(
-                project=project,
-                uri=uri,
-                rows=0,
-                dup=0,
-                pend=int(pend),
-                extr=int(extr),
-                dup_bytes=int(nbytes),
-                flip_bytes=int(fbytes),
-                extr_bytes=int(ebytes),
-                flip=flip,
-                canon_ids=sorted(int(c) for c in cids),
-            )
+    for project, uri, pend, extr, nbytes, fbytes, ebytes, pids, pcanon, cids, eids, rids in rows:
+        flip = dict(zip(pids or [], pcanon or [], strict=True))
+        seen |= set(flip) | {int(i) for i in (eids or [])} | {int(i) for i in (rids or [])}
+        p = GroupPlan(
+            project=project,
+            uri=uri,
+            rows=0,
+            dup=0,
+            pend=int(pend),
+            extr=int(extr),
+            dup_bytes=int(nbytes),
+            flip_bytes=int(fbytes),
+            extr_bytes=int(ebytes),
+            flip=flip,
+            canon_ids=sorted(int(c) for c in cids),
         )
+        if rids:
+            p.keep[OTHER_MARKER] = len(rids)
+        plans.append(p)
     return plans, seen
 
 
@@ -113,7 +122,7 @@ def _discover_as_resend(conn, sel: RepairSelector) -> tuple[list[GroupPlan], set
     rows = conn.execute(
         f"""
         SELECT q.id, q.project, btrim(q.meta->>'source_uri') AS uri, q.status,
-               octet_length(q.content),
+               octet_length(q.content), {_REPLAY_SQL.replace("meta", "q.meta")},
                coalesce(q.duplicate_of,
                 (SELECT c.id FROM ingest_queue c
                   WHERE c.kind = 'session' AND c.content_hash = q.content_hash
@@ -131,11 +140,14 @@ def _discover_as_resend(conn, sel: RepairSelector) -> tuple[list[GroupPlan], set
     ).fetchall()
     plans: dict[tuple[str, str], GroupPlan] = {}
     seen: set[int] = set()
-    for rid, project, uri, status, nbytes, canon in rows:
+    for rid, project, uri, status, nbytes, replay, canon in rows:
         seen.add(int(rid))
         p = plans.setdefault(
             (project, uri), GroupPlan(project=project, uri=uri, rows=0, dup=0, pend=0, extr=0)
         )
+        if replay:
+            p.keep[OTHER_MARKER] = p.keep.get(OTHER_MARKER, 0) + 1
+            continue
         if canon is None or canon == rid:
             p.unpaired += 1
             continue
@@ -246,6 +258,7 @@ def flip(p: GroupPlan, *, reason: str, as_resend: bool) -> int:
                            'prev_status', q.status, 'prev_error', q.error))
               FROM unnest(%(ids)s::bigint[], %(canons)s::bigint[]) AS v(id, canon)
              WHERE q.id = v.id AND q.id <> v.canon AND {status_ok}
+               AND q.meta->'repair'->>'mode' IS DISTINCT FROM 'replay'
             """,  # noqa: S608 — status_ok is one of two constant fragments
             {
                 "ids": list(p.flip),

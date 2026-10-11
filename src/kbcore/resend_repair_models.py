@@ -1,10 +1,11 @@
 """kbcore.resend_repair_models — the I/O shapes of ``kb repair resend-dups``.
 
 Split from :mod:`kbcore.resend_repair` (ratchet). Pydantic models only — the
-selector the CLI builds from its flags, the per-group dry-run line, and the two
-plans (backfill, undo). They import nothing from the repair modules, so every one
-of those can import them at the top without a cycle; ``kbcore.resend_repair``
-re-exports them, which is the name callers and tests use.
+selector the CLI builds from its flags, the per-group dry-run line, the two
+plans (backfill, undo) and the tier-3 replay plan. They import nothing from the
+repair modules, so every one of those can import them at the top without a
+cycle; ``kbcore.resend_repair`` re-exports them, which is the name callers and
+tests use.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ class RepairSelector(BaseModel):
     rows_only: bool = False  # stop after step 1
     attribute_quotes: bool = False  # tier 2 on mixed groups
     limit: int | None = None  # groups (bounds the planning work, not just the output)
+    replayed: bool = False  # tier 3 (KB 49064): --session + --since only, see resend_repair_replay
 
     @field_validator("since")
     @classmethod
@@ -117,3 +119,83 @@ class UndoPlan(BaseModel):
     rows_restored: int = 0
     items_restored: int = 0
     reviews_reopened: int = 0
+    # Replay undo only (None elsewhere): when the (uri, since) key matched nothing,
+    # the --since values the uri's replay markers DO carry (rows and items).
+    stored_since: list[str] | None = None
+
+
+class ReplayProject(BaseModel):
+    """One project's line of the tier-3 replay dry run (items of the session under it)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candidates: int = 0
+    archive_ids: list[int] = []
+    keep_recalled: int = 0  # access_log hit (automated brief/turn-start recall included)
+    keep_successor: int = 0  # another item's superseded_by (or a folded duplicate) points here
+    keep_reprocess: int = 0  # meta.reprocessed_from: an owner `kb reprocess` minted it
+    keep_no_quote: int = 0
+    keep_new_content: int = 0  # quote (raw or scrubbed form) found in a NEW row's text
+    archived: int = 0  # after apply
+
+
+class ReplayPlan(BaseModel):
+    """The tier-3 replay plan for ONE session uri (``kbcore.resend_repair_replay``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uri: str
+    since: datetime  # the instant the re-send began (owner-supplied)
+    covered_end: int  # C: max(offset + bytes) over stamped rows created before ``since``
+    pre_rows: int = 0
+    pre_status: dict[str, int] = {}  # the gate: every pre-since row extracted | duplicate
+    pre_stamped: int = 0
+    pre_unstamped_rows: int = 0  # the seed-era prefix (no meta.flush)
+    pre_unstamped_bytes: int = 0
+    first_stamped_offset: int = 0
+    prefix_short: bool = False  # CHECK: the unstamped prefix cannot hold [0, first stamp)
+    gaps: int = 0  # holes in [0, C) the stamped ranges leave
+    gap_bytes: int = 0
+    r_ids: list[int] = []  # R: re-sent rows fully inside [0, C), touching no gap
+    r_bytes: int = 0
+    r_status: dict[str, int] = {}
+    r_in_gap: int = 0  # re-sent rows touching a stamp gap -> moved to NEW (gap -> NEW)
+    r_undrained: int = 0  # R rows still pending or retryable failed: --apply refused
+    w0: datetime | None = None  # min(created_at) over R — no item of R is older
+    first_done: datetime | None = None  # min(processed_at) over R
+    w1: datetime | None = None  # max(processed_at) over R — no item of R is newer
+    new_ids: list[int] = []  # NEW: rows outside R whose extraction ran at/after W0
+    new_bytes: int = 0
+    mark_ids: list[int] = []  # R rows that will gain the replay marker
+    marked_before: int = 0  # R rows already carrying a replay marker
+    other_marker: int = 0  # R rows carrying another repair's marker (left alone)
+    projects: dict[str, ReplayProject] = {}
+    rows_marked: int = 0  # after apply
+
+    @property
+    def sid8(self) -> str:
+        return self.uri.removeprefix("session:")[:8]
+
+    @property
+    def archive_count(self) -> int:
+        return sum(len(p.archive_ids) for p in self.projects.values())
+
+    @property
+    def eligible(self) -> bool:
+        return bool(self.archive_count or self.mark_ids)
+
+    @property
+    def apply_refusals(self) -> list[str]:
+        """Why ``--apply`` must refuse this plan (empty: it may run). The dry run
+        still prints the whole plan; only the write is withheld."""
+        out: list[str] = []
+        if self.r_undrained:
+            out.append(
+                f"{self.r_undrained} R row(s) still pending or retryable -- re-run after the drain"
+            )
+        if self.prefix_short:
+            out.append(
+                "CHECK unstamped prefix: bytes below the first stamp may never have been "
+                "sent, so a re-send there is not provably a duplicate"
+            )
+        return out

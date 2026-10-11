@@ -24,7 +24,7 @@
 #     (2026-08-29 10:45 -> 2026-08-30 00:45) showed this script logging a bogus
 #     "resuming" every ten minutes against a running consolidation;
 #   * kb-consolidate.service is FAILED — its OnFailure has already paged; kicking a
-#     failing run every 5 minutes is not a resume. The 01:00 nightly owns the retry
+#     failing run every 5 minutes is not a resume. The nightly owns the retry
 #     (pre-trigger behaviour);
 #   * kb-backup.service / kb-backup-local.service is active/activating — the Sep 1 boot
 #     showed ticks at boot+0:38 and boot+5:36 landing inside the boot-path backup while

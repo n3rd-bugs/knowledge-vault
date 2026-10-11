@@ -1,13 +1,27 @@
-# kb-consolidate.timer — fire the nightly consolidation at 01:00 (PLAN.md §9)
+# kb-consolidate.timer — fire the nightly consolidation at 01:30 (PLAN.md §9)
 [Unit]
-Description=Nightly Knowledge Vault consolidation at 01:00
+Description=Nightly Knowledge Vault consolidation at 01:30
 
 [Timer]
 # 01:00 (owner decision 2026-08-01, was 03:30): the drain stops starting new
 # work at the NOON deadline, so every hour earlier is an hour more of window —
 # 11h instead of 8.5h. At 150W with cohort 30 that margin is what clears a
 # backlog night (recovery/backfill) instead of deferring half of it.
-OnCalendar=*-*-* 01:00
+# 01:30 (owner decision 2026-10-11, review #9's pre-registered rule): the 01:00
+# start began ON BATTERY on 7 of 8 nights 10-04..10-11 (a recurring outage that
+# usually ends ~01:25), buying a ~7-min battery fragment, a battery eval replay
+# and an extra dump + offsite push per night. Window is now 01:30->12:00 = 10.5h.
+#
+# CHANGING OnCalendar ON AN INSTALLED BOX (2026-10-11): the next elapse is
+# computed from last_trigger, which systemd loads from the Persistent stamp
+# (~/.local/share/systemd/timers/stamp-kb-consolidate.timer) and which survives
+# daemon-reload. Moving the time LATER after today's new time has passed (last
+# run 01:00:12, new time 01:30) therefore starts a full nightly IMMEDIATELY. Safe
+# order: stop the timer -> install the unit -> touch the stamp -> daemon-reload
+# -> start the timer (then check NEXT in list-timers is tomorrow's run).
+# scripts/install_systemd.sh applies this sequence itself to any installed timer
+# whose OnCalendar= lines changed.
+OnCalendar=*-*-* 01:30
 Persistent=true
 Unit=kb-consolidate.service
 

@@ -47,8 +47,17 @@ for a in "$@"; do
 done
 
 # The environment beats the config file, so one run can be pointed elsewhere.
+# The sweep switches too: install.sh reads KB_SWEEP_INTERVAL / KB_SWEEP_TIMER
+# from its environment FIRST and only then greps kb-flush.env, so a file line
+# sourced here must not reach it as if it were the caller's -- a file
+# `KB_SWEEP_INTERVAL=0` would otherwise overwrite an exported 1800 (the caller's
+# variable is exported, so the assignment is too), and a file `export ...=0`
+# would arrive unlabelled. Both are unset after the source and only the
+# caller's own values re-exported; install.sh reads the file itself.
 _ENV_URL="${KB_REST_URL:-}"
 _ENV_TOKEN="${KB_TOKEN:-}"
+_ENV_SWI="${KB_SWEEP_INTERVAL:-}"
+_ENV_SWT="${KB_SWEEP_TIMER:-}"
 CFG="$HOME/.claude/kb-flush.env"
 if [ -f "$CFG" ]; then
   # shellcheck disable=SC1090
@@ -56,6 +65,9 @@ if [ -f "$CFG" ]; then
 fi
 [ -n "$_ENV_URL" ] && KB_REST_URL="$_ENV_URL"
 [ -n "$_ENV_TOKEN" ] && KB_TOKEN="$_ENV_TOKEN"
+unset KB_SWEEP_INTERVAL KB_SWEEP_TIMER
+[ -z "$_ENV_SWI" ] || export KB_SWEEP_INTERVAL="$_ENV_SWI"
+[ -z "$_ENV_SWT" ] || export KB_SWEEP_TIMER="$_ENV_SWT"
 KB_REST_URL="${KB_REST_URL:-}"
 KB_TOKEN="${KB_TOKEN:-}"
 

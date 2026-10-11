@@ -5,13 +5,14 @@
 # alert says which one died.
 #
 # WHY THIS EXISTS: the unattended work — the backup at 00:30, the consolidation at
-# 01:00, the OnBootSec catch-up, the monthly edge refresh — runs on a box with an
+# 01:30, the OnBootSec catch-up, the monthly edge refresh — runs on a box with an
 # unreliable grid, at hours when nobody is awake to watch a unit go red. A failure
 # used to be silent: no backup existed for 29 or 30 July and nobody knew until
 # someone went looking. Silence is the bug; this is the fix.
 #
-# The times above are the LIVE ones (they moved on 2026-08-01; this comment named
-# the old window until 2026-08-02). The schedule itself lives in the .timer files
+# The times above are the LIVE ones (they moved on 2026-08-01, and the
+# consolidation again on 2026-10-11; this comment named the old window until
+# 2026-08-02). The schedule itself lives in the .timer files
 # and nowhere else — tests/test_ops_health.py fails this file if it names an hour
 # no timer actually uses.
 #

@@ -25,6 +25,7 @@ from kbcore.ingest import ingest
 from kbcore.queue_guard import chunk_key
 from kbcore.queue_repair import requeue_failed
 from kbcore.resend_repair import RepairSelector, session_rows_sql
+from kbcore.supersede import supersede
 from tests.test_resend_repair import (
     CHUNK1,
     SID,
@@ -311,6 +312,31 @@ def test_archive_and_review_resolution_are_one_transaction(monkeypatch):
         resend_repair_items.archive_group(p)
     assert not _review_resolved(rq), "the review flip rolled back with the item flip"
     assert _item_state(iid)[0] == "active"
+
+
+def test_tier1_archive_keeps_a_successor_made_after_the_plan(caplog):
+    """Review 2 (replay hardening 1): tiers 1/2 never plan the successor keep, so the
+    shared archive write enforces it. An item that becomes a supersession target
+    (or a folded duplicate's twin) between the dry run and the apply is NOT archived,
+    its review row stays open, and the skip is counted and logged."""
+    _seed_extracted_canonical()
+    iid, rq = _item("docker-mount", "mount decision", "read-only.")
+    plain, rq_plain = _item("docker-mount", "mount path", "the bind path")
+    older, _ = _item("docker-mount", "mount decision (old)", "ro", uri="session:other-1")
+    resend_repair.backfill_keys(dry_run=False)
+    sel = RepairSelector(session=SID[:8])
+    (p,) = resend_repair.plan(sel)
+    assert sorted(p.archive_ids) == sorted([iid, plain])
+    supersede(older, new_item_id=iid, reason="evidence auto-resolve")  # after the plan
+    with caplog.at_level("WARNING", logger="kbcore.resend_repair"):
+        (done,) = resend_repair.apply([p], sel)
+    assert done.archived == 1, "only the plain item; the successor is kept at write time"
+    assert _item_state(iid)[0] == "active" and not _review_resolved(rq)
+    assert "repair" not in _item_state(iid)[1], "no marker on a kept item"
+    assert _item_state(plain)[0] == "archived" and _review_resolved(rq_plain)
+    assert "kept 1 of 2 planned item(s) at write time -- a successor" in caplog.text
+    res = resend_repair_items.archive_items([iid], reason="x", archived={})
+    assert res == resend_repair_items.ArchiveResult(archived=0, kept_successor=1)
 
 
 # --- hygiene: the aliased session-rows fragment compiles and excludes degenerate uris --

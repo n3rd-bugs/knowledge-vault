@@ -605,7 +605,11 @@ else
   #     since -- the timer is not firing (a trigger NEWER than the last run means
   #     a sweep was asked for and has not finished: different fix, said so);
   #   N transcripts STALLED (the sweep gave up on them after repeated failures);
-  #   N unseeded transcripts awaiting the owner's --seed decision.
+  #   N unseeded transcripts awaiting the owner's --seed decision;
+  #   N diverged / N behind copies of a resumed session (KB 49064): the sweep's
+  #     diverged= / behind= or the hook's state/<okey>.diverged|.behind markers,
+  #     whichever counts more -- a diverged copy's new records were NOT sent, a
+  #     behind one is a frozen copy awaiting the owner's --seed decision.
   _sw_state="$HOME/.claude/hooks/state"
   _sw_last="$_sw_state/.sweep-last"
   _sw_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || true; }
@@ -694,6 +698,29 @@ else
       if [ "$_sw_trig" -le 0 ] || [ "$(( $(_kb_now) - _sw_trig ))" -gt 21600 ]; then _sw_exp=1; fi
     fi
     [ "$_sw_exp" = 1 ] && _sw_line="never ran -- the sweep timer is rendered but no sweep has completed (check: systemctl --user status kb-flush-sweep.timer; or run kb-flush-backfill.sh --auto by hand)"
+  fi
+  _sw_dv=""
+  _sw_bh=""
+  if [ -f "$_sw_last" ]; then
+    _sw_dv=$(sed -n 's/.* diverged=\([0-9]*\).*/\1/p' "$_sw_last" 2>/dev/null | head -1)
+    _sw_bh=$(sed -n 's/.* behind=\([0-9]*\).*/\1/p' "$_sw_last" 2>/dev/null | head -1)
+  fi
+  case "$_sw_dv" in '' | *[!0-9]*) _sw_dv=0 ;; esac
+  case "$_sw_bh" in '' | *[!0-9]*) _sw_bh=0 ;; esac
+  _sw_mdv=0
+  _sw_mbh=0
+  for _sw_m in "$_sw_state"/*.diverged; do [ -f "$_sw_m" ] && _sw_mdv=$((_sw_mdv + 1)); done
+  for _sw_m in "$_sw_state"/*.behind; do [ -f "$_sw_m" ] && _sw_mbh=$((_sw_mbh + 1)); done
+  [ "$_sw_mdv" -gt "$_sw_dv" ] && _sw_dv=$_sw_mdv
+  [ "$_sw_mbh" -gt "$_sw_bh" ] && _sw_bh=$_sw_mbh
+  if [ "$_sw_dv" -gt 0 ]; then
+    _sw_line="${_sw_line:+$_sw_line; }$_sw_dv diverged transcript copy(ies): records a resumed copy holds past the shared checkpoint were NOT sent -- see kb-flush-backfill.sh (the table) and state/<okey>.diverged"
+  fi
+  if [ "$_sw_bh" -gt 0 ]; then
+    # Never a generic `current` and never `frozen`: a copy resumed since it was
+    # marked holds unsent records past its frozen= size, and a seed at
+    # `current` would skip them -- the sweep's row names the exact seed.
+    _sw_line="${_sw_line:+$_sw_line; }$_sw_bh transcript copy(ies) behind the checkpoint with no copy reaching it need an owner decision: run kb-flush-backfill.sh and use the exact --seed its row names (a copy resumed since it was marked seeds at its frozen= size, never current)"
   fi
   if [ -n "$_sw_line" ]; then
     printf '[KB sweep] %s\n' "$_sw_line" | LC_ALL=C tr -cd '\040-\176\n'
@@ -895,6 +922,11 @@ if [ "$MODE" = "brief" ]; then
     # send N from 0 ...`, wave_c_brief C1): a pre-stamp transcript the hook will
     # not drain until the owner seeds it; it clears like any other failure once
     # that session (or, sid-less, that project) drains fully.
+    # `reason=stale-copy-diverged` / `reason=behind` (KB 49064) are the hook's
+    # refusals of a copy BEHIND its session's shared checkpoint: a diverged
+    # copy's new records were not sent, a behind one awaits the owner's --seed.
+    # (The live copy shares the sid, so its next ok line clears this warning;
+    # the markers keep the [KB sweep] line above saying it until resolved.)
     RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
       function proj(line,   f, n) {
         # <ts> flush|local|connector <proj> ...   or   <ts> backfill <sid8> <proj> ...
@@ -912,7 +944,7 @@ if [ "$MODE" = "brief" ]; then
         if (p != "") return "proj:" p
         return "*"
       }
-      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED|NEEDS TOKEN|unseeded:/ {
+      /FAILED|BUG:|NOT CONFIGURED|NOT CAPTURED|NEEDS TOKEN|unseeded:|reason=stale-copy-diverged|reason=behind/ {
         k = key($0); fail[k] = $0; failn[k] = NR; fp[k] = proj($0); next
       }
       / (ok|partial) bytes=/ {

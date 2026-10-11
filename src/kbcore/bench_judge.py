@@ -18,7 +18,7 @@ MECHANICAL READ-ONLY GUARANTEES (bench-gate rule, wave_h_guards):
 * the consolidation advisory lock is PROBED try-and-release and never held
   (:func:`assert_gpu_slot_free`): the key is schema-scoped inside
   ``db.advisory_lock`` (a literal ``pg_try_advisory_lock(42)`` never sees it), and
-  HOLDING it would make the 01:00 nightly skip the whole night.
+  HOLDING it would make the nightly skip the whole night.
 Archiving results is the CLI's job (``kb bench judge --archive``), behind an
 explicit flag, so this module stays pure. Rule 8: explicit user-invoked GPU use,
 and only on an idle slot — never beside the nightly or a resume run.
@@ -247,7 +247,7 @@ def write_results(result: dict[str, Any], out_dir: Path) -> Path:
 def assert_gpu_slot_free() -> None:
     """Refuse to start while a consolidation run (nightly or resume) holds the advisory
     lock — TRY-AND-RELEASE: the probe is dropped the instant it answers, never held for
-    the run (holding it would make the 01:00 nightly skip the night)."""
+    the run (holding it would make the nightly skip the night)."""
     from kbworker.consolidate import ADVISORY_KEY  # lazy: kbcore never imports kbworker at load
 
     with advisory_lock(ADVISORY_KEY) as acquired:

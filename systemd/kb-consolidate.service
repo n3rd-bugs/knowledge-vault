@@ -40,9 +40,9 @@ ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do docker exec kb-db pg_isready -
 ExecStartPre=/bin/sh -c 'mkdir -p %h/kb/cache/tiktoken && cp -n %h/kb/repo/vendor/tiktoken/* %h/kb/cache/tiktoken/ 2>/dev/null || true'
 ExecStart=%h/kb/repo/.venv/bin/python -m kbworker.consolidate
 # The post-run backup is a BONUS, not the backup strategy: kb-backup.timer owns
-# that at 03:00, before this starts. This one only means "a lot of rows just
-# changed, take a fresh dump" — and, unlike the timer, it cannot run at all if
-# the 4.5–7h pass is interrupted, which is why it stopped being the only one.
+# that at 00:30, before this starts at 01:30. This one only means "a lot of rows
+# just changed, take a fresh dump" — and, unlike the timer, it cannot run at all
+# if the 4.5–7h pass is interrupted, which is why it stopped being the only one.
 ExecStartPost=%h/kb/repo/scripts/backup.sh
 NoNewPrivileges=true
 

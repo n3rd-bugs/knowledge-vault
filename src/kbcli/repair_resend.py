@@ -4,7 +4,8 @@ Thin shell over :mod:`kbcore.resend_repair` (no SQL, Invariant 2), shaped on
 :func:`kbcli.repair_shared._flow`: dry-run table -> confirm -> apply -> undo trail.
 Owner-only; every write runs under the consolidation advisory lock so the nightly
 cannot interleave a ``mark_group_extracted`` with a flip. A selector is REQUIRED.
-Root cause KB 33783; design KB 33784.
+Root cause KB 33783; design KB 33784. ``--replayed`` (tier 3, KB 49064) is the
+byte-range repair of a same-session re-send (:mod:`kbcore.resend_repair_replay`).
 """
 
 from __future__ import annotations
@@ -116,14 +117,21 @@ def _backfill(apply: bool) -> None:
     typer.echo(f"keyed {done.keyed} canonical(s), marked {done.marked} later row(s).")
 
 
-def _undo(sel: RepairSelector, apply: bool) -> None:
-    plan = _guarded(lambda: resend_repair.undo(sel, dry_run=True))
+def _undo(sel: RepairSelector, apply: bool, fn=resend_repair.undo, rows: str = "") -> None:
+    plan = _guarded(lambda: fn(sel, dry_run=True))
     typer.echo(
-        f"undo: {len(plan.row_ids)} row(s) marked by resend-dups -> previous status; "
+        f"undo: {len(plan.row_ids)} row(s) marked by resend-dups -> "
+        f"{rows or 'previous status'}; "
         f"{len(plan.item_ids)} archived item(s) -> active (review rows re-opened)"
     )
     if not plan.row_ids and not plan.item_ids:
         typer.echo("nothing to undo for this selection.")
+        if plan.stored_since is not None:  # replay: the key is the APPLY's --since
+            stored = ", ".join(plan.stored_since) or "none"
+            typer.echo(
+                f"replay markers on this session carry --since: {stored} "
+                "(re-run --undo with the --since the apply ran with)"
+            )
         return
     if not apply:
         typer.echo("dry run — nothing written. Re-run with --apply to restore them.")
@@ -131,7 +139,7 @@ def _undo(sel: RepairSelector, apply: bool) -> None:
     typer.confirm(
         f"Restore {len(plan.row_ids)} row(s) and {len(plan.item_ids)} item(s)?", abort=True
     )
-    done = _locked_apply(lambda: resend_repair.undo(sel, dry_run=False))
+    done = _locked_apply(lambda: fn(sel, dry_run=False))
     typer.echo(
         f"restored {done.rows_restored} row(s), {done.items_restored} item(s); "
         f"re-opened {done.reviews_reopened} review row(s). duplicate_of/chunk_key kept (facts)."
@@ -145,7 +153,9 @@ def repair_resend_dups(
     since: str | None = typer.Option(
         None,
         "--since",
-        help="rows created at/after (ISO, UTC); under --undo: the apply's marker time",
+        help="rows created at/after (ISO, UTC); under --undo: the apply's marker time; "
+        "under --replayed: the first re-sent row's created_at, and under --replayed --undo "
+        "the SAME --since the replay apply ran with (its key, not a marker time)",
     ),
     all_: bool = typer.Option(False, "--all", help="every session duplicate group"),
     uri: str | None = typer.Option(None, "--uri", help="one exact session uri"),
@@ -167,6 +177,12 @@ def repair_resend_dups(
     limit: int | None = typer.Option(
         None, "--limit", help="plan (and apply) only the first N groups by session uri"
     ),
+    replayed: bool = typer.Option(
+        False,
+        "--replayed",
+        help="tier 3 (KB 49064): a same-session re-send by byte range; needs --session and "
+        "--since (the first re-sent row's created_at)",
+    ),
 ) -> None:
     """Retire cross-project session RESENDS: later duplicate rows still pending ->
     'duplicate'; their items archived only behind the canonical gate (every canonical
@@ -186,8 +202,14 @@ def repair_resend_dups(
         rows_only=rows_only,
         attribute_quotes=attribute_quotes,
         limit=limit,
+        replayed=replayed,
     )
     _guarded(lambda: resend_repair.require_selector(sel))
+    if replayed:
+        from kbcli.repair_resend_replay import run_replay
+
+        run_replay(sel, apply=apply, undo=undo, undo_flow=_undo)
+        return
     if undo:
         _undo(sel, apply)
         return

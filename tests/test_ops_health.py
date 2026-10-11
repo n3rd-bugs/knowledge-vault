@@ -447,8 +447,10 @@ def test_a_standdown_is_logged_rather_than_silent():
 
 
 def test_the_unit_does_not_still_claim_the_nightly_runs_at_0300():
-    """The timers moved to 00:30/01:00 on 2026-08-01. A comment that names a time
-    the system no longer uses is how the next reader gets misled."""
+    """The timers moved to 00:30/01:00 on 2026-08-01 (and the nightly to 01:30 on
+    2026-10-11). A comment that names a time the system no longer uses is how the
+    next reader gets misled. The live set is read from the timers' OnCalendar, so
+    each schedule move (01:00 included) is rejected here with no edit."""
     text = NOTIFIER_UNIT.read_text()
     schedules = set(re.findall(r"\b(\d{2}:\d{2})\b", text))
     live = {

@@ -404,9 +404,9 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # WEEKEND TOP-UP (owner request 2026-08-08), LAST of the working steps
         # and before the report/digest so the count reaches the owner. On a day
         # with no deadline the tail can finish at 19:45 and leave the card idle
-        # until 01:00; this keeps triaging in slices until the cutoff knob, an
+        # until 01:30; this keeps triaging in slices until the cutoff knob, an
         # empty queue, or the stand-down guard. Slices, because this run holds
-        # the advisory lock: a batch still running at 01:00 makes the NEXT run
+        # the advisory lock: a batch still running at 01:30 makes the NEXT run
         # skip. No-op on a deadline day and whenever the knobs are off.
         _run_step(
             counts,

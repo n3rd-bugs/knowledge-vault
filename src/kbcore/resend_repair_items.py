@@ -18,7 +18,9 @@ JSONL); found in one of B's own rows or nowhere -> ``keep: ambiguous`` (fail-saf
 The flip is the batched sibling of :func:`kbcore.items.archive_item` — the same
 ``status='active' -> 'archived'`` guard and ``meta.archived`` stamp, plus
 ``meta.repair`` and the items' open ``unverified_extraction`` review rows resolved
-in the SAME transaction (one per group). Bodies (Inv 1), trust, relations and
+in the SAME transaction (one per group) — :func:`archive_items`, the one archive
+path the tier-3 replay (:mod:`kbcore.resend_repair_replay`) shares, with its own
+reason. Bodies (Inv 1), trust, relations and
 reserved projects are never touched; nothing is deleted (Inv 5). The duplicate set
 both tiers and the audit stamp read is ``GroupPlan.dup_ids`` (existing marks + this
 run's flips), so an ``--as-resend`` run sees the rows it is about to flip.
@@ -26,12 +28,32 @@ run's flips), so an ``--as-resend`` run sees the rows it is about to flip.
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, NamedTuple
 
 from psycopg.types.json import Jsonb
 
 from kbcore.db import connect, transaction
 from kbcore.resend_repair import ARCHIVE_REASON, REPAIR_BY, SESSION_ROWS_SQL, GroupPlan, now_iso
+
+logger = logging.getLogger("kbcore.resend_repair")
+
+# The SUCCESSOR keep, as a predicate on an ``items`` row named ``{t}``: another item's
+# ``superseded_by`` points at it, or a ``'duplicate'`` item was folded into it
+# (``derived_from``). Archiving one would leave the older fact superseded by (or
+# folded into) an archived item. The replay's plan reads the same rule; the write
+# re-checks it (review 2): the plan-to-prompt window, and tiers 1/2 never plan it.
+SUCCESSOR_SQL = """(EXISTS (SELECT 1 FROM items sp WHERE sp.superseded_by = {t}.id)
+    OR EXISTS (SELECT 1 FROM relations sr JOIN items sd ON sd.id = sr.src_id
+                WHERE sr.rel = 'derived_from' AND sr.src_kind = 'item'
+                  AND sr.dst_kind = 'item' AND sr.dst_id = {t}.id
+                  AND sd.status = 'duplicate'))"""
+
+
+class ArchiveResult(NamedTuple):
+    archived: int  # items flipped active -> archived
+    kept_successor: int  # still active at write time but a successor: left alone
+
 
 _CANDIDATES_SQL = """
 SELECT i.id, i.meta->>'quote',
@@ -131,52 +153,95 @@ def _attribute_quotes(conn, p: GroupPlan, fresh: list[tuple[int, str | None]]) -
 
 
 def archive_group(p: GroupPlan) -> int:
-    """Archive ``p.archive_ids`` + resolve their open review rows, ONE transaction."""
+    """Archive ``p.archive_ids`` + resolve their open review rows, ONE transaction.
+    Returns the archived count (a successor kept at write time is logged)."""
     if not p.archive_ids or p.reserved:
         return 0
+    archived = {"canonical_project": p.canon_project, "source_uri": p.uri}
+    return archive_items(
+        p.archive_ids, reason=ARCHIVE_REASON, archived={**archived, "queue_rows": sorted(p.dup_ids)}
+    ).archived
+
+
+def archive_items(
+    ids: list[int],
+    *,
+    reason: str,
+    archived: dict[str, Any],
+    repair: dict[str, Any] | None = None,
+) -> ArchiveResult:
+    """THE archive path of every resend-dups tier, ONE transaction per call.
+
+    ``status 'active' -> 'archived'``; ``meta.archived = {at, reason} | archived`` and
+    ``meta.repair = {at, by, reason, review_ids} | repair``; the items' open
+    ``unverified_extraction`` review rows are resolved in the same transaction and
+    their ids recorded in ``meta.repair.review_ids`` (what ``--undo`` re-opens). Only
+    rows of items still ``'active'`` are resolved, so an item a concurrent writer
+    already retired never loses a review row the undo could not give back.
+
+    The SUCCESSOR keep (:data:`SUCCESSOR_SQL`) is enforced HERE, at write time, for
+    every tier: such an item is neither archived nor has its review rows resolved,
+    and is counted in ``kept_successor`` (and logged).
+    """
+    if not ids:
+        return ArchiveResult(0, 0)
     at = now_iso()
-    archived = 0
+    count = 0
+    keep = SUCCESSOR_SQL.format(t="items")
     with transaction() as conn:
+        kept = conn.execute(
+            f"SELECT count(*) FROM items WHERE id = ANY(%(ids)s::bigint[]) "  # noqa: S608
+            f"AND status = 'active' AND {keep}",  # constant fragment
+            {"ids": list(ids)},
+        ).fetchone()[0]
         reviews = conn.execute(
-            """
+            f"""
             UPDATE review_queue SET resolved = true
              WHERE item_id = ANY(%(ids)s::bigint[]) AND resolved = false
                AND reason = 'unverified_extraction'
+               AND item_id IN (SELECT id FROM items
+                                WHERE id = ANY(%(ids)s::bigint[]) AND status = 'active'
+                                  AND NOT {keep})
              RETURNING id, item_id
-            """,
-            {"ids": list(p.archive_ids)},
+            """,  # noqa: S608 — SUCCESSOR_SQL is a constant fragment
+            {"ids": list(ids)},
         ).fetchall()
         by_item: dict[int, list[int]] = {}
         for rid, iid in reviews:
             by_item.setdefault(int(iid), []).append(int(rid))
-        for iid in p.archive_ids:
+        for iid in ids:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE items
                    SET status = 'archived', updated_at = now(),
-                       meta = coalesce(meta, '{}'::jsonb) || jsonb_build_object(
+                       meta = coalesce(meta, '{{}}'::jsonb) || jsonb_build_object(
                            'archived', jsonb_build_object(
-                               'at', %(at)s::text, 'reason', %(reason)s::text,
-                               'canonical_project', %(cp)s::text, 'source_uri', %(uri)s::text,
-                               'queue_rows', %(rows)s::jsonb),
+                               'at', %(at)s::text, 'reason', %(reason)s::text) || %(arch)s::jsonb,
                            'repair', jsonb_build_object(
                                'at', %(at)s::text, 'by', %(by)s::text,
-                               'reason', %(reason)s::text, 'review_ids', %(rids)s::jsonb))
-                 WHERE id = %(id)s AND status = 'active'
-                """,
+                               'reason', %(reason)s::text, 'review_ids', %(rids)s::jsonb)
+                               || %(rep)s::jsonb)
+                 WHERE id = %(id)s AND status = 'active' AND NOT {keep}
+                """,  # noqa: S608 — SUCCESSOR_SQL is a constant fragment
                 {
                     "at": at,
-                    "reason": ARCHIVE_REASON,
-                    "cp": p.canon_project,
-                    "uri": p.uri,
-                    "rows": Jsonb(sorted(p.dup_ids)),
+                    "reason": reason,
+                    "arch": Jsonb(archived),
                     "by": REPAIR_BY,
                     "rids": Jsonb(by_item.get(iid, [])),
+                    "rep": Jsonb(repair or {}),
                     "id": iid,
                 },
             )
-            archived += cur.rowcount or 0
-    return archived
+            count += cur.rowcount or 0
+    if kept:
+        logger.warning(
+            "resend-dups archive: kept %d of %d planned item(s) at write time -- a successor "
+            "(another item's superseded_by, or a folded duplicate's derived_from, points at it)",
+            kept,
+            len(ids),
+        )
+    return ArchiveResult(count, int(kept))
 
 
 def group_rows(conn, project: str, uri: str) -> list[dict[str, Any]]:

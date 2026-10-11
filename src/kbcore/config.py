@@ -188,8 +188,8 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     # Days the deadline APPLIES (local). Weekends default to unbounded: the box
     # is free, so the nightly may run past noon and finally clear the LLM tail.
     kb_drain_deadline_days: str = "mon,tue,wed,thu,fri"
-    # MINUTES OF THE WINDOW RESERVED FOR THE LLM TAIL. The 01:00-12:00 window is subscribed at
-    # 100-110% on a median night (drain 5.9-7.1 h + tail 5.0-6.0 h against 11 h), so whichever runs
+    # MINUTES OF THE WINDOW RESERVED FOR THE LLM TAIL. The 01:30-12:00 window is subscribed at
+    # 104-125% on a median night (drain 5.9-7.1 h + tail 5.0-6.0 h vs 10.5 h), so whichever runs
     # last gets nothing — today the tail (report 9684: 99.5% of the window drained, every tail step
     # stood down). The drain therefore stops admitting NEW refill cohorts once now +
     # estimated_next_cohort_cost > deadline - reserve; 0 disables it. See kbworker.allocator for
@@ -316,7 +316,7 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     kb_review_triage_batch_weekday: int = 300
     # WEEKEND TRIAGE TOP-UP (owner request 2026-08-08): "at weekend triage as many items as we
     # can". On a day with NO drain deadline (kbcore.drainsched) the nightly can finish at 19:45 and
-    # leave the GPU idle until the next 01:00 firing, so the tail keeps triaging in SLICES until
+    # leave the GPU idle until the next 01:30 firing, so the tail keeps triaging in SLICES until
     # this local HH:MM cutoff, the queue empties, or the run's stand-down guard fires. EMPTY (or a
     # malformed value) disables the feature entirely; the batch knob above is unchanged, so a
     # normal weekday night behaves exactly as before. Applies to UNATTENDED runs only (the guarded
@@ -324,10 +324,10 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     # triage grind.
     kb_triage_topup_until: str = "23:00"
     # Rows per top-up slice, and the reason this is a slice loop rather than one big batch: the run
-    # holds pg_advisory_lock(42) for its whole duration, so a slice still running at 01:00 makes
+    # holds pg_advisory_lock(42) for its whole duration, so a slice still running at 01:30 makes
     # the NEXT nightly skip outright. At the measured 10.4 s/row, 200 rows is ~35 min — a slice
     # admitted at 22:59 ends ~23:35, leaving the archive/re-embed leftovers, the report and the
-    # post-run backup room before 01:00. Kill switch: <= 0.
+    # post-run backup room before 01:30. Kill switch: <= 0.
     kb_triage_topup_slice: int = 200
     # AUTOMATED reject-apply (owner decision 2026-08-02, kbcore.review_apply), revising "a human
     # applies in bulk": that loop sat dead 15 days while 853 reject-suggested items stayed live and

@@ -1,10 +1,10 @@
 """kbworker.allocator — who gets the nightly window: the drain, or the LLM tail.
 
-THE SUBSCRIPTION MATH. The window is 01:00->12:00 (11 h). Median arrival costs
+THE SUBSCRIPTION MATH. The window is 01:30->12:00 (10.5 h). Median arrival costs
 the drain 5.9-7.1 h (73-89 MB/day at ~12.5 MB/h measured); the LLM tail at
 current caps costs 5.5-6.5 h (triage 2.9 h, contradictions 1.3 h, summaries
-0.8-1.6 h, evidence 0.5-0.7 h). A median night DEMANDS 11.4-13.6 h of an 11 h
-window — subscribed at 104-124%, so SOMEBODY is the residual claimant: the step
+0.8-1.6 h, evidence 0.5-0.7 h). A median night DEMANDS 11.4-13.6 h of a 10.5 h
+window — subscribed at 109-130%, so SOMEBODY is the residual claimant: the step
 that runs last gets what the others left, on a saturated night nothing. The
 drain is Step 0 with a refill-until-empty loop, so today that is the tail —
 report 9684: queued_drained 33,284 s (99.5% of the window), triage 0 rows,

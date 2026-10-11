@@ -284,7 +284,7 @@ def test_a_deferred_group_IS_eligible_again_on_the_NEXT_run(kb, monkeypatch):
     into a permanently stranded row, which is the failure it exists to avoid.
     The deferral BURN, though, is per LOCAL day (review #5 pipe-2): a same-day
     boot catch-up run re-offers the group but burns no second deferral."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import timedelta
 
     monkeypatch.setattr(settings, "kb_drain_cohort", 2)
     qid = _enqueue("refill-defer-next", "User: outage\nAssistant: x")
@@ -299,8 +299,12 @@ def test_a_deferred_group_IS_eligible_again_on_the_NEXT_run(kb, monkeypatch):
     assert _row(qid) == ("pending", 0, 1), "a same-day catch-up burned a second deferral"
 
     # Tomorrow's run: still re-offered, and the day boundary re-arms the burn.
+    # TOMORROW'S LOCAL MIDNIGHT, not now(UTC)+1d: the burn keys on the boundary's
+    # civil DATE, and between local 00:00 and the UTC date change (00:00-05:00 PKT)
+    # now(UTC)+1d falls on TODAY's local date, so the test failed every night.
+    real_day_start = ingest_queue.drain_day_start
     monkeypatch.setattr(
-        ingest_queue, "drain_day_start", lambda: datetime.now(UTC) + timedelta(days=1)
+        ingest_queue, "drain_day_start", lambda: real_day_start() + timedelta(days=1)
     )
     consolidate._drain_ingest_queue()
     assert seen == [uri, uri, uri], "the next DAY did not re-offer the deferred group"

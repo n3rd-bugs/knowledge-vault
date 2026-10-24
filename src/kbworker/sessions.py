@@ -30,6 +30,7 @@ from kbcore.quote_modality import is_aspirational
 from kbcore.quote_repair import find_span
 from kbcore.review import queue_review_in
 from kbcore.scrub import scrub
+from kbcore.unicode_safe import clean
 
 if TYPE_CHECKING:  # kbworker.judging imports kbcore only — no runtime cycle either way
     from kbworker.judging import EnsemblePlan
@@ -144,7 +145,11 @@ def assemble_transcript(data: bytes) -> str:
         text = _message_text(obj)
         if text:
             out.append(text)
-    return "\n\n".join(out)
+    # json.loads turns an orphaned "\ud83e" escape (a Node.js slice that split a
+    # pair; JSON.stringify escapes the orphan) into a lone surrogate no UTF-8
+    # encoder accepts. Cleaned HERE, so the model, the quote gate and the stored
+    # raw all see the same U+FFFD (kbcore.unicode_safe); the queued JSONL is untouched.
+    return clean("\n\n".join(out))
 
 
 def _mostly_jsonl(text: str) -> bool:

@@ -13,6 +13,7 @@ import httpx
 
 from kbcore.config import settings
 from kbcore.errors import EmbedderUnavailable, ExtractionFailed
+from kbcore.unicode_safe import clean_obj
 
 # Short keep-alive per OPS-1 — embedder loads on demand and unloads fast.
 logger = logging.getLogger("kbcore.embed")
@@ -105,9 +106,16 @@ def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> li
     """
     if not texts:
         return []
+    # httpx's json= encodes STRICT UTF-8, so one lone surrogate anywhere in the
+    # batch raised UnicodeEncodeError before the request left — no caller may
+    # crash an embed that way (incident 2026-10-18, kbcore.unicode_safe). The
+    # boundaries upstream already clean, so a hit here names a NEW leak.
+    safe = clean_obj(texts)
+    if safe is not texts:
+        logger.warning("embed input carried lone surrogate(s); replaced with U+FFFD")
     payload: dict = {
         "model": settings.kb_embed_model,
-        "input": texts,
+        "input": safe,
         "keep_alive": KEEP_ALIVE,
     }
     if settings.kb_embed_device == "cpu":

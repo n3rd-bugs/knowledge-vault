@@ -75,6 +75,7 @@ from kbworker.drainloop import (  # noqa: F401
 # (mechanical split, 2026-09-13) — re-imported for the same seam reason; the
 # cap, the reserve divisor and the stop log are read back through THIS module.
 from kbworker.evidence_step import (  # noqa: F401
+    _EVIDENCE_STATS,
     _evidence,
     _evidence_batch,
 )
@@ -380,6 +381,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             refreshed, auto_resolved, moot = _evidence(stop)
             counts["evidence_auto_resolved"] = auto_resolved
             counts["auto_resolve_moot"] = moot
+            counts.update(_EVIDENCE_STATS)  # recency guard: held tonight / held open
             return refreshed
 
         _run_step(counts, "evidence_refreshed", _ev)

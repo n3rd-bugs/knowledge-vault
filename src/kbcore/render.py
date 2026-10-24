@@ -193,6 +193,9 @@ def render_review(entries: list[ReviewEntry]) -> str:
                 f"    suggested: supersede item {sugg['retire']} → keep item {sugg['keep']} "
                 f"(streak {d.get('suggestion_streak', 1)}; apply: kb review apply {e.queue_id})"
             )
+        hold = d.get("auto_resolve_hold")
+        if isinstance(hold, dict) and hold.get("reason"):  # kbcore.review_recency
+            lines.append(f"    {hold['reason']}")
         tri = d.get("triage")
         if isinstance(tri, dict):
             # WP-2 nightly LLM triage SUGGESTION (owner decision 2026-07-18: the

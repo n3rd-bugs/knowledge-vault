@@ -19,6 +19,7 @@ from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 
 # Documented seam: callers/tests resolve llm.parse_model_json / llm.JSON_COUNTERS.
 from kbcore.llm_json import JSON_COUNTERS, parse_model_json, recover_items  # noqa: F401
+from kbcore.unicode_safe import clean, clean_obj
 
 # Extractor sampling: pin ONLY a fixed seed — determinism-for-retry comes from the
 # seed, not from greedy decoding. Ollama's seed makes sampling reproducible at
@@ -161,7 +162,7 @@ def _extract_call(payload: dict[str, Any]) -> str:
         content = resp.json()["message"]["content"]
         if not isinstance(content, str):  # null/number/list: never a raw TypeError
             raise TypeError(f"message.content is {type(content).__name__}")
-        return content
+        return clean(content)  # resp.json() is a json.loads too (kbcore.unicode_safe)
     except (KeyError, ValueError, TypeError) as e:
         raise ExtractionFailed(
             f"extractor returned unparseable output: {e.__class__.__name__}: {e}"
@@ -209,7 +210,7 @@ def _chat(
     try:
         resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
-        return resp.json()["message"]["content"]
+        return clean_obj(resp.json()["message"]["content"])  # see _extract_call
     except httpx.HTTPError as e:
         raise ExtractorUnavailable(
             f"extraction call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"

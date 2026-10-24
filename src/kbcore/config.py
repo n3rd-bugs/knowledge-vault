@@ -276,6 +276,10 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     # Kill switches:
     kb_auto_supersede_doc_refresh: bool = True
     kb_auto_resolve_evidence: bool = True
+    # RECENCY GUARD on that auto-resolve (2026-10-24): never auto-retire an item created more
+    # than this many days AFTER the item it would keep — the pair stays open for the owner.
+    # 0 = never retire the newer item automatically. Default + data: kbcore.review_recency.
+    kb_auto_resolve_newer_gap_days: float = 0.5
     # Review-queue hygiene (owner decision 2026-07-18, a bounded V4 refinement in the spirit of
     # kb_auto_resolve_evidence): nightly quiet-expiry closes open unverified_extraction rows older
     # than this many days whose item was NEVER recalled (zero access_log rows). Only the review ROW

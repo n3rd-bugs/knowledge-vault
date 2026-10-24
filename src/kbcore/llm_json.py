@@ -33,6 +33,7 @@ from typing import Any
 from kbcore.config import settings
 from kbcore.errors import ExtractionFailed
 from kbcore.scrub import scrub
+from kbcore.unicode_safe import clean_obj, clean_result
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\})\s*```", re.DOTALL)
 
 
+@clean_result  # a lone "\ud834" escape must not reach a UTF-8 encoder (2026-10-18)
 def parse_model_json(content: str) -> Any:
     """Parse model output into JSON, tolerating reasoning-model wrappers.
 
@@ -133,7 +135,7 @@ def salvage_items(content: str) -> dict[str, Any] | None:
                 pass
             else:
                 if _looks_like_item(obj):
-                    items.append(obj)
+                    items.append(clean_obj(obj))  # same rule as parse_model_json
                 i = end
                 continue
         nxt = _RESUME_RE.search(text, i + 1)

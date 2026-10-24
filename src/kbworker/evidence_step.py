@@ -14,7 +14,7 @@ import logging
 from types import ModuleType
 from typing import Any
 
-from kbcore import evidence
+from kbcore import evidence, review_recency
 from kbcore.config import settings
 from kbcore.errors import AlreadySuperseded
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
@@ -23,6 +23,12 @@ from kbworker.tail_ops import STOP_CHECK_EVERY, StopCheck
 logger = logging.getLogger("kbworker.consolidate")
 
 Row = tuple[int, int, int, dict[str, Any]]
+
+# RECENCY GUARD tallies of the LAST _evidence() pass (kbcore.review_recency), kept
+# beside the 3-tuple every caller unpacks — the _CONTRA_STATS pattern: reset per
+# pass, read by the nightly into its counts. ``auto_resolve_held`` = rows held
+# THIS pass; ``auto_resolve_held_open`` = every open row the guard holds now.
+_EVIDENCE_STATS: dict[str, int] = {"auto_resolve_held": 0, "auto_resolve_held_open": 0}
 
 
 def _seam() -> ModuleType:
@@ -80,12 +86,23 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     chokepoint the doc-refresh sweep uses (the pair IS settled), counted in
     ``auto_resolve_moot``. Every other InvalidOperation (a wrong keep/retire)
     still reaches the per-pair ERROR. Returns ``(refreshed, auto_resolved, moot)``.
+
+    RECENCY GUARD (2026-10-24): an open row whose hold is in force — kbcore
+    refused to retire the NEWER item, or the owner restored one — is skipped
+    BEFORE batching: no judge calls, no streak churn, no cap slot, no reserve
+    slot (a held row carries a streak and would otherwise squat the reserve
+    forever). A stable suggestion kbcore holds tonight counts in
+    ``_EVIDENCE_STATS`` instead of ``auto_resolved``.
     """
     rows = evidence.open_contradiction_rows()
     refreshed = 0
     auto_resolved = 0
     moot = 0
-    batch = _evidence_batch(rows)
+    held = 0
+    live = [r for r in rows if not review_recency.hold_in_force(r[3])]
+    held_before = sum(1 for r in rows if review_recency.held_newer(r[3]))
+    _EVIDENCE_STATS.update(auto_resolve_held=0, auto_resolve_held_open=held_before)
+    batch = _evidence_batch(live)
     for n, (queue_id, a_id, b_id, prior) in enumerate(batch):
         if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
             _seam()._note_stop("evidence_refreshed", reason, len(batch) - n)
@@ -109,7 +126,7 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                 and detail["suggestion_streak"] >= evidence.AUTO_RESOLVE_STREAK
             ):
                 try:
-                    auto_resolve_contradiction(queue_id, sugg["keep"], sugg["retire"])
+                    retired = auto_resolve_contradiction(queue_id, sugg["keep"], sugg["retire"])
                 except AlreadySuperseded as exc:
                     moot += 1
                     closed = close_contradiction_rows_for(sugg["keep"], sugg["retire"])
@@ -119,6 +136,12 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                         queue_id,
                         exc,
                         closed,
+                    )
+                    continue
+                if retired is None:  # held: kbcore stamped why; the row stays pending
+                    held += 1
+                    _EVIDENCE_STATS.update(
+                        auto_resolve_held=held, auto_resolve_held_open=held_before + held
                     )
                     continue
                 auto_resolved += 1
@@ -132,10 +155,10 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                 )
         except Exception:  # noqa: BLE001 — one bad pair must not abort the step
             logger.exception("evidence refresh for queue row %s failed", queue_id)
-    if len(rows) > len(batch):
+    if len(live) > len(batch):
         logger.info(
             "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",
             len(batch),
-            len(rows) - len(batch),
+            len(live) - len(batch),
         )
     return refreshed, auto_resolved, moot

@@ -17,6 +17,10 @@ from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
 from kbcore.models import REVIEW_REASONS, ReviewEntry
+
+# auto_resolve_contradiction + its RECENCY GUARD (2026-10-24) live in
+# kbcore.review_recency (this file sits at its ratchet); re-exported for callers.
+from kbcore.review_recency import auto_resolve_contradiction  # noqa: F401
 from kbcore.supersede import supersede
 
 
@@ -483,25 +487,6 @@ def close_contradiction_rows_for(a_id: int, b_id: int) -> int:
             (a_id, b_id, b_id, a_id),
         ).fetchall()
     return len(rows)
-
-
-def auto_resolve_contradiction(queue_id: int, keep: int, retire: int) -> int:
-    """Auto-resolve a contradiction whose evidence held for the stability streak.
-
-    Owner V4 refinement (2026-07): supersede the evidence-losing side with the
-    winner and close the row. Invoked ONLY by the nightly worker after the same
-    suggestion persisted for AUTO_RESOLVE_STREAK consecutive refreshes; fully
-    audited (supersede reason + relation + report count + log line) and
-    reversible (supersession is a status flip, never a delete).
-    """
-    supersede(
-        retire,
-        new_item_id=keep,
-        reason="auto: evidence margin stable across nightly refreshes",
-    )
-    with transaction() as conn:
-        conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
-    return retire
 
 
 def apply_suggestion(queue_id: int) -> int:

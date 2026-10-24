@@ -12,7 +12,8 @@ from datetime import datetime
 import typer
 
 from kbcli import bulk_cmds, expire_cmds, promote_cmds
-from kbcore import render, review_apply, review_triage
+from kbcli.repair_shared import _locked_apply
+from kbcore import render, review_apply, review_restore, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import KBError
@@ -236,3 +237,50 @@ def review_apply_suggestion(
             _fail(KBError("pass a queue id or --all"))
     except KBError as e:
         _fail(e)
+
+
+@review_app.command("restore")
+def review_restore_cmd(
+    retired_id: int = typer.Argument(..., help="item an evidence resolution retired"),
+    swap: bool = typer.Option(
+        False, "--swap", help="also supersede the kept item with the restored one"
+    ),
+    apply: bool = typer.Option(False, "--apply", help="write (default: dry run, writes nothing)"),
+    note: str | None = typer.Option(None, "--note", help="why; recorded in the item's meta"),
+) -> None:
+    """Undo an evidence auto-resolution: reactivate the retired item (owner only).
+
+    Default re-opens the pair for owner review with a veto so the nightly cannot
+    re-retire it; --swap instead supersedes the previously kept item with the
+    restored one. Dry run unless --apply. items.body is never touched.
+    """
+
+    def _run() -> review_restore.RestorePlan:
+        return review_restore.restore_auto_resolved(retired_id, swap=swap, apply=apply, note=note)
+
+    try:
+        # --apply runs under the consolidation lock (refused while a nightly is in
+        # flight): the evidence pass batches from a snapshot of hold state, so a
+        # restore interleaved with it could be re-retired from a cached streak.
+        plan = _locked_apply(_run) if apply else _run()
+    except KBError as e:
+        _fail(e)
+    verb = "restored" if plan.applied else "would restore"
+    typer.echo(
+        f"{verb} item {plan.retired_id} (was superseded by {plan.kept_id}, "
+        f"{plan.kept_status}; reason {plan.supersede_reason!r})"
+    )
+    done = plan.applied
+    if plan.reopen_window:
+        typer.echo(f"  validity window {'reopened' if done else 'would reopen'} (valid_to cleared)")
+    row = f"queue {plan.queue_id}" if plan.queue_id is not None else "a new queue row"
+    if swap:
+        act = "superseded by" if done else "would be superseded by"
+        typer.echo(f"  swap: item {plan.kept_id} {act} {plan.retired_id}; {row} closed")
+    else:
+        act = "re-opened" if done else "would re-open"
+        typer.echo(f"  pair {act} for owner review: {row} (nightly auto-resolve vetoed)")
+    if plan.twin_rows:
+        typer.echo(f"  + {plan.twin_rows} other open row(s) for the same pair, same treatment")
+    if not plan.applied:
+        typer.echo("dry run: nothing written (pass --apply)")

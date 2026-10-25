@@ -215,6 +215,7 @@ def run_bench(
         "generated_at": datetime.now(UTC).isoformat(),
         "incumbent": settings.kb_extract_model,
         "pair_judge_model": settings.pair_judge_model,
+        "contradiction_judge_model": settings.contradiction_judge_model,
         "embed_model": settings.kb_embed_model,
         "pairs": [asdict(p) for p in pairs],
         "configs": configs,

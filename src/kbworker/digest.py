@@ -52,7 +52,10 @@ from kbworker.digest_lines import (  # noqa: F401
     _trust_watch_line,
     night_of,
 )
-from kbworker.digest_recency_lines import auto_resolve_held_line  # recency guard (2026-10-24)
+from kbworker.digest_recency_lines import (  # recency guard + precision gate
+    auto_resolve_held_line,
+    judge_held_line,
+)
 from kbworker.eval_epoch_lines import eval_epoch_line  # E1: first night of a golden epoch
 
 logger = logging.getLogger("kbworker.tail_steps")
@@ -131,6 +134,8 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
     lines += [f"{label}: {counts[key]}" for label, key in spec if counts.get(key) is not None]
     if held := auto_resolve_held_line(counts):  # recency guard: pairs awaiting the owner
         lines.append(held)
+    if gated := judge_held_line(counts):  # precision gate: judge found no conflict
+        lines.append(gated)
     # Deferral-cap pressure (review #3 P1 rider): fires ~2 nights of deferrals
     # BEFORE the escalation it warns about (the escalation line is ALERT-class).
     if near_cap := counts.get("groups_near_deferral_cap"):

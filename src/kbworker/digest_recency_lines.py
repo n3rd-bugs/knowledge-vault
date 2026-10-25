@@ -29,3 +29,18 @@ def auto_resolve_held_line(counts: Mapping[str, Any]) -> str | None:
     total = max(held_open, tonight)
     new = f"+{tonight} tonight; " if tonight else ""
     return f"auto-resolve held: {total} ({new}would retire the newer item)"
+
+
+def judge_held_line(counts: Mapping[str, Any]) -> str | None:
+    """``auto-resolve held: N (+M tonight; contradiction judge: no conflict)`` — the open
+    pairs the precision gate (kbcore.review_judge_gate) kept from being retired because
+    the contradiction seat found no conflict; plus a quiet note when the judge was
+    unreachable (those pairs simply wait for the next run)."""
+    held_open = _count(counts, "auto_resolve_judge_held_open")
+    tonight = _count(counts, "auto_resolve_judge_held")
+    down = _count(counts, "auto_resolve_gate_unavailable")
+    if not held_open and not tonight and not down:
+        return None
+    new = f"+{tonight} tonight; " if tonight else ""
+    line = f"auto-resolve held: {max(held_open, tonight)} ({new}contradiction judge: no conflict)"
+    return line + (f"; gate judge unreachable for {down}" if down else "")

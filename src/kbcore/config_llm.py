@@ -107,12 +107,11 @@ class LLMSettings(BaseSettings):
     # the swap is TWO .env lines: KB_PAIR_JUDGE_MODEL= and this back to 40.
     kb_contradiction_pair_cap_weekday: int = 40
     # Pair-judge seat (review #8 H3, bench-gate rule): the model behind the TWO pairwise
-    # judges ONLY — llm.items_contradict (nightly contradiction step) and
-    # twin_judge.judge_same_fact (cross-project twin linker), both via
-    # llm._pair_judge_kwargs(). Every other seat (extractor, verifier, triage, evidence,
-    # deep search, ensemble secondary judge) keeps its incumbent. Empty = the incumbent
-    # kb_extract_model with its default thinking. Lands EMPTY; the main agent flips it
-    # after `kb bench judge` shows >=0.95 agreement with the incumbent's stored verdicts.
+    # judges — llm.items_contradict (nightly contradiction step) and
+    # twin_judge.judge_same_fact (cross-project twin linker) — unless the contradiction
+    # seat below is set, which then takes items_contradict alone. Every other seat
+    # (extractor, verifier, triage, evidence, deep search, ensemble secondary judge) keeps
+    # its incumbent. Empty = the incumbent kb_extract_model with its default thinking.
     # NOT kb_ensemble_secondary_judge — that knob's empty sentinel means the opposite.
     kb_pair_judge_model: str = ""
     # Ollama `think` for the pair judges: None = key omitted (the model's default); false =
@@ -120,6 +119,15 @@ class LLMSettings(BaseSettings):
     # kb_pair_judge_model is set, so emptying the model restores model AND thinking in
     # one line. true|false or absent — a blank value fails validation (bool | None).
     kb_pair_judge_think: bool | None = None
+    # CONTRADICTION seat (2026-10-25, KB 54572; KB 31871 asked for the split): the model
+    # behind llm.items_contradict ALONE — the nightly contradiction step and the precision
+    # gate before any evidence auto-resolve (kbcore.review_judge_gate). Empty = the pair
+    # seat above. Measured on the 92 pairs the nightly auto-resolved 08-25..10-24 against a
+    # blind two-labeler ground truth (42 real conflicts): qwen3:14b precision 0.52 / recall
+    # 0.79 at 12.7 s/pair, bonsai-2:27b 0.78 / 0.83 at 11.8 s/pair. Rollback = empty it.
+    kb_contradiction_judge_model: str = ""
+    # Ollama `think` for that seat, read ONLY while its model is set (the rule above).
+    kb_contradiction_judge_think: bool | None = None
 
     @property
     def pair_judge_model(self) -> str:
@@ -130,3 +138,15 @@ class LLMSettings(BaseSettings):
     def pair_judge_think(self) -> bool | None:
         """``think`` for the two pair judges — None (key omitted) unless a model is set."""
         return self.kb_pair_judge_think if self.kb_pair_judge_model else None
+
+    @property
+    def contradiction_judge_model(self) -> str:
+        """Model for items_contradict: its own seat, else the pair seat (else the extractor)."""
+        return self.kb_contradiction_judge_model or self.pair_judge_model
+
+    @property
+    def contradiction_judge_think(self) -> bool | None:
+        """``think`` for items_contradict: its own knob while its model is set, else the pair's."""
+        if self.kb_contradiction_judge_model:
+            return self.kb_contradiction_judge_think
+        return self.pair_judge_think

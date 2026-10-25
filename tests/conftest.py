@@ -160,6 +160,9 @@ def _neutral_feature_flags(monkeypatch):
     monkeypatch.setattr(settings, "kb_rerank_url", "")
     monkeypatch.setattr(settings, "kb_embed_query_prefix", "")
     monkeypatch.setattr(settings, "kb_ensemble_secondary_judge", "")
+    monkeypatch.setattr(settings, "kb_contradiction_judge_model", "")
+    monkeypatch.setattr(settings, "kb_contradiction_judge_think", None)
+    monkeypatch.setattr(settings, "kb_auto_resolve_judge_gate", False)
 
 
 @pytest.fixture(autouse=True)

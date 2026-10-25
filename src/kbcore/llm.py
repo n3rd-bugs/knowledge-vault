@@ -331,9 +331,9 @@ def evidence_side(
 
 
 def _pair_judge_kwargs() -> dict[str, Any]:
-    """Model + ``think`` for the TWO pair judges ONLY — :func:`items_contradict` and
-    ``twin_judge.judge_same_fact`` (review #8 H3). Empty ``KB_PAIR_JUDGE_MODEL`` ⇒ the
-    extract model with ``think`` unset: the byte-identical incumbent request."""
+    """Model + ``think`` for the SAME-FACT pair judge (``twin_judge.judge_same_fact``,
+    review #8 H3); :func:`items_contradict` has its own seat. Empty ``KB_PAIR_JUDGE_MODEL``
+    ⇒ the extract model with ``think`` unset: the byte-identical incumbent request."""
     return {"model": settings.pair_judge_model, "think": settings.pair_judge_think}
 
 
@@ -346,9 +346,9 @@ _CONTRADICT_SYSTEM = (
 
 
 def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bool:
-    """True iff the extractor judges the two items to conflict (§7.3 step 3). Never
-    raises on an ambiguous/unparseable answer (False); network failures still surface
-    as :class:`ExtractorUnavailable` via ``_chat`` so consolidation logs and continues."""
+    """True iff the CONTRADICTION seat judges the two items to conflict (§7.3 step 3; the
+    seat falls back to the pair seat, then the extractor). Never raises on an unparseable
+    answer (False); network failures surface as :class:`ExtractorUnavailable` via _chat."""
     content = _chat(
         [
             {"role": "system", "content": _CONTRADICT_SYSTEM},
@@ -359,7 +359,8 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
         ],
         json_format=True,
         seed=_draw_seed(a_title, a_body, b_title, b_body),
-        **_pair_judge_kwargs(),
+        model=settings.contradiction_judge_model,
+        think=settings.contradiction_judge_think,
     )
     try:
         data = parse_model_json(content)
@@ -368,8 +369,7 @@ def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bo
     if not isinstance(data, dict):
         return False
     val = data.get("contradict")
-    # Some models emit a stringified bool under format=json; bool("false") is
-    # True, so coerce strings explicitly instead of trusting bool() on them.
+    # format=json can yield a stringified bool, and bool("false") is True: coerce strings.
     if isinstance(val, str):
         return val.strip().lower() in ("true", "yes", "1")
     return bool(val)

@@ -16,7 +16,7 @@ from typing import Any
 
 from kbcore import evidence, review_recency
 from kbcore.config import settings
-from kbcore.errors import AlreadySuperseded
+from kbcore.errors import AlreadySuperseded, ExtractorUnavailable
 from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
 from kbworker.tail_ops import STOP_CHECK_EVERY, StopCheck
 
@@ -29,6 +29,14 @@ Row = tuple[int, int, int, dict[str, Any]]
 # pass, read by the nightly into its counts. ``auto_resolve_held`` = rows held
 # THIS pass; ``auto_resolve_held_open`` = every open row the guard holds now.
 _EVIDENCE_STATS: dict[str, int] = {"auto_resolve_held": 0, "auto_resolve_held_open": 0}
+# PRECISION GATE tallies (kbcore.review_judge_gate), merged into the counts the same
+# way: rows the gate held THIS pass, every open row it holds now, and resolutions
+# left for the next run because the contradiction judge could not be reached.
+_GATE_STATS: dict[str, int] = {
+    "auto_resolve_judge_held": 0,
+    "auto_resolve_judge_held_open": 0,
+    "auto_resolve_gate_unavailable": 0,
+}
 
 
 def _seam() -> ModuleType:
@@ -93,15 +101,27 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     slot (a held row carries a streak and would otherwise squat the reserve
     forever). A stable suggestion kbcore holds tonight counts in
     ``_EVIDENCE_STATS`` instead of ``auto_resolved``.
+
+    PRECISION GATE (2026-10-25): with ``kb_auto_resolve_judge_gate`` on, kbcore
+    re-judges each stable suggestion with the contradiction seat before retiring;
+    a gate hold counts in ``_GATE_STATS`` (and is skipped the same way afterwards),
+    an unreachable judge leaves the pair for the next run.
     """
     rows = evidence.open_contradiction_rows()
     refreshed = 0
     auto_resolved = 0
     moot = 0
     held = 0
+    gate_down = False  # set by the first unreachable gate judge: skip the rest of the pass
     live = [r for r in rows if not review_recency.hold_in_force(r[3])]
     held_before = sum(1 for r in rows if review_recency.held_newer(r[3]))
     _EVIDENCE_STATS.update(auto_resolve_held=0, auto_resolve_held_open=held_before)
+    judge_before = sum(1 for r in rows if review_recency.held_judge(r[3]))
+    _GATE_STATS.update(
+        auto_resolve_judge_held=0,
+        auto_resolve_judge_held_open=judge_before,
+        auto_resolve_gate_unavailable=0,
+    )
     batch = _evidence_batch(live)
     for n, (queue_id, a_id, b_id, prior) in enumerate(batch):
         if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
@@ -125,6 +145,9 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                 and settings.kb_auto_resolve_evidence
                 and detail["suggestion_streak"] >= evidence.AUTO_RESOLVE_STREAK
             ):
+                if gate_down:  # one unreachable judge per pass, never a timeout per pair
+                    _GATE_STATS["auto_resolve_gate_unavailable"] += 1
+                    continue
                 try:
                     retired = auto_resolve_contradiction(queue_id, sugg["keep"], sugg["retire"])
                 except AlreadySuperseded as exc:
@@ -137,6 +160,22 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                         exc,
                         closed,
                     )
+                    continue
+                except ExtractorUnavailable as exc:  # the precision gate's judge is gone
+                    gate_down = True
+                    _GATE_STATS["auto_resolve_gate_unavailable"] += 1
+                    logger.warning(
+                        "contradiction row %s: precision-gate judge unreachable (%s); "
+                        "nothing retired, retried next run",
+                        queue_id,
+                        exc,
+                    )
+                    continue
+                if retired is None and (
+                    review_recency.hold_kind(queue_id) == review_recency.HOLD_JUDGE
+                ):  # the gate's judge found no conflict: held for the owner
+                    _GATE_STATS["auto_resolve_judge_held"] += 1
+                    _GATE_STATS["auto_resolve_judge_held_open"] += 1
                     continue
                 if retired is None:  # held: kbcore stamped why; the row stays pending
                     held += 1

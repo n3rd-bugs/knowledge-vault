@@ -40,6 +40,10 @@ streak churn, no rewritten detail and never a second row. The stamp records
 the gap it was taken at; raising the knob past that gap releases the row back
 into the refresh (the knob is the owner's policy, read at call time). An
 ``owner_restore`` hold (``kbcore.review_restore``) is an unconditional veto.
+
+PRECISION GATE (2026-10-25, :mod:`kbcore.review_judge_gate`): a retire the recency
+guard lets through is re-judged by the contradiction seat first; "no conflict"
+holds the row the same way (kind ``judge_no_conflict``).
 """
 
 from __future__ import annotations
@@ -63,6 +67,7 @@ AUTO_RESOLVE_REASON = "auto: evidence margin stable across nightly refreshes"
 HOLD_KEY = "auto_resolve_hold"
 HOLD_NEWER = "newer_retire"  # the recency guard held it
 HOLD_RESTORED = "owner_restore"  # the owner restored the retired side: veto
+HOLD_JUDGE = "judge_no_conflict"  # the precision gate's judge found no conflict
 #: ``detail.auto_resolution.kind`` stamped on a row an auto-resolution closed, so
 #: an owner restore can find exactly the row that retired the item.
 RESOLVED_KIND = "evidence_supersede"
@@ -106,17 +111,22 @@ def hold_in_force(detail: Mapping[str, Any] | None) -> bool:
     * ``newer_retire`` — while the stored suggestion is still the one that was
       held AND its gap is still beyond the CURRENT window: a raised knob
       releases the row, a changed suggestion means the hold is stale.
+    * ``judge_no_conflict`` — while the suggestion is unchanged, the gate is on
+      and the contradiction seat is still the model that judged it.
     """
     hold = (detail or {}).get(HOLD_KEY)
     if not isinstance(hold, Mapping):
         return False
     if hold.get("kind") == HOLD_RESTORED:
         return True
-    if hold.get("kind") != HOLD_NEWER:
+    if hold.get("kind") not in (HOLD_NEWER, HOLD_JUDGE):
         return False
     sugg = (detail or {}).get("suggested_resolution") or {}
     if (sugg.get("keep"), sugg.get("retire")) != (hold.get("keep"), hold.get("retire")):
         return False
+    if hold.get("kind") == HOLD_JUDGE:
+        model = settings.contradiction_judge_model
+        return bool(settings.kb_auto_resolve_judge_gate) and hold.get("model") == model
     gap = hold.get("gap_days")
     return isinstance(gap, int | float) and not isinstance(gap, bool) and would_hold(float(gap))
 
@@ -125,6 +135,23 @@ def held_newer(detail: Mapping[str, Any] | None) -> bool:
     """A row held by the recency guard (not an owner veto) — the digest's count."""
     hold = (detail or {}).get(HOLD_KEY)
     return hold_in_force(detail) and isinstance(hold, Mapping) and hold.get("kind") == HOLD_NEWER
+
+
+def held_judge(detail: Mapping[str, Any] | None) -> bool:
+    """A row held by the precision gate — the digest's second count."""
+    hold = (detail or {}).get(HOLD_KEY)
+    return hold_in_force(detail) and isinstance(hold, Mapping) and hold.get("kind") == HOLD_JUDGE
+
+
+def hold_kind(queue_id: int) -> str | None:
+    """The kind of hold stamped on a row (None: no hold) — how the nightly tells a
+    recency hold from a gate hold after :func:`auto_resolve_contradiction` held one."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT detail->'auto_resolve_hold'->>'kind' FROM review_queue WHERE id = %s",
+            (queue_id,),
+        ).fetchone()
+    return None if row is None else row[0]
 
 
 def hold_row(queue_id: int, keep: int, retire: int, gap_days: float) -> bool:
@@ -169,13 +196,24 @@ def auto_resolve_contradiction(queue_id: int, keep: int, retire: int) -> int | N
 
     RECENCY GUARD (module docstring): when ``retire`` is newer than ``keep`` by
     more than the window, NOTHING is superseded — the row is held (stamped,
-    still open) and ``None`` is returned. Otherwise returns the retired id.
+    still open) and ``None`` is returned. PRECISION GATE (when on): the
+    contradiction seat re-judges the pair; "no conflict" holds the same way, and
+    an unreachable judge raises ``ExtractorUnavailable`` with nothing changed.
+    Otherwise returns the retired id.
     """
     gap = newer_gap_days(keep, retire)
     if gap is not None and would_hold(gap):
         if hold_row(queue_id, keep, retire, gap):
             logger.info("contradiction row %s held: %s", queue_id, hold_reason(gap))
         return None
+    if settings.kb_auto_resolve_judge_gate:
+        from kbcore import review_judge_gate  # lazy: it imports this module's hold kinds
+
+        if not review_judge_gate.judge_confirms(keep, retire):
+            if review_judge_gate.hold_row(queue_id, keep, retire):
+                reason = review_judge_gate.hold_reason(settings.contradiction_judge_model)
+                logger.info("contradiction row %s held: %s", queue_id, reason)
+            return None
     supersede(retire, new_item_id=keep, reason=AUTO_RESOLVE_REASON)
     stamp = {
         "auto_resolution": {

@@ -280,6 +280,11 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
     # than this many days AFTER the item it would keep — the pair stays open for the owner.
     # 0 = never retire the newer item automatically. Default + data: kbcore.review_recency.
     kb_auto_resolve_newer_gap_days: float = 0.5
+    # PRECISION GATE on that auto-resolve (2026-10-25): re-judge the pair with the contradiction
+    # seat (KB_CONTRADICTION_JUDGE_MODEL) right before anything is retired; "no conflict" holds the
+    # row for the owner. Off by default (it spends a judge call per resolution); data + rule:
+    # kbcore.review_judge_gate.
+    kb_auto_resolve_judge_gate: bool = False
     # Review-queue hygiene (owner decision 2026-07-18, a bounded V4 refinement in the spirit of
     # kb_auto_resolve_evidence): nightly quiet-expiry closes open unverified_extraction rows older
     # than this many days whose item was NEVER recalled (zero access_log rows). Only the review ROW

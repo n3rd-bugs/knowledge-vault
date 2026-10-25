@@ -1,0 +1,21 @@
+[Unit]
+Description=KB rerank sidecar — llama-server with Qwen3-Reranker-0.6B (verified GGUF)
+After=network.target
+
+# The runtime is a PINNED COPY of the llama-server build that Ollama 0.31.1 shipped
+# (cp -a of /usr/local/lib/ollama, 2026-10-25), not Ollama's live lib dir: Ollama's
+# installer replaces /usr/local/lib/ollama wholesale, which would silently swap the
+# reranker's llama.cpp build or strand GGML_BACKEND_PATH (= silent CPU fallback,
+# 15 s vs 0.4 s). RUNPATH is $ORIGIN, so every lib resolves inside this directory.
+# Changing the runtime is its own measured change (score-parity probe first).
+[Service]
+Type=simple
+User=usama
+Environment=GGML_BACKEND_PATH=/opt/kb-rerank/llama-0.31.1/cuda_v12/libggml-cuda.so
+Environment=LD_LIBRARY_PATH=/opt/kb-rerank/llama-0.31.1:/opt/kb-rerank/llama-0.31.1/cuda_v12
+ExecStart=/opt/kb-rerank/llama-0.31.1/llama-server -m /home/usama/kb/models/qwen3-reranker-0.6b-q8_0.gguf --reranking --pooling rank --host 172.17.0.1 --port 8324 -ngl 99 --ctx-size 8192 -np 4 -fa on -b 2048 -ub 2048
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

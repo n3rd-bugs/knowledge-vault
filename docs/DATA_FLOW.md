@@ -125,13 +125,15 @@ stale.
 | Judge (factored) | `qwen3:14b` | (same) | local | verifies non-primary singletons; fail-closed |
 | Triage / contradictions / evidence | `qwen3:14b` | (same) | local | tail steps, capped per night |
 | Embedder | `qwen3-embedding:0.6b` | 0.6 B · ~2.4 GB | **remote RTX 5080** (local fallback + 90 s breaker) | 1024-d; **query prefix required** (hit@5 0.759 vs 0.724 without) |
-| Reranker | `Qwen3-Reranker-0.6B` | 0.6 B GGUF | sidecar (llama-server :8324) | official GGUF only — community conversions score garbage; chunk-evidence fed (hit@5 0.86 → 0.89); host-RAM prompt cache OFF (`LLAMA_ARG_CACHE_RAM=0` drop-in, 2026-10-11: RSS 9.4 GB → 1.8 GB, scores bit-identical after warm-up) |
+| Reranker | `Qwen3-Reranker-0.6B` | 0.6 B GGUF | sidecar (llama-server :8324) | official GGUF only — community conversions score garbage; chunk-evidence fed (hit@5 0.86 → 0.89); host-RAM prompt cache OFF (`LLAMA_ARG_CACHE_RAM=0` drop-in, 2026-10-11: RSS 9.4 GB → 1.8 GB, scores bit-identical after warm-up); runs a **pinned** llama-server copy (`/opt/kb-rerank/llama-0.31.1`, 2026-10-25) so Ollama upgrades never touch it — units in `deploy/system/` |
 | Window budgeter | `cl100k` (tiktoken, vendored) | — | in-process, offline | counts tokens for window fitting; 1.15× margin covers the qwen-tokenizer mismatch |
 
 GPU rules: **one model slot** (`OLLAMA_MAX_LOADED_MODELS=1`), finite keep-alive
 (600 s — never `-1`), 150 W power cap (UPS), model-major cohorts so each load
 serves ~58 calls. Embeddings live on the second box so the local slot never
-thrashes against a 0.6 B model.
+thrashes against a 0.6 B model. Local Ollama is **0.40.11** (2026-10-25, from
+0.31.1; manual tarball install, rollback copy and runbook in
+`deploy/system/README.md`).
 
 ```mermaid
 flowchart LR

@@ -17,7 +17,7 @@ from typing import Any
 from kbcore import evidence, review_recency
 from kbcore.config import settings
 from kbcore.errors import AlreadySuperseded, ExtractorUnavailable
-from kbcore.review import auto_resolve_contradiction, close_contradiction_rows_for
+from kbcore.review import close_contradiction_rows_for
 from kbworker.tail_ops import STOP_CHECK_EVERY, StopCheck
 
 logger = logging.getLogger("kbworker.consolidate")
@@ -30,10 +30,11 @@ Row = tuple[int, int, int, dict[str, Any]]
 # THIS pass; ``auto_resolve_held_open`` = every open row the guard holds now.
 _EVIDENCE_STATS: dict[str, int] = {"auto_resolve_held": 0, "auto_resolve_held_open": 0}
 # PRECISION GATE tallies (kbcore.review_judge_gate), merged into the counts the same
-# way: rows the gate held THIS pass, every open row it holds now, and resolutions
-# left for the next run because the contradiction judge could not be reached.
+# way: rows the gate held THIS pass ("no conflict" / no verdict on the pair), every
+# open row it holds now, and rows deferred because the judge could not be reached.
 _GATE_STATS: dict[str, int] = {
     "auto_resolve_judge_held": 0,
+    "auto_resolve_judge_failed": 0,
     "auto_resolve_judge_held_open": 0,
     "auto_resolve_gate_unavailable": 0,
 }
@@ -103,26 +104,33 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     ``_EVIDENCE_STATS`` instead of ``auto_resolved``.
 
     PRECISION GATE (2026-10-25): with ``kb_auto_resolve_judge_gate`` on, kbcore
-    re-judges each stable suggestion with the contradiction seat before retiring;
-    a gate hold counts in ``_GATE_STATS`` (and is skipped the same way afterwards),
-    an unreachable judge leaves the pair for the next run.
+    re-judges each stable suggestion queued by another judge before retiring; a
+    gate hold counts in ``_GATE_STATS`` (and is skipped the same way afterwards).
+    Resolutions run AFTER every refresh (two phases) so the judge — another model
+    on a one-slot card — loads once per pass; once it is unreachable the rest of
+    the pass defers what needs it while the recency guard and moot path still act.
     """
     rows = evidence.open_contradiction_rows()
     refreshed = 0
     auto_resolved = 0
     moot = 0
     held = 0
-    gate_down = False  # set by the first unreachable gate judge: skip the rest of the pass
+    gate_down = False  # the first unreachable gate judge: defer what needs it, all pass
     live = [r for r in rows if not review_recency.hold_in_force(r[3])]
     held_before = sum(1 for r in rows if review_recency.held_newer(r[3]))
     _EVIDENCE_STATS.update(auto_resolve_held=0, auto_resolve_held_open=held_before)
     judge_before = sum(1 for r in rows if review_recency.held_judge(r[3]))
     _GATE_STATS.update(
         auto_resolve_judge_held=0,
+        auto_resolve_judge_failed=0,
         auto_resolve_judge_held_open=judge_before,
         auto_resolve_gate_unavailable=0,
     )
     batch = _evidence_batch(live)
+    # Phase 1 refreshes every row (evidence_side calls on the default model); phase 2
+    # resolves the rows whose suggestion is stable. Split so the precision gate's
+    # judge (another model on a ONE-slot card) loads once per pass, not twice per row.
+    candidates: list[tuple[int, dict[str, Any], int]] = []
     for n, (queue_id, a_id, b_id, prior) in enumerate(batch):
         if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
             _seam()._note_stop("evidence_refreshed", reason, len(batch) - n)
@@ -145,55 +153,69 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                 and settings.kb_auto_resolve_evidence
                 and detail["suggestion_streak"] >= evidence.AUTO_RESOLVE_STREAK
             ):
-                if gate_down:  # one unreachable judge per pass, never a timeout per pair
-                    _GATE_STATS["auto_resolve_gate_unavailable"] += 1
-                    continue
-                try:
-                    retired = auto_resolve_contradiction(queue_id, sugg["keep"], sugg["retire"])
-                except AlreadySuperseded as exc:
-                    moot += 1
-                    closed = close_contradiction_rows_for(sugg["keep"], sugg["retire"])
-                    logger.warning(
-                        "contradiction row %s moot: %s "
-                        "(an earlier resolution already superseded it; %d row(s) closed)",
-                        queue_id,
-                        exc,
-                        closed,
-                    )
-                    continue
-                except ExtractorUnavailable as exc:  # the precision gate's judge is gone
-                    gate_down = True
-                    _GATE_STATS["auto_resolve_gate_unavailable"] += 1
-                    logger.warning(
-                        "contradiction row %s: precision-gate judge unreachable (%s); "
-                        "nothing retired, retried next run",
-                        queue_id,
-                        exc,
-                    )
-                    continue
-                if retired is None and (
-                    review_recency.hold_kind(queue_id) == review_recency.HOLD_JUDGE
-                ):  # the gate's judge found no conflict: held for the owner
-                    _GATE_STATS["auto_resolve_judge_held"] += 1
-                    _GATE_STATS["auto_resolve_judge_held_open"] += 1
-                    continue
-                if retired is None:  # held: kbcore stamped why; the row stays pending
-                    held += 1
-                    _EVIDENCE_STATS.update(
-                        auto_resolve_held=held, auto_resolve_held_open=held_before + held
-                    )
-                    continue
-                auto_resolved += 1
-                logger.info(
-                    "auto-resolved contradiction row %s: keep %s, retire %s (%s, streak %d)",
-                    queue_id,
-                    sugg["keep"],
-                    sugg["retire"],
-                    sugg["rule"],
-                    detail["suggestion_streak"],
-                )
+                candidates.append((queue_id, sugg, detail["suggestion_streak"]))
         except Exception:  # noqa: BLE001 — one bad pair must not abort the step
             logger.exception("evidence refresh for queue row %s failed", queue_id)
+    gated = bool(settings.kb_auto_resolve_judge_gate)
+    for n, (queue_id, sugg, streak) in enumerate(candidates):
+        if gated and stop is not None and (reason := stop()):  # judge calls are GPU work
+            _seam()._note_stop("evidence_refreshed", reason, len(candidates) - n)
+            break
+        try:
+            # judge=False once the judge is gone: the recency guard and the moot check
+            # still settle what needs no judge; the rest is deferred, never retired.
+            out = review_recency.resolve_contradiction(
+                queue_id, sugg["keep"], sugg["retire"], judge=not gate_down
+            )
+        except AlreadySuperseded as exc:
+            moot += 1
+            closed = close_contradiction_rows_for(sugg["keep"], sugg["retire"])
+            logger.warning(
+                "contradiction row %s moot: %s "
+                "(an earlier resolution already superseded it; %d row(s) closed)",
+                queue_id,
+                exc,
+                closed,
+            )
+            continue
+        except ExtractorUnavailable as exc:  # the precision gate's judge is gone
+            gate_down = True
+            _GATE_STATS["auto_resolve_gate_unavailable"] += 1
+            logger.warning(
+                "contradiction row %s: precision-gate judge unreachable (%s); "
+                "nothing retired, the rest of the pass deferred",
+                queue_id,
+                exc,
+            )
+            continue
+        except Exception:  # noqa: BLE001 — one bad pair must not abort the step
+            logger.exception("auto-resolution of queue row %s failed", queue_id)
+            continue
+        if out.hold == review_recency.GATE_DEFERRED:
+            _GATE_STATS["auto_resolve_gate_unavailable"] += 1
+            continue
+        if out.hold in (review_recency.HOLD_JUDGE, review_recency.HOLD_FAILED):
+            key = "judge_held" if out.hold == review_recency.HOLD_JUDGE else "judge_failed"
+            _GATE_STATS[f"auto_resolve_{key}"] += 1
+            _GATE_STATS["auto_resolve_judge_held_open"] += 1
+            continue
+        if out.hold == review_recency.HOLD_NEWER:
+            held += 1
+            _EVIDENCE_STATS.update(
+                auto_resolve_held=held, auto_resolve_held_open=held_before + held
+            )
+            continue
+        if out.retired is None:  # nothing stamped (the owner closed it meanwhile)
+            continue
+        auto_resolved += 1
+        logger.info(
+            "auto-resolved contradiction row %s: keep %s, retire %s (%s, streak %d)",
+            queue_id,
+            sugg["keep"],
+            sugg["retire"],
+            sugg["rule"],
+            streak,
+        )
     if len(live) > len(batch):
         logger.info(
             "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",

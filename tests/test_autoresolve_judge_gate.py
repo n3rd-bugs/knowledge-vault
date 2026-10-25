@@ -13,14 +13,24 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 
+import httpx
 import pytest
 
-from kbcore import db, evidence, llm, review, review_judge_gate, review_recency, twin_judge
+from kbcore import (
+    consolidation,
+    db,
+    evidence,
+    llm,
+    review,
+    review_judge_gate,
+    review_recency,
+    twin_judge,
+)
 from kbcore.config import Settings, settings
 from kbcore.consolidation import record_contradiction
 from kbcore.errors import ExtractorUnavailable
 from kbcore.ingest import ingest
-from kbworker import consolidate, digest, evidence_step
+from kbworker import consolidate, digest, evidence_step, tail_ops
 from kbworker.digest_recency_lines import judge_held_line
 
 T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
@@ -49,7 +59,13 @@ def _pair(tag: str) -> tuple[int, int, int]:
 
 
 @pytest.fixture()
-def gate(kb, monkeypatch):
+def events() -> list:
+    """Every gather and judge call of a test, in order (the two-phase check)."""
+    return []
+
+
+@pytest.fixture()
+def gate(kb, monkeypatch, events):
     """Gate on, contradiction seat = SEAT; ``gate.verdict`` is what the stub judge
     answers (a value or an exception), ``gate.judged`` records every judged pair."""
     monkeypatch.setattr(settings, "kb_auto_resolve_judge_gate", True)
@@ -58,6 +74,7 @@ def gate(kb, monkeypatch):
 
     def judge(a_title: str, a_body: str, b_title: str, b_body: str) -> bool:
         state["judged"].append((a_title, b_title))
+        events.append(("judge", a_title))
         if isinstance(state["verdict"], Exception):
             raise state["verdict"]
         return state["verdict"]
@@ -67,15 +84,18 @@ def gate(kb, monkeypatch):
 
 
 @pytest.fixture()
-def nights(kb, monkeypatch):
-    """``night(mode)`` = one evidence pass whose refresh suggests, for EVERY open row,
-    retiring its older item (``"retire_old"``, kept = the newer) or its newer one."""
+def nights(kb, monkeypatch, events):
+    """``night(mode)`` = one evidence pass whose refresh suggests, for every open row,
+    retiring its older item (``"retire_old"``, kept = the newer) or its newer one;
+    ``night.mode_for[a_id]`` overrides the mode for one pair."""
     calls: list[tuple[int, int]] = []
-    state = {"mode": "retire_old"}
+    state: dict = {"mode": "retire_old", "mode_for": {}}
 
     def gather(a: int, b: int) -> dict:  # a = the older item (record_contradiction order)
         calls.append((a, b))
-        keep, retire = (b, a) if state["mode"] == "retire_old" else (a, b)
+        events.append(("gather", a))
+        mode = state["mode_for"].get(a, state["mode"])
+        keep, retire = (b, a) if mode == "retire_old" else (a, b)
         sugg = {"action": "supersede", "keep": keep, "retire": retire, "rule": "evidence: test"}
         return {"a_id": a, "b_id": b, "evidence_updated": datetime.now(UTC).isoformat(),
                 "suggested_resolution": sugg}  # fmt: skip
@@ -88,6 +108,7 @@ def nights(kb, monkeypatch):
         return consolidate._evidence()
 
     night.calls = calls  # type: ignore[attr-defined]
+    night.mode_for = state["mode_for"]  # type: ignore[attr-defined]
     return night
 
 
@@ -103,6 +124,21 @@ def _row(qid: int) -> tuple[bool, dict]:
         ).fetchone()
 
 
+def _wrapped(cause: Exception) -> ExtractorUnavailable:
+    """An ExtractorUnavailable the way kbcore.llm._chat raises it (``from`` httpx)."""
+    exc = ExtractorUnavailable(f"extraction call failed: {cause!r}")
+    exc.__cause__ = cause
+    return exc
+
+
+GATE_ZERO = {
+    "auto_resolve_judge_held": 0,
+    "auto_resolve_judge_failed": 0,
+    "auto_resolve_judge_held_open": 0,
+    "auto_resolve_gate_unavailable": 0,
+}
+
+
 def test_defaults_are_inert():
     assert Settings.model_fields["kb_auto_resolve_judge_gate"].default is False
     assert Settings.model_fields["kb_contradiction_judge_model"].default == ""
@@ -114,13 +150,8 @@ def test_a_confirmed_conflict_still_auto_resolves(gate, nights):
     nights()
     assert nights() == (1, 1, 0)
     assert _status(old) == "superseded" and _row(qid)[0] is True
-    # asked the way the nightly step asks: lower id as Item A
-    assert gate["judged"] == [("bug ok", "fix ok")]
-    assert evidence_step._GATE_STATS == {
-        "auto_resolve_judge_held": 0,
-        "auto_resolve_judge_held_open": 0,
-        "auto_resolve_gate_unavailable": 0,
-    }
+    assert gate["judged"] == [("bug ok", "fix ok")], "asked as the nightly asks: lower id first"
+    assert evidence_step._GATE_STATS == GATE_ZERO
 
 
 def test_no_conflict_holds_the_row_and_retires_nothing(gate, nights):
@@ -134,22 +165,89 @@ def test_no_conflict_holds_the_row_and_retires_nothing(gate, nights):
     hold = detail["auto_resolve_hold"]
     assert hold["kind"] == review_recency.HOLD_JUDGE == "judge_no_conflict"
     assert (hold["keep"], hold["retire"], hold["model"]) == (new, old, SEAT)
-    assert (
-        hold["reason"]
-        == f"held: the contradiction judge ({SEAT}) finds no conflict - owner decision"
-    )
-    assert hold["reason"].isascii()
+    want = f"held: the contradiction judge ({SEAT}) finds no conflict - owner decision"
+    assert hold["reason"] == want and hold["reason"].isascii()
     assert detail["suggested_resolution"]["retire"] == old, "the suggestion stays visible"
-    assert evidence_step._GATE_STATS["auto_resolve_judge_held"] == 1
-    assert evidence_step._GATE_STATS["auto_resolve_judge_held_open"] == 1
+    assert evidence_step._GATE_STATS == {**GATE_ZERO, "auto_resolve_judge_held": 1,
+                                         "auto_resolve_judge_held_open": 1}  # fmt: skip
     assert evidence_step._EVIDENCE_STATS == {"auto_resolve_held": 0, "auto_resolve_held_open": 0}
-    # Night 3: idempotent — skipped before batching: no refresh, no judge, no churn.
+    # Night 3: skipped before batching: no refresh, no judge, no churn.
     refreshed, judged = len(nights.calls), len(gate["judged"])
     assert nights() == (0, 0, 0)
     assert (len(nights.calls), len(gate["judged"])) == (refreshed, judged)
     assert _row(qid) == (False, detail)
-    assert evidence_step._GATE_STATS["auto_resolve_judge_held"] == 0
-    assert evidence_step._GATE_STATS["auto_resolve_judge_held_open"] == 1
+    assert evidence_step._GATE_STATS == {**GATE_ZERO, "auto_resolve_judge_held_open": 1}
+
+
+def test_a_gate_hold_is_sticky_across_a_seat_change_and_a_gate_off(gate, nights, monkeypatch):
+    """A held row's streak is already past the threshold: releasing it on a rollback
+    would retire it automatically the very next pass. Only the owner releases it."""
+    gate["verdict"] = False
+    old, new, qid = _pair("sticky")
+    nights()
+    nights()
+    detail = _row(qid)[1]
+    monkeypatch.setattr(settings, "kb_contradiction_judge_model", "")  # the seat rolled back
+    assert nights() == (0, 0, 0)
+    monkeypatch.setattr(settings, "kb_auto_resolve_judge_gate", False)  # and the gate off
+    assert nights() == (0, 0, 0)
+    assert _status(old) == "active" and _row(qid) == (False, detail)
+    review.dismiss(qid)  # the owner decides (a bug and its fix are not a conflict)
+    assert _row(qid)[0] is True
+
+
+def test_a_row_queued_by_this_seat_is_not_re_asked(gate, nights):
+    """Same seat = a byte-identical, same-seed request: no second call, no GPU swap."""
+    old, new, qid = _pair("same")
+    review_judge_gate.stamp_judged_by(old, new)
+    assert _row(qid)[1]["judged_by"] == {"model": SEAT, "think": None}
+    gate["verdict"] = False  # would hold, if it were asked
+    nights()
+    assert nights() == (1, 1, 0)
+    assert gate["judged"] == [] and _status(old) == "superseded"
+
+
+def test_a_moot_row_closes_without_a_judge_call(gate, nights):
+    """Two rows share the loser X: the first resolution retires X, the second row is
+    moot — closed by the moot path, never held (it would leak open forever)."""
+    x = ingest("gate", "qa", "loser", "the old claim", uri="x", trust="unverified")
+    k1 = ingest("gate", "qa", "winner one", "the new claim", uri="k1", trust="unverified")
+    k2 = ingest("gate", "qa", "winner two", "another new claim", uri="k2", trust="unverified")
+    assert record_contradiction(x, k1) and record_contradiction(x, k2)
+    nights()
+    assert nights() == (2, 1, 1)
+    assert _status(x) == "superseded"
+    assert len(gate["judged"]) == 1, "the moot row spent no judge call"
+    with db.connect() as conn:
+        open_rows = conn.execute(
+            "SELECT count(*) FROM review_queue WHERE reason = 'contradiction' AND resolved = false"
+        ).fetchone()[0]
+    assert open_rows == 0
+
+
+def test_a_judge_timeout_on_one_pair_holds_it_and_the_pass_goes_on(gate, nights, monkeypatch):
+    a_old, a_new, a_qid = _pair("slow")
+    b_old, b_new, b_qid = _pair("fine")
+    nights()
+    calls = {"n": 0}
+
+    def judge(a_title, a_body, b_title, b_body):  # the first pair times out, the next is fine
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _wrapped(httpx.ReadTimeout("timed out"))
+        return True
+
+    monkeypatch.setattr(llm, "items_contradict", judge)
+    assert nights() == (2, 1, 0)
+    hold = _row(a_qid)[1]["auto_resolve_hold"]
+    assert hold["kind"] == review_recency.HOLD_FAILED == "judge_failed"
+    assert hold["reason"] == (
+        f"held: the contradiction judge ({SEAT}) gave no verdict (ReadTimeout) - owner decision"
+    )
+    assert _status(a_old) == "active" and _status(b_old) == "superseded"
+    assert evidence_step._GATE_STATS["auto_resolve_judge_failed"] == 1
+    assert evidence_step._GATE_STATS["auto_resolve_gate_unavailable"] == 0
+    assert nights() == (0, 0, 0) and calls["n"] == 2, "never re-stalled: the hold is sticky"
 
 
 def test_an_unreachable_judge_retires_nothing_and_stops_asking(gate, nights):
@@ -157,7 +255,7 @@ def test_an_unreachable_judge_retires_nothing_and_stops_asking(gate, nights):
     b_old, b_new, b_qid = _pair("down2")
     nights()  # streak 1 on both rows: no candidate yet, no judge call
     assert gate["judged"] == []
-    gate["verdict"] = ExtractorUnavailable("model 'bonsai-2:27b' not found")
+    gate["verdict"] = _wrapped(httpx.ConnectError("connection refused"))
     assert nights() == (2, 0, 0)  # both rows are candidates tonight
     assert _status(a_old) == "active" and _status(b_old) == "active"
     for qid in (a_qid, b_qid):
@@ -169,39 +267,37 @@ def test_an_unreachable_judge_retires_nothing_and_stops_asking(gate, nights):
     assert nights() == (2, 2, 0)
 
 
+def test_after_an_outage_the_recency_guard_still_holds(gate, nights):
+    a_old, a_new, a_qid = _pair("needsjudge")
+    b_old, b_new, b_qid = _pair("recent")
+    nights.mode_for[b_old] = "retire_new"  # pair b would retire its NEWER item
+    nights()
+    gate["verdict"] = _wrapped(httpx.ConnectError("connection refused"))
+    nights()
+    assert _row(b_qid)[1]["auto_resolve_hold"]["kind"] == "newer_retire"
+    assert evidence_step._EVIDENCE_STATS["auto_resolve_held"] == 1
+    assert evidence_step._GATE_STATS["auto_resolve_gate_unavailable"] == 1
+
+
+def test_resolutions_run_after_every_refresh(gate, nights, events):
+    """Two phases: all evidence calls (default model) first, then the judge (another
+    model on the one-slot card) — one model swap per pass, not two per row."""
+    _pair("p1")
+    _pair("p2")
+    nights()
+    events.clear()
+    nights()
+    kinds = [k for k, _ in events]
+    assert kinds == ["gather", "gather", "judge", "judge"]
+
+
 def test_the_recency_hold_comes_first_and_spends_no_judge_call(gate, nights):
-    gate["verdict"] = True
     old, new, qid = _pair("recent")
     nights("retire_new")  # retire the NEWER item, a day later: the recency guard holds
     nights("retire_new")
     assert _status(new) == "active"
     assert _row(qid)[1]["auto_resolve_hold"]["kind"] == "newer_retire"
     assert gate["judged"] == []
-
-
-def test_a_new_judge_model_releases_the_hold_for_re_judging(gate, nights, monkeypatch):
-    gate["verdict"] = False
-    old, new, qid = _pair("swap")
-    nights()
-    nights()
-    assert _row(qid)[1]["auto_resolve_hold"]["model"] == SEAT
-    monkeypatch.setattr(settings, "kb_contradiction_judge_model", "gemma4:12b")
-    gate["verdict"] = True
-    judged = len(gate["judged"])
-    assert nights() == (1, 1, 0), "released, re-judged by the new seat, confirmed"
-    assert len(gate["judged"]) == judged + 1 and _status(old) == "superseded"
-
-
-def test_switching_the_gate_off_restores_the_ungated_behaviour(gate, nights, monkeypatch):
-    gate["verdict"] = False
-    old, new, qid = _pair("off")
-    nights()
-    nights()
-    assert _row(qid)[0] is False
-    monkeypatch.setattr(settings, "kb_auto_resolve_judge_gate", False)
-    judged = len(gate["judged"])
-    assert nights() == (1, 1, 0)
-    assert _status(old) == "superseded" and len(gate["judged"]) == judged
 
 
 def test_the_gate_never_overwrites_an_owner_restore_veto(gate):
@@ -216,13 +312,28 @@ def test_the_gate_never_overwrites_an_owner_restore_veto(gate):
 def test_the_kbcore_chokepoint_gates_on_its_own(gate):
     gate["verdict"] = False
     old, new, qid = _pair("core")
-    assert review.auto_resolve_contradiction(qid, new, old) is None
-    assert review_recency.hold_kind(qid) == "judge_no_conflict"
+    out = review_recency.resolve_contradiction(qid, new, old)
+    assert out == review_recency.Outcome(None, "judge_no_conflict")
     first = _row(qid)
     assert review.auto_resolve_contradiction(qid, new, old) is None
     assert _row(qid) == first, "the hold is stamped once"
+    assert review_recency.resolve_contradiction(qid, new, old, judge=False).hold == "gate_deferred"
     gate["verdict"] = True
     assert review.auto_resolve_contradiction(qid, new, old) == old
+
+
+def test_the_contradiction_step_stamps_the_seat_on_rows_it_queues(gate, monkeypatch):
+    a = ingest("gate", "qa", "claim a", "x is 5", uri="ca", trust="unverified")
+    b = ingest("gate", "qa", "claim b", "x is 7", uri="cb", trust="unverified")
+    monkeypatch.setattr(consolidation, "contradiction_pairs", lambda *a_, **k: [(a, b, 0.9)])
+    assert tail_ops._contradictions("gate") == 1
+    with db.connect() as conn:
+        judged_by = conn.execute(
+            "SELECT detail->'judged_by' FROM review_queue WHERE reason = 'contradiction' "
+            "AND (detail->>'a_id')::bigint = %s",
+            (a,),
+        ).fetchone()[0]
+    assert judged_by == {"model": SEAT, "think": None}
 
 
 def test_the_digest_names_gate_holds():
@@ -231,10 +342,11 @@ def test_the_digest_names_gate_holds():
     want = "auto-resolve held: 5 (+2 tonight; contradiction judge: no conflict)"
     assert judge_held_line(counts) == want
     assert want in digest.digest_lines(counts)
+    failed = judge_held_line({"auto_resolve_judge_failed": 1, "auto_resolve_judge_held_open": 1})
+    assert failed == "auto-resolve held: 1 (contradiction judge: no conflict); no verdict on 1"
     down = judge_held_line({"auto_resolve_gate_unavailable": 3})
-    assert (
-        down
-        == "auto-resolve held: 0 (contradiction judge: no conflict); gate judge unreachable for 3"
+    assert down == (
+        "auto-resolve held: 0 (contradiction judge: no conflict); gate judge unreachable for 3"
     )
 
 

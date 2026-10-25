@@ -18,7 +18,7 @@ import logging
 from collections.abc import Callable
 from datetime import datetime
 
-from kbcore import consolidation, llm
+from kbcore import consolidation, llm, review_judge_gate
 from kbcore.config import settings
 from kbcore.review import close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
@@ -192,6 +192,7 @@ def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None
         verdict = llm.items_contradict(a_title, a_body, b_title, b_body)
         if verdict and consolidation.record_contradiction(a_id, b_id):
             queued += 1
+            review_judge_gate.stamp_judged_by(a_id, b_id)  # the gate never re-asks this seat
         try:
             consolidation.record_pair_judgement(a_id, b_id, verdict)
         except Exception:  # noqa: BLE001 — the memory is an optimisation, never a gate

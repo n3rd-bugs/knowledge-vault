@@ -102,9 +102,8 @@ class LLMSettings(BaseSettings):
     # 500 (was 200, 2026-08-03): measured 9.2 s/pair (not the 41 inferred) => ~77
     # min; safe to widen because judged pairs PERSIST across a deadline cut.
     # Day-aware weekday cap (review #6): deadline days judge min(cap, this) — kbworker.tail_ops.
-    # Widened 40 -> 200 ONLY together with the pair-judge swap below (~2.3 min at 0.7 s/pair;
-    # bounded at 40-67 min if the model is rolled back mid-week at 12-20 s/pair). Rollback of
-    # the swap is TWO .env lines: KB_PAIR_JUDGE_MODEL= and this back to 40.
+    # Widen 40 -> 200 ONLY while the CONTRADICTION seat (below) is a fast judge (~2.3 min at
+    # 0.7 s/pair; 40-67 min at 12-20 s/pair) and put it back to 40 when it is not.
     kb_contradiction_pair_cap_weekday: int = 40
     # Pair-judge seat (review #8 H3, bench-gate rule): the model behind the TWO pairwise
     # judges — llm.items_contradict (nightly contradiction step) and
@@ -125,6 +124,8 @@ class LLMSettings(BaseSettings):
     # seat above. Measured on the 92 pairs the nightly auto-resolved 08-25..10-24 against a
     # blind two-labeler ground truth (42 real conflicts): qwen3:14b precision 0.52 / recall
     # 0.79 at 12.7 s/pair, bonsai-2:27b 0.78 / 0.83 at 11.8 s/pair. Rollback = empty it.
+    # Pairs an earlier seat judged "no conflict" stay remembered (contradiction_judgements is
+    # keyed by EMBED model) and are not re-judged by a new seat until a re-embed.
     kb_contradiction_judge_model: str = ""
     # Ollama `think` for that seat, read ONLY while its model is set (the rule above).
     kb_contradiction_judge_think: bool | None = None

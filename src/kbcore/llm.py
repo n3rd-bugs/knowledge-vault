@@ -10,6 +10,7 @@ seconds, never -1 — CLAUDE.md rule 8, corrected 2026-07-29). Transport failure
 from __future__ import annotations
 
 import hashlib
+import logging
 from typing import Any
 
 import httpx
@@ -20,6 +21,8 @@ from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 # Documented seam: callers/tests resolve llm.parse_model_json / llm.JSON_COUNTERS.
 from kbcore.llm_json import JSON_COUNTERS, parse_model_json, recover_items  # noqa: F401
 from kbcore.unicode_safe import clean, clean_obj
+
+logger = logging.getLogger("kbcore.llm")
 
 # Extractor sampling: pin ONLY a fixed seed — determinism-for-retry comes from the
 # seed, not from greedy decoding. Ollama's seed makes sampling reproducible at
@@ -67,6 +70,21 @@ def _classify_extractor_error(e: httpx.HTTPError) -> Exception:
     if isinstance(e, httpx.TimeoutException) and not isinstance(e, httpx.ConnectTimeout):
         return ExtractionFailed(msg)  # read timeout: THIS row is too heavy — bound it
     return ExtractorUnavailable(msg)  # connect errors and other transport failures
+
+
+def _repeat_aborted(e: httpx.HTTPError) -> bool:
+    """Ollama >= 0.40 ABORTS a degenerate reply (101 identical tokens in a row — in
+    practice a whitespace run inside format=json) with HTTP 500 "prediction aborted,
+    token repeat limit reached"; 0.31.1 cut the same loop at 31 and answered 200 with
+    the truncated text. A content failure of THIS reply, not an outage: the callers
+    read it back as the empty reply 0.31.1 effectively gave, so the unparseable-reply
+    path applies (the extractor's one re-ask at seed+1, a judge's per-item failure)
+    instead of the outage path that defers a whole group (upgrade 2026-10-25)."""
+    return (
+        isinstance(e, httpx.HTTPStatusError)
+        and e.response.status_code == 500
+        and "token repeat limit" in (e.response.text or "").lower()
+    )
 
 
 # The 14B can take a while on first-token; generous read timeout, tight connect.
@@ -157,6 +175,9 @@ def _extract_call(payload: dict[str, Any]) -> str:
         resp = httpx.post(f"{settings.ollama_url}/api/chat", json=payload, timeout=_TIMEOUT)
         resp.raise_for_status()
     except httpx.HTTPError as e:
+        if _repeat_aborted(e):
+            logger.warning("extractor %s: token-repeat abort, read as empty", payload["model"])
+            return ""
         raise _classify_extractor_error(e) from e
     try:
         content = resp.json()["message"]["content"]
@@ -212,6 +233,9 @@ def _chat(
         resp.raise_for_status()
         return clean_obj(resp.json()["message"]["content"])  # see _extract_call
     except httpx.HTTPError as e:
+        if _repeat_aborted(e):
+            logger.warning("chat %s: token-repeat abort, read as empty", payload["model"])
+            return ""
         raise ExtractorUnavailable(
             f"extraction call to {settings.ollama_url} failed: {e.__class__.__name__}: {e}"
         ) from e

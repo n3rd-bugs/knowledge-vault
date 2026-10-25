@@ -73,13 +73,13 @@ def _classify_extractor_error(e: httpx.HTTPError) -> Exception:
 
 
 def _repeat_aborted(e: httpx.HTTPError) -> bool:
-    """Ollama >= 0.40 ABORTS a degenerate reply (101 identical tokens in a row — in
+    """Ollama >= 0.40 ABORTS a degenerate reply (101 identical tokens in a row, in
     practice a whitespace run inside format=json) with HTTP 500 "prediction aborted,
-    token repeat limit reached"; 0.31.1 cut the same loop at 31 and answered 200 with
-    the truncated text. A content failure of THIS reply, not an outage: the callers
-    read it back as the empty reply 0.31.1 effectively gave, so the unparseable-reply
-    path applies (the extractor's one re-ask at seed+1, a judge's per-item failure)
-    instead of the outage path that defers a whole group (upgrade 2026-10-25)."""
+    token repeat limit reached"; 0.31.1 cut it at 31 and answered 200 with the text so
+    far. A CONTENT failure, not an outage: callers read it as an EMPTY reply, so the
+    unparseable path applies (the extractor's one re-ask at seed+1, a judge's per-item
+    failure), never the one that defers a whole group. The 500 carries no partial text,
+    so item salvage cannot run on it as it did on 0.31.1 (upgrade 2026-10-25)."""
     return (
         isinstance(e, httpx.HTTPStatusError)
         and e.response.status_code == 500

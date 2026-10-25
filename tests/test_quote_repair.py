@@ -308,3 +308,13 @@ def test_refine_floor_is_exact_at_every_threshold(quote, text):
     for threshold in (0.5, 0.8, 0.9, 0.95, best, min(1.0, best + 1e-9)):
         expected = unfloored if best >= threshold else None
         assert find_span(quote, text, threshold) == expected, threshold
+
+
+def test_a_long_quote_verbatim_after_strip_is_grounded_past_the_cap():
+    # gate_quotes' exact check runs on the UNSTRIPPED quote; a long block quoted with a
+    # stray leading/trailing space must still ground at 1.0 (as before the cap), since
+    # nothing needs relocating and the cap's cost rationale does not apply.
+    block = " ".join(f"line {i}: the regulator re-arms after UVLO" for i in range(40))
+    text = "preamble\n" + block + "\nepilogue"
+    assert len(block) > quote_repair.MAX_QUOTE_CHARS
+    assert quote_repair.find_span(" " + block + " ", text, 0.95) == (block, 1.0)

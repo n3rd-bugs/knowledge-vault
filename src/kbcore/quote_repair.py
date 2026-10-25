@@ -83,7 +83,11 @@ def find_span(quote: str, text: str, min_ratio: float) -> tuple[str, float] | No
     """
     quote = quote.strip()
     n = len(quote)
-    if n == 0 or n > MAX_QUOTE_CHARS or not text:
+    if n == 0 or not text:
+        return None
+    if quote in text:  # verbatim once stripped: grounded at ANY length, nothing to relocate
+        return quote, 1.0
+    if n > MAX_QUOTE_CHARS:
         return None
 
     sm = SequenceMatcher(autojunk=False)

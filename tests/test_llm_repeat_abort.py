@@ -94,6 +94,24 @@ def test_contradiction_and_evidence_judges_degrade_like_an_unparseable_reply(scr
 
 
 def test_plain_500_on_chat_is_still_an_outage(script):
-    script["queue"] = [_Resp(503, '{"error":"server busy"}')]
+    script["queue"] = [_Resp(500, '{"error":"llama runner process has terminated"}')]
     with pytest.raises(ExtractorUnavailable):
         llm.items_contradict("a", "a body", "b", "b body")
+
+
+def test_the_abort_text_on_any_other_status_is_still_an_outage(script):
+    script["queue"] = [_Resp(503, _ABORT), _Resp(503, _ABORT)]
+    with pytest.raises(ExtractorUnavailable):
+        llm.extract_items("some transcript")
+    with pytest.raises(ExtractorUnavailable):
+        llm.items_contradict("a", "a body", "b", "b body")
+
+
+def test_an_abort_leaves_no_empty_failure_dump(script, tmp_path, monkeypatch):
+    # recover_items dumps unparseable replies (newest kb_extract_failure_dumps kept);
+    # header-only dumps of "" would evict the informative ones.
+    monkeypatch.setattr(settings, "kb_state_dir", tmp_path)
+    script["queue"] = [_Resp(500, _ABORT), _Resp(500, _ABORT)]
+    with pytest.raises(ExtractionFailed):
+        llm.extract_items("some transcript")
+    assert not list((tmp_path / "extract-failures").glob("*"))

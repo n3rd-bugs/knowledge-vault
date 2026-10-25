@@ -22,7 +22,7 @@ from typing import Any
 from kbcore import llm
 from kbcore.config import settings
 from kbcore.db import connect
-from kbcore.errors import ExtractorUnavailable
+from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 from kbcore.ingest import ingest
 from kbcore.models import DeepSearchResult, SearchHit
 from kbcore.search import search
@@ -209,6 +209,10 @@ def deep_search(
     kept_ids = [d["id"] for d in docs]
     conflicts = _contradiction_edges(kept_ids)
     report = synthesize(question, docs, conflicts)
+    if not report.strip():
+        # A blank synthesis (an Ollama token-repeat abort reads back as "", kbcore.llm)
+        # must fail the run, never be saved as a sources-only "report" marked done.
+        raise ExtractionFailed("deep-search synthesis came back empty; nothing saved")
 
     footer = "\n\nSources:\n" + "\n".join(
         f"- [item {d['id']}] {d['title']} ({d['project']}, {d['trust']})" for d in docs

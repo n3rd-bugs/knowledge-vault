@@ -207,3 +207,18 @@ def test_mcp_kb_deep_search_registered(corpus):
 
     text = asyncio.run(run())
     assert "machine-synthesized" in text and "Answer citing" in text
+
+
+def test_an_empty_synthesis_fails_and_saves_nothing(corpus, monkeypatch):
+    # The Ollama >= 0.40 token-repeat abort reads back as "" (kbcore.llm._chat): a
+    # sources-only report must not be ingested and returned as a successful run.
+    from kbcore.errors import ExtractionFailed
+
+    monkeypatch.setattr(deepsearch, "synthesize", lambda q, docs, conflicts: "  \n")
+    with db.connect() as conn:
+        before = conn.execute("SELECT count(*) FROM items WHERE type = 'report'").fetchone()[0]
+    with pytest.raises(ExtractionFailed):
+        deepsearch.deep_search("how does modbus framing work?")
+    with db.connect() as conn:
+        after = conn.execute("SELECT count(*) FROM items WHERE type = 'report'").fetchone()[0]
+    assert after == before

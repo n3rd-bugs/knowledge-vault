@@ -200,7 +200,7 @@ def record_unparseable(model: str, content: str, err: BaseException) -> Path | N
     Debug artefacts, not knowledge (outside rule 5); body scrubbed like ingest.
     """
     keep = settings.kb_extract_failure_dumps
-    if keep <= 0:
+    if keep <= 0 or not content:  # an empty reply (a token-repeat abort) says nothing
         return None
     try:
         root = Path(settings.kb_state_dir).expanduser() / "extract-failures"

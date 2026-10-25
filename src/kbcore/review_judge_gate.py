@@ -17,8 +17,8 @@ the pair right before anything is retired, asked the way the nightly step asks
 (``detail.auto_resolve_hold`` kind ``judge_no_conflict``): it stays open with its
 suggestion visible and nothing is superseded — the owner decides. A judge that
 cannot be reached RAISES, so the pair is simply retried next run: automation never
-retires on an unconfirmed conflict. An unparseable answer reads as "no conflict"
-(items_contradict's contract), i.e. it holds — the fail-safe direction.
+retires on an unconfirmed conflict; a reply that carries no verdict never counts
+as one (below).
 
 SAME SEAT, NO CALL. The nightly step stamps ``detail.judged_by`` (model + think)
 on every row it queues. Re-asking that same seat repeats a byte-identical,
@@ -27,14 +27,18 @@ fixed; only run-to-run GPU noise could change the answer), so such a row counts 
 confirmed without a call: the gate is the backlog filter for rows queued by a
 DIFFERENT judge (every row before 2026-10-25 was queued by qwen3:14b).
 
-NO VERDICT. A judge that times out (or answers 4xx) on THIS pair holds it too, kind
-``judge_failed``: the request is seed-pinned, so it would stall the same way every
-night. Only a real outage (connect error, model missing, 5xx) defers the pass.
+NO VERDICT. When the judge gives no usable verdict on THIS pair (a read timeout,
+an unusable or unparseable reply, a token-repeat abort) the row is NOT
+retired and the failure is counted on it (``judge_failed``, ``attempts``); it is
+re-judged next pass, and only the third consecutive failure makes the hold final
+— a slot contended by an interactive job must not park pairs for good. Two
+per-pair failures in a row within one pass trip the pass breaker (the worker then
+treats the judge as down). An outage (connect error, any HTTP status) raises.
 
-STICKY. A gate hold stays in force until the owner acts
-(:func:`kbcore.review_recency.hold_in_force`): a held row keeps a streak already
-past the threshold, so releasing it on a gate-off or seat rollback would retire
-it automatically on the very next pass — the defect this gate exists to stop.
+STICKY. A ``judge_no_conflict`` (or final ``judge_failed``) hold stays in force
+until the owner acts (:func:`kbcore.review_recency.hold_in_force`): a held row
+keeps a streak already past the threshold, so releasing it on a gate-off or seat
+rollback would retire it on the very next pass — the defect this gate stops.
 """
 
 from __future__ import annotations
@@ -50,9 +54,11 @@ from kbcore import llm
 from kbcore.config import settings
 from kbcore.consolidation import item_pair_texts
 from kbcore.db import connect, transaction
-from kbcore.errors import AlreadySuperseded, ExtractorUnavailable
+from kbcore.errors import ExtractorUnavailable
 from kbcore.review_recency import (
+    FAILED_FINAL_AT,
     GATE_DEFERRED,
+    GATE_RETRY,
     HOLD_FAILED,
     HOLD_JUDGE,
     HOLD_KEY,
@@ -85,61 +91,110 @@ def stamp_judged_by(a_id: int, b_id: int) -> None:
         )
 
 
-def assert_retire_active(retire: int) -> None:
-    """The moot check, BEFORE any judge call: a loser an earlier resolution of this
-    pass already retired raises what supersede() would, so the row closes as moot."""
-    with connect() as conn:
-        row = conn.execute("SELECT status FROM items WHERE id = %s", (retire,)).fetchone()
-    if row is not None and row[0] == "superseded":
-        raise AlreadySuperseded(f"item {retire} is already superseded")
-
-
-def judge_confirms(keep: int, retire: int) -> bool:
-    """The contradiction seat's verdict on the pair. Raises
-    :class:`~kbcore.errors.ExtractorUnavailable` when the judge is unreachable."""
+def verdict(keep: int, retire: int) -> bool | None:
+    """The contradiction seat's THREE-state verdict: True / False, or None when the
+    reply carries none (empty, unparseable, no usable ``contradict``). The request is
+    byte-identical to :func:`kbcore.llm.items_contradict`'s (lower id as Item A, the
+    same prompt, per-content seed and seat), whose bool contract maps None to False.
+    Raises :class:`~kbcore.errors.ExtractorUnavailable` when the judge fails."""
     a_id, b_id = (keep, retire) if keep <= retire else (retire, keep)
     (a_title, a_body), (b_title, b_body) = item_pair_texts(a_id, b_id)
-    return llm.items_contradict(a_title, a_body, b_title, b_body)
+    content = llm._chat(
+        [
+            {"role": "system", "content": llm._CONTRADICT_SYSTEM},
+            {
+                "role": "user",
+                "content": f"Item A: {a_title}\n{a_body}\n\nItem B: {b_title}\n{b_body}",
+            },
+        ],
+        json_format=True,
+        seed=llm._draw_seed(a_title, a_body, b_title, b_body),
+        model=settings.contradiction_judge_model,
+        think=settings.contradiction_judge_think,
+    )
+    try:
+        data = llm.parse_model_json(content)
+    except (ValueError, TypeError):
+        return None
+    val = data.get("contradict") if isinstance(data, dict) else None
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str) and val.strip().lower() in ("true", "yes", "1", "false", "no", "0"):
+        return val.strip().lower() in ("true", "yes", "1")
+    return None
 
 
 def per_pair_failure(exc: ExtractorUnavailable) -> bool:
-    """A judge failure about THIS pair (read timeout, 4xx other than model-missing)
-    rather than an outage — kbcore.llm._chat wraps every httpx error the same way."""
+    """A judge failure that may be about THIS pair (a read timeout, a reply _chat could
+    not use) rather than an outage. Any HTTP status is an outage: Ollama's 4xx are
+    request-shape errors common to every pair (e.g. think on a non-thinking model)."""
     cause = exc.__cause__
-    if isinstance(cause, httpx.TimeoutException):
-        return not isinstance(cause, httpx.ConnectTimeout)
-    if isinstance(cause, httpx.HTTPStatusError):
-        status = cause.response.status_code
-        return 400 <= status < 500 and status != 404
-    return False
+    if isinstance(cause, KeyError | ValueError | TypeError):  # unusable reply body
+        return True
+    return isinstance(cause, httpx.TimeoutException) and not isinstance(cause, httpx.ConnectTimeout)
 
 
 def gate(queue_id: int, keep: int, retire: int, *, judge: bool = True) -> str | None:
-    """:data:`CONFIRMED` (retire) or why not: HOLD_JUDGE / HOLD_FAILED stamped now,
-    GATE_DEFERRED (``judge=False``: the pass lost its judge), or "" (nothing stamped:
-    the owner closed the row meanwhile). An outage raises ExtractorUnavailable."""
-    assert_retire_active(retire)
+    """:data:`CONFIRMED` (retire) or why not: HOLD_JUDGE stamped now, GATE_RETRY (no
+    verdict, counted; re-judged next pass), HOLD_FAILED (no verdict a third time:
+    final), GATE_DEFERRED (``judge=False``: the pass lost its judge), or "" (nothing
+    stamped: the owner closed the row meanwhile). An outage raises."""
     with connect() as conn:
         row = conn.execute(
-            "SELECT detail->'judged_by' FROM review_queue WHERE id = %s", (queue_id,)
+            "SELECT detail->'judged_by', resolved FROM review_queue WHERE id = %s", (queue_id,)
         ).fetchone()
-    if row is not None and row[0] == seat():
+    if row is None or row[1] is True:
+        return ""  # closed since the snapshot: nothing to judge
+    if row[0] == seat():
         return CONFIRMED  # queued by this very seat: a re-ask is the same request
     if not judge:
         return GATE_DEFERRED
-    kind, why = HOLD_JUDGE, "finds no conflict"
     try:
-        if judge_confirms(keep, retire):
-            return CONFIRMED
+        answer = verdict(keep, retire)
     except ExtractorUnavailable as exc:
         if not per_pair_failure(exc):
             raise
-        kind, why = HOLD_FAILED, f"gave no verdict ({type(exc.__cause__).__name__})"
-    reason = hold_reason(settings.contradiction_judge_model, why)
-    if not hold_row(queue_id, keep, retire, kind, reason):
+        return fail_row(queue_id, keep, retire, type(exc.__cause__).__name__)
+    if answer is None:
+        return fail_row(queue_id, keep, retire, "unparseable")
+    if answer:
+        return CONFIRMED
+    reason = hold_reason(settings.contradiction_judge_model)
+    if not hold_row(queue_id, keep, retire, HOLD_JUDGE, reason):
         return ""
     logger.info("contradiction row %s held: %s", queue_id, reason)
-    return kind
+    return HOLD_JUDGE
+
+
+def fail_row(queue_id: int, keep: int, retire: int, what: str) -> str:
+    """Count a no-verdict on an OPEN row (same pair + seat: attempts + 1, else 1); the
+    third makes the hold final. GATE_RETRY / HOLD_FAILED, or "" when the row was
+    closed or carries an owner veto meanwhile."""
+    model = settings.contradiction_judge_model
+    with transaction() as conn:
+        row = conn.execute(
+            "SELECT detail->'auto_resolve_hold' FROM review_queue "
+            "WHERE id = %s AND resolved = false FOR UPDATE",
+            (queue_id,),
+        ).fetchone()
+        prior = (row[0] if row else None) or {}
+        if row is None or prior.get("kind") == HOLD_RESTORED:
+            return ""
+        same = (prior.get("kind"), prior.get("keep"), prior.get("retire"), prior.get("model"))
+        attempts = (
+            (prior.get("attempts") or 0) + 1 if same == (HOLD_FAILED, keep, retire, model) else 1
+        )
+        final = attempts >= FAILED_FINAL_AT
+        reason = hold_reason(model, f"gave no verdict ({what}; attempt {attempts})")
+        stamp = {"kind": HOLD_FAILED, "keep": keep, "retire": retire, "model": model,
+                 "attempts": attempts, "final": final, "reason": reason,
+                 "at": datetime.now(UTC).isoformat()}  # fmt: skip
+        conn.execute(
+            "UPDATE review_queue SET detail = COALESCE(detail, '{}'::jsonb) || %s WHERE id = %s",
+            (Jsonb({HOLD_KEY: stamp}), queue_id),
+        )
+    logger.warning("contradiction row %s: %s", queue_id, reason)
+    return HOLD_FAILED if final else GATE_RETRY
 
 
 def hold_reason(model: str, why: str = "finds no conflict") -> str:

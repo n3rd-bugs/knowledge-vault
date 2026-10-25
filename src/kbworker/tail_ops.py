@@ -192,7 +192,10 @@ def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None
         verdict = llm.items_contradict(a_title, a_body, b_title, b_body)
         if verdict and consolidation.record_contradiction(a_id, b_id):
             queued += 1
-            review_judge_gate.stamp_judged_by(a_id, b_id)  # the gate never re-asks this seat
+            try:  # so the gate never re-asks this seat; an optimisation, never a gate
+                review_judge_gate.stamp_judged_by(a_id, b_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("stamping the judge on pair %s/%s failed", a_id, b_id)
         try:
             consolidation.record_pair_judgement(a_id, b_id, verdict)
         except Exception:  # noqa: BLE001 — the memory is an optimisation, never a gate

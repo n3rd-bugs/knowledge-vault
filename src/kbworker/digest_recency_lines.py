@@ -32,19 +32,22 @@ def auto_resolve_held_line(counts: Mapping[str, Any]) -> str | None:
 
 
 def judge_held_line(counts: Mapping[str, Any]) -> str | None:
-    """``auto-resolve held: N (+M tonight; contradiction judge: no conflict)`` — the open
-    pairs the precision gate (kbcore.review_judge_gate) kept from being retired, with
-    the pairs its judge gave no verdict on and a note when the judge was unreachable
-    (those pairs simply wait for the next run)."""
-    held_open = _count(counts, "auto_resolve_judge_held_open")
-    tonight = _count(counts, "auto_resolve_judge_held")
-    failed = _count(counts, "auto_resolve_judge_failed")
+    """``auto-resolve held by the judge: N (X no conflict, Y no verdict; +M tonight)`` —
+    the open pairs the precision gate (kbcore.review_judge_gate) kept from being
+    retired, by kind, plus a separate clause when its judge was unreachable."""
+    no_conflict = _count(counts, "auto_resolve_judge_held_open")
+    no_verdict = _count(counts, "auto_resolve_judge_failed_open")
+    tonight = _count(counts, "auto_resolve_judge_held") + _count(
+        counts, "auto_resolve_judge_failed"
+    )
     down = _count(counts, "auto_resolve_gate_unavailable")
-    if not held_open and not tonight and not failed and not down:
-        return None
-    new = f"+{tonight} tonight; " if tonight else ""
-    line = f"auto-resolve held: {max(held_open, tonight + failed)} "
-    line += f"({new}contradiction judge: no conflict)"
-    if failed:
-        line += f"; no verdict on {failed}"
-    return line + (f"; gate judge unreachable for {down}" if down else "")
+    parts = []
+    if no_conflict or no_verdict or tonight:
+        new = f"; +{tonight} tonight" if tonight else ""
+        parts.append(
+            f"auto-resolve held by the judge: {no_conflict + no_verdict} "
+            f"({no_conflict} no conflict, {no_verdict} no verdict{new})"
+        )
+    if down:
+        parts.append(f"precision gate: judge unreachable, {down} deferred")
+    return "; ".join(parts) or None

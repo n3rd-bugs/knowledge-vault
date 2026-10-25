@@ -57,6 +57,7 @@ from psycopg.types.json import Jsonb
 
 from kbcore.config import settings
 from kbcore.db import connect, transaction
+from kbcore.errors import AlreadySuperseded
 from kbcore.supersede import supersede
 
 logger = logging.getLogger("kbcore.review_recency")
@@ -68,8 +69,10 @@ HOLD_KEY = "auto_resolve_hold"
 HOLD_NEWER = "newer_retire"  # the recency guard held it
 HOLD_RESTORED = "owner_restore"  # the owner restored the retired side: veto
 HOLD_JUDGE = "judge_no_conflict"  # the precision gate's judge found no conflict
-HOLD_FAILED = "judge_failed"  # the gate's judge gave no verdict on THIS pair (timeout, 4xx)
+HOLD_FAILED = "judge_failed"  # the gate's judge gave no verdict on THIS pair (final at 3)
+GATE_RETRY = "gate_retry"  # a no-verdict counted on the row; re-judged next pass
 GATE_DEFERRED = "gate_deferred"  # the pair needs the gate's judge and the pass has none
+FAILED_FINAL_AT = 3  # consecutive no-verdicts that make a judge_failed hold final
 #: ``detail.auto_resolution.kind`` stamped on a row an auto-resolution closed, so
 #: an owner restore can find exactly the row that retired the item.
 RESOLVED_KIND = "evidence_supersede"
@@ -113,10 +116,10 @@ def hold_in_force(detail: Mapping[str, Any] | None) -> bool:
     * ``newer_retire`` — while the stored suggestion is still the one that was
       held AND its gap is still beyond the CURRENT window: a raised knob
       releases the row, a changed suggestion means the hold is stale.
-    * ``judge_no_conflict`` / ``judge_failed`` — while the suggestion is unchanged: STICKY like the
-      owner veto (a held row is never refreshed, so in practice until the owner
-      acts). Releasing it on a gate-off or seat rollback would retire the pair
-      on the very next pass — its streak is already past the threshold.
+    * ``judge_no_conflict`` and a FINAL ``judge_failed`` — while the suggestion is
+      unchanged: STICKY like the owner veto (a held row is never refreshed, so in
+      practice until the owner acts). Releasing it on a gate-off or seat rollback
+      would retire the pair on the very next pass — its streak is past the threshold.
     """
     hold = (detail or {}).get(HOLD_KEY)
     if not isinstance(hold, Mapping):
@@ -128,8 +131,10 @@ def hold_in_force(detail: Mapping[str, Any] | None) -> bool:
     sugg = (detail or {}).get("suggested_resolution") or {}
     if (sugg.get("keep"), sugg.get("retire")) != (hold.get("keep"), hold.get("retire")):
         return False
-    if hold.get("kind") in (HOLD_JUDGE, HOLD_FAILED):
+    if hold.get("kind") == HOLD_JUDGE:
         return True
+    if hold.get("kind") == HOLD_FAILED:
+        return hold.get("final") is True  # until then the pair is re-judged next pass
     gap = hold.get("gap_days")
     return isinstance(gap, int | float) and not isinstance(gap, bool) and would_hold(float(gap))
 
@@ -140,11 +145,10 @@ def held_newer(detail: Mapping[str, Any] | None) -> bool:
     return hold_in_force(detail) and isinstance(hold, Mapping) and hold.get("kind") == HOLD_NEWER
 
 
-def held_judge(detail: Mapping[str, Any] | None) -> bool:
-    """A row held by the precision gate (either kind) — the digest's second count."""
+def held_judge(detail: Mapping[str, Any] | None, kind: str) -> bool:
+    """A row whose precision-gate hold of ``kind`` is in force — the digest's counts."""
     hold = (detail or {}).get(HOLD_KEY)
-    gate_kinds = (HOLD_JUDGE, HOLD_FAILED)
-    return hold_in_force(detail) and isinstance(hold, Mapping) and hold.get("kind") in gate_kinds
+    return hold_in_force(detail) and isinstance(hold, Mapping) and hold.get("kind") == kind
 
 
 def hold_row(queue_id: int, keep: int, retire: int, gap_days: float) -> bool:
@@ -206,6 +210,13 @@ def resolve_contradiction(queue_id: int, keep: int, retire: int, *, judge: bool 
     lost its judge) defers such a row untouched; an unreachable judge raises
     ``ExtractorUnavailable`` with nothing changed.
     """
+    statuses = _statuses(keep, retire)
+    if statuses.get(retire) == "superseded":  # an earlier resolution of this pass retired it:
+        raise AlreadySuperseded(f"item {retire} is already superseded")  # the moot path
+    if keep in statuses and statuses[keep] != "active":
+        logger.warning("contradiction row %s: keeper %s is %s; nothing done", queue_id, keep,
+                       statuses[keep])  # fmt: skip
+        return Outcome(None, None)
     gap = newer_gap_days(keep, retire)
     if gap is not None and would_hold(gap):
         stamped = hold_row(queue_id, keep, retire, gap)
@@ -217,7 +228,9 @@ def resolve_contradiction(queue_id: int, keep: int, retire: int, *, judge: bool 
 
         why = review_judge_gate.gate(queue_id, keep, retire, judge=judge)
         if why is not review_judge_gate.CONFIRMED:
-            return Outcome(None, why)
+            return Outcome(None, why or None)
+    if not _still_open(queue_id):  # the owner closed or vetoed it since the snapshot
+        return Outcome(None, None)
     supersede(retire, new_item_id=keep, reason=AUTO_RESOLVE_REASON)
     stamp = {
         "auto_resolution": {
@@ -232,11 +245,36 @@ def resolve_contradiction(queue_id: int, keep: int, retire: int, *, judge: bool 
         # reopened + vetoed the row: never close it again behind the owner's back.
         conn.execute(
             "UPDATE review_queue SET resolved = true, "
-            "detail = COALESCE(detail, '{}'::jsonb) || %s WHERE id = %s "
+            "detail = COALESCE(detail, '{}'::jsonb) || %s WHERE id = %s AND resolved = false "
             "AND COALESCE(detail->'auto_resolve_hold'->>'kind', '') <> %s",
             (Jsonb(stamp), queue_id, HOLD_RESTORED),
         )
     return Outcome(retire, None)
+
+
+def superseded(item_id: int) -> bool:
+    """Whether the item is superseded now (the nightly's post-pass moot sweep)."""
+    return _statuses(item_id).get(item_id) == "superseded"
+
+
+def _statuses(*item_ids: int) -> dict[int, str]:
+    """``{id: status}`` for the items that exist (a missing one is left to supersede)."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, status FROM items WHERE id = ANY(%s)", (list(item_ids),)
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _still_open(queue_id: int) -> bool:
+    """The row is still open and carries no owner veto — re-read right before acting,
+    because the nightly resolves from a snapshot taken earlier in the pass."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT resolved, detail->'auto_resolve_hold'->>'kind' FROM review_queue WHERE id = %s",
+            (queue_id,),
+        ).fetchone()
+    return row is not None and row[0] is False and row[1] != HOLD_RESTORED
 
 
 def auto_resolve_contradiction(queue_id: int, keep: int, retire: int) -> int | None:

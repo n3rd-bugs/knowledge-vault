@@ -36,6 +36,7 @@ _GATE_STATS: dict[str, int] = {
     "auto_resolve_judge_held": 0,
     "auto_resolve_judge_failed": 0,
     "auto_resolve_judge_held_open": 0,
+    "auto_resolve_judge_failed_open": 0,
     "auto_resolve_gate_unavailable": 0,
 }
 
@@ -119,11 +120,15 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     live = [r for r in rows if not review_recency.hold_in_force(r[3])]
     held_before = sum(1 for r in rows if review_recency.held_newer(r[3]))
     _EVIDENCE_STATS.update(auto_resolve_held=0, auto_resolve_held_open=held_before)
-    judge_before = sum(1 for r in rows if review_recency.held_judge(r[3]))
     _GATE_STATS.update(
         auto_resolve_judge_held=0,
         auto_resolve_judge_failed=0,
-        auto_resolve_judge_held_open=judge_before,
+        auto_resolve_judge_held_open=sum(
+            1 for r in rows if review_recency.held_judge(r[3], review_recency.HOLD_JUDGE)
+        ),
+        auto_resolve_judge_failed_open=sum(
+            1 for r in rows if review_recency.held_judge(r[3], review_recency.HOLD_FAILED)
+        ),
         auto_resolve_gate_unavailable=0,
     )
     batch = _evidence_batch(live)
@@ -146,10 +151,12 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
                 detail["suggestion_streak"] = prior.get("suggestion_streak", 0) + 1 if same else 1
             else:
                 detail["suggestion_streak"] = 0  # overwrite any stale streak
-            if evidence.update_review_detail(queue_id, detail):
+            still_open = evidence.update_review_detail(queue_id, detail)
+            if still_open:
                 refreshed += 1
             if (
-                sugg
+                still_open  # a row closed meanwhile is never resolved from its snapshot
+                and sugg
                 and settings.kb_auto_resolve_evidence
                 and detail["suggestion_streak"] >= evidence.AUTO_RESOLVE_STREAK
             ):
@@ -157,8 +164,12 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
         except Exception:  # noqa: BLE001 — one bad pair must not abort the step
             logger.exception("evidence refresh for queue row %s failed", queue_id)
     gated = bool(settings.kb_auto_resolve_judge_gate)
+    no_verdict_run = 0  # consecutive per-pair judge failures: 2 trip the pass breaker
+    held_tonight: list[tuple[int, int, int]] = []  # (queue_id, keep, retire) held this pass
     for n, (queue_id, sugg, streak) in enumerate(candidates):
-        if gated and stop is not None and (reason := stop()):  # judge calls are GPU work
+        # Only a BATTERY stand-down stops phase 2: on a deadline the collected rows still
+        # resolve (the reserve's promise; at most ~13 s of judge per candidate).
+        if gated and stop is not None and (reason := stop()) == "battery":
             _seam()._note_stop("evidence_refreshed", reason, len(candidates) - n)
             break
         try:
@@ -169,7 +180,11 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
             )
         except AlreadySuperseded as exc:
             moot += 1
-            closed = close_contradiction_rows_for(sugg["keep"], sugg["retire"])
+            try:
+                closed = close_contradiction_rows_for(sugg["keep"], sugg["retire"])
+            except Exception:  # noqa: BLE001 — one bad pair must not abort the step
+                logger.exception("closing moot contradiction row %s failed", queue_id)
+                continue
             logger.warning(
                 "contradiction row %s moot: %s "
                 "(an earlier resolution already superseded it; %d row(s) closed)",
@@ -194,9 +209,20 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
         if out.hold == review_recency.GATE_DEFERRED:
             _GATE_STATS["auto_resolve_gate_unavailable"] += 1
             continue
-        if out.hold in (review_recency.HOLD_JUDGE, review_recency.HOLD_FAILED):
-            key = "judge_held" if out.hold == review_recency.HOLD_JUDGE else "judge_failed"
-            _GATE_STATS[f"auto_resolve_{key}"] += 1
+        if out.hold is not None and out.hold != review_recency.GATE_DEFERRED:
+            held_tonight.append((queue_id, sugg["keep"], sugg["retire"]))
+        if out.hold in (review_recency.GATE_RETRY, review_recency.HOLD_FAILED):
+            _GATE_STATS["auto_resolve_judge_failed"] += 1
+            if out.hold == review_recency.HOLD_FAILED:  # the third: final, sticky
+                _GATE_STATS["auto_resolve_judge_failed_open"] += 1
+            no_verdict_run += 1
+            if no_verdict_run >= 2 and not gate_down:
+                gate_down = True
+                logger.warning("precision gate: two no-verdicts in a row; judge treated as down")
+            continue
+        no_verdict_run = 0
+        if out.hold == review_recency.HOLD_JUDGE:
+            _GATE_STATS["auto_resolve_judge_held"] += 1
             _GATE_STATS["auto_resolve_judge_held_open"] += 1
             continue
         if out.hold == review_recency.HOLD_NEWER:
@@ -216,6 +242,18 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
             sugg["rule"],
             streak,
         )
+    # A row held earlier in phase 2 whose loser a LATER row then retired is moot: close
+    # it, or it lingers open while open_contradiction_rows (both items active) hides it.
+    for queue_id, keep, retire in held_tonight:
+        try:
+            if review_recency.superseded(retire):
+                moot += 1
+                closed = close_contradiction_rows_for(keep, retire)
+                logger.warning(
+                    "contradiction row %s moot after its hold (%d closed)", queue_id, closed
+                )
+        except Exception:  # noqa: BLE001 — bookkeeping must not abort the step
+            logger.exception("post-pass moot check for row %s failed", queue_id)
     if len(live) > len(batch):
         logger.info(
             "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",

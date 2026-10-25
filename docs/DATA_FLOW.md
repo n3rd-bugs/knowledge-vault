@@ -120,10 +120,12 @@ stale.
 | Role | Model | Size / VRAM | Where | Notes |
 |---|---|---|---|---|
 | Extractor (primary) | `qwen3:14b` | 14 B · ~11.7 GB | local RTX 4080 S | benchmark winner: best granularity, 100 % verbatim grounding; `num_ctx` 16384, pinned seed |
-| Extractor (ensemble) | `granite4.1:8b` | 8 B · ~5 GB | local | union member; also **secondary judge** (probe bench: 7/7 real kept, 6/6 fakes caught) |
+| Extractor (ensemble) | `gemma4:12b` | 12 B · ~9.6 GB (+MTP draft) | local | union member since 2026-10-25 (refreshed 2026-09-27 weights; replaced `granite4.1:8b`): blind panel 33 kept facts @ 0.70 precision vs qwen3 26 @ 0.50; ensemble union 42 → 52 for +18 % extraction GPU (KB 54572) |
 | Extractor (ensemble) | `gemma3:12b` | 12 B · ~8 GB | local | union member only — failed the judge bench both directions, never judges |
+| Secondary judge | `granite4.1:8b` | 8 B · ~5 GB | local | judges primary singletons (probe bench: 7/7 real kept, 6/6 fakes caught); no longer an extractor |
 | Judge (factored) | `qwen3:14b` | (same) | local | verifies non-primary singletons; fail-closed |
-| Triage / contradictions / evidence | `qwen3:14b` | (same) | local | tail steps, capped per night |
+| Contradiction judge + precision gate | `bonsai-2:27b` | 27 B ternary · ~8.9 GB | local | `KB_CONTRADICTION_JUDGE_MODEL` (2026-10-25): on the 92 auto-resolved pairs vs a blind ground truth precision 0.78 vs qwen3's 0.52; `KB_AUTO_RESOLVE_JUDGE_GATE` re-judges (strict three-state) before any evidence auto-retire — no conflict holds the row for the owner |
+| Triage / same-fact twins / evidence | `qwen3:14b` | (same) | local | tail steps, capped per night |
 | Embedder | `qwen3-embedding:0.6b` | 0.6 B · ~2.4 GB | **remote RTX 5080** (local fallback + 90 s breaker) | 1024-d; **query prefix required** (hit@5 0.759 vs 0.724 without) |
 | Reranker | `Qwen3-Reranker-0.6B` | 0.6 B GGUF | sidecar (llama-server :8324) | official GGUF only — community conversions score garbage; chunk-evidence fed (hit@5 0.86 → 0.89); host-RAM prompt cache OFF (`LLAMA_ARG_CACHE_RAM=0` drop-in, 2026-10-11: RSS 9.4 GB → 1.8 GB, scores bit-identical after warm-up); runs a **pinned** llama-server copy (`/opt/kb-rerank/llama-0.31.1`, 2026-10-25) so Ollama upgrades never touch it — units in `deploy/system/` |
 | Window budgeter | `cl100k` (tiktoken, vendored) | — | in-process, offline | counts tokens for window fitting; 1.15× margin covers the qwen-tokenizer mismatch |

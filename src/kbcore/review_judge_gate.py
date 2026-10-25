@@ -20,12 +20,13 @@ cannot be reached RAISES, so the pair is simply retried next run: automation nev
 retires on an unconfirmed conflict; a reply that carries no verdict never counts
 as one (below).
 
-SAME SEAT, NO CALL. The nightly step stamps ``detail.judged_by`` (model + think)
-on every row it queues. Re-asking that same seat repeats a byte-identical,
-same-seed request (prompt, Item order and :func:`kbcore.llm._draw_seed` are all
-fixed; only run-to-run GPU noise could change the answer), so such a row counts as
-confirmed without a call: the gate is the backlog filter for rows queued by a
-DIFFERENT judge (every row before 2026-10-25 was queued by qwen3:14b).
+PROVENANCE. The nightly step stamps ``detail.judged_by`` (model + think) on every
+row it queues. The gate still re-asks even when that is the current seat: the
+detection step reads the reply leniently (``bool(val)`` — a malformed
+``{"contradict": ["false"]}`` queues the pair), and only this strict three-state
+re-ask (:func:`verdict`) may authorise a retirement. Same request, same seed, so a
+clean "yes" stays a yes; the cost is one judge call per candidate, batched after
+the evidence refresh so the judge model loads once per pass.
 
 NO VERDICT. When the judge gives no usable verdict on THIS pair (a read timeout,
 an unusable or unparseable reply, a token-repeat abort) the row is NOT
@@ -80,8 +81,8 @@ def seat() -> dict[str, Any]:
 
 
 def stamp_judged_by(a_id: int, b_id: int) -> None:
-    """Record the current seat on the OPEN contradiction row for ``a -> b`` (just queued
-    by the nightly step), so the gate never re-asks the seat that queued it."""
+    """Record the current seat on the OPEN contradiction row for ``a -> b`` (just
+    queued by the nightly step) — provenance: which judge put the pair in the queue."""
     with transaction() as conn:
         conn.execute(
             "UPDATE review_queue SET detail = detail || %s WHERE reason = 'contradiction' "
@@ -141,12 +142,10 @@ def gate(queue_id: int, keep: int, retire: int, *, judge: bool = True) -> str | 
     stamped: the owner closed the row meanwhile). An outage raises."""
     with connect() as conn:
         row = conn.execute(
-            "SELECT detail->'judged_by', resolved FROM review_queue WHERE id = %s", (queue_id,)
+            "SELECT resolved FROM review_queue WHERE id = %s", (queue_id,)
         ).fetchone()
-    if row is None or row[1] is True:
+    if row is None or row[0] is True:
         return ""  # closed since the snapshot: nothing to judge
-    if row[0] == seat():
-        return CONFIRMED  # queued by this very seat: a re-ask is the same request
     if not judge:
         return GATE_DEFERRED
     try:

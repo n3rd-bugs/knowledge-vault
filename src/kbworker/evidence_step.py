@@ -105,7 +105,7 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     ``_EVIDENCE_STATS`` instead of ``auto_resolved``.
 
     PRECISION GATE (2026-10-25): with ``kb_auto_resolve_judge_gate`` on, kbcore
-    re-judges each stable suggestion queued by another judge before retiring; a
+    re-judges each stable suggestion (strict three-state parse) before retiring; a
     gate hold counts in ``_GATE_STATS`` (and is skipped the same way afterwards).
     Resolutions run AFTER every refresh (two phases) so the judge — another model
     on a one-slot card — loads once per pass; once it is unreachable the rest of

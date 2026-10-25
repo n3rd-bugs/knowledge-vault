@@ -203,20 +203,18 @@ def resolve_contradiction(queue_id: int, keep: int, retire: int, *, judge: bool 
 
     RECENCY GUARD (module docstring): when ``retire`` is newer than ``keep`` by
     more than the window, NOTHING is superseded — the row is held (stamped,
-    still open). PRECISION GATE (when on, :mod:`kbcore.review_judge_gate`): an
-    already retired loser raises ``AlreadySuperseded`` before any judge call (the
-    moot path); a row queued by another judge is re-judged by the contradiction
-    seat; "no conflict" or no verdict holds the row; ``judge=False`` (the pass has
-    lost its judge) defers such a row untouched; an unreachable judge raises
-    ``ExtractorUnavailable`` with nothing changed.
+    still open). A side that is no longer active (retired earlier in the pass, or
+    archived) raises ``AlreadySuperseded`` FIRST, gate on or off: the moot path
+    closes the row, which open_contradiction_rows could never return again.
+    PRECISION GATE (when on, :mod:`kbcore.review_judge_gate`): the contradiction
+    seat re-judges the pair with a strict three-state parse; "no conflict" or no
+    verdict holds the row; ``judge=False`` (the pass has lost its judge) defers such
+    a row untouched; an unreachable judge raises ``ExtractorUnavailable``.
     """
     statuses = _statuses(keep, retire)
-    if statuses.get(retire) == "superseded":  # an earlier resolution of this pass retired it:
-        raise AlreadySuperseded(f"item {retire} is already superseded")  # the moot path
-    if keep in statuses and statuses[keep] != "active":
-        logger.warning("contradiction row %s: keeper %s is %s; nothing done", queue_id, keep,
-                       statuses[keep])  # fmt: skip
-        return Outcome(None, None)
+    for item in (retire, keep):  # an earlier resolution (or archive) took one side out:
+        if statuses.get(item, "active") != "active":  # the pair is moot — the caller closes
+            raise AlreadySuperseded(f"item {item} is already {statuses[item]}")  # its rows
     gap = newer_gap_days(keep, retire)
     if gap is not None and would_hold(gap):
         stamped = hold_row(queue_id, keep, retire, gap)

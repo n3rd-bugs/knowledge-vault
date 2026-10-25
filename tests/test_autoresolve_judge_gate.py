@@ -28,7 +28,7 @@ from kbcore import (
 )
 from kbcore.config import Settings, settings
 from kbcore.consolidation import record_contradiction
-from kbcore.errors import ExtractorUnavailable
+from kbcore.errors import AlreadySuperseded, ExtractorUnavailable
 from kbcore.ingest import ingest
 from kbworker import consolidate, digest, evidence_step, tail_ops
 from kbworker.digest_recency_lines import judge_held_line
@@ -201,15 +201,17 @@ def test_a_gate_hold_is_sticky_across_a_seat_change_and_a_gate_off(gate, nights,
     assert _row(qid)[0] is True
 
 
-def test_a_row_queued_by_this_seat_is_not_re_asked(gate, nights):
-    """Same seat = a byte-identical, same-seed request: no second call, no GPU swap."""
+def test_a_row_queued_by_this_seat_is_still_re_asked_strictly(gate, nights):
+    """Detection reads replies leniently (bool(val): a malformed reply can queue a
+    pair); only the gate's strict three-state re-ask may authorise a retirement."""
     old, new, qid = _pair("same")
     review_judge_gate.stamp_judged_by(old, new)
     assert _row(qid)[1]["judged_by"] == {"model": SEAT, "think": None}
-    gate["verdict"] = False  # would hold, if it were asked
+    gate["verdict"] = None  # the strict parser finds no verdict in the same reply
     nights()
-    assert nights() == (1, 1, 0)
-    assert gate["judged"] == [] and _status(old) == "superseded"
+    assert nights() == (1, 0, 0)
+    assert gate["judged"] == [(new, old)] and _status(old) == "active"
+    assert _row(qid)[1]["auto_resolve_hold"]["kind"] == "judge_failed"
 
 
 def test_a_moot_row_closes_without_a_judge_call(gate, nights):
@@ -408,13 +410,32 @@ def test_a_row_held_before_its_loser_is_retired_is_closed_as_moot(gate, nights):
     assert open_rows == 0
 
 
-def test_a_retired_keeper_is_a_no_op_without_a_judge_call(gate):
+def test_an_inactive_keeper_makes_the_pair_moot_without_a_judge_call(gate):
     old, new, qid = _pair("keeper")
     with db.transaction() as conn:
         conn.execute("UPDATE items SET status = 'archived' WHERE id = %s", (new,))
-    out = review_recency.resolve_contradiction(qid, new, old)
-    assert out == review_recency.Outcome(None, None) and gate["judged"] == []
-    assert _status(old) == "active"
+    with pytest.raises(AlreadySuperseded, match="is already archived"):
+        review_recency.resolve_contradiction(qid, new, old)
+    assert gate["judged"] == [] and _status(old) == "active"
+
+
+def test_a_chain_that_retires_a_keeper_closes_the_later_row(gate, nights):
+    """keep C / retire A, then keep A / retire B in the same pass: the second row's
+    keeper is gone — closed as moot, not left open where the nightly can't see it."""
+    a = ingest("gate", "qa", "a", "claim a", uri="cha", trust="unverified")
+    b = ingest("gate", "qa", "b", "claim b", uri="chb", trust="unverified")
+    c = ingest("gate", "qa", "c", "claim c", uri="chc", trust="unverified")
+    assert record_contradiction(a, c)  # row 1 (a_id a): keep c, retire a
+    assert record_contradiction(b, a)  # row 2 (a_id b): keep a, retire b
+    # the fixture retires each row's a_id side and keeps its b_id side by default
+    nights()
+    nights()
+    assert _status(a) == "superseded"
+    with db.connect() as conn:
+        open_rows = conn.execute(
+            "SELECT count(*) FROM review_queue WHERE reason = 'contradiction' AND resolved = false"
+        ).fetchone()[0]
+    assert open_rows == 0
 
 
 def test_an_owner_dismissal_since_the_snapshot_is_never_overridden(gate):

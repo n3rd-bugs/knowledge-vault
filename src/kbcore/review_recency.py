@@ -250,9 +250,10 @@ def resolve_contradiction(queue_id: int, keep: int, retire: int, *, judge: bool 
     return Outcome(retire, None)
 
 
-def superseded(item_id: int) -> bool:
-    """Whether the item is superseded now (the nightly's post-pass moot sweep)."""
-    return _statuses(item_id).get(item_id) == "superseded"
+def pair_moot(keep: int, retire: int) -> bool:
+    """Either side is no longer active — the nightly's post-pass moot sweep, the same
+    rule resolve_contradiction applies up front."""
+    return any(status != "active" for status in _statuses(keep, retire).values())
 
 
 def _statuses(*item_ids: int) -> dict[int, str]:

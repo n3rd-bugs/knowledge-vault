@@ -34,12 +34,14 @@ def auto_resolve_held_line(counts: Mapping[str, Any]) -> str | None:
 def judge_held_line(counts: Mapping[str, Any]) -> str | None:
     """``auto-resolve held by the judge: N (X no conflict, Y no verdict; +M tonight)`` —
     the open pairs the precision gate (kbcore.review_judge_gate) kept from being
-    retired, by kind, plus a separate clause when its judge was unreachable."""
+    retired, by kind; pairs whose no-verdict is still being retried, and an
+    unreachable judge, are their own clauses (neither is a hold)."""
     no_conflict = _count(counts, "auto_resolve_judge_held_open")
     no_verdict = _count(counts, "auto_resolve_judge_failed_open")
     tonight = _count(counts, "auto_resolve_judge_held") + _count(
         counts, "auto_resolve_judge_failed"
     )
+    retry = _count(counts, "auto_resolve_judge_retry")
     down = _count(counts, "auto_resolve_gate_unavailable")
     parts = []
     if no_conflict or no_verdict or tonight:
@@ -48,6 +50,8 @@ def judge_held_line(counts: Mapping[str, Any]) -> str | None:
             f"auto-resolve held by the judge: {no_conflict + no_verdict} "
             f"({no_conflict} no conflict, {no_verdict} no verdict{new})"
         )
+    if retry:
+        parts.append(f"precision gate: {retry} retrying (no verdict yet)")
     if down:
         parts.append(f"precision gate: judge unreachable, {down} deferred")
     return "; ".join(parts) or None

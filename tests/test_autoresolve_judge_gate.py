@@ -138,6 +138,7 @@ def _wrapped(cause: Exception) -> ExtractorUnavailable:
 GATE_ZERO = {
     "auto_resolve_judge_held": 0,
     "auto_resolve_judge_failed": 0,
+    "auto_resolve_judge_retry": 0,
     "auto_resolve_judge_held_open": 0,
     "auto_resolve_judge_failed_open": 0,
     "auto_resolve_gate_unavailable": 0,
@@ -242,12 +243,18 @@ def test_a_no_verdict_is_retried_and_only_the_third_is_final(gate, nights):
         assert nights() == (1, 0, 0)
         hold = _row(qid)[1]["auto_resolve_hold"]
         assert (hold["kind"], hold["attempts"], hold["final"]) == ("judge_failed", attempt, False)
-        assert "gave no verdict (ReadTimeout; attempt" in hold["reason"]
-        assert evidence_step._GATE_STATS["auto_resolve_judge_failed"] == 1
+        assert hold["reason"] == (
+            f"retrying: the contradiction judge ({SEAT}) gave no verdict (ReadTimeout; "
+            f"attempt {attempt} of 3) - re-judged next pass"
+        )
+        assert evidence_step._GATE_STATS["auto_resolve_judge_retry"] == 1
+        assert evidence_step._GATE_STATS["auto_resolve_judge_failed"] == 0
         assert evidence_step._GATE_STATS["auto_resolve_judge_failed_open"] == 0
     assert nights() == (1, 0, 0)
     hold = _row(qid)[1]["auto_resolve_hold"]
     assert (hold["attempts"], hold["final"]) == (3, True)
+    assert hold["reason"].startswith("held: ") and hold["reason"].endswith("- owner decision")
+    assert evidence_step._GATE_STATS["auto_resolve_judge_failed"] == 1
     assert evidence_step._GATE_STATS["auto_resolve_judge_failed_open"] == 1
     assert evidence_step._GATE_STATS["auto_resolve_judge_held_open"] == 0
     judged = len(gate["judged"])
@@ -260,7 +267,10 @@ def test_a_verdict_after_a_failure_resolves_normally(gate, nights):
     nights()
     gate["verdict"] = None  # an unparseable reply: no verdict
     assert nights() == (1, 0, 0)
-    assert "gave no verdict (unparseable; attempt 1)" in _row(qid)[1]["auto_resolve_hold"]["reason"]
+    assert (
+        "gave no verdict (unparseable; attempt 1 of 3)"
+        in _row(qid)[1]["auto_resolve_hold"]["reason"]
+    )
     gate["verdict"] = True
     assert nights() == (1, 1, 0) and _status(old) == "superseded"
 
@@ -271,7 +281,7 @@ def test_two_no_verdicts_in_a_row_trip_the_pass_breaker(gate, nights):
     gate["verdict"] = _wrapped(ValueError("Expecting value"))  # an unusable reply body
     assert nights() == (3, 0, 0)
     assert len(gate["judged"]) == 2, "the third pair is deferred, not judged"
-    assert evidence_step._GATE_STATS["auto_resolve_judge_failed"] == 2
+    assert evidence_step._GATE_STATS["auto_resolve_judge_retry"] == 2
     assert evidence_step._GATE_STATS["auto_resolve_gate_unavailable"] == 1
     assert all(_status(o) == "active" for o, _, _ in pairs)
 
@@ -453,16 +463,18 @@ def test_the_digest_names_gate_holds_by_kind():
     want = "auto-resolve held by the judge: 6 (5 no conflict, 1 no verdict; +2 tonight)"
     assert judge_held_line(counts) == want
     assert want in digest.digest_lines(counts)
-    retry = judge_held_line({"auto_resolve_judge_failed": 1})
-    assert retry == "auto-resolve held by the judge: 0 (0 no conflict, 0 no verdict; +1 tonight)"
+    assert judge_held_line({"auto_resolve_judge_retry": 1}) == (
+        "precision gate: 1 retrying (no verdict yet)"
+    )
     down = judge_held_line({"auto_resolve_gate_unavailable": 3})
     assert down == "precision gate: judge unreachable, 3 deferred"
 
 
-def test_a_deadline_in_phase_one_still_resolves_the_collected_rows(gate, nights):
+def test_a_deadline_in_phase_one_still_resolves_the_collected_rows(gate, nights, monkeypatch):
     """Only a battery stand-down stops phase 2: the hot reserve keeps its promise."""
     old, new, qid = _pair("deadline")
     nights()
+    monkeypatch.setattr(consolidate, "_on_battery", lambda: False)
     calls = {"n": 0}
 
     def stop():
@@ -473,18 +485,84 @@ def test_a_deadline_in_phase_one_still_resolves_the_collected_rows(gate, nights)
     assert (refreshed, resolved) == (1, 1) and _status(old) == "superseded"
 
 
-def test_a_battery_stand_down_stops_the_judge_phase(gate, nights):
+def test_a_battery_stand_down_stops_the_judge_phase_even_past_the_deadline(
+    gate, nights, monkeypatch
+):
+    """Past the deadline should_stop() answers 'deadline' and never reads the battery,
+    so phase 2 asks the power guard itself."""
     old, new, qid = _pair("battery")
     nights()
-    calls = {"n": 0}
-
-    def stop():
-        calls["n"] += 1
-        return None if calls["n"] == 1 else "battery"  # phase 1 runs, phase 2 stands down
-
-    refreshed, resolved, _ = consolidate._evidence(stop=stop)
+    monkeypatch.setattr(consolidate, "_on_battery", lambda: True)
+    refreshed, resolved, _ = consolidate._evidence(stop=lambda: None)
     assert (refreshed, resolved) == (1, 0) and gate["judged"] == []
     assert _status(old) == "active"
+
+
+def test_a_recency_hold_between_no_verdicts_does_not_reset_the_breaker(gate, nights):
+    p1 = _pair("b1")
+    p2 = _pair("b2")
+    p3 = _pair("b3")
+    nights.mode_for[p2[0]] = "retire_new"  # the middle row is recency-held, no judge
+    nights()
+    gate["verdict"] = _wrapped(httpx.ReadTimeout("timed out"))
+    nights()
+    assert len(gate["judged"]) == 2, "fail, recency hold, fail: the breaker trips at 2"
+    assert evidence_step._GATE_STATS["auto_resolve_judge_retry"] == 2
+    assert _row(p2[2])[1]["auto_resolve_hold"]["kind"] == "newer_retire"
+    assert _status(p1[0]) == "active" and _status(p3[0]) == "active"
+
+
+def test_a_held_row_whose_keeper_a_later_row_retires_is_closed(gate, nights):
+    """keep y / retire z is held first; a later row retires y: the sweep closes the
+    held row (its keeper is gone) and takes the hold back out of tonight's counts."""
+    z = ingest("gate", "qa", "z", "value 1", uri="kz", trust="unverified")
+    y = ingest("gate", "qa", "y", "value 2", uri="ky", trust="unverified")
+    x = ingest("gate", "qa", "x", "value 3", uri="kx", trust="unverified")
+    assert record_contradiction(z, y)  # row 1: keep y, retire z (judged first)
+    assert record_contradiction(y, x)  # row 2: keep x, retire y
+    nights()
+    answers = iter([False, True])  # row 1: no conflict (held); row 2: confirmed
+    gate["verdict"] = lambda: next(answers)
+    _, resolved, moot = nights()
+    assert (resolved, moot) == (1, 1) and _status(y) == "superseded"
+    with db.connect() as conn:
+        open_rows = conn.execute(
+            "SELECT count(*) FROM review_queue WHERE reason = 'contradiction' AND resolved = false"
+        ).fetchone()[0]
+    assert open_rows == 0
+    assert evidence_step._GATE_STATS["auto_resolve_judge_held"] == 0
+    assert evidence_step._GATE_STATS["auto_resolve_judge_held_open"] == 0
+
+
+def test_attempts_restart_when_the_seat_changes_think(gate, nights, monkeypatch):
+    old, new, qid = _pair("think")
+    nights()
+    gate["verdict"] = _wrapped(httpx.ReadTimeout("timed out"))
+    nights()
+    nights()
+    assert _row(qid)[1]["auto_resolve_hold"]["attempts"] == 2
+    monkeypatch.setattr(settings, "kb_contradiction_judge_think", False)  # a new seat
+    nights()
+    hold = _row(qid)[1]["auto_resolve_hold"]
+    assert (hold["attempts"], hold["final"]) == (1, False)
+
+
+def test_apply_all_skips_rows_a_hold_keeps_for_the_owner(gate, nights):
+    from typer.testing import CliRunner
+
+    from kbcli.main import app
+
+    gate["verdict"] = False
+    old, new, qid = _pair("cli")
+    nights()
+    nights()
+    out = CliRunner().invoke(app, ["review", "apply", "--all"])
+    assert out.exit_code == 0, out.output
+    assert f"[{qid}] skipped: held: the contradiction judge" in out.output
+    assert "1 held row(s) skipped (--include-held)" in out.output
+    assert _status(old) == "active"
+    out = CliRunner().invoke(app, ["review", "apply", "--all", "--include-held"])
+    assert out.exit_code == 0 and _status(old) == "superseded"
 
 
 def test_a_failed_judge_stamp_never_aborts_the_contradiction_step(gate, monkeypatch):
@@ -570,6 +648,9 @@ def test_an_empty_contradiction_seat_falls_back_to_the_pair_seat(capture, monkey
         ('{"contradict": false}', False),
         ('{"contradict": "false"}', False),
         ('{"contradict": "yes"}', True),
+        ('{"contradict": 1}', True),
+        ('{"contradict": 0}', False),
+        ('{"contradict": 2}', None),
         ('{"contradict": "maybe"}', None),
         ('{"verdict": true}', None),
         ("", None),  # a token-repeat abort reads as an empty reply (kbcore.llm)

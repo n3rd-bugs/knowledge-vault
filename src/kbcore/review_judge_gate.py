@@ -120,6 +120,8 @@ def verdict(keep: int, retire: int) -> bool | None:
     val = data.get("contradict") if isinstance(data, dict) else None
     if isinstance(val, bool):
         return val
+    if type(val) is int and val in (0, 1):  # what items_contradict reads as False/True
+        return val == 1
     if isinstance(val, str) and val.strip().lower() in ("true", "yes", "1", "false", "no", "0"):
         return val.strip().lower() in ("true", "yes", "1")
     return None
@@ -166,8 +168,8 @@ def gate(queue_id: int, keep: int, retire: int, *, judge: bool = True) -> str | 
 
 
 def fail_row(queue_id: int, keep: int, retire: int, what: str) -> str:
-    """Count a no-verdict on an OPEN row (same pair + seat: attempts + 1, else 1); the
-    third makes the hold final. GATE_RETRY / HOLD_FAILED, or "" when the row was
+    """Count a no-verdict on an OPEN row (same pair + seat — model AND think: attempts
+    + 1, else 1); the third makes the hold final. GATE_RETRY / HOLD_FAILED, or "" when the row was
     closed or carries an owner veto meanwhile."""
     model = settings.contradiction_judge_model
     with transaction() as conn:
@@ -179,14 +181,19 @@ def fail_row(queue_id: int, keep: int, retire: int, what: str) -> str:
         prior = (row[0] if row else None) or {}
         if row is None or prior.get("kind") == HOLD_RESTORED:
             return ""
-        same = (prior.get("kind"), prior.get("keep"), prior.get("retire"), prior.get("model"))
+        same = (prior.get("kind"), prior.get("keep"), prior.get("retire"), prior.get("seat"))
         attempts = (
-            (prior.get("attempts") or 0) + 1 if same == (HOLD_FAILED, keep, retire, model) else 1
+            (prior.get("attempts") or 0) + 1 if same == (HOLD_FAILED, keep, retire, seat()) else 1
         )
         final = attempts >= FAILED_FINAL_AT
-        reason = hold_reason(model, f"gave no verdict ({what}; attempt {attempts})")
+        tried = f"gave no verdict ({what}; attempt {attempts} of {FAILED_FINAL_AT})"
+        reason = (
+            hold_reason(model, tried)
+            if final
+            else f"retrying: the contradiction judge ({model}) {tried} - re-judged next pass"
+        )
         stamp = {"kind": HOLD_FAILED, "keep": keep, "retire": retire, "model": model,
-                 "attempts": attempts, "final": final, "reason": reason,
+                 "seat": seat(), "attempts": attempts, "final": final, "reason": reason,
                  "at": datetime.now(UTC).isoformat()}  # fmt: skip
         conn.execute(
             "UPDATE review_queue SET detail = COALESCE(detail, '{}'::jsonb) || %s WHERE id = %s",

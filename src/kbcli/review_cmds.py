@@ -13,7 +13,7 @@ import typer
 
 from kbcli import bulk_cmds, expire_cmds, promote_cmds
 from kbcli.repair_shared import _locked_apply
-from kbcore import render, review_apply, review_restore, review_triage
+from kbcore import render, review_apply, review_recency, review_restore, review_triage
 from kbcore import review as review_mod
 from kbcore.config import settings
 from kbcore.errors import KBError
@@ -219,17 +219,27 @@ def review_undo_auto(
 def review_apply_suggestion(
     queue_id: int | None = typer.Argument(None, help="queue row whose suggestion to apply"),
     apply_all: bool = typer.Option(False, "--all", help="apply every open suggestion"),
+    include_held: bool = typer.Option(
+        False, "--include-held", help="with --all: also apply rows a hold keeps for the owner"
+    ),
 ) -> None:
-    """Apply the suggested resolution(s) computed by the nightly evidence pass."""
+    """Apply the suggested resolution(s) computed by the nightly evidence pass. --all
+    skips rows whose auto-resolve hold is in force (recency guard, precision gate)."""
     try:
         if apply_all:
-            applied = 0
+            applied = skipped = 0
             for e in review_mod.list_open_review():
-                if e.detail.get("suggested_resolution"):
-                    retired = review_mod.apply_suggestion(e.queue_id)
-                    typer.echo(f"[{e.queue_id}] applied: item {retired} superseded")
-                    applied += 1
-            typer.echo(f"applied {applied} suggestion(s)")
+                if not e.detail.get("suggested_resolution"):
+                    continue
+                if not include_held and review_recency.hold_in_force(e.detail):
+                    typer.echo(f"[{e.queue_id}] skipped: {e.detail['auto_resolve_hold']['reason']}")
+                    skipped += 1
+                    continue
+                retired = review_mod.apply_suggestion(e.queue_id)
+                typer.echo(f"[{e.queue_id}] applied: item {retired} superseded")
+                applied += 1
+            tail = f"; {skipped} held row(s) skipped (--include-held)" if skipped else ""
+            typer.echo(f"applied {applied} suggestion(s){tail}")
         elif queue_id is not None:
             retired = review_mod.apply_suggestion(queue_id)
             typer.echo(f"applied: item {retired} superseded")

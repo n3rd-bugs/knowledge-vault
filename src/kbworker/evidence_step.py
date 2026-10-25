@@ -35,6 +35,7 @@ _EVIDENCE_STATS: dict[str, int] = {"auto_resolve_held": 0, "auto_resolve_held_op
 _GATE_STATS: dict[str, int] = {
     "auto_resolve_judge_held": 0,
     "auto_resolve_judge_failed": 0,
+    "auto_resolve_judge_retry": 0,
     "auto_resolve_judge_held_open": 0,
     "auto_resolve_judge_failed_open": 0,
     "auto_resolve_gate_unavailable": 0,
@@ -123,6 +124,7 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     _GATE_STATS.update(
         auto_resolve_judge_held=0,
         auto_resolve_judge_failed=0,
+        auto_resolve_judge_retry=0,
         auto_resolve_judge_held_open=sum(
             1 for r in rows if review_recency.held_judge(r[3], review_recency.HOLD_JUDGE)
         ),
@@ -165,12 +167,13 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
             logger.exception("evidence refresh for queue row %s failed", queue_id)
     gated = bool(settings.kb_auto_resolve_judge_gate)
     no_verdict_run = 0  # consecutive per-pair judge failures: 2 trip the pass breaker
-    held_tonight: list[tuple[int, int, int]] = []  # (queue_id, keep, retire) held this pass
+    unresolved: list[tuple[int, int, int, str | None]] = []  # (qid, keep, retire, hold kind)
     for n, (queue_id, sugg, streak) in enumerate(candidates):
         # Only a BATTERY stand-down stops phase 2: on a deadline the collected rows still
-        # resolve (the reserve's promise; at most ~13 s of judge per candidate).
-        if gated and stop is not None and (reason := stop()) == "battery":
-            _seam()._note_stop("evidence_refreshed", reason, len(candidates) - n)
+        # resolve (the reserve's promise). Asked of the power guard DIRECTLY: past the
+        # deadline should_stop() answers "deadline" and never looks at the battery.
+        if gated and stop is not None and _seam()._on_battery():
+            _seam()._note_stop("evidence_refreshed", "battery", len(candidates) - n)
             break
         try:
             # judge=False once the judge is gone: the recency guard and the moot check
@@ -205,27 +208,30 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
             continue
         except Exception:  # noqa: BLE001 — one bad pair must not abort the step
             logger.exception("auto-resolution of queue row %s failed", queue_id)
+            unresolved.append((queue_id, sugg["keep"], sugg["retire"], None))
             continue
         if out.hold == review_recency.GATE_DEFERRED:
             _GATE_STATS["auto_resolve_gate_unavailable"] += 1
             continue
-        if out.hold is not None and out.hold != review_recency.GATE_DEFERRED:
-            held_tonight.append((queue_id, sugg["keep"], sugg["retire"]))
+        if out.retired is None:  # every unresolved candidate gets the post-pass moot check
+            unresolved.append((queue_id, sugg["keep"], sugg["retire"], out.hold))
         if out.hold in (review_recency.GATE_RETRY, review_recency.HOLD_FAILED):
-            _GATE_STATS["auto_resolve_judge_failed"] += 1
             if out.hold == review_recency.HOLD_FAILED:  # the third: final, sticky
+                _GATE_STATS["auto_resolve_judge_failed"] += 1
                 _GATE_STATS["auto_resolve_judge_failed_open"] += 1
+            else:
+                _GATE_STATS["auto_resolve_judge_retry"] += 1
             no_verdict_run += 1
             if no_verdict_run >= 2 and not gate_down:
                 gate_down = True
                 logger.warning("precision gate: two no-verdicts in a row; judge treated as down")
             continue
-        no_verdict_run = 0
-        if out.hold == review_recency.HOLD_JUDGE:
+        if out.hold == review_recency.HOLD_JUDGE:  # the judge answered: the run resets
+            no_verdict_run = 0
             _GATE_STATS["auto_resolve_judge_held"] += 1
             _GATE_STATS["auto_resolve_judge_held_open"] += 1
             continue
-        if out.hold == review_recency.HOLD_NEWER:
+        if out.hold == review_recency.HOLD_NEWER:  # no judge asked: the run is untouched
             held += 1
             _EVIDENCE_STATS.update(
                 auto_resolve_held=held, auto_resolve_held_open=held_before + held
@@ -233,6 +239,8 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
             continue
         if out.retired is None:  # nothing stamped (the owner closed it meanwhile)
             continue
+        if gated:
+            no_verdict_run = 0  # a gated retirement means the judge confirmed
         auto_resolved += 1
         logger.info(
             "auto-resolved contradiction row %s: keep %s, retire %s (%s, streak %d)",
@@ -242,18 +250,32 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
             sugg["rule"],
             streak,
         )
-    # A row held earlier in phase 2 whose loser a LATER row then retired is moot: close
-    # it, or it lingers open while open_contradiction_rows (both items active) hides it.
-    for queue_id, keep, retire in held_tonight:
+    # A candidate left unresolved earlier in phase 2 whose keeper OR loser a later row
+    # then retired is moot: close it (open_contradiction_rows, both sides active, would
+    # never return it) and take back any hold it was counted under tonight.
+    undo = {
+        review_recency.HOLD_JUDGE: ("auto_resolve_judge_held", "auto_resolve_judge_held_open"),
+        review_recency.HOLD_FAILED: ("auto_resolve_judge_failed", "auto_resolve_judge_failed_open"),
+        review_recency.GATE_RETRY: ("auto_resolve_judge_retry", None),
+    }
+    for queue_id, keep, retire, kind in unresolved:
         try:
-            if review_recency.superseded(retire):
-                moot += 1
-                closed = close_contradiction_rows_for(keep, retire)
-                logger.warning(
-                    "contradiction row %s moot after its hold (%d closed)", queue_id, closed
-                )
+            if not review_recency.pair_moot(keep, retire):
+                continue
+            closed = close_contradiction_rows_for(keep, retire)
         except Exception:  # noqa: BLE001 — bookkeeping must not abort the step
             logger.exception("post-pass moot check for row %s failed", queue_id)
+            continue
+        moot += 1
+        logger.warning("contradiction row %s moot after phase 2 (%d closed)", queue_id, closed)
+        if kind == review_recency.HOLD_NEWER:
+            held -= 1
+            _EVIDENCE_STATS.update(
+                auto_resolve_held=held, auto_resolve_held_open=held_before + held
+            )
+        for key in undo.get(kind, ()):
+            if key:
+                _GATE_STATS[key] -= 1
     if len(live) > len(batch):
         logger.info(
             "evidence refresh capped at %d pairs; %d open pairs deferred to the next run",

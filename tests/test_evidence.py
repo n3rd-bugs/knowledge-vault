@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from kbcore import db, evidence, llm
+from kbcore import db, evidence, llm, llm_prompts
 from kbcore.config import settings
 from kbcore.ingest import ingest
 from kbcore.review import queue_review
@@ -47,6 +47,29 @@ def _force_lead(item_id: int, vec: str) -> None:
 def test_evidence_side_coerces_answer(monkeypatch, content, expected):
     monkeypatch.setattr(llm, "_chat", lambda *a, **k: content)
     assert llm.evidence_side("at", "ab", "bt", "bb", "ct", "cb") == expected
+
+
+def test_evidence_side_sends_the_strict_prompt(monkeypatch):
+    """KB 55038: the judge gets the STRICT prompt (a side only for the specific point A
+    and B differ on; a related-but-different situation, or doubt, is "neither")."""
+    seen = []
+
+    def chat(messages, **_kw):
+        seen.append(messages)
+        return '{"side": "a"}'
+
+    monkeypatch.setattr(llm, "_chat", chat)
+    assert llm.evidence_side("at", "ab", "bt", "bb", "ct", "cb") == "a"
+    system = seen[0][0]
+    assert system["role"] == "system"
+    assert system["content"] == llm_prompts.EVIDENCE_SYSTEM
+    for rule in (
+        "specific point on which A differs",
+        "related but different situation",
+        'When unsure, answer "neither"',
+    ):
+        assert rule in system["content"]
+    assert seen[0][1]["content"] == "Item A: at\nab\n\nItem B: bt\nbb\n\nEvidence: ct\ncb"
 
 
 # --- gather_evidence ------------------------------------------------------------

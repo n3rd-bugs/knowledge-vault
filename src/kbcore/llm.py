@@ -20,6 +20,7 @@ from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 
 # Documented seam: callers/tests resolve llm.parse_model_json / llm.JSON_COUNTERS.
 from kbcore.llm_json import JSON_COUNTERS, parse_model_json, recover_items  # noqa: F401
+from kbcore.llm_prompts import EVIDENCE_SYSTEM as _EVIDENCE_SYSTEM
 from kbcore.unicode_safe import clean, clean_obj
 
 logger = logging.getLogger("kbcore.llm")
@@ -289,14 +290,6 @@ def summarize_items(topic: str, items: list[dict[str, Any]]) -> str:
         json_format=False,
     )
     return content.strip()
-
-
-_EVIDENCE_SYSTEM = (
-    "Two knowledge items (A and B) contradict each other. You are given a third "
-    "item as evidence. Decide which side the evidence supports. Answer STRICT "
-    'JSON only: {"side": "a"} or {"side": "b"} or {"side": "neither"}. '
-    'If the evidence is off-topic, ambiguous, or supports both, answer "neither".'
-)
 
 
 def evidence_side(

@@ -927,7 +927,11 @@ if [ "$MODE" = "brief" ]; then
     # copy's new records were not sent, a behind one awaits the owner's --seed.
     # (The live copy shares the sid, so its next ok line clears this warning;
     # the markers keep the [KB sweep] line above saying it until resolved.)
-    RECENT_FAIL=$(tail -n 40 "$FLOG" | awk '
+    # `flush skip:` lines (a prompt-less session's SessionEnd, KB 51863) are
+    # dropped BEFORE the 40-line window: they are neither failure nor success,
+    # and a burst of them (a VS Code reload ending many idle panels) must never
+    # push an uncleared failure out of the window.
+    RECENT_FAIL=$(awk '!/ flush skip: /' "$FLOG" | tail -n 40 | awk '
       function proj(line,   f, n) {
         # <ts> flush|local|connector <proj> ...   or   <ts> backfill <sid8> <proj> ...
         n = split(line, f, " ")

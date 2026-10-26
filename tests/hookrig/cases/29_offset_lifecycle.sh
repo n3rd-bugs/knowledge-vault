@@ -13,6 +13,7 @@
 #     the file — a noclobber write there would keep the stale value forever).
 #   * the offset SURVIVES a fully-drained SessionEnd (no rm -f "$OFFF" anywhere).
 #   * kb_state_sweep retires a session's state ONLY when the offset mtime > 30 d
+#     (or, with no offset, its .seen breadcrumb > 90 d -- case 48, KB 51863)
 #     AND the transcript is absent under BOTH $HOME/.claude/projects and
 #     $CLAUDE_CONFIG_DIR/projects; a <okey>.retry beside it prints a loss note.
 #     (The "child's own .lock.d is gone after a sweeping drain" pin lives in

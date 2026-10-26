@@ -303,6 +303,47 @@ kb_badpath_warn() { # <path> <event> <sid8>
   return 0
 }
 
+# The SessionEnd of a PROMPT-LESS session (KB 51863). Claude Code writes
+# <projects root>/<slug>/<sid>.jsonl at a session's first recorded message, but a
+# session that ends before one -- the VS Code extension's config-cache probe, a
+# panel opened and closed, an idle panel closed days later -- still fires
+# SessionStart + SessionEnd naming the file it WOULD have used. kb_badpath_warn
+# called every one a BUG (54 of 54 on usama-server 2026-09-28..10-26, nothing
+# lost), and the pre-brief could never clear them: no transcript, so no later
+# `ok` for that sid. So when the event is SessionEnd, the path is exactly
+# $HOME/.claude/projects/<one dir>/<sid>.jsonl, and no firing of this session
+# ever found its transcript (no state/<sid>.* file -- every firing that gets past
+# the file test leaves the <sid>.seen breadcrumb, which only the daily state
+# sweep retires: with the offset, or after 90 days for a session that never
+# drained -- and no recall stamp), this
+# logs ONE `flush skip:` line -- no BUG token, no box stamp. Only that root: it
+# is the one kb-flush-backfill.sh's sweep scans, so where a sweep runs, a
+# transcript written after this firing is still captured; under another root
+# (CLAUDE_CONFIG_DIR, a HOME spelled differently) the line stays a BUG.
+# Everything else stays a BUG too: Stop and PreCompact (a session with turns
+# fires Stop first), and a mis-converted Windows path (KB 40411), which is not
+# <root>/<dir>/<sid>.jsonl. The classification uses shell builtins only (it runs
+# on the very PATH that may have broken); the timestamp forks date, as
+# kb_badpath_warn does. Pinned by tests/hookrig/cases/48 (+ case 42's Windows step).
+kb_promptless_end() { # <path> <event> <sid> -> 0 = logged as a skip, 1 = not this case
+  [ "${2:-}" = SessionEnd ] || return 1
+  case "${3:-}" in '' | *[!A-Za-z0-9._-]*) return 1 ;; esac
+  [ "${#3}" -le 80 ] || return 1 # longer ids are truncated in the state keys
+  _kph="$HOME/.claude/hooks"
+  _kprest=${1#"${HOME%/}/.claude/projects"/}
+  [ "$_kprest" != "$1" ] || return 1 # not under the projects root
+  _kpdir=${_kprest%/*}
+  case "$_kpdir" in '' | */*) return 1 ;; esac   # exactly one directory level
+  [ "$_kprest" = "$_kpdir/$3.jsonl" ] || return 1 # the session's OWN transcript
+  for _kpf in "$_kph/state/$3".* "$_kph/state/recall-$3".*; do
+    [ -e "$_kpf" ] && return 1 # a firing of this session got further once: a real BUG
+  done
+  printf '%s flush skip: SessionEnd of a session that never wrote a transcript (no prompt) ev=%s sid=%s\n' \
+    "$(date -u -Is 2>/dev/null || date -u 2>/dev/null)" "$2" "${3:0:8}" \
+    >>"$_kph/flush-session.log" 2>/dev/null || true
+  return 0
+}
+
 # Windows/Git Bash (KB item 496): a co-located jq (installer drops one next to
 # the hooks) must resolve even when Claude Code inherited a PATH without it.
 # $0 itself may arrive as a native path, so normalise it before dirname.
@@ -993,10 +1034,16 @@ kb_decide_offset() {
 export -f kb_decide_offset
 
 # State sweep (C8). Runs in the detached child AFTER kb_lock_release, once per
-# 24 h. Retire a session's state set ONLY when the offset is older than 30 days
+# 24 h (bearer and CONNECTOR children; a LOCAL box never runs it). Retire a
+# session's state set ONLY when its offset is older than 30 days -- or, for a
+# session with NO offset, its .seen breadcrumb (KB 51863) is older than 90 days --
 # AND the transcript is gone under BOTH config roots. One subshell per candidate
 # so a re-taken lock is released on subshell exit; a .retry beside a retired
-# offset means bytes were still pending -> a loss note.
+# offset means bytes were still pending, and an orphan .seen means the session
+# found its transcript but never drained: both get a loss note. The orphan
+# horizon sits well past Claude Code's 30-day transcript retention, because a
+# retired .seen turns that session's eventual SessionEnd back into a prompt-less
+# skip; a .seen beside an offset goes with the offset.
 kb_state_sweep() {
   _sl="$STATE/.state-sweep.last"
   _now=$(date +%s 2>/dev/null || echo 0)
@@ -1007,11 +1054,16 @@ kb_state_sweep() {
   printf %s "$_now" >"$_sl.t" 2>/dev/null && mv "$_sl.t" "$_sl" 2>/dev/null || true
   _r1="$HOME/.claude/projects"
   _r2="${CLAUDE_CONFIG_DIR:-}/projects"
-  for _of in "$STATE"/*.offset; do
+  for _of in "$STATE"/*.offset "$STATE"/*.seen; do
     [ -e "$_of" ] || continue
+    case "$_of" in *.seen) [ -e "${_of%.seen}.offset" ] && continue ;; esac
     (
-      _k=$(basename "$_of" .offset)
-      [ -n "$(find "$_of" -maxdepth 0 -mmin +43200 2>/dev/null)" ] || exit 0
+      # Strip ONLY the suffix the glob matched (a key may itself end in .seen).
+      case "$_of" in
+        *.offset) _k=$(basename "$_of" .offset) _age=43200 ;;
+        *) _k=$(basename "$_of" .seen) _age=129600 ;;
+      esac
+      [ -n "$(find "$_of" -maxdepth 0 -mmin +"$_age" 2>/dev/null)" ] || exit 0
       _tr=""
       [ -d "$_r1" ] && _tr=$(find "$_r1" -mindepth 2 -maxdepth 2 -name "$_k.jsonl" -print -quit 2>/dev/null)
       if [ -z "$_tr" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ -d "$_r2" ]; then
@@ -1021,6 +1073,7 @@ kb_state_sweep() {
       kb_lock_take "$_k" || exit 0
       _loss=""
       [ -f "$STATE/$_k.retry" ] && _loss=" (retry marker present: bytes were pending)"
+      [ -f "$STATE/$_k.offset" ] || _loss=" (no checkpoint: the session never drained, its bytes were never sent)"
       # The whole per-session state set of Appendix I (<okey>.<suffix>; only the
       # lock keeps the .offset infix) plus a leftover atomic-write temp. The lock
       # dir, when this box uses one, is ours now and kb_lock_release removes it.
@@ -1028,7 +1081,8 @@ kb_state_sweep() {
         "$STATE/$_k.last" "$STATE/$_k.gate" "$STATE/$_k.retry" "$STATE/$_k.project" \
         "$STATE/$_k.unseeded" "$STATE/$_k.sweep" "$STATE/$_k.stalecopy" \
         "$STATE/$_k.diverged" "$STATE/$_k.diverged.stamp" "$STATE/$_k.diverged.t" \
-        "$STATE/$_k.behind" "$STATE/$_k.behind.stamp" "$STATE/$_k.behind.t"
+        "$STATE/$_k.behind" "$STATE/$_k.behind.stamp" "$STATE/$_k.behind.t" \
+        "$STATE/$_k.seen"
       kb_lock_release
       echo "$(date -Is) flush state sweep: retired sid=$_k transcript gone$_loss"
     )
@@ -1174,9 +1228,10 @@ CWD=$(kb_winpath "$CWD")
 # Checked BEFORE the file test so a purged sub-agent transcript never logs.
 case "$T" in */subagents/*) exit 0 ;; esac
 # A NAMED transcript that is not a file is never a quiet exit (KB 40411): the
-# literal-path BUG line above is the only trace, since LOG/STATE come later.
+# literal-path BUG line above is the only trace, since LOG/STATE come later --
+# or, for a prompt-less session's SessionEnd, the `flush skip:` line (KB 51863).
 [ -f "$T" ] || {
-  kb_badpath_warn "$T" "$EV" "${SID:0:8}"
+  kb_promptless_end "$T" "$EV" "$SID" || kb_badpath_warn "$T" "$EV" "${SID:0:8}"
   exit 0
 }
 
@@ -1201,7 +1256,18 @@ OFF_RETRY="$STATE/${OKEY:-default}.retry"
 OFF_PROJECT="$STATE/${OKEY:-default}.project"
 OFF_UNSEEDED="$STATE/${OKEY:-default}.unseeded"
 OFF_SWEEP="$STATE/${OKEY:-default}.sweep"
-export OFF_LAST OFF_GATE OFF_RETRY OFF_PROJECT OFF_UNSEEDED OFF_SWEEP
+OFF_SEEN="$STATE/${OKEY:-default}.seen"
+export OFF_LAST OFF_GATE OFF_RETRY OFF_PROJECT OFF_UNSEEDED OFF_SWEEP OFF_SEEN
+# The session's one-time breadcrumb (KB 51863): THIS firing found the transcript.
+# kb_promptless_end calls a SessionEnd with a missing transcript prompt-less only
+# when no firing ever got here, and a closed Stop gate (every Stop in LOCAL and
+# CONNECTOR mode, and REST/MCP ones under the byte floors) writes nothing else, so
+# without it a short session whose transcript later vanished would read as one
+# that never had a prompt. An empty file, one stat per firing; kb_state_sweep
+# retires it with the session's offset, or alone after 90 days when the session
+# never drained (a LOCAL box never runs that sweep, so there it stays, like the
+# session's .project).
+[ -e "$OFF_SEEN" ] || : >"$OFF_SEEN" 2>/dev/null || true
 
 # Wave-C knobs, read in ONE place (Appendix contract defaults).
 export KB_FLUSH_CHUNK="${KB_FLUSH_CHUNK:-700000}"

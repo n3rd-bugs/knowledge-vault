@@ -1069,6 +1069,7 @@ def test_the_state_sweep_retires_the_markers_with_the_offset(tmp_path: Path):
             "diverged.stamp",
             "behind.stamp",
             "stalecopy",
+            "seen",  # KB 51863: the session's breadcrumb goes with its offset
         )
     ]
     for f in retired:

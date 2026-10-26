@@ -15,6 +15,10 @@
 #         * still exits 0, prints nothing, and creates no offset and no pin.
 #       Positive controls: an aged stamp logs again; an EXISTING transcript logs
 #       no BUG line and really submits.
+#       The named path is OUTSIDE the projects root, like a mis-converted one
+#       (KB 40411): since KB 51863 a SessionEnd naming the session's OWN
+#       canonical <root>/<slug>/<sid>.jsonl with no state is a prompt-less
+#       session and logs case 48's `flush skip:` line instead.
 # RED on today's hooks (HEAD b2b37a3) -- expected FAIL lines:
 #       "exactly ONE BUG line for sid=0badf11e -- expected [1], got [0]",
 #       "...naming ev=SessionEnd -- expected [1], got [0]",
@@ -38,7 +42,7 @@ BADSTAMP="$ST/.badpath.stamp"
 
 SID="0badf11e-1111-4111-8111-111111111111"
 SID8="${SID:0:8}"
-WIN_T="C:\\Users\\badpath\\.claude\\projects\\C--Users-badpath-gone\\$SID.jsonl"
+WIN_T="C:\\Users\\badpath\\gone\\$SID.jsonl"
 WIN_CWD='C:\Users\badpath\gone'
 end_event() { # <sid> <transcript> [event]
   "$RIG_JQ" -nc --arg s "$1" --arg t "$2" --arg c "$WIN_CWD" --arg e "${3:-SessionEnd}" \
@@ -48,7 +52,7 @@ offsets() { find "$ST" -maxdepth 1 -name '*.offset' 2>/dev/null | wc -l | tr -d 
 bugs() { log_count "BUG: transcript not found.* sid=$1"; }
 
 step "precondition: the named transcript really does not exist"
-if [ -e "/c/Users/badpath/.claude/projects/C--Users-badpath-gone/$SID.jsonl" ]; then
+if [ -e "/c/Users/badpath/gone/$SID.jsonl" ]; then
   fail "fixture: the transcript exists"
 else
   pass "C:\\...\\$SID.jsonl resolves to nothing"
@@ -94,6 +98,23 @@ assert_eq "0" "$RC" "exits 0"
 wait_log "BUG: transcript not found.*sid=$SID8" 5 || true
 settle
 assert_eq "2" "$(log_count 'BUG: transcript not found')" "an aged stamp logs a second line"
+
+step "a SessionEnd naming its OWN canonical transcript (converted from C:\\...) with no state is a skip"
+# KB 51863 / case 48 on the Windows image: kb_winpath's /c/Users/... form of the
+# canonical path is under $HOME/.claude/projects, so a prompt-less session's
+# SessionEnd logs `flush skip:` here too, and no BUG line.
+SIDC="0badf33e-3333-4333-8333-333333333333"
+for _f in "$ST"/.badpath*; do # age the box stamp, so a BUG here could really log
+  [ -e "$_f" ] || continue
+  printf '0\n' >"$_f"
+  touch -d @1000000000 "$_f"
+done
+_bugs_before=$(log_count 'BUG: transcript not found')
+fire "$HOOKS/flush-session-to-kb.sh" "$(end_event "$SIDC" "C:\\Users\\badpath\\.claude\\projects\\C--Users-badpath-gone\\$SIDC.jsonl")"
+assert_eq "0" "$RC" "exits 0"
+settle
+assert_eq "1" "$(log_count "flush skip: .* sid=${SIDC:0:8}")" "one skip line for the converted canonical path"
+assert_eq "$_bugs_before" "$(log_count 'BUG: transcript not found')" "...and no new BUG line"
 
 step "POSITIVE CONTROL: an EXISTING transcript logs no BUG line and submits"
 mkdir -p "/c/Users/badpath/work/here"

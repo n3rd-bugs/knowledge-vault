@@ -166,9 +166,19 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   registers Git's LAUNCHER `<git root>\bin\bash.exe` when it exists (it sets
   MSYSTEM and PATH before bash starts), else today's value. A named-but-missing
   transcript logs one hourly `BUG: transcript not found` line instead of exiting
-  in silence; a CRLF-written pin is read CR-stripped; a rate-limited NEEDS TOKEN
-  refusal is labelled `refused`; and the `[KB sweep]` line names each stalled
-  session with its remedy (verdict `refused` + a `.notoken` stamp only).
+  in silence — except the SessionEnd of a prompt-less session (KB 51863): Claude
+  Code writes `~/.claude/projects/<slug>/<sid>.jsonl` at the first recorded
+  message, so a SessionEnd naming exactly that file, for a session no firing ever
+  got past the file test (no `state/<sid>.*`, no recall stamp), logs one neutral
+  `flush skip:` line (the VS Code extension's config-cache probe and
+  opened-and-closed panels end this way, on every OS). The pre-brief drops skip
+  lines before its 40-line failure window. A Stop or PreCompact, another root
+  (`CLAUDE_CONFIG_DIR` — the backfill sweep never scans it), a non-canonical path, or a
+  session seen before is still a BUG (`tests/hookrig/cases/48`); a CRLF-written
+  pin is read CR-stripped; a
+  rate-limited NEEDS TOKEN refusal is labelled `refused`; and the `[KB sweep]`
+  line names each stalled session with its remedy (verdict `refused` + a
+  `.notoken` stamp only).
 - **A session resumed from another directory** (KB 49064) leaves TWO transcripts
   with ONE session id — the frozen copy in the old project dir and the live one
   in the new — sharing one checkpoint. A transcript behind that checkpoint while
@@ -370,6 +380,10 @@ held lock leaves `<epoch> 0 lock <size>` — nothing failed, `<end>` is the
 transcript size at deferral — so the resumed session finishes the tail),
 `<okey>.project` (`<slug>\t<how>`, the session pin), `<okey>.unseeded` (refused: pre-stamp
 transcript or unreadable checkpoint), `<okey>.sweep` (the sweep's stall record),
+`<okey>.seen` (empty: some firing found the transcript — even a closed-gate Stop —
+so a later SessionEnd with the file missing is a BUG, not a prompt-less skip; KB 51863;
+retired by the state sweep with the offset, or — a session that never drained — alone
+after 90 days with a loss note; a LOCAL box never runs that sweep),
 `<okey>.stalecopy` (the stale-copy line's 24 h rate-limit stamp),
 `<okey>.diverged` / `<okey>.behind` (KB 49064: ONE line `<iso> <path> size=<n>
 checkpoint=<n>[ cover=<copy>] frozen=<n>` naming the refused copy; `frozen=` is

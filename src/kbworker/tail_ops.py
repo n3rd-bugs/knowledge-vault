@@ -22,7 +22,7 @@ from kbcore import consolidation, llm, review_judge_gate
 from kbcore.config import settings
 from kbcore.review import close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
-from kbworker import summary_stamps
+from kbworker import prep, summary_budget, summary_stamps
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -33,6 +33,7 @@ CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
 # gets a fresh allotment; day-keyed caps are Wave I), so it has to be counted somewhere
 # both _contradictions and the report can see. Reset per run, like _COHORT_STATS.
 _CONTRA_STATS: dict[str, int] = {"judged": 0}
+_SUMMARY_STATS: dict[str, int] = {"summaries_capped": 0, "summary_sources_left_out": 0}
 
 # "deadline" / "battery" / None — see ``consolidate.should_stop``.
 StopCheck = Callable[[], "str | None"]
@@ -136,7 +137,13 @@ def _summaries(since: datetime | None, stop: StopCheck | None = None) -> int:
     for it (H8b). So the 'deferred' number a stand-down reports is tags this run
     would actually have written, never a residue re-tried nightly, and a no-yield
     tag costs exactly one summarizer call per change in its feeding set.
+
+    BUDGET (KB 55031): the sources are fitted to the prompt ceiling first
+    (:mod:`kbworker.summary_budget`, newest first); the summary is written from and
+    linked to ONLY the fitted ones, and a cut tag logs one WARNING and counts in
+    ``_SUMMARY_STATS`` instead of being silently truncated by Ollama.
     """
+    _SUMMARY_STATS.update(summaries_capped=0, summary_sources_left_out=0)
     written = 0
     stamps = summary_stamps.load()
     selected = consolidation.tags_needing_summary(since)
@@ -152,6 +159,19 @@ def _summaries(since: datetime | None, stop: StopCheck | None = None) -> int:
             _note_stop("summaries_written", reason, len(todo) - n)
             break
         sources = consolidation.active_items_with_tag(project, tag)
+        total = len(sources)
+        sources, left_out = summary_budget.fit_summary_sources(tag, sources)
+        if left_out:
+            _SUMMARY_STATS["summaries_capped"] += 1
+            _SUMMARY_STATS["summary_sources_left_out"] += left_out
+            logger.warning(
+                "summaries: project=%s tag=%s kept %d/%d sources; token ceiling=%d",
+                project,
+                tag,
+                len(sources),
+                total,
+                prep._token_ceiling(),
+            )
         if len(sources) < 3:
             summary_stamps.record(stamps, project, tag, new_count, "too_few_sources")
             continue

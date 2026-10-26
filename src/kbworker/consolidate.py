@@ -113,6 +113,7 @@ from kbworker.run_report import (  # noqa: F401
 from kbworker.tail_ops import (  # noqa: F401
     _CONTRA_STATS,
     _STOP_LOG,
+    _SUMMARY_STATS,
     CONTRA_HIGH,
     CONTRA_LOW,
     STOP_CHECK_EVERY,
@@ -368,6 +369,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         _run_step(counts, "upload_parts_swept", documents.sweep_staging)
         _run_step(counts, "enrolment_codes_swept", enrolment.sweep_expired)
         _run_step(counts, "summaries_written", lambda: _summaries(since, stop))
+        counts.update(_SUMMARY_STATS)
 
         def _contra() -> int:
             queued = _contradictions_all(projects, stop)

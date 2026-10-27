@@ -152,6 +152,9 @@ def test_consolidate_main_drains_and_reports(kb, monkeypatch):
     )
     monkeypatch.setattr(llm, "summarize_items", lambda topic, items: "summary")
     monkeypatch.setattr(llm, "items_contradict", lambda *a, **k: False)
+    # The nightly also TRIAGES the item it just saved: without this stub each main()
+    # reached the real Ollama (gemma4, ~6 s per full suite run; found 2026-10-27).
+    monkeypatch.setattr(llm, "triage_extraction", lambda *a, **k: None)
     ingest_queue.enqueue("p", "some memory content to extract from tonight", kind="memory")
 
     result = consolidate.main()

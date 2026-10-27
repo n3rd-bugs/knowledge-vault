@@ -14,12 +14,14 @@ Labels come from what the system already believes: an item-item ``alternative_to
 edge is the linker's (or the owner's) standing same-fact verdict; a
 ``contradiction_judgements`` row at the CURRENT embed model is the incumbent
 judge's verdict (migration 017 keys the memory by embed_model, so a re-embed
-legitimately empties this source until the nightly re-judges).
+legitimately empties this source until the nightly re-judges) — except a pre-fit
+verdict on an oversized pair, which may be a blind reply (KB 55589, :func:`judged_pairs`).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import random
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -29,10 +31,13 @@ from pathlib import Path
 
 import psycopg
 
+from kbcore import judge_fit
 from kbcore.config import settings
 from kbcore.db import connect
 from kbcore.errors import InvalidOperation
 from kbcore.twin_probe import probe_candidates
+
+logger = logging.getLogger("kbcore.bench_pairs")
 
 KIND_SAME_FACT = "same_fact"  # twin_judge prompt; label = an alternative_to edge exists
 KIND_CONTRADICT = "contradict"  # items_contradict prompt; label = the incumbent's verdict
@@ -90,15 +95,51 @@ def edge_pairs() -> list[BenchPair]:
 def judged_pairs(sample: int) -> list[BenchPair]:
     """``contradiction_judgements`` rows at the CURRENT embed model (migration 017 keys
     by embed_model), the incumbent's verdict as label. Positives (rare) come first,
-    then a reproducible random draw of negatives, ``sample`` rows in all."""
+    then a reproducible random draw of negatives, ``sample`` rows in all.
+
+    A row checked before :data:`kbcore.judge_fit.FIT_EPOCH` whose UNFITTED prompt was over
+    :data:`~kbcore.judge_fit.LEGACY_CEILING` is not a label: its verdict may be the blind
+    reply to a prompt Ollama had truncated (KB 55589). It is skipped BEFORE the sample is
+    counted, so ``sample`` still means usable labels; rows from the fitted judge stay.
+    The byte prefilter skips the count for the rest (a cl100k token is never shorter
+    than one byte)."""
+    want, ceiling = max(0, int(sample)), judge_fit.LEGACY_CEILING
+    out: list[BenchPair] = []
+    skipped = 0
     with _read_only() as conn:
         conn.execute("SELECT setseed(%s)", (SAMPLE_SEED,))
+        # random() is drawn in the subquery over the memory table ALONE, in its scan order —
+        # as before the size check joined items — so the seeded draw does not depend on
+        # the join plan, and with nothing skipped it is the draw the bench always made.
         rows = conn.execute(
-            "SELECT a_id, b_id, verdict FROM contradiction_judgements "
-            "WHERE embed_model = %s ORDER BY verdict DESC, random() LIMIT %s",
-            (settings.kb_embed_model, max(0, int(sample))),
+            "SELECT j.a_id, j.b_id, j.verdict, j.checked_at < %s AND"
+            " octet_length(ia.title) + octet_length(ia.body) + octet_length(ib.title)"
+            " + octet_length(ib.body) > %s"
+            " FROM (SELECT a_id, b_id, verdict, checked_at, random() AS draw"
+            " FROM contradiction_judgements WHERE embed_model = %s) j"
+            " JOIN items ia ON ia.id = j.a_id JOIN items ib ON ib.id = j.b_id"
+            " ORDER BY j.verdict DESC, j.draw",
+            (judge_fit.FIT_EPOCH, ceiling // 2, settings.kb_embed_model),
         ).fetchall()
-    return [BenchPair(int(a), int(b), KIND_CONTRADICT, bool(v), "judged") for a, b, v in rows]
+        for a, b, verdict, suspect in rows:
+            if len(out) >= want:
+                break
+            if suspect and _oversized(conn, int(a), int(b), ceiling):
+                skipped += 1
+                continue
+            out.append(BenchPair(int(a), int(b), KIND_CONTRADICT, bool(verdict), "judged"))
+    if skipped:
+        logger.info("judged pairs: %d pre-fit verdict(s) over the ceiling skipped", skipped)
+    return out
+
+
+def _oversized(conn: psycopg.Connection, a_id: int, b_id: int, ceiling: int) -> bool:
+    """True when the pair's unfitted contradiction prompt is over ``ceiling``."""
+    rows = conn.execute(
+        "SELECT id, title, body FROM items WHERE id = ANY(%s)", ([a_id, b_id],)
+    ).fetchall()
+    texts = {r[0]: (r[1], r[2]) for r in rows}
+    return judge_fit.contradict_tokens(*texts[a_id], *texts[b_id]) > ceiling
 
 
 def band_negatives(n: int, exclude: set[tuple[int, int]]) -> list[BenchPair]:

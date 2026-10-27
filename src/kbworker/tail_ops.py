@@ -22,7 +22,8 @@ from kbcore import consolidation, llm, review_judge_gate
 from kbcore.config import settings
 from kbcore.review import close_contradiction_rows_for
 from kbcore.supersede import same_uri_active_pairs, supersede
-from kbworker import prep, summary_budget, summary_stamps
+from kbworker import contradiction_blanks, prep, summary_budget, summary_stamps
+from kbworker.contradiction_budget import _contradiction_pair_cap, no_verdict_guard
 
 logger = logging.getLogger("kbworker.consolidate")
 
@@ -32,7 +33,10 @@ CONTRA_LOW, CONTRA_HIGH = 0.80, 0.95
 # (settings.kb_contradiction_pair_cap) and PER RUN, not per night (a resumed fragment
 # gets a fresh allotment; day-keyed caps are Wave I), so it has to be counted somewhere
 # both _contradictions and the report can see. Reset per run, like _COHORT_STATS.
-_CONTRA_STATS: dict[str, int] = {"judged": 0}
+_CONTRA_STATS: dict[str, int] = dict.fromkeys(
+    ("judged", "no_verdict", "resting", "fresh_judged", "fresh_blank"), 0
+)
+_CONTRA_BLANK: list[list[int]] = []  # [a_id, b_id] of each no-verdict pair this run (KB 55589)
 _SUMMARY_STATS: dict[str, int] = {"summaries_capped": 0, "summary_sources_left_out": 0}
 
 # "deadline" / "battery" / None — see ``consolidate.should_stop``.
@@ -198,18 +202,40 @@ def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None
     Every verdict — overwhelmingly "no contradiction" — is remembered in
     ``contradiction_judgements`` so the next night does not re-pay for it
     (:func:`kbcore.consolidation.record_pair_judgement`; ~90% of this step's cost
-    was re-judged negatives). It is recorded AFTER the contradiction is queued, so
-    a kill between the two loses the memory rather than the finding: the pair is
-    simply judged once more next run.
+    was re-judged negatives), AFTER the contradiction is queued: a kill between the
+    two loses the memory, not the finding. A reply with NO verdict (None: empty,
+    unparseable, even after :func:`kbcore.llm.items_contradict`'s one re-ask) is not a
+    "no" — counted, warned, never remembered (KB 55589); the pair rests a week
+    (:mod:`kbworker.contradiction_blanks`) instead of taking the head of every night,
+    and a seat that stops answering altogether stands the step down
+    (:func:`kbworker.contradiction_budget.no_verdict_guard`, wired in
+    :func:`_contradictions_all`).
     """
     queued = 0
-    pairs = consolidation.contradiction_pairs(project, CONTRA_LOW, CONTRA_HIGH, limit=cap)
+    blanks = contradiction_blanks.load()  # pairs that gave no verdict lately rest (KB 55589)
+    more = None if cap is None else cap + len(blanks)
+    pairs = consolidation.contradiction_pairs(project, CONTRA_LOW, CONTRA_HIGH, limit=more)
+    pairs, resting = contradiction_blanks.select(blanks, pairs, cap)
+    if resting:
+        _CONTRA_STATS["resting"] += resting
+        logger.info("contradictions: %d no-verdict pair(s) in %s resting", resting, project)
     for n, (a_id, b_id, _sim) in enumerate(pairs):
         if stop is not None and n % STOP_CHECK_EVERY == 0 and (reason := stop()):
             _note_stop("contradictions_queued", reason, len(pairs) - n)
             break
         (a_title, a_body), (b_title, b_body) = consolidation.item_pair_texts(a_id, b_id)
         verdict = llm.items_contradict(a_title, a_body, b_title, b_body)
+        _CONTRA_STATS["judged"] += 1
+        fresh = not contradiction_blanks.known(blanks, a_id, b_id)  # a retry never trips it
+        _CONTRA_STATS["fresh_judged"] += fresh
+        if verdict is None:  # fitted + re-asked, so rare; it rests, then is asked again
+            _CONTRA_STATS["no_verdict"] += 1
+            _CONTRA_STATS["fresh_blank"] += fresh
+            _CONTRA_BLANK.append([a_id, b_id])
+            contradiction_blanks.record(blanks, a_id, b_id)
+            logger.warning("contradiction judge gave no verdict on pair %s/%s", a_id, b_id)
+            continue
+        contradiction_blanks.clear(blanks, a_id, b_id)
         if verdict and consolidation.record_contradiction(a_id, b_id):
             queued += 1
             try:  # provenance (which judge queued it); bookkeeping, never a gate
@@ -219,36 +245,10 @@ def _contradictions(project: str, stop: StopCheck | None = None, cap: int | None
         try:
             consolidation.record_pair_judgement(a_id, b_id, verdict)
         except Exception:  # noqa: BLE001 — the memory is an optimisation, never a gate
-            # Same rule as the cohort path: an optimisation that can fail the
-            # step is not one. A pair whose memory did not land is simply judged
-            # again next run — the cost of the old behaviour, not a wrong answer.
+            # Same rule as the cohort path: an optimisation that can fail the step is
+            # not one; a pair whose memory did not land is simply judged again next run.
             logger.warning("recording the judgement for pair %s/%s failed", a_id, b_id)
-        _CONTRA_STATS["judged"] += 1
     return queued
-
-
-def _contradiction_pair_cap(now: datetime | None = None) -> int:
-    """Tonight's contradiction-pair budget — day-aware (review #6), the sibling of
-    ``consolidate._evidence_pair_cap`` for the step before it.
-
-    Unbounded days (``kbcore.drainsched.is_unbounded_day`` — the single "box is
-    free tonight" definition) keep the full ``kb_contradiction_pair_cap`` (500,
-    the catch-up bound); deadline days bind at ``min(cap,
-    kb_contradiction_pair_cap_weekday)`` — measured 129-153 s/pair, so the
-    154-pair nights spent ~21 binding minutes past what 40 covers, growing with
-    ingest. Convergence-safe: judged-pair memory persists across nights
-    (migration 017) and the candidate query is sim-DESC, so a capped night
-    spends its budget on the closest pairs and never re-pays judged ones. This
-    cap is also what bounds the re-judging wave after any embedder swap. ``min``
-    keeps BOTH kill switches (0 in the main knob kills everywhere; 0 in the
-    weekday knob is weekday-only). ``now`` is for day-pinned tests.
-    """
-    from kbcore.drainsched import is_unbounded_day
-
-    cap = int(settings.kb_contradiction_pair_cap)
-    if is_unbounded_day(now):
-        return cap
-    return min(cap, int(settings.kb_contradiction_pair_cap_weekday))
 
 
 def _contradictions_all(
@@ -264,8 +264,10 @@ def _contradictions_all(
     explicit ``cap`` overrides it, and ``cap`` of 0 is the kill switch — no pair
     is judged at all.
     """
-    _CONTRA_STATS["judged"] = 0
+    _CONTRA_STATS.update(dict.fromkeys(_CONTRA_STATS, 0))
+    _CONTRA_BLANK.clear()
     budget = _contradiction_pair_cap() if cap is None else int(cap)
+    stop = no_verdict_guard(stop, _CONTRA_STATS)  # a seat that cannot answer stands down
     queued = 0
     for project in projects:
         remaining = budget - _CONTRA_STATS["judged"]

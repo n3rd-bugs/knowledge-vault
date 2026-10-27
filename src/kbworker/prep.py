@@ -21,8 +21,8 @@ from kbworker.cohort import _COHORT_STATS
 logger = logging.getLogger("kbworker.consolidate")
 
 # --- extraction input budget -------------------------------------------------
-# Ollama truncates a chat prompt to num_ctx/2 tokens and keeps only the first
-# n_keep (4) tokens of the front, so an oversized job loses the SYSTEM PROMPT and
+# A chat prompt over num_ctx-1 tokens is cut by Ollama TO ~num_ctx/2, keeping the
+# first n_keep (4) tokens + the tail, so an oversized job loses the SYSTEM PROMPT and
 # the model is handed an instruction-less tail slice. Measured 2026-07-31: a
 # 1,034,082-token prompt was cut to 8,194 tokens ("truncating input prompt" x13
 # in journald) — SILENTLY, because Ollama returns 200 with a plausible-looking
@@ -55,9 +55,9 @@ def window_budget_bytes() -> int:
 def window_budget_tokens() -> int:
     """Tokens ONE extraction call may carry: num_ctx/2 minus prompt overhead.
 
-    num_ctx/2 is Ollama's prompt ceiling (measured: 8,194 tokens at num_ctx
-    16384, "truncating input prompt" in journald when exceeded, keep=4 so the
-    SYSTEM PROMPT is what truncation drops).
+    CONSERVATIVE: Ollama truncates only a prompt over num_ctx-1 (16,383 at 16384), and
+    then cuts it TO ~num_ctx/2 (8,194; "truncating input prompt" in journald, keep=4 so
+    the SYSTEM PROMPT is what truncation drops); the other half stays free (KB 55589).
     """
     return max(512, int(settings.kb_llm_num_ctx) // 2 - EXTRACT_PROMPT_OVERHEAD_TOKENS)
 
@@ -111,8 +111,8 @@ def _warn_if_oversized(key: str, text: str, budget_tokens: int | None = None) ->
         return False
     logger.warning(
         "TRUNCATION RISK: job %r submits %d tokens (measured, cl100k) against the "
-        "%d-token budget from num_ctx=%d — Ollama truncates to num_ctx/2 and the "
-        "SYSTEM PROMPT is what it drops first",
+        "%d-token budget from num_ctx=%d — past num_ctx-1 Ollama cuts to ~num_ctx/2 "
+        "and the SYSTEM PROMPT is what it drops first",
         key,
         tokens,
         budget,

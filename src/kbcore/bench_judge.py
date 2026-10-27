@@ -3,7 +3,7 @@
 Three ad-hoc benches in two months gated every model adoption, and the 08-30 raw
 JSON did not survive the reboot. This is the repeatable version: it re-asks the
 UNMODIFIED pair-judge prompts — :func:`kbcore.twin_judge.same_fact_messages` (the
-nonce-fenced same-fact question) and :data:`kbcore.llm._CONTRADICT_SYSTEM` — over
+nonce-fenced same-fact question) and :func:`kbcore.judge_fit.contradict_messages` — over
 pairs whose label is already known (:mod:`kbcore.bench_pairs`: the incumbent's
 stored verdicts, or the live ``alternative_to`` edges), once per candidate
 ``model x think``, and scores agreement, judged-rate, FP/FN and seconds per pair
@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kbcore import llm, scope
+from kbcore import judge_fit, llm, scope
 
 # THE SEAM: the pair sources were split into bench_pairs for the ratchet and are
 # re-imported here because this module owns the feature — the CLI and the tests
@@ -102,26 +102,15 @@ def _pair_rows(a_id: int, b_id: int) -> tuple[tuple[str, str, str], tuple[str, s
 
 
 def contradict_messages(a_title: str, a_body: str, b_title: str, b_body: str) -> list[dict]:
-    """``llm.items_contradict``'s exact request (its parity is pinned by test)."""
-    return [
-        {"role": "system", "content": llm._CONTRADICT_SYSTEM},
-        {"role": "user", "content": f"Item A: {a_title}\n{a_body}\n\nItem B: {b_title}\n{b_body}"},
-    ]
+    """``llm.items_contradict``'s exact request — the one fitted builder
+    (:func:`kbcore.judge_fit.contradict_messages`; parity pinned by test)."""
+    return judge_fit.contradict_messages(a_title, a_body, b_title, b_body)
 
 
-def contradict_verdict(content: str) -> bool:
-    """``llm.items_contradict``'s answer coercion, verbatim (parity pinned by test):
-    ambiguous/unparseable ⇒ False; stringified bools coerced explicitly."""
-    try:
-        data = llm.parse_model_json(content)
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    val = data.get("contradict")
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "yes", "1")
-    return bool(val)
+def contradict_verdict(content: str) -> bool | None:
+    """``llm.items_contradict``'s reading, the same function (parity pinned by test): a
+    reply with no usable verdict is None — UNJUDGED (judged-rate), never a negative."""
+    return llm.parse_contradict(content)
 
 
 def judge_pair(pair: BenchPair, *, model: str, think: bool | None) -> Verdict:
@@ -134,18 +123,20 @@ def judge_pair(pair: BenchPair, *, model: str, think: bool | None) -> Verdict:
         messages = contradict_messages(a_title, a_body, b_title, b_body)
     seed = llm._draw_seed(a_title, a_body, b_title, b_body)
     t0 = time.perf_counter()
+    verdict: bool | None
     try:
-        content = llm._chat(messages, json_format=True, model=model, seed=seed, think=think)
+        if pair.kind == KIND_SAME_FACT:
+            content = llm._chat(messages, json_format=True, model=model, seed=seed, think=think)
+            same, judged, rationale = parse_verdict(content)
+            verdict = same if judged else None
+        else:  # production's two-draw ask (seed, then seed+1 on a blank reply)
+            verdict = llm.ask_contradict(messages, seed, model=model, think=think)
+            rationale = ""
     except (ExtractorUnavailable, ExtractionFailed) as e:
         secs = time.perf_counter() - t0
         rationale = f"judge unavailable: {e.__class__.__name__}"
         return Verdict(pair.a_id, pair.b_id, pair.kind, pair.label, None, rationale, secs)
     secs = time.perf_counter() - t0
-    if pair.kind == KIND_SAME_FACT:
-        same, judged, rationale = parse_verdict(content)
-        verdict: bool | None = same if judged else None
-    else:
-        verdict, rationale = contradict_verdict(content), ""
     return Verdict(pair.a_id, pair.b_id, pair.kind, pair.label, verdict, rationale, secs)
 
 

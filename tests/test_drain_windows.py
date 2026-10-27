@@ -54,8 +54,8 @@ def _prose(kb_size: int) -> str:
 
 
 def test_the_budget_is_derived_from_num_ctx_and_is_conservative():
-    """Ollama's prompt ceiling is num_ctx/2 TOKENS; the budget is bytes, so it
-    must sit well under a naive tokens x 4 conversion or the split is theatre."""
+    """The window budget is num_ctx/2 TOKENS (conservative: Ollama cuts only past num_ctx-1);
+    in bytes it must sit well under a naive tokens x 4 conversion or the split is theatre."""
     assert settings.kb_llm_num_ctx == 16384, "default changed — recheck the numbers below"
     budget = consolidate.window_budget_bytes()
     assert 20_000 <= budget <= 30_000, f"{budget} is not the ~25 kB the 16K context affords"

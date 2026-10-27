@@ -102,16 +102,17 @@ class _FakeResp:
         return {"message": {"content": self._content}}
 
 
-def test_items_contradict_parses_and_defaults_false(monkeypatch):
+def test_items_contradict_parses_and_never_defaults_false(monkeypatch):
     monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: _FakeResp('{"contradict": true}'))
     assert llm.items_contradict("A", "a", "B", "b") is True
 
     monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: _FakeResp('{"contradict": false}'))
     assert llm.items_contradict("A", "a", "B", "b") is False
 
-    # Ambiguous / unparseable answer must NOT raise — defaults to False.
+    # Ambiguous / unparseable answer must NOT raise — and is NO verdict (None), never a
+    # silent False the nightly would memorize as "no conflict" (KB 55589).
     monkeypatch.setattr(llm.httpx, "post", lambda *a, **k: _FakeResp("not json at all"))
-    assert llm.items_contradict("A", "a", "B", "b") is False
+    assert llm.items_contradict("A", "a", "B", "b") is None
 
 
 def test_summarize_items_returns_content(monkeypatch):

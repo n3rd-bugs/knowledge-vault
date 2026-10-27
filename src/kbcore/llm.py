@@ -15,12 +15,14 @@ from typing import Any
 
 import httpx
 
+from kbcore import judge_fit
 from kbcore.config import settings
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 
 # Documented seam: callers/tests resolve llm.parse_model_json / llm.JSON_COUNTERS.
 from kbcore.llm_json import JSON_COUNTERS, parse_model_json, recover_items  # noqa: F401
-from kbcore.llm_prompts import EVIDENCE_SYSTEM as _EVIDENCE_SYSTEM
+from kbcore.llm_prompts import CONTRADICT_SYSTEM as _CONTRADICT_SYSTEM  # noqa: F401
+from kbcore.llm_prompts import EVIDENCE_SYSTEM as _EVIDENCE_SYSTEM  # noqa: F401
 from kbcore.unicode_safe import clean, clean_obj
 
 logger = logging.getLogger("kbcore.llm")
@@ -296,20 +298,11 @@ def evidence_side(
     a_title: str, a_body: str, b_title: str, b_body: str, c_title: str, c_body: str
 ) -> str:
     """Which side of a contradiction the candidate item supports: 'a'|'b'|'neither'.
-    Mirrors :func:`items_contradict`: an unparseable/unexpected answer degrades to
-    'neither' (never raises); network failures surface as :class:`ExtractorUnavailable`."""
+    An unparseable/unexpected answer degrades to 'neither' (never raises); network
+    failures surface as :class:`ExtractorUnavailable`. The request is fitted to the
+    window (:func:`kbcore.judge_fit.evidence_messages`); the seed is the original texts'."""
     content = _chat(
-        [
-            {"role": "system", "content": _EVIDENCE_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    f"Item A: {a_title}\n{a_body}\n\n"
-                    f"Item B: {b_title}\n{b_body}\n\n"
-                    f"Evidence: {c_title}\n{c_body}"
-                ),
-            },
-        ],
+        judge_fit.evidence_messages(a_title, a_body, b_title, b_body, c_title, c_body),
         json_format=True,
         seed=_draw_seed(a_title, a_body, b_title, b_body, c_title, c_body),
     )
@@ -330,42 +323,53 @@ def _pair_judge_kwargs() -> dict[str, Any]:
     return {"model": settings.pair_judge_model, "think": settings.pair_judge_think}
 
 
-_CONTRADICT_SYSTEM = (
-    "You compare two knowledge items and decide whether they factually CONTRADICT — "
-    "state incompatible facts or decisions about the same thing (not merely different "
-    'topics). Answer STRICT JSON only: {"contradict": true} or {"contradict": false}. '
-    "If you are unsure, answer false."
-)
-
-
-def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bool:
-    """True iff the CONTRADICTION seat judges the two items to conflict (§7.3 step 3; the
-    seat falls back to the pair seat, then the extractor). Never raises on an unparseable
-    answer (False); network failures surface as :class:`ExtractorUnavailable` via _chat."""
-    content = _chat(
-        [
-            {"role": "system", "content": _CONTRADICT_SYSTEM},
-            {
-                "role": "user",
-                "content": f"Item A: {a_title}\n{a_body}\n\nItem B: {b_title}\n{b_body}",
-            },
-        ],
-        json_format=True,
-        seed=_draw_seed(a_title, a_body, b_title, b_body),
+def items_contradict(a_title: str, a_body: str, b_title: str, b_body: str) -> bool | None:
+    """The CONTRADICTION seat's THREE-state verdict on two items (§7.3 step 3; the seat
+    falls back to the pair seat, then the extractor): True / False, or None when the reply
+    carries none (:func:`parse_contradict`) — never a silent False, so the nightly does not
+    memorize it (KB 55589). The request is fitted to the window
+    (:func:`kbcore.judge_fit.contradict_messages`; seeds from the original texts) and is
+    the precision gate's, byte for byte. Network failures raise ExtractorUnavailable."""
+    return ask_contradict(
+        judge_fit.contradict_messages(a_title, a_body, b_title, b_body),
+        _draw_seed(a_title, a_body, b_title, b_body),
         model=settings.contradiction_judge_model,
         think=settings.contradiction_judge_think,
     )
+
+
+def ask_contradict(
+    messages: list[dict], seed: int, *, model: str | None, think: bool | None
+) -> bool | None:
+    """Ask a contradiction request, ONCE more at seed+1 when the reply carries no verdict
+    (the extractor's re-ask): the seats think first, and an unlucky long draw can loop or
+    run out of room where another draw answers. Production and the seat bench both ask
+    this way, so the bench measures the verdict the nightly gets."""
+    for draw in (seed, seed + 1):
+        content = _chat(messages, json_format=True, seed=draw, model=model, think=think)
+        if (verdict := parse_contradict(content)) is not None:
+            return verdict
+    return None
+
+
+_VERDICT_WORDS = {"true": True, "yes": True, "1": True, "false": False, "no": False, "0": False}
+
+
+def parse_contradict(content: str) -> bool | None:
+    """Strict reading of a contradiction reply (was the precision gate's): a JSON bool, an
+    int 0/1, or one of :data:`_VERDICT_WORDS` (format=json can stringify a bool, and
+    ``bool("false")`` is True); anything else — unparseable, empty, not an object, a
+    missing or odd ``contradict`` — is None, no verdict."""
     try:
         data = parse_model_json(content)
     except (ValueError, TypeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    val = data.get("contradict")
-    # format=json can yield a stringified bool, and bool("false") is True: coerce strings.
-    if isinstance(val, str):
-        return val.strip().lower() in ("true", "yes", "1")
-    return bool(val)
+        return None
+    val = data.get("contradict") if isinstance(data, dict) else None
+    if isinstance(val, bool):
+        return val
+    if type(val) is int and val in (0, 1):
+        return val == 1
+    return _VERDICT_WORDS.get(val.strip().lower()) if isinstance(val, str) else None
 
 
 # --- Factored verifier (pipeline v2 WP-B1, owner decision 2026-07-18) ---------

@@ -31,8 +31,9 @@ from __future__ import annotations
 
 import logging
 import secrets
+from collections.abc import Sequence
 
-from kbcore import llm
+from kbcore import judge_fit, llm
 from kbcore.consolidation import item_pair_texts
 from kbcore.errors import ExtractionFailed, ExtractorUnavailable
 
@@ -55,6 +56,13 @@ SAME_FACT_SYSTEM = (
 )
 
 
+# The fit is measured with this stand-in, never the call's random nonce, so the cut is the
+# same on every call (production and the bench agree on it). With its leading space it is
+# 17 cl100k tokens — each of its 16 characters its own token and the space alone, the most
+# any 16-hex-digit string can cost — so a real token_hex(8) fence never measures over it.
+_FIT_NONCE = "0a1b2c3d4e5f6a7b"
+
+
 def _fenced(label: str, project: str, title: str, body: str, nonce: str) -> str:
     """One item wrapped in nonce-delimited markers the body cannot forge."""
     return f"BEGIN {label} {nonce} (project {project})\n{title}\n{body}\nEND {label} {nonce}"
@@ -64,19 +72,28 @@ def same_fact_messages(
     a_project: str, a_title: str, a_body: str, b_project: str, b_title: str, b_body: str
 ) -> list[dict[str, str]]:
     """The judge's exact request: system prompt + both items nonce-fenced (a fresh
-    nonce per call). Shared with :mod:`kbcore.bench_judge` so the agreement probe
-    asks the UNMODIFIED question through the same request shape."""
+    nonce per call), the bodies fitted to the window (:func:`kbcore.judge_fit.fit`;
+    byte-identical when they fit). Shared with :mod:`kbcore.bench_judge` so the
+    agreement probe asks the UNMODIFIED question through the same request shape."""
     nonce = secrets.token_hex(8)
+
+    def render(bodies: Sequence[str], fence: str = nonce) -> str:
+        return (
+            f"{_fenced('ITEM_A', a_project, a_title, bodies[0], fence)}\n\n"
+            f"{_fenced('ITEM_B', b_project, b_title, bodies[1], fence)}\n\n"
+            "Do ITEM_A and ITEM_B record the same underlying fact?"
+        )
+
+    fitted = judge_fit.fit(
+        "same_fact",
+        SAME_FACT_SYSTEM,
+        lambda bodies: render(bodies, _FIT_NONCE),
+        [a_body, b_body],
+        what=judge_fit.label(a_title, b_title),
+    )
     return [
         {"role": "system", "content": SAME_FACT_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                f"{_fenced('ITEM_A', a_project, a_title, a_body, nonce)}\n\n"
-                f"{_fenced('ITEM_B', b_project, b_title, b_body, nonce)}\n\n"
-                "Do ITEM_A and ITEM_B record the same underlying fact?"
-            ),
-        },
+        {"role": "user", "content": render(fitted)},
     ]
 
 

@@ -677,6 +677,24 @@ def test_the_gate_verdict_is_three_state(kb, monkeypatch, content, expected):
     assert review_judge_gate.verdict(b, a) is expected
 
 
+def test_an_oversized_pair_is_fitted_the_same_way_by_the_gate_and_the_nightly(
+    kb, capture, monkeypatch
+):
+    """KB 55589: the gate delegates to items_contradict, so the FITTED request (cut, marker,
+    seed from the original texts) is byte-identical too — not just the short-pair one."""
+    monkeypatch.setattr(settings, "kb_contradiction_judge_model", SEAT)
+    monkeypatch.setattr(settings, "kb_llm_num_ctx", 2048)  # judge ceiling floor: 1024
+    a = ingest("gate", "spec", "sa", " ".join(f"a{i}" for i in range(1500)), uri="fa")
+    b = ingest("gate", "spec", "sb", " ".join(f"b{i}" for i in range(1500)), uri="fb")
+    (at, ab), (bt, bb) = consolidation.item_pair_texts(a, b)
+    llm.items_contradict(at, ab, bt, bb)
+    nightly = json.dumps(capture["payload"])
+    assert "tokens omitted ...]" in capture["payload"]["messages"][1]["content"]
+    assert capture["payload"]["options"]["seed"] == llm._draw_seed(at, ab, bt, bb)
+    review_judge_gate.verdict(b, a)
+    assert json.dumps(capture["payload"]) == nightly
+
+
 def test_the_gate_asks_byte_for_byte_what_the_nightly_asks(kb, capture, monkeypatch):
     monkeypatch.setattr(settings, "kb_contradiction_judge_model", SEAT)
     a = ingest("gate", "qa", "ta", "x is 5", uri="ta", trust="unverified")

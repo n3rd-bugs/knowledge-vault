@@ -44,9 +44,12 @@ class LLMSettings(BaseSettings):
     # Context window for every /api/chat LLM call. Without an explicit num_ctx, Ollama runs its
     # RUNTIME default (4K), silently truncating transcript input and capping JSON output
     # (done_reason=length) — measured 2026-07-18: the incumbent's grounding collapsed to 0% on
-    # >4K-token transcripts and every model's output could be cut mid-JSON. 16384 covers our
-    # 16K-char extraction window with output headroom; KV cost at 16K ≈ +2-3GB (fits beside the
-    # resident 14B). Raise only after checking VRAM headroom.
+    # >4K-token transcripts and every model's output could be cut mid-JSON. A prompt over
+    # num_ctx-1 is cut by Ollama TO ~num_ctx/2 (system prompt lost), so prompts are fitted AT
+    # CALL TIME from this value: drain windows + summaries (num_ctx/2-1024)/1.15 cl100k (6,233,
+    # conservative), pair judges (num_ctx-6144)/1.15 (8,904; room for the seats' hidden
+    # thinking, KB 55589). KV cost at 16K ≈ +2-3GB (fits beside the resident 14B). Raise
+    # only after checking VRAM headroom.
     kb_llm_num_ctx: int = 16384
     # Malformed-JSON re-ask (incident 2026-09-12): ONE ~900 KB window came back with an unescaped
     # quote inside a string, extract_items raised, the per-job fallback failed identically and
@@ -125,7 +128,8 @@ class LLMSettings(BaseSettings):
     # blind two-labeler ground truth (42 real conflicts): qwen3:14b precision 0.52 / recall
     # 0.79 at 12.7 s/pair, bonsai-2:27b 0.78 / 0.83 at 11.8 s/pair. Rollback = empty it.
     # Pairs an earlier seat judged "no conflict" stay remembered (contradiction_judgements is
-    # keyed by EMBED model) and are not re-judged by a new seat until a re-embed.
+    # keyed by EMBED model) and are not re-judged by a new seat until a re-embed — except the
+    # pre-fit oversized ones, via `kb repair rejudge-oversized` (KB 55589).
     kb_contradiction_judge_model: str = ""
     # Ollama `think` for that seat, read ONLY while its model is set (the rule above).
     kb_contradiction_judge_think: bool | None = None

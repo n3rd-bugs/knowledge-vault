@@ -161,8 +161,8 @@ def contradiction_pairs(
 def record_pair_judgement(a_id: int, b_id: int, verdict: bool) -> bool:
     """Remember that this pair was judged at the CURRENT embed model. INSERT-only.
 
-    Written the moment the judge answers, so an interrupted step (power cut,
-    deadline, kill) loses at most the pair in flight instead of the whole
+    Written the moment the judge gives a True/False verdict (None is never memorized,
+    KB 55589), so a cut step loses at most the pair in flight instead of the whole
     night's judging. ``ON CONFLICT DO NOTHING`` keeps this purely additive
     (Invariant 5): a verdict is never updated or deleted, and the memory is
     invalidated only by re-embedding under a new model, which changes the key.

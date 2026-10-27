@@ -15,15 +15,26 @@ evidence.gather_evidence) is monkeypatched. Four defects, one file:
 from __future__ import annotations
 
 import itertools
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from kbcore import consolidation, db, evidence, llm, review_auto, review_expire, review_triage
+from kbcore import (
+    consolidation,
+    db,
+    evidence,
+    judge_fit,
+    llm,
+    review_auto,
+    review_expire,
+    review_triage,
+)
 from kbcore.config import settings
+from kbcore.errors import ExtractorUnavailable
 from kbcore.ingest import ingest
 from kbcore.review import queue_review
-from kbworker import consolidate
+from kbworker import consolidate, contradiction_blanks
 
 # --- helpers -----------------------------------------------------------------
 
@@ -223,6 +234,11 @@ def test_the_nightly_report_carries_the_curation_keys(kb, monkeypatch, tmp_path)
     assert counts["contradiction_suggestions_pending"] == 0
     assert counts["first_expiry_date"] is None, "the only open row is exempt from expiry"
     assert counts["contradiction_pairs_judged"] == 0
+    # KB 55589: the prompt-budget keys ride the report too (added, never renamed).
+    assert counts["contradiction_pairs_trimmed"] == 0
+    assert counts["contradiction_pairs_no_verdict"] == 0
+    assert counts["judge_prompts_trimmed"] == {"contradict": 0, "evidence": 0, "same_fact": 0}
+    assert counts["contradiction_no_verdict_pairs"] == []
     # Existing keys are never renamed — the report is read night over night.
     for key in ("review_expired", "review_queue_open", "evidence_refreshed", "archived"):
         assert key in counts
@@ -254,6 +270,248 @@ def test_a_positive_verdict_is_remembered_too(kb, monkeypatch):
             "SELECT count(*) FROM review_queue WHERE reason = 'contradiction'"
         ).fetchone()
     assert rows == 1, "the contradiction is still queued exactly once"
+
+
+def _age_blanks(days: int) -> None:
+    """Move every no-verdict stamp ``days`` into the past (the rest is RETRY_DAYS)."""
+    stamps = contradiction_blanks.load()
+    when = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    for entry in stamps.values():
+        entry["at"] = when
+    contradiction_blanks._save(stamps)
+
+
+def _pin_caps(monkeypatch, cap: int = 500) -> None:
+    """The breaker tests need room: never read the calendar's (or .env's) pair cap."""
+    monkeypatch.setattr(settings, "kb_contradiction_pair_cap", cap)
+    monkeypatch.setattr(settings, "kb_contradiction_pair_cap_weekday", cap)
+
+
+def _stats(**want: int) -> dict[str, int]:
+    base = {"judged": 0, "no_verdict": 0, "resting": 0, "fresh_judged": 0, "fresh_blank": 0}
+    return {**base, **want}
+
+
+def test_a_reply_with_no_verdict_is_never_remembered(kb, monkeypatch):
+    """KB 55589: None (empty, unparseable) is not a "no" — counted, warned, never memorized;
+    the pair rests RETRY_DAYS (it would blank again tomorrow: same request, same seeds),
+    then is asked again, and a real answer clears the stamp."""
+    a, b = _near_pair("contra", "blank")
+    answers = iter([None, False])
+    monkeypatch.setattr(llm, "items_contradict", lambda *a_, **k: next(answers))
+
+    assert consolidate._contradictions_all(["contra"]) == 0
+    assert _judgements() == [], "a reply without a verdict must never become 'no conflict'"
+    assert consolidate._CONTRA_STATS == _stats(
+        judged=1, no_verdict=1, fresh_judged=1, fresh_blank=1
+    )
+    assert consolidate._CONTRA_BLANK == [[a, b]], "the report names the pair"
+    assert [(x, y) for x, y, _s in consolidation.contradiction_pairs("contra")] == [(a, b)]
+    assert contradiction_blanks.known(contradiction_blanks.load(), a, b)
+
+    assert consolidate._contradictions_all(["contra"]) == 0  # tomorrow: it rests
+    assert consolidate._CONTRA_STATS == _stats(resting=1), "a resting pair is not judged"
+
+    _age_blanks(contradiction_blanks.RETRY_DAYS + 1)
+    assert consolidate._contradictions_all(["contra"]) == 0  # after its rest: a real "no"
+    assert _judgements() == [(a, b, settings.kb_embed_model, False)]
+    assert consolidate._CONTRA_STATS == _stats(judged=1), "a retry is not a fresh pair"
+    assert consolidate._CONTRA_BLANK == []
+    assert contradiction_blanks.load() == {}, "an answer clears the stamp"
+
+
+def test_resting_blanks_do_not_take_the_cap(kb, monkeypatch):
+    """Blank pairs sort to the head (sim DESC) night after night; resting, they are skipped
+    and the cap goes to the pairs behind them."""
+    _pin_caps(monkeypatch)
+    heads = [_near_pair("rest", f"h{i}") for i in range(2)]
+    monkeypatch.setattr(llm, "items_contradict", lambda *_a: None)
+    consolidate._contradictions_all(["rest"])
+    assert {tuple(p) for p in consolidate._CONTRA_BLANK} == set(heads)
+    tails = [_near_pair("rest", f"t{i}") for i in range(2)]
+    asked: list[str] = []
+    monkeypatch.setattr(llm, "items_contradict", lambda at, *_r: asked.append(at) or False)
+    monkeypatch.setattr(settings, "kb_contradiction_pair_cap", 2)
+    monkeypatch.setattr(settings, "kb_contradiction_pair_cap_weekday", 2)
+
+    consolidate._contradictions_all(["rest"])
+    assert sorted(asked) == sorted(f"a t{i}" for i in range(2)), "the cap went to the tails"
+    assert {(x, y) for x, y, _m, _v in _judgements()} == set(tails)
+
+
+def test_a_new_seat_or_embedder_frees_a_resting_pair(kb, monkeypatch):
+    a, b = _near_pair("rest2", "x")
+    monkeypatch.setattr(llm, "items_contradict", lambda *_a: None)
+    consolidate._contradictions_all(["rest2"])
+    stamps = contradiction_blanks.load()
+    assert contradiction_blanks.resting(stamps, a, b)
+    monkeypatch.setattr(settings, "kb_contradiction_judge_model", "another-seat:9b")
+    assert not contradiction_blanks.resting(stamps, a, b), "a new seat starts fresh"
+
+
+def test_a_seat_that_cannot_answer_stands_the_step_down(kb, monkeypatch):
+    """KB 55589's breaker: never-memorized blanks must not spend the whole cap every night.
+    From the 6th FRESH pair judged, half or more blank stands the step down at the next
+    stop check (every STOP_CHECK_EVERY pairs) — here after 10 of 14, and the next project
+    is not judged at all."""
+    _pin_caps(monkeypatch)
+    for tag in range(12):
+        _near_pair("blank1", f"p{tag}")
+    _near_pair("blank2", "q0")
+    _near_pair("blank2", "q1")
+    calls: list[str] = []
+    monkeypatch.setattr(llm, "items_contradict", lambda at, *_r: calls.append(at) or None)
+    consolidate._STOP_LOG.clear()
+
+    assert consolidate._contradictions_all(["blank1", "blank2"]) == 0
+    assert len(calls) == 10, calls
+    assert consolidate._CONTRA_STATS == _stats(
+        judged=10, no_verdict=10, fresh_judged=10, fresh_blank=10
+    )
+    assert _judgements() == []
+    assert consolidate._STOP_LOG["contradictions_queued"] == {"reason": "no verdict", "deferred": 4}
+
+
+def test_a_block_of_retried_blanks_neither_trips_the_breaker_nor_stalls_the_step(kb, monkeypatch):
+    """Round-2 review: persistent blanks at the head of the queue must not stand the step
+    down every night. Retried ones (known blanks past their rest) do not count."""
+    _pin_caps(monkeypatch)
+    poison = [_near_pair("blk", f"z{i}") for i in range(6)]
+    monkeypatch.setattr(llm, "items_contradict", lambda *_a: None)
+    consolidate._contradictions_all(["blk"])  # night 1: six fresh blanks (under the floor)
+    good = [_near_pair("blk", f"g{i}") for i in range(6)]
+    _age_blanks(contradiction_blanks.RETRY_DAYS + 1)  # the six are due for a retry
+    poisoned = {p for pair in poison for p in pair}
+    monkeypatch.setattr(
+        llm,
+        "items_contradict",
+        lambda at, ab, bt, bb: None if at.removeprefix("a ").startswith("z") else False,
+    )
+    consolidate._STOP_LOG.clear()
+
+    consolidate._contradictions_all(["blk"])
+    assert "contradictions_queued" not in consolidate._STOP_LOG, "retries never trip it"
+    assert consolidate._CONTRA_STATS["fresh_blank"] == 0
+    assert {(x, y) for x, y, _m, _v in _judgements()} == set(good)
+    assert not poisoned & {x for x, _y, _m, _v in _judgements()}
+    retried = consolidate._CONTRA_STATS["judged"] - len(good)
+    assert retried == contradiction_blanks.RETRIES_PER_RUN, "a few retries per run, no more"
+    stamps = contradiction_blanks.load()
+    again = [p for p in poison if contradiction_blanks.resting(stamps, *p)]
+    assert again == poison[:5], "each retried pair is re-stamped and rests again ..."
+    assert not contradiction_blanks.resting(stamps, *poison[5]), "... the sixth waits its turn"
+    assert sorted(stamps[f"{a}\t{b}"]["nights"] for a, b in poison) == [1, 2, 2, 2, 2, 2]
+
+
+def test_a_seat_broken_for_weeks_still_stands_down_and_retries_stay_bounded(kb, monkeypatch):
+    """Round-3 review: due retries go AFTER every fresh pair (so the breaker sees fresh
+    replies first) and at most RETRIES_PER_RUN of them run — a seat that stays broken
+    under the same name must not grow its nightly bill week by week."""
+    _pin_caps(monkeypatch)
+    for i in range(30):
+        _near_pair("dead", f"d{i}")
+    monkeypatch.setattr(llm, "items_contradict", lambda *_a: None)
+    for night in range(3):
+        consolidate._STOP_LOG.clear()
+        consolidate._contradictions_all(["dead"])
+        assert consolidate._STOP_LOG["contradictions_queued"]["reason"] == "no verdict"
+        assert consolidate._CONTRA_STATS["fresh_judged"] == 10, f"night {night}"
+        assert consolidate._CONTRA_STATS["judged"] == 10, "the breaker trips before retries"
+        _age_blanks(contradiction_blanks.RETRY_DAYS + 1)
+
+
+def test_an_occasional_blank_never_trips_the_breaker(kb, monkeypatch):
+    _pin_caps(monkeypatch)
+    for tag in range(12):
+        _near_pair("blank3", f"r{tag}")
+    answers = itertools.cycle([None, False, False])  # a third blank: under half
+    monkeypatch.setattr(llm, "items_contradict", lambda *_a: next(answers))
+    consolidate._STOP_LOG.clear()
+
+    assert consolidate._contradictions_all(["blank3"]) == 0
+    assert consolidate._CONTRA_STATS == _stats(
+        judged=12, no_verdict=4, fresh_judged=12, fresh_blank=4
+    )
+    assert "contradictions_queued" not in consolidate._STOP_LOG
+    assert len(_judgements()) == 8, "every real answer is remembered"
+
+
+def test_the_nightly_report_counts_trimmed_and_blank_pairs(kb, monkeypatch, tmp_path):
+    """The report keys (and the digest clause) through main(), not just module state: one
+    oversized pair fitted and answered, one small pair whose replies carry no verdict."""
+    monkeypatch.setattr(settings, "kb_raw", tmp_path / "kbraw")
+    monkeypatch.setattr(settings, "kb_eval_in_consolidation", False)
+    monkeypatch.setattr(settings, "kb_llm_num_ctx", 2048)  # judge ceiling floor: 1024
+    big = ingest("rpt", "spec", "big a", " ".join(f"a{i}" for i in range(1500)), uri="rpt-a")
+    big_b = ingest("rpt", "spec", "big b", " ".join(f"b{i}" for i in range(1500)), uri="rpt-b")
+    small = (ingest("rpt", "qa", "small a", "x is 5", uri="rs-a"),)
+    small += (ingest("rpt", "qa", "small b", "x is 7", uri="rs-b"),)
+    pairs = [(big, big_b, 0.9), (*small, 0.88)]
+    monkeypatch.setattr(
+        consolidation,
+        "contradiction_pairs",
+        lambda project, *a_, **k: pairs if project == "rpt" else [],
+    )
+
+    def chat(messages, **_k):
+        user = messages[-1]["content"]
+        if "Item A: big a" in user:
+            return '{"contradict": false}'
+        return "" if "Item A: small a" in user else "{}"
+
+    monkeypatch.setattr(llm, "_chat", chat)
+    judge_fit.FIT_STATS.update(contradict=5)  # a stale count must not leak into the report
+
+    counts = consolidate.main()
+
+    assert counts["contradiction_pairs_judged"] == 2
+    assert counts["contradiction_pairs_trimmed"] == 1
+    assert counts["contradiction_pairs_no_verdict"] == 1
+    assert counts["contradiction_no_verdict_pairs"] == [list(small)]
+    assert counts["judge_prompts_trimmed"] == {"contradict": 1, "evidence": 0, "same_fact": 0}
+    from kbworker import digest
+
+    assert "judged pairs: 2 (1 trimmed, 1 no verdict)" in digest.digest_lines(counts)
+
+
+def test_a_step_that_fails_midway_still_reports_what_it_spent(kb, monkeypatch, tmp_path):
+    _pin_caps(monkeypatch)
+    monkeypatch.setattr(settings, "kb_raw", tmp_path / "kbraw")
+    monkeypatch.setattr(settings, "kb_eval_in_consolidation", False)
+    first = _near_pair("mid", "first")
+    _near_pair("mid", "second")
+
+    def chat(messages, **_k):
+        if "Item A: a first" in messages[-1]["content"]:
+            return ""  # no verdict on either draw
+        raise ExtractorUnavailable("ollama went away")
+
+    monkeypatch.setattr(llm, "_chat", chat)
+
+    counts = consolidate.main()
+
+    assert counts["contradictions_queued"] == 0  # the step failed: _run_step's default
+    assert counts["contradiction_pairs_judged"] == 1
+    assert counts["contradiction_pairs_no_verdict"] == 1
+    assert counts["contradiction_no_verdict_pairs"] == [list(first)]
+
+
+def test_an_oversized_pair_is_judged_fitted_and_its_answer_remembered(kb, monkeypatch):
+    """KB 55589 end to end through the step: the real items_contradict fits the prompt
+    (counted in FIT_STATS, which the report reads per step) and a real "no" is memorized."""
+    monkeypatch.setattr(settings, "kb_llm_num_ctx", 2048)  # judge ceiling floor: 1024
+    a = ingest("contra", "spec", "spec a", " ".join(f"a{i}" for i in range(1500)), uri="ts-a")
+    b = ingest("contra", "spec", "spec b", " ".join(f"b{i}" for i in range(1500)), uri="ts-b")
+    monkeypatch.setattr(consolidation, "contradiction_pairs", lambda *a_, **k: [(a, b, 0.9)])
+    sent: list[str] = []
+    monkeypatch.setattr(
+        llm, "_chat", lambda m, **k: sent.append(m[1]["content"]) or '{"contradict": false}'
+    )
+    judge_fit.FIT_STATS.update(contradict=0)
+    assert consolidate._contradictions_all(["contra"]) == 0
+    assert judge_fit.FIT_STATS["contradict"] == 1
+    assert "tokens omitted ...]" in sent[0]
+    assert _judgements() == [(a, b, settings.kb_embed_model, False)]
 
 
 def test_re_embedding_with_a_new_model_reopens_the_pair(kb, judge_calls, monkeypatch):

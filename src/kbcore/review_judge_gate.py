@@ -21,12 +21,14 @@ retires on an unconfirmed conflict; a reply that carries no verdict never counts
 as one (below).
 
 PROVENANCE. The nightly step stamps ``detail.judged_by`` (model + think) on every
-row it queues. The gate still re-asks even when that is the current seat: the
-detection step reads the reply leniently (``bool(val)`` — a malformed
-``{"contradict": ["false"]}`` queues the pair), and only this strict three-state
-re-ask (:func:`verdict`) may authorise a retirement. Same request, same seed, so a
-clean "yes" stays a yes; the cost is one judge call per candidate, batched after
-the evidence refresh so the judge model loads once per pass.
+row it queues. The gate still re-asks even when that is the current seat: rows queued
+before 2026-10-27 were read leniently (``bool(val)`` — a malformed
+``{"contradict": ["false"]}`` queued the pair) and many by earlier seats, so only this
+strict three-state re-ask (:func:`verdict`) may authorise a retirement. Since KB 55589
+the detection step reads with the same strict parser and fitted request, so for a row
+the current seat queued it is the same request and seed — a clean "yes" stays a yes;
+the cost is one judge call per candidate, batched after the evidence refresh so the
+judge model loads once per pass.
 
 NO VERDICT. When the judge gives no usable verdict on THIS pair (a read timeout,
 an unusable or unparseable reply, a token-repeat abort) the row is NOT
@@ -94,37 +96,14 @@ def stamp_judged_by(a_id: int, b_id: int) -> None:
 
 def verdict(keep: int, retire: int) -> bool | None:
     """The contradiction seat's THREE-state verdict: True / False, or None when the
-    reply carries none (empty, unparseable, no usable ``contradict``). The request is
-    byte-identical to :func:`kbcore.llm.items_contradict`'s (lower id as Item A, the
-    same prompt, per-content seed and seat), whose bool contract maps None to False.
-    Raises :class:`~kbcore.errors.ExtractorUnavailable` when the judge fails."""
+    reply carries none (empty, unparseable, no usable ``contradict``). It IS
+    :func:`kbcore.llm.items_contradict`, asked the nightly step's way (lower id as Item
+    A), so the request — prompt, fitting (:mod:`kbcore.judge_fit`), per-content seed and
+    seat — is byte-identical by construction. Raises
+    :class:`~kbcore.errors.ExtractorUnavailable` when the judge fails."""
     a_id, b_id = (keep, retire) if keep <= retire else (retire, keep)
     (a_title, a_body), (b_title, b_body) = item_pair_texts(a_id, b_id)
-    content = llm._chat(
-        [
-            {"role": "system", "content": llm._CONTRADICT_SYSTEM},
-            {
-                "role": "user",
-                "content": f"Item A: {a_title}\n{a_body}\n\nItem B: {b_title}\n{b_body}",
-            },
-        ],
-        json_format=True,
-        seed=llm._draw_seed(a_title, a_body, b_title, b_body),
-        model=settings.contradiction_judge_model,
-        think=settings.contradiction_judge_think,
-    )
-    try:
-        data = llm.parse_model_json(content)
-    except (ValueError, TypeError):
-        return None
-    val = data.get("contradict") if isinstance(data, dict) else None
-    if isinstance(val, bool):
-        return val
-    if type(val) is int and val in (0, 1):  # what items_contradict reads as False/True
-        return val == 1
-    if isinstance(val, str) and val.strip().lower() in ("true", "yes", "1", "false", "no", "0"):
-        return val.strip().lower() in ("true", "yes", "1")
-    return None
+    return llm.items_contradict(a_title, a_body, b_title, b_body)
 
 
 def per_pair_failure(exc: ExtractorUnavailable) -> bool:

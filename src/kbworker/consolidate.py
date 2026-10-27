@@ -23,6 +23,7 @@ from kbcore import (
     fleet_flush,
     fleet_health,
     ingest_queue,
+    judge_fit,
     llm,  # noqa: F401 — patch surface: tests patch `consolidate.llm.*`
     review_auto,
     review_rejects,
@@ -111,6 +112,7 @@ from kbworker.run_report import (  # noqa: F401
     _write_report,
 )
 from kbworker.tail_ops import (  # noqa: F401
+    _CONTRA_BLANK,
     _CONTRA_STATS,
     _STOP_LOG,
     _SUMMARY_STATS,
@@ -266,6 +268,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             return {"skipped": True}
 
         _STOP_LOG.clear()
+        judge_fit.FIT_STATS.update(dict.fromkeys(judge_fit.FIT_STATS, 0))  # per run, in place
         reset_stop_cache()
         run_t0 = time.monotonic()  # wall clock for the digest run line (review #8 H7)
         since = consolidation.last_consolidation_at()
@@ -300,6 +303,10 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             # if the step fails, and no existing key is renamed — the report is
             # persisted in consolidation_requests.result and read night-over-night.
             "contradiction_pairs_judged": 0,
+            "contradiction_pairs_trimmed": 0,  # KB 55589: oversized prompts fitted
+            "contradiction_pairs_no_verdict": 0,  # replies with no verdict: not memorized
+            "contradiction_no_verdict_pairs": [],  # ...and which pairs (first 20)
+            "contradiction_pairs_resting": 0,  # earlier no-verdicts left out this run
             "triage_awaiting_apply": 0,
             "reject_suggestions_pending": 0,
             "never_triaged_open": 0,
@@ -372,9 +379,15 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         counts.update(_SUMMARY_STATS)
 
         def _contra() -> int:
-            queued = _contradictions_all(projects, stop)
-            counts["contradiction_pairs_judged"] = _CONTRA_STATS["judged"]
-            return queued
+            fitted = judge_fit.FIT_STATS["contradict"]
+            try:
+                return _contradictions_all(projects, stop)
+            finally:  # a step that failed midway still reports what it spent (KB 55589)
+                counts["contradiction_pairs_judged"] = _CONTRA_STATS["judged"]
+                counts["contradiction_pairs_trimmed"] = judge_fit.FIT_STATS["contradict"] - fitted
+                counts["contradiction_pairs_no_verdict"] = _CONTRA_STATS["no_verdict"]
+                counts["contradiction_no_verdict_pairs"] = _CONTRA_BLANK[:20]
+                counts["contradiction_pairs_resting"] = _CONTRA_STATS["resting"]
 
         _run_step(counts, "contradictions_queued", _contra)
 
@@ -429,6 +442,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # WHY the run is as short as it is, and how much it left behind. Rides
         # into consolidation_requests.result with the rest of the report.
         counts["stopped"] = {k: dict(v) for k, v in _STOP_LOG.items()}
+        counts["judge_prompts_trimmed"] = dict(judge_fit.FIT_STATS)  # every judge, every step
         # arm/disarm the AC-restore trigger; a run that consumed a pause marker is a
         # RESUME and the digest says so (review #8 H7d — prior payload or None).
         counts["resumed_from_pause"] = record_battery_pause(counts)

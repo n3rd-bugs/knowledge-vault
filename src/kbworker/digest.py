@@ -52,10 +52,7 @@ from kbworker.digest_lines import (  # noqa: F401
     _trust_watch_line,
     night_of,
 )
-from kbworker.digest_recency_lines import (  # recency guard + precision gate
-    auto_resolve_held_line,
-    judge_held_line,
-)
+from kbworker.digest_recency_lines import auto_resolve_held_line, judge_held_line, judged_line
 from kbworker.eval_epoch_lines import eval_epoch_line  # E1: first night of a golden epoch
 
 logger = logging.getLogger("kbworker.tail_steps")
@@ -129,9 +126,10 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
         ("saved", "queued_items_saved"),
         ("triaged", "review_triaged"),
         ("auto-applied", "auto_applied"),
-        ("judged pairs", "contradiction_pairs_judged"),
     )
     lines += [f"{label}: {counts[key]}" for label, key in spec if counts.get(key) is not None]
+    if judged := judged_line(counts):  # "judged pairs: N", + trimmed / no verdict (KB 55589)
+        lines.append(judged)
     if held := auto_resolve_held_line(counts):  # recency guard: pairs awaiting the owner
         lines.append(held)
     if gated := judge_held_line(counts):  # precision gate: judge found no conflict

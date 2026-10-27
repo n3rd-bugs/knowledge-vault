@@ -88,9 +88,16 @@ def test_judge_abort_is_a_per_item_failure_not_a_dead_judge(script):
 
 
 def test_contradiction_and_evidence_judges_degrade_like_an_unparseable_reply(script):
-    script["queue"] = [_Resp(500, _ABORT), _Resp(500, _ABORT)]
-    assert llm.items_contradict("a", "a body", "b", "b body") is False
+    script["queue"] = [_Resp(500, _ABORT), _Resp(500, _ABORT), _Resp(500, _ABORT)]
+    assert llm.items_contradict("a", "a body", "b", "b body") is None  # no verdict (KB 55589)
+    first, second = script["payloads"]  # ...after its ONE re-ask at seed+1
+    assert second["options"]["seed"] == first["options"]["seed"] + 1
     assert llm.evidence_side("a", "ab", "b", "bb", "c", "cb") == "neither"
+
+
+def test_a_contradiction_abort_then_an_answer_is_a_verdict(script):
+    script["queue"] = [_Resp(500, _ABORT), _ok('{"contradict": true}')]
+    assert llm.items_contradict("a", "a body", "b", "b body") is True
 
 
 def test_plain_500_on_chat_is_still_an_outage(script):

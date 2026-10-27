@@ -17,6 +17,7 @@ import ast
 import json
 import re
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 
 import psycopg
@@ -29,6 +30,7 @@ from kbcore.bench_judge import KIND_CONTRADICT, KIND_SAME_FACT, BenchPair, Verdi
 from kbcore.config import settings
 from kbcore.errors import ExtractorUnavailable, InvalidOperation
 from kbcore.ingest import ingest
+from kbcore.judge_fit import FIT_EPOCH, LEGACY_CEILING, contradict_tokens
 
 runner = CliRunner()
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -292,9 +294,10 @@ def test_a_non_boolean_same_fact_is_no_verdict(rows, monkeypatch, body):
         ('{"contradict": true}', True),
         ('{"contradict": "false"}', False),
         ('{"contradict": "true"}', True),
-        ("not json", False),
-        ('{"other": 1}', False),
-        ("[1,2,3]", False),
+        ("not json", None),  # no usable verdict: UNJUDGED, never a negative (KB 55589)
+        ('{"other": 1}', None),
+        ("[1,2,3]", None),
+        ('{"contradict": ["false"]}', None),
     ],
 )
 def test_contradict_verdict_parity_with_items_contradict(monkeypatch, payload, expected):
@@ -425,6 +428,40 @@ def test_judged_pairs_carry_the_incumbent_verdict_positives_first_at_this_embed_
             (ids[0], ids[3]),
         )
     assert len(bench_judge.judged_pairs(sample=10)) == 3
+
+
+def test_a_pre_fit_verdict_on_an_oversized_pair_is_not_a_label(kb, caplog):
+    """KB 55589: before the fitted judge, an oversized pair's stored verdict may be the blind
+    reply to a truncated prompt (or a reply cut short) — skipped BEFORE the sample is
+    counted; the fitted judge's own verdicts (after FIT_EPOCH) are labels again. The
+    oversized pair is a POSITIVE so it sorts first whatever random() draws: a skip applied
+    after the sample (LIMIT, then filter) would return nothing for sample=1."""
+    big = " ".join(f"w{i}" for i in range(3500))  # two of these: over the 8,904 ceiling
+    huge = [ingest("unroll", "spec", f"spec {n}", f"{big} {n}", uri=f"spec:{n}") for n in (0, 1)]
+    mid_body = " ".join(f"m{i}" for i in range(900))  # over the byte prefilter, under the ceiling
+    mid = [ingest("unroll", "spec", f"mid {n}", f"{mid_body} {n}", uri=f"mid:{n}") for n in (0, 1)]
+    small = [_item("unroll", n) for n in (7, 8)]
+    mid_texts = consolidation.item_pair_texts(*mid)  # the exact count decides, not the bytes
+    assert sum(len(t.encode()) for p in mid_texts for t in p) > LEGACY_CEILING // 2
+    assert contradict_tokens(*mid_texts[0], *mid_texts[1]) < LEGACY_CEILING
+    assert consolidation.record_pair_judgement(huge[0], huge[1], True)
+    assert consolidation.record_pair_judgement(mid[0], mid[1], False)
+    assert consolidation.record_pair_judgement(small[0], small[1], False)
+    pre, post = FIT_EPOCH - timedelta(days=1), FIT_EPOCH + timedelta(days=1)
+    with db.transaction() as conn:
+        conn.execute("UPDATE contradiction_judgements SET checked_at = %s", (pre,))
+    caplog.set_level("INFO", logger="kbcore.bench_pairs")
+    labels = {(p.a_id, p.b_id) for p in bench_judge.judged_pairs(sample=10)}
+    assert labels == {tuple(mid), tuple(small)}, "only the oversized pair is skipped"
+    assert "1 pre-fit verdict(s) over the ceiling skipped" in caplog.text
+    one = bench_judge.judged_pairs(sample=1)  # refilled: the sample counts usable labels
+    assert len(one) == 1 and (one[0].a_id, one[0].b_id) != tuple(huge)
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE contradiction_judgements SET checked_at = %s WHERE a_id = %s", (post, huge[0])
+        )
+    first = bench_judge.judged_pairs(sample=1)[0]
+    assert (first.a_id, first.b_id, first.label) == (*huge, True), "a fitted verdict is a label"
 
 
 def test_load_pairs_reads_a_plain_list_or_a_previous_results_file(tmp_path):

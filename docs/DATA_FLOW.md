@@ -71,8 +71,8 @@ one job, never a cross-project blend.
 ## 3 · Nightly
 
 **Drain** (GPU-heavy, first): refills cohort-by-cohort, oldest first. Each
-session is split into token-fitted windows (~7 k tokens — Ollama truncates at
-`num_ctx/2`, so windows are *measured*, not estimated). Three extractors run
+session is split into token-fitted windows (~7 k tokens; a prompt past `num_ctx-1` is
+cut to ~`num_ctx/2`, system prompt first — so windows are *measured*). Three extractors run
 **model-major** (each model loads once per cohort — 0.017 loads/call measured).
 Extracted items must quote the transcript verbatim (fuzzy repair ≥ 0.95) or are
 rejected. Cross-model clusters corroborate; singletons face a judge. Survivors
@@ -82,8 +82,8 @@ ingest as `unverified` + a review row.
 **reject suggestions auto-apply** after a 3-day cooling window (accessed items
 excluded; duplicates only within one project and never across a pair the
 cross-project twin linker already joined; cluster-winner closes share the same
-cap; everything undoable); contradiction pairs are judged with a
-per-pair memory (never re-pay a verdict); stable suggestions auto-resolve at
+cap; everything undoable); contradiction pairs are judged (budget-fitted prompts) with a
+per-pair memory (never re-pay a verdict; no verdict = re-asked); stable suggestions auto-resolve at
 streak 2; summaries, evidence, dedupe, doc-refresh supersede, 30-day quiet
 expiry (capped at 500/night, oldest first; untriaged and reject-suggested rows
 never expire, and the batch is undoable), re-embed, then the eval sentinel and a
@@ -124,18 +124,20 @@ stale.
 | Extractor (ensemble) | `gemma3:12b` | 12 B · ~8 GB | local | union member only — failed the judge bench both directions, never judges |
 | Secondary judge | `granite4.1:8b` | 8 B · ~5 GB | local | judges primary singletons (probe bench: 7/7 real kept, 6/6 fakes caught); no longer an extractor |
 | Judge (factored) | `gemma4:12b` | (same) | local | the primary verifies non-primary singletons; fail-closed |
-| Contradiction judge + precision gate | `bonsai-2:27b` | 27 B ternary · ~8.9 GB | local | `KB_CONTRADICTION_JUDGE_MODEL` (2026-10-25): on the 92 auto-resolved pairs vs a blind ground truth precision 0.78 vs qwen3's 0.52; `KB_AUTO_RESOLVE_JUDGE_GATE` re-judges (strict three-state) before any evidence auto-retire — no conflict holds the row for the owner |
-| Triage / summaries / same-fact twins / evidence / deep search | `gemma4:12b` | (same) | local | follow `KB_EXTRACT_MODEL`; tail steps capped per night; summaries are fitted to the prompt ceiling first (KB 55031) |
+| Contradiction judge + precision gate | `bonsai-2:27b` | 27 B ternary · ~8.9 GB | local | `KB_CONTRADICTION_JUDGE_MODEL` (2026-10-25): on the 92 auto-resolved pairs vs a blind ground truth precision 0.78 vs qwen3's 0.52; `KB_AUTO_RESOLVE_JUDGE_GATE` re-judges (strict three-state) before any evidence auto-retire — no conflict holds the row for the owner; both prompts are fitted to `(num_ctx-6144)/1.15` ≈ 8.9 k cl100k (titles intact, each body's head + an omission marker; the 6,144-token reserve is reply room — the seat thinks before it answers, 600-3,231 tokens measured; KB 55589) and the nightly reads strict three-state too — a no-verdict is counted, never memorized; `kb repair rejudge-oversized` re-asks the pre-fit blind ones |
+| Triage / summaries / same-fact twins / evidence / deep search | `gemma4:12b` | (same) | local | follow `KB_EXTRACT_MODEL`; tail steps capped per night; summaries fitted to the drain budget (~6.2 k cl100k, KB 55031); same-fact and evidence prompts to the judge budget (~8.9 k, KB 55589) |
 | Embedder | `qwen3-embedding:0.6b` | 0.6 B · ~2.4 GB | **remote RTX 5080** (local fallback + 90 s breaker) | 1024-d; **query prefix required** (hit@5 0.759 vs 0.724 without) |
 | Reranker | `Qwen3-Reranker-0.6B` | 0.6 B GGUF | sidecar (llama-server :8324) | official GGUF only — community conversions score garbage; chunk-evidence fed (hit@5 0.86 → 0.89); host-RAM prompt cache OFF (`LLAMA_ARG_CACHE_RAM=0` drop-in, 2026-10-11: RSS 9.4 GB → 1.8 GB, scores bit-identical after warm-up); runs a **pinned** llama-server copy (`/opt/kb-rerank/llama-0.31.1`, 2026-10-25) so Ollama upgrades never touch it — units in `deploy/system/` |
-| Window budgeter | `cl100k` (tiktoken, vendored) | — | in-process, offline | counts tokens for window fitting; 1.15× margin covers the qwen-tokenizer mismatch |
+| Window budgeter | `cl100k` (tiktoken, vendored) | — | in-process, offline | counts tokens for window, summary and judge-prompt fitting; 1.15× margin for the model-tokenizer mismatch (measured for qwen3) |
 
 GPU rules: **one model slot** (`OLLAMA_MAX_LOADED_MODELS=1`), finite keep-alive
 (600 s — never `-1`), 150 W power cap (UPS), model-major cohorts so each load
 serves ~58 calls. Embeddings live on the second box so the local slot never
 thrashes against a 0.6 B model. Local Ollama is **0.40.11** (2026-10-25, from
 0.31.1; manual tarball install, rollback copy and runbook in
-`deploy/system/README.md`).
+`deploy/system/README.md`). Ollama truncates only a prompt over `num_ctx-1`, cutting it
+to ~`num_ctx/2` with the system prompt lost — so drain windows, summaries and the pair-judge
+prompts are token-fitted before they are sent (deep search is character-capped).
 
 ```mermaid
 flowchart LR

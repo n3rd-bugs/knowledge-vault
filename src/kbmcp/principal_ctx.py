@@ -23,6 +23,7 @@ import logging
 import secrets
 
 import anyio
+from anyio.lowlevel import RunVar
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
@@ -30,6 +31,24 @@ from kbcore import db, enrolment, principals, scope
 from kbcore.config import settings
 
 log = logging.getLogger("kbmcp.principal")
+
+# Lookups that need the database run on worker threads (aresolve_bearer,
+# PrincipalMiddleware). Without slots of their own, a flood of bogus kbg_ bearers
+# (misses are never cached) would become one Postgres connection per thread of the
+# shared 40-thread limiter — per process, against max_connections 100 — and take
+# every thread from the sync routes and tools. One small limiter per event loop.
+_LOOKUP_SLOTS = 4
+_lookup_limiter: RunVar[anyio.CapacityLimiter] = RunVar("kb_credential_lookup_limiter")
+
+
+def _lookup_slots() -> anyio.CapacityLimiter:
+    try:
+        return _lookup_limiter.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(_LOOKUP_SLOTS)
+        _lookup_limiter.set(limiter)
+        return limiter
+
 
 # Common claim keys a Google-verified AccessToken may carry the email under.
 _EMAIL_CLAIM_KEYS = ("email", "https://www.googleapis.com/auth/userinfo.email")
@@ -115,7 +134,9 @@ async def aresolve_bearer(header_or_token: str | None) -> scope.Principal | None
         return None
     if _master_matches(_bearer_token(header_or_token)):
         return scope.OWNER
-    return await anyio.to_thread.run_sync(_resolve_bearer_fail_fast, header_or_token)
+    return await anyio.to_thread.run_sync(
+        _resolve_bearer_fail_fast, header_or_token, limiter=_lookup_slots()
+    )
 
 
 def resolve_google_email(email: str | None) -> scope.Principal:
@@ -149,12 +170,19 @@ def _email_from_access_token(tok) -> str | None:
 
 def _request_inputs() -> tuple[object | None, str | None]:
     """The two request facts a principal is resolved from: FastMCP's verified
-    access token (public MultiAuth instance) and the raw Authorization header."""
+    access token (public MultiAuth instance) and the raw Authorization header.
+
+    The header must be asked for BY NAME: FastMCP's get_http_headers() drops
+    ``authorization`` by default (it exists for forwarding headers downstream).
+    Without ``include`` the header always read as None, so on the local instance
+    no principal was stamped here and a tool ran under whatever principal the MCP
+    session's task inherited — the one that CREATED the session (2026-10-28 review).
+    """
     try:
         tok = get_access_token()
     except Exception:  # outside a request context
         tok = None
-    return tok, get_http_headers().get("authorization")
+    return tok, get_http_headers(include={"authorization"}).get("authorization")
 
 
 def _principal_for(tok, raw: str | None) -> scope.Principal | None:
@@ -198,7 +226,9 @@ class PrincipalMiddleware(Middleware):
         ):
             principal = scope.OWNER
         else:
-            principal = await anyio.to_thread.run_sync(_principal_fail_fast, tok, raw)
+            principal = await anyio.to_thread.run_sync(
+                _principal_fail_fast, tok, raw, limiter=_lookup_slots()
+            )
         if principal is None:
             # Unresolvable on a served request → fail closed via scope.current().
             # (Should not happen: auth gates upstream.) Leave the ContextVar unset.

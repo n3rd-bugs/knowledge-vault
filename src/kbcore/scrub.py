@@ -97,7 +97,12 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
             r"(?i)authorization\s*:\s*(?:basic|bearer|token)\s+(?!\[REDACTED:)[A-Za-z0-9+/=._\-]{8,}"
         ),
     ),
-    ("jwt", re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+")),
+    # Anchored at the start of a [\w-] run, with the step to the FIRST eyJ in that
+    # run atomic. The unanchored form backtracked quadratically on a long run of
+    # "eyJ" with no dots — 64 KB cost 1.5 s, and kbcore.logsafe runs this list on
+    # request paths anyone can send (2026-10-28 review). Same matches, except a run
+    # prefix glued to the token (`%3DeyJ…` → "3D") is redacted along with it.
+    ("jwt", re.compile(r"(?<![\w-])(?>[\w-]*?eyJ)[\w-]+\.[\w-]+\.[\w-]+")),
     (
         "credential",
         re.compile(r"(?i)(?:password|passwd|secret|token)\s*[=:]\s*(?!\[REDACTED:)\S{6,}"),

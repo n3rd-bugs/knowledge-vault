@@ -133,6 +133,13 @@ READ_ALLOWLIST = {
     "browse.items_with_tag",
     "browse.list_tags",
     "config.settings",
+    # 2026-10-28 (log review): kbweb.lookups runs the gate's credential lookups on a
+    # worker thread inside db.fail_fast (no 60 s connect retry on the request path)
+    # and answers DatabaseUnavailable with a constant 503; server.main() installs the
+    # process-wide log redaction. None of the three reads or writes knowledge.
+    "db.fail_fast",
+    "errors.DatabaseUnavailable",
+    "logsafe.install",
     # A11-3: DuplicateContent is caught by the confined write surface to render a
     # constant (no-oracle) response — a domain-error class, not a write function.
     "errors.DuplicateContent",

@@ -49,11 +49,17 @@ _CONNECT_RETRY_SLEEP = 2.0
 # covers only the calling context (the worker thread a credential lookup runs on),
 # while the nightly and every concurrent caller keep the full budget.
 _retry_override: ContextVar[float | None] = ContextVar("kb_db_retry_override", default=None)
+# ...and its bound on ONE attempt. No retry is not enough when the database hangs
+# instead of refusing (dropped packets, a stuck postmaster): libpq then waits for
+# psycopg's default connect_timeout, 130 s.
+_FAIL_FAST_CONNECT_TIMEOUT = 5
 
 
 def _connect_retrying(url: str, **kw: object) -> psycopg.Connection:
     override = _retry_override.get()
     budget = float(settings.kb_db_connect_retry_secs) if override is None else override
+    if override is not None:
+        kw.setdefault("connect_timeout", _FAIL_FAST_CONNECT_TIMEOUT)
     deadline = time.monotonic() + budget
     warned = False
     while True:
@@ -129,13 +135,15 @@ def fail_fast() -> Iterator[None]:
     kb-rest retried for 60 s, then escaped as an unhandled 500. Inside this block a
     refused connection fails at once, and any psycopg operational error (refused,
     restarting, dropped mid-query) surfaces as :class:`DatabaseUnavailable`, so the
-    caller can answer a clean, retryable 503.
+    caller can answer a clean, retryable 503. Its text is CONSTANT: psycopg's names
+    the database host, which is logged here and never handed to a client.
     """
     token = _retry_override.set(0.0)
     try:
         yield
     except psycopg.OperationalError as e:
-        raise DatabaseUnavailable(str(e).splitlines()[0] if str(e) else type(e).__name__) from e
+        logger.warning("database unavailable: %s", (str(e).splitlines() or [type(e).__name__])[0])
+        raise DatabaseUnavailable("database unavailable") from e
     finally:
         _retry_override.reset(token)
 

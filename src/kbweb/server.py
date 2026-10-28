@@ -36,10 +36,11 @@ from starlette.staticfiles import StaticFiles
 
 from kbcore import logsafe, offsite_config, principals, scope
 from kbcore.config import settings
-from kbcore.errors import InvalidOperation, KBError, NotFound
+from kbcore.errors import DatabaseUnavailable, InvalidOperation, KBError, NotFound
 from kbmcp.server import _validate_runtime_config
 from kbweb import (
     auth,
+    lookups,
     views_admin,
     views_backup,
     views_export,
@@ -171,7 +172,13 @@ class SessionAuthMiddleware(BaseHTTPMiddleware):
         if path == "/login" or path.startswith("/static") or path.startswith("/auth/google"):
             return await call_next(request)
         identity = auth.cookie_identity(request.cookies.get(auth.COOKIE))
-        principal = _principal_for_identity(identity)
+        if identity and identity.startswith("g:"):  # re-checked in the DB: off the loop
+            try:
+                principal = await lookups.off_loop(_principal_for_identity, identity)
+            except DatabaseUnavailable:
+                return lookups.unavailable()
+        else:
+            principal = _principal_for_identity(identity)
         if principal is None:
             return RedirectResponse("/login", status_code=302)
         required = ROUTE_CAPS.get(_zone(path))
@@ -202,7 +209,10 @@ async def login(request):  # GET shows form, POST checks token
         supplied = str(form.get("token") or "")
         if auth.token_ok(supplied):
             return _issue_session("/", auth.OWNER_IDENTITY)  # master → owner
-        grantee = principals.resolve_token(supplied)  # a kbg_ token → grantee
+        try:
+            grantee = await lookups.off_loop(principals.resolve_token, supplied)  # kbg_ → grantee
+        except DatabaseUnavailable:
+            return lookups.unavailable()
         if grantee is not None:
             return _issue_session("/", auth.grantee_identity(grantee.name))
         error = "Invalid token."
@@ -253,16 +263,21 @@ async def google_callback(request):  # GET /auth/google/callback
     if not code or not auth.state_ok(request.cookies.get(auth.STATE_COOKIE), state):
         log.warning("google callback rejected: missing code or state mismatch")
     elif auth.state_is_drive(state):
-        resp = _complete_drive_connect(request, code)
+        resp = await lookups.off_loop(_complete_drive_connect, request, code)  # Google + file I/O
         if resp is not None:
             return resp
     else:
-        email = auth.exchange_google_code(code)
+        email = await lookups.off_loop(auth.exchange_google_code, code)  # a Google round-trip
         identity = None
         if email and auth.email_allowed(email):
             identity = auth.OWNER_IDENTITY  # allowlisted owner email
         elif email:
-            grantee = principals.resolve_email(email)  # a kind='google' grantee
+            try:
+                grantee = await lookups.off_loop(principals.resolve_email, email)  # kind='google'
+            except DatabaseUnavailable:
+                resp = lookups.unavailable()
+                resp.delete_cookie(auth.STATE_COOKIE, path="/", secure=True)
+                return resp
             if grantee is not None:
                 identity = auth.grantee_identity(grantee.name)
         if identity is not None:

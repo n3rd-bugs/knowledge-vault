@@ -97,6 +97,23 @@ def _no_real_notifications(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_leaked_log_record_factory(monkeypatch):
+    """kbcore.logsafe.install() swaps the PROCESS-WIDE LogRecord factory, and
+    consolidate.main() — which ~40 tests drive — calls it. Left installed, every
+    later test's log output is silently redacted, so a "this secret is never
+    logged" assertion could no longer fail. Each test gets the factory it started
+    with back, and install() stays callable."""
+    import logging
+
+    from kbcore import logsafe
+
+    original = logging.getLogRecordFactory()
+    monkeypatch.setattr(logsafe, "_installed", False)
+    yield
+    logging.setLogRecordFactory(original)
+
+
+@pytest.fixture(autouse=True)
 def _sentinel_floors_at_code_defaults(monkeypatch):
     """Tests must not inherit the box's .env eval floors (same hermeticity gotcha
     as _ranking_dials_at_code_defaults). Review #4's P0 fix anchored

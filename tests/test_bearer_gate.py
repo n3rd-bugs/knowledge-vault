@@ -146,7 +146,7 @@ def test_a_down_database_answers_503_at_once_not_after_the_retry_budget(monkeypa
     calls = _refusing_connects(monkeypatch)
     gate = bearer.BearerAuthMiddleware(_ok_app)
     started = time.monotonic()
-    with caplog.at_level(logging.WARNING, logger="kbmcp"):
+    with caplog.at_level(logging.WARNING):
         start, body = asyncio.run(_call(gate, _scope(f"Bearer {GRANTEE}")))
     assert time.monotonic() - started < 5, "the 60 s connect retry must not apply here"
     assert len(calls) == 1, "one refused connect, no retry loop"
@@ -154,7 +154,9 @@ def test_a_down_database_answers_503_at_once_not_after_the_retry_budget(monkeypa
     assert json.loads(body["body"]) == {"error": "service unavailable"}
     assert b"172.26.0.5" not in body["body"], "the database host never reaches the client"
     [line] = [r.getMessage() for r in caplog.records if r.name == "kbmcp"]
-    assert line.startswith("503 database unavailable (connection failed:") and GRANTEE not in line
+    assert line.startswith("503 database unavailable client=172.26.0.8 ") and GRANTEE not in line
+    [cause] = [r.getMessage() for r in caplog.records if r.name == "kbcore.db"]
+    assert cause.startswith("database unavailable: connection failed:"), "the cause is logged"
 
 
 def test_the_master_token_never_needs_the_database(monkeypatch):
@@ -211,12 +213,66 @@ def test_fail_fast_is_scoped_to_its_block_and_its_context(monkeypatch):
         t.join()
     assert db._retry_override.get() is None, "the full budget is back after the block"
     assert seen_elsewhere == [None], "a concurrent caller keeps the full budget"
-    with pytest.raises(DatabaseUnavailable, match="^connection failed"):
-        with db.fail_fast():
-            raise psycopg.OperationalError("connection failed: refused\n\tdetail")
+    with pytest.raises(DatabaseUnavailable, match="^database unavailable$"):
+        with db.fail_fast():  # constant text: psycopg's names the database host
+            raise psycopg.OperationalError('connection to server at "10.9.8.7" failed\n\tdetail')
     with pytest.raises(ValueError):  # anything that is not an outage passes through as itself
         with db.fail_fast():
             raise ValueError("not a database problem")
+
+
+def test_fail_fast_also_bounds_a_hung_connect(monkeypatch):
+    """No retry is not enough when the database HANGS: libpq would wait psycopg's
+    default 130 s. Inside fail_fast every attempt carries a short connect_timeout."""
+    seen: list[dict] = []
+
+    def capture(url, **kw):
+        seen.append(kw)
+        raise psycopg.OperationalError("boom")  # not retryable: stops at once either way
+
+    monkeypatch.setattr(db.psycopg, "connect", capture)
+    with pytest.raises(DatabaseUnavailable), db.fail_fast():
+        db.connect()
+    with pytest.raises(psycopg.OperationalError):
+        db.connect()
+    assert seen[0]["connect_timeout"] == db._FAIL_FAST_CONNECT_TIMEOUT
+    assert "connect_timeout" not in seen[1], "the nightly's connections are unchanged"
+
+
+def test_credential_lookups_have_a_few_slots_of_their_own(monkeypatch):
+    """A flood of bogus kbg_ bearers must not become one Postgres connection per
+    thread of the shared 40-thread limiter."""
+    lock = threading.Lock()
+    active = [0, 0]  # now, peak
+
+    def slow_resolve(header):
+        with lock:
+            active[0] += 1
+            active[1] = max(active[1], active[0])
+        time.sleep(0.05)
+        with lock:
+            active[0] -= 1
+        return None
+
+    monkeypatch.setattr(principal_ctx, "resolve_bearer", slow_resolve)
+    gate = bearer.BearerAuthMiddleware(_ok_app)
+
+    async def flood():
+        outs = await asyncio.gather(*(_call(gate, _scope(f"Bearer {GRANTEE}")) for _ in range(12)))
+        assert all(o[0]["status"] == 401 for o in outs)
+
+    asyncio.run(flood())
+    assert 1 < active[1] <= principal_ctx._LOOKUP_SLOTS
+
+
+def test_a_scoped_ipv6_cf_header_cannot_smuggle_text_into_the_line(caplog):
+    forged = _scope(cf=b"::1%x peer=6.6.6.6:1 POST /api/enrol ua=curl\x1b[2J\x07")
+    gate = bearer.BearerAuthMiddleware(_ok_app)
+    with caplog.at_level(logging.WARNING, logger="kbmcp"):
+        asyncio.run(_call(gate, forged))
+    [line] = [r.getMessage() for r in caplog.records if r.name == "kbmcp"]
+    assert line.startswith("401 unauthorized client=172.26.0.8 peer=172.26.0.8:44934 GET ")
+    assert "6.6.6.6" not in line and "\x1b" not in line and "\x07" not in line
 
 
 # --- the MCP principal middleware --------------------------------------------
@@ -265,11 +321,43 @@ def test_the_owner_tags_resolve_inline_without_a_thread_or_the_db(monkeypatch, i
 
 
 def test_mcp_resolution_with_the_database_down_fails_fast(monkeypatch):
+    """...and what reaches an MCP client (the SDK returns str(exc)) names no host."""
     calls = _refusing_connects(monkeypatch)
     started = time.monotonic()
-    with pytest.raises(DatabaseUnavailable):
+    with pytest.raises(DatabaseUnavailable) as raised:
         principal_ctx._principal_fail_fast(None, f"Bearer {GRANTEE}")
     assert time.monotonic() - started < 5 and len(calls) == 1
+    assert str(raised.value) == "database unavailable"
+
+
+def test_the_mcp_principal_is_read_from_the_authorization_header(monkeypatch):
+    """FastMCP's get_http_headers() drops `authorization` unless asked for it by
+    name — without that the local instance never stamped a principal and tools ran
+    under whoever created the MCP session."""
+    from fastmcp.server import dependencies
+    from starlette.requests import Request
+
+    def a_request():
+        return Request(
+            {"type": "http", "headers": [(b"authorization", f"Bearer {GRANTEE}".encode())]}
+        )
+
+    monkeypatch.setattr(dependencies, "get_http_request", a_request)
+    assert "authorization" not in dependencies.get_http_headers(), "FastMCP's default"
+    assert principal_ctx._request_inputs()[1] == f"Bearer {GRANTEE}"
+
+
+def test_build_app_logs_rejections_on_the_oauth_instance(monkeypatch):
+    from kbmcp import server
+
+    monkeypatch.setattr(settings, "kb_bind", "127.0.0.1")
+    monkeypatch.setattr(settings, "kb_oauth_enabled", True)
+    monkeypatch.setattr(settings, "google_client_id", "client-id.apps.example")
+    monkeypatch.setattr(settings, "google_client_secret", "GOCSPX-" + "t" * 28)
+    monkeypatch.setattr(settings, "kb_public_url", "https://kb.example.test")
+    assert isinstance(server.build_app().app, bearer.RejectLogMiddleware)
+    monkeypatch.setattr(settings, "kb_oauth_enabled", False)
+    assert isinstance(server.build_app().app, bearer.BearerAuthMiddleware)
 
 
 # --- REST routes and the shared cache -----------------------------------------
@@ -289,22 +377,44 @@ def test_a_rest_route_that_meets_a_down_database_gets_a_clean_503(monkeypatch):
     assert r.status_code == 503 and r.json() == {"error": "service unavailable"}
 
 
-def test_concurrent_token_lookups_share_the_cache_safely(kb):
-    """Lookups now run on worker threads: evict-then-insert must not race."""
+class _SlowIterDict(dict):
+    """A cache whose items() yields slowly and says when a scan has begun, so a
+    concurrent clear() lands MID-scan: unlocked, the live iteration then raises
+    'dictionary changed size during iteration'."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.scanning = threading.Event()
+
+    def items(self):
+        self.scanning.set()
+        for pair in dict.items(self):
+            time.sleep(0.005)
+            yield pair
+
+
+def test_concurrent_token_lookups_share_the_cache_safely(kb, monkeypatch):
+    """Lookups now run on worker threads: the evict-then-insert scan must hold the
+    lock against a concurrent clear (this fails on an unlocked cache)."""
     _pid, token = principals.create_principal("cache-race", kind="token")
+    stale = scope.Principal(name="stale", is_owner=False)
+    cache = _SlowIterDict({f"h{i}": (stale, float("inf")) for i in range(20)})
+    monkeypatch.setattr(principals, "_cache", cache)
     errors: list[BaseException] = []
 
-    def hammer():
-        try:
-            for _ in range(40):
-                assert principals.resolve_token(token) is not None
-                principals._clear_cache()
+    def resolve():
+        try:  # a cache miss: the DB, then the eviction scan over the 20 entries
+            assert principals.resolve_token(token) is not None
         except BaseException as e:  # noqa: BLE001 — surfaced by the assertion below
             errors.append(e)
 
-    threads = [threading.Thread(target=hammer) for _ in range(6)]
+    def clear_mid_scan():
+        assert cache.scanning.wait(timeout=10)
+        principals._clear_cache()
+
+    threads = [threading.Thread(target=resolve), threading.Thread(target=clear_mid_scan)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-    assert errors == []
+        t.join(timeout=30)
+    assert errors == [] and cache.scanning.is_set()

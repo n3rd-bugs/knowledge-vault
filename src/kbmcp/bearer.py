@@ -44,16 +44,20 @@ def client_ip(asgi_scope) -> str:
     and OVERWRITES any client-supplied value, and these servers are reachable only
     via the tunnel or localhost (KB_BIND, Invariant 6) — so the header is
     trustworthy when present and the peer is already right when it is not. A value
-    that does not parse as an IP address was not written by Cloudflare and is
-    ignored. X-Forwarded-For is deliberately NOT consulted: its first hop is
+    that is not a plain IP address was not written by Cloudflare and is ignored —
+    including an IPv6 scope id (``::1%<anything>``), which ipaddress accepts
+    verbatim. X-Forwarded-For is deliberately NOT consulted: its first hop is
     client-controlled.
     """
     for name, value in asgi_scope.get("headers") or []:
         if name == b"cf-connecting-ip":
             try:
-                return str(ipaddress.ip_address(value.decode("latin-1").strip()))
+                addr = ipaddress.ip_address(value.decode("latin-1").strip())
             except ValueError:
                 break
+            if getattr(addr, "scope_id", None) is None:
+                return str(addr)
+            break
     client = asgi_scope.get("client")
     return client[0] if client else ""
 
@@ -67,9 +71,9 @@ def _printable(text: str, limit: int) -> str:
 def describe(asgi_scope) -> str:
     """Who asked for what, log-safe: the real client, the socket peer, the method
     and path (never the query string), and the user agent. Never a credential."""
-    client = client_ip(asgi_scope) or "-"
+    client = _printable(client_ip(asgi_scope), 64) or "-"
     peer = asgi_scope.get("client")
-    peer_text = f"{peer[0]}:{peer[1]}" if peer else "-"
+    peer_text = _printable(f"{peer[0]}:{peer[1]}", 80) if peer else "-"
     ua = ""
     for name, value in asgi_scope.get("headers") or []:
         if name == b"user-agent":
@@ -109,8 +113,9 @@ class BearerAuthMiddleware:
             }
             try:
                 principal = await principal_ctx.aresolve_bearer(headers.get("authorization", ""))
-            except DatabaseUnavailable as e:
-                log.warning("503 database unavailable (%s) %s", e, describe(asgi_scope))
+            except DatabaseUnavailable:
+                # kbcore.db logged the cause; this line says whose request it cost.
+                log.warning("503 database unavailable %s", describe(asgi_scope))
                 await _reply(
                     send, 503, b'{"error": "service unavailable"}', [(b"retry-after", b"5")]
                 )

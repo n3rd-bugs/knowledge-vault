@@ -24,6 +24,7 @@ from kbcore import (
     ingest_queue,
     items,
     jobs,
+    logsafe,
     review,
     scope,
     search,
@@ -429,6 +430,7 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logsafe.install()  # no secret reaches journald, whichever library logs it
     # Fail-closed on the served process (see kbmcp.server.main): a request without a
     # resolved principal RAISES rather than defaulting to OWNER. The shared
     # BearerAuthMiddleware sets it; anyio copies the ContextVar into the sync-route

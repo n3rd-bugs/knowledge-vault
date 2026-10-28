@@ -129,6 +129,14 @@ CREDENTIAL_KINDS: tuple[CredentialKind, ...] = (
         sample="1//0" + "g" * 30,
         label="google_refresh_token",
     ),
+    # No setting: a claude.ai user's Google ACCESS token reaches kb-mcp-public on
+    # every sign-in and was logged by httpx in the tokeninfo URL (2026-10-28) —
+    # it is never ours to configure, so shape is the only defence.
+    CredentialKind(
+        kind="Google OAuth access token verified by the public MCP",
+        sample="ya29." + "a0AfB_" + "k" * 60,
+        label="google_access_token",
+    ),
 )
 
 SETTINGS_BACKED = {k.setting: k for k in CREDENTIAL_KINDS if k.setting}

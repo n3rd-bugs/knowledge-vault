@@ -25,6 +25,7 @@ from kbcore import (
     ingest_queue,
     judge_fit,
     llm,  # noqa: F401 — patch surface: tests patch `consolidate.llm.*`
+    logsafe,
     review_auto,
     review_rejects,
     review_triage,
@@ -262,6 +263,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
     never mistaken for a broken one.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logsafe.install()  # no secret reaches journald, whichever library logs it
     with advisory_lock(ADVISORY_KEY) as acquired:
         if not acquired:
             logger.info("another consolidation holds lock %d; skipping this run", ADVISORY_KEY)

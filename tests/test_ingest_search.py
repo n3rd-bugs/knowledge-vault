@@ -51,6 +51,20 @@ def test_ingest_scrubs_before_storing():
     assert item.meta["redactions"] == {"github_token": 1}
 
 
+def test_a_google_access_token_is_scrubbed_and_reingest_stays_a_noop():
+    """The ya29. shape joined SECRET_PATTERNS on 2026-10-28 (kbcore.logsafe) — the
+    ingest path must redact it AND stay idempotent (CLAUDE.md hard rule 3)."""
+    fake = "ya29." + "a0AfB_" + "z" * 80  # the vendor shape, not a live token
+    note = dict(project="p", type="note", title="pasted log", body=f"GET /tokeninfo?x={fake} 200")
+    item_id = ingest(**note)
+    item = get_item(item_id)
+    assert fake not in item.body and "[REDACTED:google_access_token]" in item.body
+    assert item.meta["redactions"] == {"google_access_token": 1}
+    after_first = _counts()
+    assert ingest(**note) is None, "the same paste again is a duplicate, not a second item"
+    assert _counts() == after_first
+
+
 def test_search_finds_by_keyword_and_filters_by_tags():
     ingest(**GOTCHA)
     ingest(

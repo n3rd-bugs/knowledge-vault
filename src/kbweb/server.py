@@ -34,7 +34,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from kbcore import offsite_config, principals, scope
+from kbcore import logsafe, offsite_config, principals, scope
 from kbcore.config import settings
 from kbcore.errors import InvalidOperation, KBError, NotFound
 from kbmcp.server import _validate_runtime_config
@@ -375,6 +375,7 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logsafe.install()  # no secret reaches journald, whichever library logs it
     # Fail-closed on the served process (see kbmcp.server.main): a request without a
     # resolved principal RAISES rather than defaulting to OWNER. SessionAuthMiddleware
     # binds it per request.

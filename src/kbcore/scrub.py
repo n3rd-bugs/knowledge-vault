@@ -59,6 +59,12 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # long-lived, so a copy quoted in a transcript is a durable credential heading
     # for durable storage — exactly the shape the session hooks flush.
     ("google_refresh_token", re.compile(r"1//0[A-Za-z0-9_\-]{20,}")),
+    # A Google OAuth ACCESS token (ya29.…): what the public MCP's Google sign-in
+    # verifies on every cache miss (tokeninfo?access_token=…), and what httpx's
+    # INFO request line wrote into journald until 2026-10-28 — kbcore.logsafe now
+    # sends every log record through this list too. Short-lived (~1 h), but a
+    # working bearer for that hour wherever a copy lands.
+    ("google_access_token", re.compile(r"ya29\.[A-Za-z0-9_\-.]{20,}")),
     # …and the third shape the same credential travels in: inline URL userinfo
     # (`postgresql://kb:pw@host`, `https://admin:pw@ntfy…`). The config layer
     # below catches THIS deployment's db password wherever it appears, but a URL

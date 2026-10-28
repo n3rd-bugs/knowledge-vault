@@ -18,7 +18,7 @@ from pathlib import Path
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from kbcore import jobs
+from kbcore import jobs, logsafe
 from kbcore.config import settings
 from kbcore.deepsearch import deep_search
 from kbcore.ingest import archive_raw, ingest
@@ -160,6 +160,7 @@ class _InboxHandler(FileSystemEventHandler):
 def main() -> None:
     """Run the watcher loop: watchdog observer + poll fallback + daily reposcan."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logsafe.install()  # no secret reaches journald, whichever library logs it
     inbox = settings.inbox
     inbox.mkdir(parents=True, exist_ok=True)
     logger.info("watching inbox %s (poll every %ss)", inbox, int(POLL_INTERVAL))

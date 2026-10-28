@@ -16,7 +16,7 @@ import time
 from fastmcp import FastMCP
 from starlette.middleware.cors import CORSMiddleware
 
-from kbcore import scope
+from kbcore import logsafe, scope
 from kbcore.config import settings
 from kbmcp import KB_TOOLSET_VERSION
 
@@ -322,6 +322,9 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # httpx logs every request URL at INFO — including FastMCP's Google
+    # tokeninfo?access_token=… — so every record goes through kbcore.scrub first.
+    logsafe.install()
     # Fail-closed: a SERVED request that reaches kbcore without a resolved principal
     # RAISES (→ masked 500) instead of silently defaulting to OWNER — a request-scope
     # propagation gap fails loud, never as the owner (judge-mandated). Flipped at

@@ -402,6 +402,42 @@ def test_url_userinfo_is_masked_short_in_logs():
     )
 
 
+def test_an_own_secret_containing_an_at_sign_survives_the_url_mask_whole(monkeypatch):
+    monkeypatch.setattr(settings, "kb_db_password", "Sup3r@Secret-2026x")
+    out = logsafe.redact("connect postgresql://kb:Sup3r@Secret-2026x@db:5432/kb")
+    assert "Secret-2026x" not in out and "Sup3r" not in out
+
+
+def test_a_topic_with_a_shape_inside_it_is_still_redacted_whole(monkeypatch):
+    topic = "kb-task-alerts-" + "abcdefghij" * 3  # "sk-alerts-..." is an api_key shape
+    monkeypatch.setattr(settings, "kb_notify_topic", topic)
+    out = logsafe.redact(f"HTTP Request: POST https://ntfy.example.net/{topic}")
+    assert out == "HTTP Request: POST https://ntfy.example.net/[REDACTED:kb_notify_topic]"
+
+
+def test_a_google_token_containing_a_shorter_shape_is_redacted_whole():
+    token = "ya29.a0AfB1cdE2tk_Q7wX2mPz9-LkV3" + "m" * 40  # "tk_..." is the ntfy shape
+    clean, red = scrub(f"tokeninfo?access_token={token} 200")
+    assert "LkV3" not in clean and red == {"google_access_token": 1}
+
+
+def test_a_json_quoted_credential_is_redacted():
+    out = logsafe.redact(
+        '{"user": "kb", "password": "hunter2-very-secret", "token":"s3cr3t-12345"}'
+    )
+    assert "hunter2" not in out and "s3cr3t" not in out and '"user": "kb"' in out
+
+
+def test_one_unbroken_secret_longer_than_the_margin_does_not_leak_at_a_cut():
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJ" + "A" * 4300 + ".c2lnbmF0dXJl"  # claims > margin
+    head = logsafe._head("x" * 8000 + " " + jwt + " ok", logsafe._MAX_MESSAGE)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in head
+    run = "sk-" + "Q" * 16_981  # one run longer than the tail look-back
+    text = "y" * 35_323 + " " + run + " "
+    text += "z" * (60_000 - len(text))
+    assert "QQQQQQQQ" not in logsafe._ends(text, logsafe._MAX_TRACEBACK)
+
+
 def test_a_malformed_call_with_an_exception_as_msg_leaks_nothing(installed, capsys):
     logger = logging.getLogger("kbtest.malformed2")
     logger.propagate = False

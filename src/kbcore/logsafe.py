@@ -63,6 +63,12 @@ _PRIVATE_KEY_TAIL = re.compile(r"\A(?:(?!-----BEGIN )[\s\S])*?-----END [A-Z ]*PR
 # own rule writes a 26-char marker for as little as "a:b", and a line packed with
 # them grows ~4x before every later rule scans it again.
 _URL_USERINFO = dict(scrub.SECRET_PATTERNS)["url_credentials"]
+# A credential under a quoted JSON key (`"password": "..."`): scrub's assignment
+# rule wants `=`/`:` right after the key, so JSON bodies in error logs slipped by.
+_JSON_CREDENTIAL = re.compile(
+    r"(?i)(\"(?:password|passwd|secret|client_secret|token|access_token|refresh_token|"
+    r"id_token|api_key|apikey)\"\s*:\s*\")(?!\[REDACTED:)[^\"\\]{6,}(\")"
+)
 # Same floor as scrub's own-secret walk: a short topic is more likely a word.
 _MIN_TOPIC_LEN = 12
 # Query parameters that carry a credential in URLs this system logs: an OAuth
@@ -83,14 +89,39 @@ def redact(text: str) -> str:
 
     # NULs first: scrub strips them anyway, and a NUL inside a key header would hide
     # it from the linear pre-pass and hand it back to scrub's costly rule.
-    text = _URL_USERINFO.sub("***", text.replace("\x00", ""))
-    clean, _ = scrub.scrub(_PRIVATE_KEY.sub("[REDACTED:private_key]", text))
-    clean = _SECRET_QUERY.sub(r"\1[REDACTED:query]", clean)
+    text = text.replace("\x00", "")
+    # Exact VALUES before any shape rule: a shape rule (the URL mask below, an sk-
+    # inside a topic) can split a value so the exact match no longer finds it — a
+    # raw password containing "@" lost its tail to the URL mask that way.
+    for label, value in scrub.own_secrets():
+        if value in text:
+            text = text.replace(value, f"[REDACTED:{label}]")
     # Normalised exactly as kbcore.notify builds the push URL.
     topic = (settings.kb_notify_topic or "").strip().strip("/")
-    if len(topic) >= _MIN_TOPIC_LEN and topic in clean:
-        clean = clean.replace(topic, "[REDACTED:kb_notify_topic]")
-    return clean
+    if len(topic) >= _MIN_TOPIC_LEN and topic in text:
+        text = text.replace(topic, "[REDACTED:kb_notify_topic]")
+    text = _JSON_CREDENTIAL.sub(r"\1[REDACTED:credential]\2", _URL_USERINFO.sub("***", text))
+    clean, _ = scrub.scrub(_PRIVATE_KEY.sub("[REDACTED:private_key]", text))
+    return _SECRET_QUERY.sub(r"\1[REDACTED:query]", clean)
+
+
+def _without_last_run(scan: str) -> str:
+    """``scan`` minus its trailing run of non-space chars — the run a window's far
+    edge may have split. A secret that is one unbroken run LONGER than the margin
+    (a JWT with >4 KB of claims, a 16 KB sk- run) is cut in BOTH scans alike, so the
+    scans agree on its raw prefix; dropping the edge run takes it out."""
+    if not scan or scan[-1].isspace():
+        return scan
+    parts = scan.rsplit(None, 1)
+    return scan[: len(scan) - len(parts[-1])] if len(parts) == 2 else ""
+
+
+def _without_first_run(scan: str) -> str:
+    """Mirror of :func:`_without_last_run` for a tail window's near edge."""
+    if not scan or scan[0].isspace():
+        return scan
+    parts = scan.split(None, 1)
+    return scan[len(parts[0]) :] if len(parts) == 2 else ""
 
 
 def _dropped(n: int) -> str:
@@ -108,7 +139,7 @@ def _first(text: str, keep: int) -> str:
     shrinks and grows the text, which moves where an edge lands."""
     if len(text) <= keep + _MARGIN:
         return redact(text)[:keep]
-    wide = redact(text[: keep + _MARGIN])
+    wide = _without_last_run(redact(text[: keep + _MARGIN]))
     return os.path.commonprefix([wide, redact(text[:keep])])[:keep]
 
 
@@ -123,7 +154,7 @@ def _last(text: str, keep: int) -> str:
     and a scan of exactly the kept part — the mirror of :func:`_first`."""
     if len(text) <= keep + _LOOKBACK:
         return redact(text)[-keep:]
-    wide = redact(_tail_window(text[-(keep + _LOOKBACK) :]))
+    wide = _without_first_run(redact(_tail_window(text[-(keep + _LOOKBACK) :])))
     narrow = redact(_tail_window(text[-keep:]))
     common = os.path.commonprefix([wide[::-1], narrow[::-1]])[::-1]
     return common[-keep:]

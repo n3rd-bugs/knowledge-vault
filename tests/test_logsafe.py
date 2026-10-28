@@ -326,17 +326,20 @@ def test_no_fragment_of_a_planted_secret_survives_any_cut(monkeypatch):
     monkeypatch.setattr(settings, "kb_token", own)
     grantee = "kbg_" + "Q" * 43
     shrinker = "sk-" + "W" * 60  # -> [REDACTED:api_key], 45 chars shorter
-    words = ["alpha ", "beta ", "gamma\n", "delta ", "error: ", "value "]
+    grower = "?code=ab "  # -> ?code=[REDACTED:query], 14 chars LONGER
+    words = ["alpha ", "beta ", "gamma\n", "delta ", "error: ", "value ", "\x00"]
     rng = random.Random(3)
-    for case in range(250):
+    for case in range(300):
         size, parts = rng.randint(9_000, 40_000), []
         while sum(map(len, parts)) < size:
             roll = rng.random()
-            if roll < 0.25:
+            if roll < 0.20:
                 parts.append(shrinker)
-            elif roll < 0.30:
-                parts.append(own)
             elif roll < 0.35:
+                parts.append(grower)
+            elif roll < 0.40:
+                parts.append(own)
+            elif roll < 0.45:
                 parts.append(grantee)
             else:
                 parts.append(rng.choice(words))
@@ -349,15 +352,67 @@ def test_no_fragment_of_a_planted_secret_survives_any_cut(monkeypatch):
                 assert run not in out, f"case {case}: {run} leaked"
 
 
-def test_a_long_key_whose_begin_line_precedes_the_tail_window_is_redacted():
-    body = "MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQ" * 180  # ~9 KB, RSA-8192-sized
+_BODY = "MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQ" * 180  # ~9 KB, RSA-8192-sized
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        f"-----BEGIN PRIVATE KEY-----\n{_BODY}\n-----END PRIVATE KEY-----",
+        f"-----BEGIN PRIVATE KEY-----\n{_BODY}\n-----END PRIVATE\x00 KEY-----",  # NUL in END
+        f"-----BEGIN PRIVATE KEY-----\n{_BODY}\nValueError: bad key",  # no END at all
+        f"-----BEGIN PRIVATE KEY-----\n{_BODY}\n-----BEGIN CERTIFICATE-----\nMIIC\n"
+        "-----END CERTIFICATE-----",  # ended by the next BEGIN
+    ],
+    ids=["terminated", "nul-in-end", "unterminated", "next-begin"],
+)
+def test_a_long_key_whose_begin_line_precedes_the_kept_tail_is_redacted(key):
+    text = "y" * 30_000 + key + "z" * 6_000
+    keep = logsafe._MAX_TRACEBACK // 2
+    begin = text.index("-----BEGIN")
+    # The layout must stay what it tests: BEGIN outside the kept tail, body inside it.
+    assert len(text) - (keep + logsafe._LOOKBACK) < begin < len(text) - keep
+    assert text.rindex("MIIJ") > len(text) - keep
+    out = logsafe._ends(text, logsafe._MAX_TRACEBACK)
+    assert "MIIJQgIBADAN" not in out and "-----END PRIVATE" not in out
+
+
+def test_a_key_bigger_than_the_look_back_still_loses_its_tail_body():
+    """A body + END with its BEGIN beyond even the look-back: the tail-window rule."""
+    body = "MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQ" * 500  # ~25 KB
     text = (
         "y" * 30_000
         + f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
-        + "z" * 3_000
+        + "z" * 2_000
     )
+    keep = logsafe._MAX_TRACEBACK // 2
+    assert text.index("-----BEGIN") < len(text) - (keep + logsafe._LOOKBACK)
     out = logsafe._ends(text, logsafe._MAX_TRACEBACK)
-    assert "MIIJQgIBADAN" not in out and "-----END PRIVATE KEY-----" not in out
+    assert "MIIJQgIBADAN" not in out[-keep:]
+
+
+def test_a_short_line_that_grows_when_redacted_is_still_cut():
+    out = logsafe._head("?code=x " * 900, logsafe._MAX_MESSAGE)  # 7200 chars -> ~20 KB redacted
+    assert len(out) < logsafe._MAX_MESSAGE + 60 and "chars dropped by kbcore.logsafe" in out
+
+
+def test_url_userinfo_is_masked_short_in_logs():
+    assert logsafe.redact("connect postgresql://kb:s3cretpw@db:5432/kb") == (
+        "connect postgresql://***@db:5432/kb"
+    )
+
+
+def test_a_malformed_call_with_an_exception_as_msg_leaks_nothing(installed, capsys):
+    logger = logging.getLogger("kbtest.malformed2")
+    logger.propagate = False
+    handler = logging.StreamHandler()
+    logger.addHandler(handler)
+    try:  # one argument too many for a msg with no % placeholder: handleError prints both
+        logger.error(RuntimeError(f"GET {_TOKENINFO} failed"), "retrying")
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate = True
+    assert "ya29." not in capsys.readouterr().err
 
 
 def test_a_nul_inside_a_key_header_does_not_bring_the_slow_rule_back():

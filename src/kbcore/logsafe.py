@@ -27,6 +27,7 @@ Installed once per process by each server's ``main()``.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import traceback
 from collections.abc import Mapping
@@ -40,10 +41,12 @@ _POSITIONAL_ARGS_LOGGERS = frozenset({"uvicorn.access"})
 _MAX_MESSAGE = 8192  # chars of one record that are emitted
 _MAX_ACCESS = 2048  # ...of one uvicorn access line (a URL longer than this is not diagnostics)
 _MAX_TRACEBACK = 16384  # head and tail of a traceback (its last line names the error)
-# Scanned PAST every cut, then the redacted text is cut: a secret that crosses a
-# cut is seen whole (a Google access token is at most 2048 bytes; own secrets and
-# JWTs are far shorter) instead of losing the prefix or the length its pattern needs.
+# Scanned PAST every cut, so a secret that crosses a cut is seen whole (a Google
+# access token is at most 2048 bytes; own secrets and JWTs are far shorter). A
+# tail window looks further BACK, far enough to hold the BEGIN line of any real
+# private key (RSA-16384 PEM ~12.6 KB) whose body runs into the kept tail.
 _MARGIN = 4096
+_LOOKBACK = 16384
 # Log-only, linear pre-pass for private keys, run BEFORE scrub. scrub's private_key
 # rule (kept unchanged for ingest) rescans up to 20000 chars from EVERY BEGIN header
 # — ~60 ms on a 16 KiB traceback full of them, holding the GIL — and needs the END
@@ -53,9 +56,13 @@ _PRIVATE_KEY = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN )[\s\S])*?"
     r"(?:-----END [A-Z ]*PRIVATE KEY-----|(?=-----BEGIN )|\Z)"
 )
-# ...and, for a TAIL window, a key whose BEGIN line lies before the window: the
-# body and END it starts with carry no header for either rule to anchor on.
+# ...and, for a TAIL window, a key whose BEGIN line lies before even the look-back:
+# the body and END it starts with carry no header for either rule to anchor on.
 _PRIVATE_KEY_TAIL = re.compile(r"\A(?:(?!-----BEGIN )[\s\S])*?-----END [A-Z ]*PRIVATE KEY-----")
+# URL userinfo (`scheme://user:pw@host`), replaced by 3 chars BEFORE scrub: scrub's
+# own rule writes a 26-char marker for as little as "a:b", and a line packed with
+# them grows ~4x before every later rule scans it again.
+_URL_USERINFO = dict(scrub.SECRET_PATTERNS)["url_credentials"]
 # Same floor as scrub's own-secret walk: a short topic is more likely a word.
 _MIN_TOPIC_LEN = 12
 # Query parameters that carry a credential in URLs this system logs: an OAuth
@@ -76,7 +83,7 @@ def redact(text: str) -> str:
 
     # NULs first: scrub strips them anyway, and a NUL inside a key header would hide
     # it from the linear pre-pass and hand it back to scrub's costly rule.
-    text = text.replace("\x00", "")
+    text = _URL_USERINFO.sub("***", text.replace("\x00", ""))
     clean, _ = scrub.scrub(_PRIVATE_KEY.sub("[REDACTED:private_key]", text))
     clean = _SECRET_QUERY.sub(r"\1[REDACTED:query]", clean)
     # Normalised exactly as kbcore.notify builds the push URL.
@@ -91,38 +98,53 @@ def _dropped(n: int) -> str:
 
 
 def _first(text: str, keep: int) -> str:
-    """The first ``keep`` chars of ``text`` once redacted. When the scanned window
-    itself had to be cut, its far ``_MARGIN`` chars are context only — a secret can
-    straddle that edge, and redactions earlier in the window may have pulled the
-    edge forward into what is kept — so they are dropped before the final cut."""
+    """The first ``keep`` chars of ``text`` once redacted.
+
+    Only what TWO scans agree on is kept: one of a window ``_MARGIN`` past the cut
+    (it sees whole any secret that crosses the cut) and one of exactly the kept
+    part. Where a cut — at the window's far edge, or at ``keep`` — splits a secret
+    so that one scan no longer recognises it, the scans differ from that point on,
+    and the common prefix stops before it. No fixed position can do this: redaction
+    shrinks and grows the text, which moves where an edge lands."""
     if len(text) <= keep + _MARGIN:
         return redact(text)[:keep]
-    clean = redact(text[: keep + _MARGIN])
-    return clean[: min(keep, max(0, len(clean) - _MARGIN))]
+    wide = redact(text[: keep + _MARGIN])
+    return os.path.commonprefix([wide, redact(text[:keep])])[:keep]
+
+
+def _tail_window(text: str) -> str:
+    return _PRIVATE_KEY_TAIL.sub("[REDACTED:private_key]", text.replace("\x00", ""))
 
 
 def _last(text: str, keep: int) -> str:
-    """The last ``keep`` chars of ``text`` once redacted (mirror of :func:`_first`)."""
-    if len(text) <= keep + _MARGIN:
+    """The last ``keep`` chars of ``text`` once redacted: the common SUFFIX of a
+    scan reaching ``_LOOKBACK`` before the cut (so the BEGIN line of a key whose
+    body runs into the tail is seen, and an unterminated key is redacted to the end)
+    and a scan of exactly the kept part — the mirror of :func:`_first`."""
+    if len(text) <= keep + _LOOKBACK:
         return redact(text)[-keep:]
-    window = text[-(keep + _MARGIN) :]
-    clean = redact(_PRIVATE_KEY_TAIL.sub("[REDACTED:private_key]", window))
-    clean = clean[_MARGIN:] if len(clean) > _MARGIN else ""
-    return clean[-keep:]
+    wide = redact(_tail_window(text[-(keep + _LOOKBACK) :]))
+    narrow = redact(_tail_window(text[-keep:]))
+    common = os.path.commonprefix([wide[::-1], narrow[::-1]])[::-1]
+    return common[-keep:]
 
 
 def _head(text: str, limit: int) -> str:
     """``text`` redacted and cut to its first ``limit`` chars (marked when cut)."""
     if len(text) <= limit:
-        return redact(text)
+        clean = redact(text)  # the whole text was scanned: cutting it splits no secret
+        return clean if len(clean) <= limit else clean[:limit] + _dropped(len(clean) - limit)
     return _first(text, limit) + _dropped(len(text) - limit)
 
 
 def _ends(text: str, limit: int) -> str:
     """``text`` redacted and cut to its first and last ``limit // 2`` chars."""
-    if len(text) <= limit:
-        return redact(text)
     half = limit // 2
+    if len(text) <= limit:
+        clean = redact(text)
+        if len(clean) <= limit:
+            return clean
+        return f"{clean[:half]}\n{_dropped(len(clean) - limit)}…\n{clean[-half:]}"
     return f"{_first(text, half)}\n{_dropped(len(text) - limit)}…\n{_last(text, half)}"
 
 
@@ -135,9 +157,12 @@ def _redact_value(value: object, limit: int) -> object:
 
 
 def _redact_parts(record: logging.LogRecord, limit: int) -> None:
-    """Redact the format string and each argument separately, keeping their shape."""
-    if isinstance(record.msg, str):
-        record.msg = _head(record.msg, limit)
+    """Redact the format string and each argument separately, keeping their shape.
+    A non-str msg (an exception object passed as the message) is redacted as the
+    text it prints — logging's handleError would otherwise write its repr raw."""
+    if record.msg is not None:
+        msg = record.msg if isinstance(record.msg, str) else str(record.msg)
+        record.msg = _head(msg, limit)
     if isinstance(record.args, tuple):
         record.args = tuple(_redact_value(a, limit) for a in record.args)
     elif isinstance(record.args, Mapping):

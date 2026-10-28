@@ -19,6 +19,7 @@ from starlette.middleware.cors import CORSMiddleware
 from kbcore import logsafe, scope
 from kbcore.config import settings
 from kbmcp import KB_TOOLSET_VERSION
+from kbmcp.bearer import BearerAuthMiddleware, RejectLogMiddleware
 
 log = logging.getLogger("kbmcp")
 
@@ -204,49 +205,7 @@ resources.register(mcp)
 mcp.add_middleware(principal_ctx.PrincipalMiddleware())
 
 
-class BearerAuthMiddleware:
-    """Pure-ASGI bearer check on every request (SEC-1). No streaming buffering.
-
-    Per-project sharing: the master ``KB_TOKEN`` resolves to OWNER (constant-time,
-    exactly as before); a live ``kbg_`` grantee token resolves to that grantee; any
-    other value is rejected with the SAME 401 (no revoked-vs-unknown oracle). The
-    resolved principal is set in ``kbcore.scope`` for the request (REST sync routes
-    inherit it via anyio's context copy; MCP tools are also stamped by the FastMCP
-    PrincipalMiddleware in their own execution context). The parameter is
-    ``asgi_scope`` — NOT ``scope`` — so it never shadows the ``kbcore.scope`` module.
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, asgi_scope, receive, send):
-        if asgi_scope["type"] == "http":
-            headers = {
-                k.decode("latin-1").lower(): v.decode("latin-1")
-                for k, v in asgi_scope.get("headers", [])
-            }
-            principal = principal_ctx.resolve_bearer(headers.get("authorization", ""))
-            if principal is None:
-                log.warning("401 unauthorized from %s", asgi_scope.get("client"))
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [
-                            (b"content-type", b"application/json"),
-                            (b"www-authenticate", b"Bearer"),
-                        ],
-                    }
-                )
-                await send({"type": "http.response.body", "body": b'{"error": "unauthorized"}'})
-                return
-            token = scope.set_principal(principal)
-            try:
-                await self.app(asgi_scope, receive, send)
-            finally:
-                scope.reset_principal(token)
-            return
-        await self.app(asgi_scope, receive, send)
+# BearerAuthMiddleware lives in kbmcp.bearer (2026-10-28); still importable from here.
 
 
 def _validate_runtime_config() -> None:
@@ -296,9 +255,11 @@ def build_app():
     app = mcp.http_app(path="/mcp", json_response=True)
     # With OAuth on, FastMCP's own auth middleware (MultiAuth: Google + bearer)
     # handles every request — do NOT also wrap with the pure-ASGI bearer check,
-    # which would 401 the OAuth discovery/callback paths. Otherwise the bearer
-    # middleware is the sole gate.
-    if not settings.kb_oauth_enabled:
+    # which would 401 the OAuth discovery/callback paths; its rejections are only
+    # LOGGED here, with the real client. Otherwise the bearer middleware is the sole gate.
+    if settings.kb_oauth_enabled:
+        app = RejectLogMiddleware(app)
+    else:
         app = BearerAuthMiddleware(app)
     # CORS must be the OUTERMOST layer. claude.ai's web/desktop connector runs in
     # a browser context and issues a cross-origin preflight (OPTIONS /mcp) that

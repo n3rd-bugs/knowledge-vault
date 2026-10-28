@@ -12,10 +12,12 @@ import time
 import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import psycopg
 
 from kbcore.config import settings
+from kbcore.errors import DatabaseUnavailable
 
 logger = logging.getLogger("kbcore.db")
 
@@ -43,10 +45,15 @@ _RETRYABLE_CONNECT = (
     "could not connect",
 )
 _CONNECT_RETRY_SLEEP = 2.0
+# fail_fast()'s override of that budget. A ContextVar, not a settings write: it
+# covers only the calling context (the worker thread a credential lookup runs on),
+# while the nightly and every concurrent caller keep the full budget.
+_retry_override: ContextVar[float | None] = ContextVar("kb_db_retry_override", default=None)
 
 
 def _connect_retrying(url: str, **kw: object) -> psycopg.Connection:
-    budget = float(settings.kb_db_connect_retry_secs)
+    override = _retry_override.get()
+    budget = float(settings.kb_db_connect_retry_secs) if override is None else override
     deadline = time.monotonic() + budget
     warned = False
     while True:
@@ -110,6 +117,27 @@ def connect(schema: str | None = None, *, allow_public: bool = False) -> psycopg
             "to protect live data"
         )
     return conn
+
+
+@contextmanager
+def fail_fast() -> Iterator[None]:
+    """Run the block with the connect retry OFF; database failures raise DatabaseUnavailable.
+
+    For request-path lookups that must not wait out ``kb_db_connect_retry_secs``.
+    The bearer gate resolves ``kbg_`` tokens and enrolment codes against the DB,
+    and while kb-db was down on 2026-10-28 (13:44-14:28 PKT) each such lookup in
+    kb-rest retried for 60 s, then escaped as an unhandled 500. Inside this block a
+    refused connection fails at once, and any psycopg operational error (refused,
+    restarting, dropped mid-query) surfaces as :class:`DatabaseUnavailable`, so the
+    caller can answer a clean, retryable 503.
+    """
+    token = _retry_override.set(0.0)
+    try:
+        yield
+    except psycopg.OperationalError as e:
+        raise DatabaseUnavailable(str(e).splitlines()[0] if str(e) else type(e).__name__) from e
+    finally:
+        _retry_override.reset(token)
 
 
 @contextmanager

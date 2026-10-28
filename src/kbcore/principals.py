@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -254,10 +255,14 @@ def list_principals() -> list[PrincipalInfo]:
 # within one TTL — no separate grant cache that could outlive a revocation.
 
 _cache: dict[str, tuple[Principal, float]] = {}
+# The bearer gate resolves on worker threads (kbmcp.principal_ctx.aresolve_bearer),
+# so lookups run concurrently: the evict-then-insert below holds this lock.
+_cache_lock = threading.Lock()
 
 
 def _clear_cache() -> None:
-    _cache.clear()
+    with _cache_lock:
+        _cache.clear()
 
 
 def _build_grantee(conn, pid: int, name: str, kind: str, role: str) -> Principal:
@@ -310,15 +315,17 @@ def resolve_token(token: str | None) -> Principal | None:
             (h,),
         ).fetchone()
         if row is None:
-            _cache.pop(h, None)
+            with _cache_lock:
+                _cache.pop(h, None)
             return None
         principal = _build_grantee(conn, int(row[0]), row[1], row[2], row[3])
     # Evict expired entries, then cache this positive result for the TTL window.
     from kbcore.config import settings
 
-    for stale in [k for k, v in _cache.items() if v[1] <= now]:
-        del _cache[stale]
-    _cache[h] = (principal, now + settings.kb_principal_cache_ttl)
+    with _cache_lock:
+        for stale in [k for k, v in _cache.items() if v[1] <= now]:
+            del _cache[stale]
+        _cache[h] = (principal, now + settings.kb_principal_cache_ttl)
     return principal
 
 

@@ -37,6 +37,16 @@ class EmbedderUnavailable(KBError):
     """The Ollama embedding endpoint could not be reached or returned an error."""
 
 
+class DatabaseUnavailable(KBError):
+    """Postgres could not be reached (refused, restarting, connection dropped).
+
+    Raised only inside :func:`kbcore.db.fail_fast` — the request-path credential
+    lookups, which must fail at once instead of waiting out the connect-retry
+    budget. Retryable: the surfaces answer it with a 503, never a 401 (a down
+    database is not a bad credential).
+    """
+
+
 class ExtractorUnavailable(KBError):
     """The Ollama extractor (/api/chat) could not be reached (connectivity blip).
 

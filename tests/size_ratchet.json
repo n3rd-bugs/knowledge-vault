@@ -16,7 +16,6 @@
   "src/kbcore/scope.py": 378,
   "src/kbcore/search.py": 368,
   "src/kbcore/search_legs.py": 381,
-  "src/kbmcp/server.py": 336,
   "src/kbmcp/tools_setup.py": 448,
   "src/kbrest/server.py": 442,
   "src/kbweb/auth.py": 328,

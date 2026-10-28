@@ -27,6 +27,7 @@ import time
 from collections import deque
 
 from kbcore.config import settings
+from kbmcp.bearer import client_ip
 
 log = logging.getLogger("kbrest.auth_alert")
 
@@ -126,20 +127,6 @@ class AuthAlertMiddleware:
         await self.app(asgi_scope, receive, _send)
 
 
-def _client_ip(asgi_scope) -> str:
-    """The true client IP for the alert's distinct-IP count.
-
-    The socket peer is useless here: every tunneled request arrives from the
-    cloudflared container's bridge address, so the first real firing (2026-08-23,
-    536-request scan burst) reported '1 IPs' no matter how many sources probed.
-    Cloudflare stamps the real client into CF-Connecting-IP and OVERWRITES any
-    client-supplied value, and kb-rest is reachable only via the tunnel or
-    localhost (KB_BIND, Invariant 6) — so the header is trustworthy when present
-    and the peer address is already correct when it is not. X-Forwarded-For is
-    deliberately NOT consulted: its first hop is client-controlled.
-    """
-    for name, value in asgi_scope.get("headers") or []:
-        if name == b"cf-connecting-ip":
-            return value.decode("latin-1").strip()
-    client = asgi_scope.get("client")
-    return client[0] if client else ""
+# The true client IP for the alert's distinct-IP count — the same function the
+# bearer gate's 401 line uses (moved to kbmcp.bearer on 2026-10-28; see there).
+_client_ip = client_ip

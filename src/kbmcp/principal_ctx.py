@@ -22,10 +22,11 @@ from __future__ import annotations
 import logging
 import secrets
 
+import anyio
 from fastmcp.server.dependencies import get_access_token, get_http_headers
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-from kbcore import enrolment, principals, scope
+from kbcore import db, enrolment, principals, scope
 from kbcore.config import settings
 
 log = logging.getLogger("kbmcp.principal")
@@ -50,17 +51,22 @@ ENROLLING_GRANTEE_NAME = "enrolling-machine-grantee"
 ENROLLING_NAMES = frozenset({ENROLLING_NAME, ENROLLING_GRANTEE_NAME})
 
 
+def _bearer_token(header_or_token: str) -> str:
+    if header_or_token[:7].lower() == "bearer ":
+        return header_or_token[7:].strip()
+    return header_or_token
+
+
 def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
     """Map a bearer credential (raw token or ``Bearer <tok>`` header) to a Principal.
 
     Master → OWNER (constant-time). A live ``kbg_`` grantee token → that grantee.
     Anything else → None, which callers MUST treat exactly like an unknown token
-    (identical 401; no revoked-vs-unknown oracle)."""
+    (identical 401; no revoked-vs-unknown oracle). Sync and DB-backed: async
+    callers use :func:`aresolve_bearer`."""
     if not header_or_token:
         return None
-    tok = header_or_token
-    if tok[:7].lower() == "bearer ":
-        tok = tok[7:].strip()
+    tok = _bearer_token(header_or_token)
     if _master_matches(tok):
         return scope.OWNER
     grantee = principals.resolve_token(tok)
@@ -86,6 +92,30 @@ def resolve_bearer(header_or_token: str | None) -> scope.Principal | None:
     if owner_issued is False:
         return scope.Principal(name=ENROLLING_GRANTEE_NAME, is_owner=False)
     return None
+
+
+def _resolve_bearer_fail_fast(header_or_token: str) -> scope.Principal | None:
+    with db.fail_fast():
+        return resolve_bearer(header_or_token)
+
+
+async def aresolve_bearer(header_or_token: str | None) -> scope.Principal | None:
+    """:func:`resolve_bearer` for ASYNC callers (the ASGI bearer gate).
+
+    The master token resolves inline — constant-time, no DB — so the owner path
+    never depends on database health. Anything else may need the DB (a ``kbg_``
+    token, an enrolment code) and runs on a worker thread under
+    :func:`kbcore.db.fail_fast`: a sync psycopg call on the event loop stalls
+    EVERY request the server is holding, and a down database must cost one
+    refused connect, not the 60 s retry budget. Raises
+    :class:`~kbcore.errors.DatabaseUnavailable` when the lookup cannot reach the
+    database — the caller answers 503, never 401.
+    """
+    if not header_or_token:
+        return None
+    if _master_matches(_bearer_token(header_or_token)):
+        return scope.OWNER
+    return await anyio.to_thread.run_sync(_resolve_bearer_fail_fast, header_or_token)
 
 
 def resolve_google_email(email: str | None) -> scope.Principal:
@@ -117,19 +147,22 @@ def _email_from_access_token(tok) -> str | None:
     return None
 
 
-def resolve_current_principal() -> scope.Principal | None:
-    """Resolve the principal for the CURRENT FastMCP request, or None if it cannot
-    be determined (caller decides whether that is fail-closed)."""
+def _request_inputs() -> tuple[object | None, str | None]:
+    """The two request facts a principal is resolved from: FastMCP's verified
+    access token (public MultiAuth instance) and the raw Authorization header."""
     try:
         tok = get_access_token()
     except Exception:  # outside a request context
         tok = None
+    return tok, get_http_headers().get("authorization")
+
+
+def _principal_for(tok, raw: str | None) -> scope.Principal | None:
     if tok is not None:
         # Public MultiAuth path. The StaticTokenVerifier tags the master 'bearer'.
         if getattr(tok, "client_id", None) == "bearer":
             return scope.OWNER
         # A grantee kbg_ token could also ride the raw header on this instance.
-        raw = get_http_headers().get("authorization")
         via_bearer = resolve_bearer(raw)
         if via_bearer is not None:
             return via_bearer
@@ -137,14 +170,35 @@ def resolve_current_principal() -> scope.Principal | None:
         return resolve_google_email(_email_from_access_token(tok))
     # Local instance (FastMCP auth off): the ASGI BearerAuthMiddleware already
     # validated the header; resolve it here in the tool-execution context.
-    return resolve_bearer(get_http_headers().get("authorization"))
+    return resolve_bearer(raw)
+
+
+def resolve_current_principal() -> scope.Principal | None:
+    """Resolve the principal for the CURRENT FastMCP request, or None if it cannot
+    be determined (caller decides whether that is fail-closed)."""
+    return _principal_for(*_request_inputs())
+
+
+def _principal_fail_fast(tok, raw: str | None) -> scope.Principal | None:
+    with db.fail_fast():
+        return _principal_for(tok, raw)
 
 
 class PrincipalMiddleware(Middleware):
     """Stamp the resolved principal into kbcore.scope for each MCP message."""
 
     async def on_message(self, context: MiddlewareContext, call_next):
-        principal = resolve_current_principal()
+        # The request context is read HERE, on the event loop; the resolution —
+        # a DB read for a grantee token or a Google email (resolve_email is not
+        # cached) — runs on a worker thread with the connect retry off, for the
+        # same reason as aresolve_bearer. The two owner tags need no DB.
+        tok, raw = _request_inputs()
+        if getattr(tok, "client_id", None) == "bearer" or (
+            tok is None and raw and _master_matches(_bearer_token(raw))
+        ):
+            principal = scope.OWNER
+        else:
+            principal = await anyio.to_thread.run_sync(_principal_fail_fast, tok, raw)
         if principal is None:
             # Unresolvable on a served request → fail closed via scope.current().
             # (Should not happen: auth gates upstream.) Leave the ContextVar unset.

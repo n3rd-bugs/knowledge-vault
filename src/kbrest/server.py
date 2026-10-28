@@ -35,6 +35,7 @@ from kbcore import (
 )
 from kbcore.config import settings
 from kbcore.errors import (
+    DatabaseUnavailable,
     DuplicateContent,
     EmbedderUnavailable,
     ExtractionFailed,
@@ -45,7 +46,8 @@ from kbcore.errors import (
 )
 from kbcore.models import ItemDetail, ProjectInfo, ReviewEntry, SearchHit, SimilarHit
 from kbmcp import principal_ctx
-from kbmcp.server import BearerAuthMiddleware, _validate_runtime_config
+from kbmcp.bearer import BearerAuthMiddleware
+from kbmcp.server import _validate_runtime_config
 from kbrest import auth_alert
 from kbrest.schemas import (
     EnrolRequest,
@@ -86,6 +88,8 @@ def create_app() -> FastAPI:
     app.add_exception_handler(InvalidOperation, lambda r, e: _err(400, str(e)))
     app.add_exception_handler(ValueError, lambda r, e: _err(400, str(e)))
     app.add_exception_handler(EmbedderUnavailable, lambda r, e: _err(503, str(e)))
+    # Constant text: the psycopg detail names the database host, which is not the client's.
+    app.add_exception_handler(DatabaseUnavailable, lambda r, e: _err(503, "service unavailable"))
     app.add_exception_handler(ExtractorUnavailable, lambda r, e: _err(503, str(e)))
     # ExtractionFailed → 503, NOT 422: on the REST facade this only ever comes from
     # a synchronous embed under load (a busy-GPU read timeout on /api/search or

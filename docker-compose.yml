@@ -2,6 +2,11 @@ services:
   db:
     image: pgvector/pgvector:pg16
     container_name: kb-db
+    # Run as the image's postgres user (uid/gid 999, owner of every file in the volume), so
+    # the entrypoint skips its root -> `gosu postgres` drop: gosu 1.19 (go1.24) livelocks in
+    # sched_yield when it switches user under kernel 7.0.0-42 (2026-10-28: kb-db never started
+    # after the upgrade reboot; `gosu postgres id` hangs, `--user 999:999` works).
+    user: "999:999"
     environment:
       POSTGRES_DB: kb
       POSTGRES_USER: kb

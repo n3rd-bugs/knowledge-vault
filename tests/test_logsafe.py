@@ -156,6 +156,27 @@ def test_the_jwt_pattern_is_linear_on_input_built_to_make_it_backtrack():
     assert time.perf_counter() - started < 0.25
 
 
+def test_the_jwt_rewrite_is_byte_identical_to_the_old_pattern():
+    """Ingest dedupes on the SCRUBBED text: a re-sent transcript must scrub exactly
+    as it did before the rewrite, glued run prefixes (`%3DeyJ…`) included."""
+    import random
+    import re
+
+    from kbcore import scrub as scrub_mod
+
+    old = re.compile(r"eyJ[\w-]+\.[\w-]+\.[\w-]+")
+    new = dict(scrub_mod.SECRET_PATTERNS)["jwt"]
+    repl = scrub_mod._REPLACEMENTS["jwt"]
+    rng = random.Random(7)
+    alphabet = 'eyJ.-_a%3D "é'
+    samples = [f"id_token%3D{_JWT}&x", f"%22{_JWT}", f"x.{_JWT}.y", f"abc{_JWT} {_JWT}"]
+    samples += [
+        "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 40))) for _ in range(20000)
+    ]
+    for s in samples:
+        assert new.sub(repl, s) == old.sub("[REDACTED:jwt]", s), s
+
+
 @pytest.mark.parametrize(
     "text",
     [f"Bearer {_JWT}", f"id_token={_JWT}&x=1", f'"{_JWT}"', f"%22{_JWT}%22", f"glued{_JWT}"],
@@ -234,6 +255,83 @@ def test_a_malformed_record_cannot_leak_through_handle_error(installed, capsys):
         logger.removeHandler(handler)
         logger.propagate = True
     assert "ya29." not in capsys.readouterr().err
+
+
+# --- secrets that cross a cut (the redacted text is cut, not the raw text) -----
+
+
+@pytest.mark.parametrize("before_cut", [1, 5, 19, 40])
+def test_a_secret_crossing_the_message_cut_is_not_emitted(installed, monkeypatch, before_cut):
+    own = "kbtok-" + "8" * 40  # shapeless: matched only by its exact value
+    monkeypatch.setattr(settings, "kb_token", own)
+    for secret in (own, "kbg_" + "Q" * 43, _GOOGLE, _JWT):
+        filler = "~" * (logsafe._MAX_MESSAGE - before_cut)  # a char no secret contains
+        record = logging.getLogger("kbmcp").makeRecord(
+            "kbmcp", logging.INFO, __file__, 1, "%s%s tail", (filler, secret), None
+        )
+        emitted = record.getMessage()
+        # Cutting the RAW text kept the secret's first `before_cut` chars, too few for
+        # any pattern to match, and emitted them; the redacted text keeps a marker.
+        kept = emitted[len(filler) : len(filler) + before_cut]
+        assert kept != secret[:before_cut], f"{secret[:6]}… leaked across the cut"
+        assert kept == "[REDACTED:"[:before_cut] or kept.startswith("[REDACTED:")
+        assert len(emitted) < logsafe._MAX_MESSAGE + 80
+
+
+def test_a_secret_crossing_the_traceback_tail_cut_is_not_emitted(installed, caplog):
+    half = logsafe._MAX_TRACEBACK // 2
+    try:  # ya29 straddles the start of the kept tail window
+        raise RuntimeError("y" * 40_000 + _GOOGLE + "z" * (half - 20))
+    except RuntimeError:
+        with caplog.at_level(logging.ERROR, logger="kbmcp"):
+            logging.getLogger("kbmcp").exception("boom")
+    [record] = [r for r in caplog.records if r.name == "kbmcp"]
+    text = logging.Formatter().format(record)
+    assert "a0AfB_byC" not in text and "xxxxxxxxxxxxxxxxxxxx" not in text[-half:]
+
+
+def test_a_private_key_crossing_the_cut_or_unterminated_is_redacted(installed):
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 80
+    pem = f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+    for text in (
+        "x" * (logsafe._MAX_MESSAGE - 500) + pem,  # its END lies past the cut
+        f"cfg dump: -----BEGIN RSA PRIVATE KEY-----\n{body[:900]}",  # no END at all
+    ):
+        record = logging.getLogger("kbmcp").makeRecord(
+            "kbmcp", logging.INFO, __file__, 1, "%s", (text,), None
+        )
+        emitted = record.getMessage()
+        assert "MIIEvQIBADAN" not in emitted and "[REDACTED:private_key]" in emitted
+
+
+def test_a_traceback_full_of_key_headers_is_cheap(installed, caplog):
+    """scrub's private_key rule rescans 20000 chars from every BEGIN; any
+    authenticated MCP caller can put 16 KiB of them into a logged exception."""
+    try:
+        raise ValueError("-----BEGIN PRIVATE KEY-----" * 600)
+    except ValueError:
+        started = time.perf_counter()
+        logging.getLogger("kbmcp").exception("tool error")
+        assert time.perf_counter() - started < 0.02
+
+
+def test_a_failed_redaction_of_an_access_line_still_formats(installed, monkeypatch, capsys):
+    def boom(_text):
+        raise RuntimeError("scrub broke")
+
+    monkeypatch.setattr(logsafe, "redact", boom)
+    record = logging.getLogger("uvicorn.access").makeRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        ("203.0.113.9:4444", "GET", f"/x?access_token={_GOOGLE}", "1.1", 200),
+        None,
+    )
+    fmt = AccessFormatter(fmt="%(client_addr)s %(request_line)s %(status_code)s", use_colors=False)
+    line = fmt.format(record)
+    assert "ya29." not in line and "[withheld]" in line and "200" in line
 
 
 def test_a_topic_configured_with_slashes_is_still_redacted(installed, caplog, monkeypatch):

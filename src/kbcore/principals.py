@@ -329,6 +329,16 @@ def resolve_token(token: str | None) -> Principal | None:
     return principal
 
 
+def cached_principal(token: str | None) -> Principal | None:
+    """The TTL-cached resolution of a ``kbg_`` token, or None. Never touches the DB:
+    the async bearer gates answer a known grantee inline instead of queueing for a
+    lookup slot behind a flood of bogus tokens (kbmcp.principal_ctx)."""
+    if not token or not token.startswith(TOKEN_PREFIX):
+        return None
+    entry = _cache.get(_hash(token))
+    return entry[0] if entry is not None and entry[1] > time.monotonic() else None
+
+
 def resolve_name(name: str | None) -> Principal | None:
     """Resolve a LIVE grantee by its handle (web-cookie path), or None if missing/
     revoked/expired. Re-checked per request so a revoked grantee's still-valid

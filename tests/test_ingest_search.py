@@ -51,6 +51,18 @@ def test_ingest_scrubs_before_storing():
     assert item.meta["redactions"] == {"github_token": 1}
 
 
+def test_a_glued_jwt_scrubs_as_it_always_did_and_reingest_stays_a_noop():
+    """The jwt pattern was rewritten (linear) on 2026-10-28; its output must not
+    change, or a re-sent transcript stops deduping against its stored copy."""
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlF"
+    note = dict(project="p", type="note", title="callback url", body=f"/cb?id_token%3D{jwt}&x=1")
+    item = get_item(ingest(**note))
+    assert item.body == "/cb?id_token%3D[REDACTED:jwt]&x=1", "the 3D glued prefix stays"
+    after_first = _counts()
+    assert ingest(**note) is None
+    assert _counts() == after_first
+
+
 def test_a_google_access_token_is_scrubbed_and_reingest_stays_a_noop():
     """The ya29. shape joined SECRET_PATTERNS on 2026-10-28 (kbcore.logsafe) — the
     ingest path must redact it AND stay idempotent (CLAUDE.md hard rule 3)."""

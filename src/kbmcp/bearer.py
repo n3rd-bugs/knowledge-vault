@@ -107,12 +107,18 @@ class BearerAuthMiddleware:
 
     async def __call__(self, asgi_scope, receive, send):
         if asgi_scope["type"] == "http":
-            headers = {
-                k.decode("latin-1").lower(): v.decode("latin-1")
-                for k, v in asgi_scope.get("headers", [])
-            }
+            # The FIRST Authorization header — as Starlette's Headers.get and so the
+            # MCP PrincipalMiddleware read it; a dict here would let the last one win.
+            credential = next(
+                (
+                    v.decode("latin-1")
+                    for k, v in asgi_scope.get("headers", [])
+                    if k.lower() == b"authorization"
+                ),
+                "",
+            )
             try:
-                principal = await principal_ctx.aresolve_bearer(headers.get("authorization", ""))
+                principal = await principal_ctx.aresolve_bearer(credential)
             except DatabaseUnavailable:
                 # kbcore.db logged the cause; this line says whose request it cost.
                 log.warning("503 database unavailable %s", describe(asgi_scope))

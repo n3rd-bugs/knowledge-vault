@@ -100,14 +100,19 @@ SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     # Anchored at the start of a [\w-] run, with the step to the FIRST eyJ in that
     # run atomic. The unanchored form backtracked quadratically on a long run of
     # "eyJ" with no dots — 64 KB cost 1.5 s, and kbcore.logsafe runs this list on
-    # request paths anyone can send (2026-10-28 review). Same matches, except a run
-    # prefix glued to the token (`%3DeyJ…` → "3D") is redacted along with it.
-    ("jwt", re.compile(r"(?<![\w-])(?>[\w-]*?eyJ)[\w-]+\.[\w-]+\.[\w-]+")),
+    # request paths anyone can send (2026-10-28 review). The run prefix glued to
+    # the token (`%3DeyJ…` → "3D") is captured and written back (_REPLACEMENTS),
+    # so the output is BYTE-IDENTICAL to the old pattern's: ingest dedupes on the
+    # scrubbed text, and a re-sent transcript must hash as it did before.
+    ("jwt", re.compile(r"(?<![\w-])(?>([\w-]*?)eyJ)[\w-]+\.[\w-]+\.[\w-]+")),
     (
         "credential",
         re.compile(r"(?i)(?:password|passwd|secret|token)\s*[=:]\s*(?!\[REDACTED:)\S{6,}"),
     ),
 ]
+# Replacement templates for patterns that capture text which is NOT the secret
+# (default: the bare "[REDACTED:<label>]" marker).
+_REPLACEMENTS: dict[str, str] = {"jwt": r"\g<1>[REDACTED:jwt]"}
 
 
 # Every kbcore function that MINTS or returns a PLAINTEXT secret, mapped to the
@@ -255,7 +260,7 @@ def scrub(text: str) -> tuple[str, dict[str, int]]:
             text = text.replace(value, f"[REDACTED:{label}]")
             redactions[label] = redactions.get(label, 0) + n
     for label, pattern in SECRET_PATTERNS:
-        text, n = pattern.subn(f"[REDACTED:{label}]", text)
+        text, n = pattern.subn(_REPLACEMENTS.get(label, f"[REDACTED:{label}]"), text)
         if n:
             redactions[label] = redactions.get(label, 0) + n
     return text, redactions

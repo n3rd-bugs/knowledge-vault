@@ -69,6 +69,29 @@ def test_a_token_login_with_the_db_down_is_a_fast_503(app, monkeypatch):
     assert len(calls) == 1
 
 
+def test_google_round_trips_cannot_take_the_db_lookup_slots():
+    """The Google callback is reachable before any login: slow exchanges must not
+    stall grantee session checks, so they run in slots of their own."""
+    import threading
+
+    import anyio
+
+    from kbweb import lookups
+
+    release = threading.Event()
+
+    async def scenario():
+        async with anyio.create_task_group() as tg:
+            for _ in range(lookups._SLOTS):  # fill every Google slot with a stuck call
+                tg.start_soon(lookups.google_call, release.wait, 10)
+            await anyio.sleep(0.05)
+            with anyio.fail_after(2):  # ...and a DB lookup still gets a slot at once
+                assert await lookups.off_loop(lambda: "resolved") == "resolved"
+            release.set()
+
+    anyio.run(scenario)
+
+
 def test_the_owner_gate_needs_no_database(app, monkeypatch):
     """The owner cookie resolves inline: through the gate to a route-less path
     (the router's own 404) without a single connect attempt."""

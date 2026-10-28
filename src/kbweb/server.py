@@ -263,11 +263,11 @@ async def google_callback(request):  # GET /auth/google/callback
     if not code or not auth.state_ok(request.cookies.get(auth.STATE_COOKIE), state):
         log.warning("google callback rejected: missing code or state mismatch")
     elif auth.state_is_drive(state):
-        resp = await lookups.off_loop(_complete_drive_connect, request, code)  # Google + file I/O
+        resp = await lookups.google_call(_complete_drive_connect, request, code)  # + file I/O
         if resp is not None:
             return resp
     else:
-        email = await lookups.off_loop(auth.exchange_google_code, code)  # a Google round-trip
+        email = await lookups.google_call(auth.exchange_google_code, code)  # a Google round-trip
         identity = None
         if email and auth.email_allowed(email):
             identity = auth.OWNER_IDENTITY  # allowlisted owner email

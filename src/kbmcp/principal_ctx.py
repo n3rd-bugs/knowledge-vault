@@ -24,7 +24,7 @@ import secrets
 
 import anyio
 from anyio.lowlevel import RunVar
-from fastmcp.server.dependencies import get_access_token, get_http_headers
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 from kbcore import db, enrolment, principals, scope
@@ -132,11 +132,27 @@ async def aresolve_bearer(header_or_token: str | None) -> scope.Principal | None
     """
     if not header_or_token:
         return None
-    if _master_matches(_bearer_token(header_or_token)):
-        return scope.OWNER
+    inline = _inline_principal(None, header_or_token)
+    if inline is not None:
+        return inline
     return await anyio.to_thread.run_sync(
         _resolve_bearer_fail_fast, header_or_token, limiter=_lookup_slots()
     )
+
+
+def _inline_principal(tok, raw: str | None) -> scope.Principal | None:
+    """What resolves with no database at all, in _principal_for's precedence: the
+    static bearer FastMCP tagged, the master token, a kbg_ grantee still in the TTL
+    cache — so a known caller never queues for a lookup slot behind a flood of bogus
+    tokens. None means "ask the database"."""
+    if getattr(tok, "client_id", None) == "bearer":
+        return scope.OWNER
+    if not raw:
+        return None
+    token = _bearer_token(raw)
+    if _master_matches(token):
+        return scope.OWNER
+    return principals.cached_principal(token)
 
 
 def resolve_google_email(email: str | None) -> scope.Principal:
@@ -172,17 +188,23 @@ def _request_inputs() -> tuple[object | None, str | None]:
     """The two request facts a principal is resolved from: FastMCP's verified
     access token (public MultiAuth instance) and the raw Authorization header.
 
-    The header must be asked for BY NAME: FastMCP's get_http_headers() drops
-    ``authorization`` by default (it exists for forwarding headers downstream).
-    Without ``include`` the header always read as None, so on the local instance
-    no principal was stamped here and a tool ran under whatever principal the MCP
-    session's task inherited — the one that CREATED the session (2026-10-28 review).
+    The header is read from the request itself, and it is the FIRST Authorization
+    header — the one the auth layers check (Starlette's Headers.get, and
+    kbmcp.bearer). FastMCP's get_http_headers() would not do: it drops
+    ``authorization`` by default, so the header always read as None and on the local
+    instance a tool ran under whatever principal the MCP session's task inherited —
+    the one that CREATED the session (2026-10-28 review); and asked for by name it
+    builds a dict, where the LAST duplicate header wins.
     """
     try:
         tok = get_access_token()
     except Exception:  # outside a request context
         tok = None
-    return tok, get_http_headers(include={"authorization"}).get("authorization")
+    try:
+        raw = get_http_request().headers.get("authorization")
+    except Exception:  # no HTTP request (e.g. the in-memory transport)
+        raw = None
+    return tok, raw
 
 
 def _principal_for(tok, raw: str | None) -> scope.Principal | None:
@@ -219,19 +241,19 @@ class PrincipalMiddleware(Middleware):
         # The request context is read HERE, on the event loop; the resolution —
         # a DB read for a grantee token or a Google email (resolve_email is not
         # cached) — runs on a worker thread with the connect retry off, for the
-        # same reason as aresolve_bearer. The two owner tags need no DB.
+        # same reason as aresolve_bearer. What needs no DB resolves inline.
         tok, raw = _request_inputs()
-        if getattr(tok, "client_id", None) == "bearer" or (
-            tok is None and raw and _master_matches(_bearer_token(raw))
-        ):
-            principal = scope.OWNER
-        else:
-            principal = await anyio.to_thread.run_sync(
-                _principal_fail_fast, tok, raw, limiter=_lookup_slots()
-            )
+        principal = _inline_principal(tok, raw) or await anyio.to_thread.run_sync(
+            _principal_fail_fast, tok, raw, limiter=_lookup_slots()
+        )
+        if principal is None and raw:
+            # A credential the auth layer accepted no longer resolves (revoked or
+            # redeemed in between). Never fall through to the principal the MCP
+            # session's task inherited from whoever created it: a walled identity.
+            principal = scope.Principal(name="unresolved-credential", is_owner=False)
         if principal is None:
-            # Unresolvable on a served request → fail closed via scope.current().
-            # (Should not happen: auth gates upstream.) Leave the ContextVar unset.
+            # No HTTP request at all (in-memory transport): nothing to stamp; in
+            # server mode scope.current() fails closed.
             return await call_next(context)
         with scope.use_principal(principal):
             return await call_next(context)

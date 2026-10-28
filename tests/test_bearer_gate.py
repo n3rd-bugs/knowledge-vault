@@ -330,21 +330,65 @@ def test_mcp_resolution_with_the_database_down_fails_fast(monkeypatch):
     assert str(raised.value) == "database unavailable"
 
 
-def test_the_mcp_principal_is_read_from_the_authorization_header(monkeypatch):
-    """FastMCP's get_http_headers() drops `authorization` unless asked for it by
-    name — without that the local instance never stamped a principal and tools ran
-    under whoever created the MCP session."""
+def test_the_mcp_principal_is_read_from_the_first_authorization_header(monkeypatch):
+    """FastMCP's get_http_headers() drops `authorization` by default — so the local
+    instance never stamped a principal and tools ran under whoever created the MCP
+    session — and asked for by name it lets the LAST duplicate win, while the auth
+    layers check the FIRST. The principal must come from the header auth checked."""
     from fastmcp.server import dependencies
     from starlette.requests import Request
 
     def a_request():
         return Request(
-            {"type": "http", "headers": [(b"authorization", f"Bearer {GRANTEE}".encode())]}
+            {
+                "type": "http",
+                "headers": [
+                    (b"authorization", f"Bearer {GRANTEE}".encode()),
+                    (b"authorization", f"Bearer {MASTER}".encode()),
+                ],
+            }
         )
 
     monkeypatch.setattr(dependencies, "get_http_request", a_request)
+    monkeypatch.setattr(principal_ctx, "get_http_request", a_request)
     assert "authorization" not in dependencies.get_http_headers(), "FastMCP's default"
     assert principal_ctx._request_inputs()[1] == f"Bearer {GRANTEE}"
+
+
+def test_the_bearer_gate_checks_the_first_authorization_header_too(monkeypatch):
+    _refusing_connects(monkeypatch)  # the kbg_-shaped first header must not reach a DB here
+    monkeypatch.setattr(principal_ctx, "resolve_bearer", lambda header: None)
+    gate = bearer.BearerAuthMiddleware(_ok_app)
+    first_bad = _scope("Bearer nope")
+    first_bad["headers"].append((b"authorization", f"Bearer {MASTER}".encode()))
+    assert asyncio.run(_call(gate, first_bad))[0]["status"] == 401, "a later master does not count"
+    first_master = _scope(f"Bearer {MASTER}")
+    first_master["headers"].append((b"authorization", b"Bearer nope"))
+    assert asyncio.run(_call(gate, first_master))[0]["status"] == 200
+
+
+def test_a_credential_that_no_longer_resolves_gets_a_walled_identity(monkeypatch):
+    """Never the principal the MCP session's task inherited from its creator."""
+    monkeypatch.setattr(principal_ctx, "_request_inputs", lambda: (None, f"Bearer {GRANTEE}"))
+    monkeypatch.setattr(principal_ctx, "_principal_fail_fast", lambda tok, raw: None)
+
+    async def call_next(_ctx):
+        return scope.current()
+
+    with scope.use_principal(scope.OWNER):  # what an inherited session context would carry
+        seen = asyncio.run(principal_ctx.PrincipalMiddleware().on_message(None, call_next))
+    assert not seen.is_owner and seen.name == "unresolved-credential"
+
+
+def test_a_cached_grantee_resolves_inline_without_a_slot(monkeypatch):
+    grantee = scope.Principal(name="reader-2", is_owner=False)
+    monkeypatch.setattr(principals, "cached_principal", lambda token: grantee)
+
+    def must_not_run(*_a):
+        raise AssertionError("a cached grantee must not queue for a DB lookup slot")
+
+    monkeypatch.setattr(principal_ctx, "_resolve_bearer_fail_fast", must_not_run)
+    assert asyncio.run(principal_ctx.aresolve_bearer(f"Bearer {GRANTEE}")) is grantee
 
 
 def test_build_app_logs_rejections_on_the_oauth_instance(monkeypatch):

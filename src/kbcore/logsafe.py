@@ -16,10 +16,11 @@ A factory, not a handler filter: uvicorn and FastMCP configure their own handler
 (and uvicorn's loggers do not propagate), so a filter on the root handler would
 miss them. Every record is created through the factory, whoever handles it.
 
-The work per record is BOUNDED: uvicorn's access record carries the request path
-and query of every request — text anyone can send, up to h11's 16 KiB — and this
-runs on the event loop. A record is cut to a fixed size before it is scanned, and
-only the scanned part is emitted, so nothing past the cap is logged unscanned.
+The work per record is BOUNDED and linear: uvicorn's access record carries the
+request path and query of every request — text anyone can send, up to h11's 16 KiB
+— and this runs on the event loop. A long record is scanned to a fixed margin past
+its cap and the REDACTED text is then cut, so a secret crossing the cut is still
+seen whole and nothing past the cap is emitted at all.
 Installed once per process by each server's ``main()``.
 """
 
@@ -36,9 +37,22 @@ from kbcore import scrub
 # AccessFormatter takes a 5-tuple apart), so they are redacted argument by argument
 # instead of being collapsed into one pre-formatted string.
 _POSITIONAL_ARGS_LOGGERS = frozenset({"uvicorn.access"})
-_MAX_MESSAGE = 8192  # chars of one record that are scanned and emitted
+_MAX_MESSAGE = 8192  # chars of one record that are emitted
 _MAX_ACCESS = 2048  # ...of one uvicorn access line (a URL longer than this is not diagnostics)
 _MAX_TRACEBACK = 16384  # head and tail of a traceback (its last line names the error)
+# Scanned PAST every cut, then the redacted text is cut: a secret that crosses a
+# cut is seen whole (a Google access token is at most 2048 bytes; own secrets and
+# JWTs are far shorter) instead of losing the prefix or the length its pattern needs.
+_MARGIN = 4096
+# Log-only, linear pre-pass for private keys, run BEFORE scrub. scrub's private_key
+# rule (kept unchanged for ingest) rescans up to 20000 chars from EVERY BEGIN header
+# — ~60 ms on a 16 KiB traceback full of them, holding the GIL — and needs the END
+# line, which a cut may have dropped. This one stops at the next BEGIN or at the end
+# of the scanned text, and redacts an unterminated key up to there (fail closed).
+_PRIVATE_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN )[\s\S])*?"
+    r"(?:-----END [A-Z ]*PRIVATE KEY-----|(?=-----BEGIN )|\Z)"
+)
 # Same floor as scrub's own-secret walk: a short topic is more likely a word.
 _MIN_TOPIC_LEN = 12
 # Query parameters that carry a credential in URLs this system logs: an OAuth
@@ -57,7 +71,7 @@ def redact(text: str) -> str:
     and the ntfy topic removed."""
     from kbcore.config import settings
 
-    clean, _ = scrub.scrub(text)
+    clean, _ = scrub.scrub(_PRIVATE_KEY.sub("[REDACTED:private_key]", text))
     clean = _SECRET_QUERY.sub(r"\1[REDACTED:query]", clean)
     # Normalised exactly as kbcore.notify builds the push URL.
     topic = (settings.kb_notify_topic or "").strip().strip("/")
@@ -66,31 +80,39 @@ def redact(text: str) -> str:
     return clean
 
 
-def _cap(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return f"{text[:limit]}…[{len(text) - limit} chars dropped by kbcore.logsafe]"
+def _dropped(n: int) -> str:
+    return f"…[{n} chars dropped by kbcore.logsafe]"
 
 
-def _cap_ends(text: str, limit: int) -> str:
+def _head(text: str, limit: int) -> str:
+    """``text`` redacted and cut to its first ``limit`` chars (marked when cut)."""
     if len(text) <= limit:
-        return text
+        return redact(text)
+    return redact(text[: limit + _MARGIN])[:limit] + _dropped(len(text) - limit)
+
+
+def _ends(text: str, limit: int) -> str:
+    """``text`` redacted and cut to its first and last ``limit // 2`` chars."""
+    if len(text) <= limit:
+        return redact(text)
     half = limit // 2
-    return f"{text[:half]}\n…[{len(text) - limit} chars dropped by kbcore.logsafe]…\n{text[-half:]}"
+    head = redact(text[: half + _MARGIN])[:half]
+    tail = redact(text[-(half + _MARGIN) :])[-half:]
+    return f"{head}\n{_dropped(len(text) - limit)}…\n{tail}"
 
 
 def _redact_value(value: object, limit: int) -> object:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     text = value if isinstance(value, str) else str(value)
-    clean = redact(_cap(text, limit))
+    clean = _head(text, limit)
     return value if clean == text else clean
 
 
 def _redact_parts(record: logging.LogRecord, limit: int) -> None:
     """Redact the format string and each argument separately, keeping their shape."""
     if isinstance(record.msg, str):
-        record.msg = redact(_cap(record.msg, limit))
+        record.msg = _head(record.msg, limit)
     if isinstance(record.args, tuple):
         record.args = tuple(_redact_value(a, limit) for a in record.args)
     elif isinstance(record.args, Mapping):
@@ -104,11 +126,11 @@ def _redact_exception(record: logging.LogRecord) -> None:
     itself, like rich's, can then no longer print the raw one)."""
     if record.exc_info and not record.exc_text:
         text = "".join(traceback.format_exception(*record.exc_info)).rstrip("\n")
-        clean = redact(_cap_ends(text, _MAX_TRACEBACK))
+        clean = _ends(text, _MAX_TRACEBACK)
         if clean != text:
             record.exc_text, record.exc_info = clean, None
     if record.stack_info:
-        record.stack_info = redact(_cap_ends(record.stack_info, _MAX_TRACEBACK))
+        record.stack_info = _ends(record.stack_info, _MAX_TRACEBACK)
 
 
 def _redact_record(record: logging.LogRecord) -> None:
@@ -120,13 +142,24 @@ def _redact_record(record: logging.LogRecord) -> None:
     except Exception:  # noqa: BLE001 — logging reports a bad call itself, printing msg AND args
         _redact_parts(record, limit)
         return
-    clean = redact(_cap(full, limit))
+    clean = _head(full, limit)
     if clean == full:
         return  # the common case: nothing to hide and nothing to cut, the record is untouched
     if positional:
         _redact_parts(record, limit)  # keep the tuple its formatter unpacks
         return
     record.msg, record.args = clean, None
+
+
+def _withhold(record: logging.LogRecord, why: Exception, msg, args) -> None:
+    record.exc_info = record.exc_text = record.stack_info = None
+    if record.name in _POSITIONAL_ARGS_LOGGERS and isinstance(args, tuple):
+        # Keep the arity its formatter unpacks (and the int status it int()s); the
+        # format string is the logger's own constant, never request text.
+        record.msg = msg
+        record.args = tuple(a if isinstance(a, int) else "[withheld]" for a in args)
+        return
+    record.msg, record.args = _WITHHELD % type(why).__name__, None
 
 
 def install() -> None:
@@ -138,11 +171,11 @@ def install() -> None:
 
     def factory(*args, **kwargs):
         record = base(*args, **kwargs)
+        msg, record_args = record.msg, record.args
         try:
             _redact_record(record)
         except Exception as e:  # noqa: BLE001 — fail CLOSED: withhold, never leak
-            record.msg, record.args = _WITHHELD % type(e).__name__, None
-            record.exc_info = record.exc_text = record.stack_info = None
+            _withhold(record, e, msg, record_args)
         return record
 
     logging.setLogRecordFactory(factory)

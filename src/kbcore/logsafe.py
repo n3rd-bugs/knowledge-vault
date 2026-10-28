@@ -53,6 +53,9 @@ _PRIVATE_KEY = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN )[\s\S])*?"
     r"(?:-----END [A-Z ]*PRIVATE KEY-----|(?=-----BEGIN )|\Z)"
 )
+# ...and, for a TAIL window, a key whose BEGIN line lies before the window: the
+# body and END it starts with carry no header for either rule to anchor on.
+_PRIVATE_KEY_TAIL = re.compile(r"\A(?:(?!-----BEGIN )[\s\S])*?-----END [A-Z ]*PRIVATE KEY-----")
 # Same floor as scrub's own-secret walk: a short topic is more likely a word.
 _MIN_TOPIC_LEN = 12
 # Query parameters that carry a credential in URLs this system logs: an OAuth
@@ -71,6 +74,9 @@ def redact(text: str) -> str:
     and the ntfy topic removed."""
     from kbcore.config import settings
 
+    # NULs first: scrub strips them anyway, and a NUL inside a key header would hide
+    # it from the linear pre-pass and hand it back to scrub's costly rule.
+    text = text.replace("\x00", "")
     clean, _ = scrub.scrub(_PRIVATE_KEY.sub("[REDACTED:private_key]", text))
     clean = _SECRET_QUERY.sub(r"\1[REDACTED:query]", clean)
     # Normalised exactly as kbcore.notify builds the push URL.
@@ -84,11 +90,32 @@ def _dropped(n: int) -> str:
     return f"…[{n} chars dropped by kbcore.logsafe]"
 
 
+def _first(text: str, keep: int) -> str:
+    """The first ``keep`` chars of ``text`` once redacted. When the scanned window
+    itself had to be cut, its far ``_MARGIN`` chars are context only — a secret can
+    straddle that edge, and redactions earlier in the window may have pulled the
+    edge forward into what is kept — so they are dropped before the final cut."""
+    if len(text) <= keep + _MARGIN:
+        return redact(text)[:keep]
+    clean = redact(text[: keep + _MARGIN])
+    return clean[: min(keep, max(0, len(clean) - _MARGIN))]
+
+
+def _last(text: str, keep: int) -> str:
+    """The last ``keep`` chars of ``text`` once redacted (mirror of :func:`_first`)."""
+    if len(text) <= keep + _MARGIN:
+        return redact(text)[-keep:]
+    window = text[-(keep + _MARGIN) :]
+    clean = redact(_PRIVATE_KEY_TAIL.sub("[REDACTED:private_key]", window))
+    clean = clean[_MARGIN:] if len(clean) > _MARGIN else ""
+    return clean[-keep:]
+
+
 def _head(text: str, limit: int) -> str:
     """``text`` redacted and cut to its first ``limit`` chars (marked when cut)."""
     if len(text) <= limit:
         return redact(text)
-    return redact(text[: limit + _MARGIN])[:limit] + _dropped(len(text) - limit)
+    return _first(text, limit) + _dropped(len(text) - limit)
 
 
 def _ends(text: str, limit: int) -> str:
@@ -96,9 +123,7 @@ def _ends(text: str, limit: int) -> str:
     if len(text) <= limit:
         return redact(text)
     half = limit // 2
-    head = redact(text[: half + _MARGIN])[:half]
-    tail = redact(text[-(half + _MARGIN) :])[-half:]
-    return f"{head}\n{_dropped(len(text) - limit)}…\n{tail}"
+    return f"{_first(text, half)}\n{_dropped(len(text) - limit)}…\n{_last(text, half)}"
 
 
 def _redact_value(value: object, limit: int) -> object:

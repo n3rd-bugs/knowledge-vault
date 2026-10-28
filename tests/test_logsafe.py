@@ -315,6 +315,58 @@ def test_a_traceback_full_of_key_headers_is_cheap(installed, caplog):
         assert time.perf_counter() - started < 0.02
 
 
+def test_no_fragment_of_a_planted_secret_survives_any_cut(monkeypatch):
+    """Property test (round-3 review): redaction-heavy text — api_key-shaped runs
+    that SHRINK when redacted, pulling a fixed cut forward into the scan margin —
+    with secrets planted anywhere, cut by the message and the traceback caps. No
+    8-char run of any planted secret may come out of either."""
+    import random
+
+    own = "kbtok-" + "9" * 40  # shapeless: matched only by its exact value
+    monkeypatch.setattr(settings, "kb_token", own)
+    grantee = "kbg_" + "Q" * 43
+    shrinker = "sk-" + "W" * 60  # -> [REDACTED:api_key], 45 chars shorter
+    words = ["alpha ", "beta ", "gamma\n", "delta ", "error: ", "value "]
+    rng = random.Random(3)
+    for case in range(250):
+        size, parts = rng.randint(9_000, 40_000), []
+        while sum(map(len, parts)) < size:
+            roll = rng.random()
+            if roll < 0.25:
+                parts.append(shrinker)
+            elif roll < 0.30:
+                parts.append(own)
+            elif roll < 0.35:
+                parts.append(grantee)
+            else:
+                parts.append(rng.choice(words))
+        text = "".join(parts)
+        for out in (
+            logsafe._head(text, logsafe._MAX_MESSAGE),
+            logsafe._ends(text, logsafe._MAX_TRACEBACK),
+        ):
+            for run in ("99999999", "QQQQQQQQ", "WWWWWWWW"):
+                assert run not in out, f"case {case}: {run} leaked"
+
+
+def test_a_long_key_whose_begin_line_precedes_the_tail_window_is_redacted():
+    body = "MIIJQgIBADANBgkqhkiG9w0BAQEFAASCCSwwggkoAgEAAoICAQ" * 180  # ~9 KB, RSA-8192-sized
+    text = (
+        "y" * 30_000
+        + f"-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----"
+        + "z" * 3_000
+    )
+    out = logsafe._ends(text, logsafe._MAX_TRACEBACK)
+    assert "MIIJQgIBADAN" not in out and "-----END PRIVATE KEY-----" not in out
+
+
+def test_a_nul_inside_a_key_header_does_not_bring_the_slow_rule_back():
+    started = time.perf_counter()
+    out = logsafe.redact("-----BEGIN PRIVATE\x00 KEY-----" * 450)
+    assert time.perf_counter() - started < 0.01
+    assert "PRIVATE KEY" not in out
+
+
 def test_a_failed_redaction_of_an_access_line_still_formats(installed, monkeypatch, capsys):
     def boom(_text):
         raise RuntimeError("scrub broke")

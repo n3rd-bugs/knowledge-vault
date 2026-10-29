@@ -6,10 +6,11 @@ at the 300-line ratchet; each hooks in with one line.
 
 WHY (KB 31857 review #8 "E1 contents", KB 32942 review #9a): golden.yaml
 changes land only at a review boundary, and that commit "re-anchors the floor
-and resets the WoW baseline". Every eval report carries the golden set's
-content hash (``eval_golden_hash``, kbcore.eval_epoch). Two consequences
-render here, both positive-only — a report without the key contributes
-nothing new:
+and resets the WoW baseline". Every eval report carries the eval EPOCH KEY
+(``eval_golden_hash``, kbcore.eval_epoch: the golden bytes + the embed model
++ the configured embed hosts — no longer the golden file's content alone).
+Two consequences render here, both positive-only — a report without the key
+contributes nothing new:
 
 * DIGEST: the first night of a new epoch (``eval_epoch_reset``, set by
   kbworker.eval_regression) says so, because that night's eval has no prior
@@ -30,6 +31,17 @@ nothing new:
   belongs to, keyed on that run's START exactly as the weekly's table rows
   are (``weekly_instruments.run_start`` + ``digest_lines.night_of``), so the
   reader can find the row where the series restarted.
+
+E2 (review #10) renders the detector's new facts here too — digest.py and
+digest_lines.py sit at the ratchet: the EVAL RED alert (hit@5 AND MRR against
+the floors the detector compared, plus the trip cause; ``digest_lines.
+_eval_red_line`` delegates to :func:`eval_red_line`), ONE alert line per
+persistent golden case — at most :data:`CASE_LINES_MAX` in golden order plus
+one ``EVAL CASE +N more``, so a mass failure cannot push every other alert
+class past the digest's 20-line cap — and a notice per first pass after a red
+streak (kbworker.eval_persistence), capped the same way. Golden INDEX and
+satisfier id only — never a query text (a digest is a phone push, and a pushed
+golden query is an echo).
 """
 
 from __future__ import annotations
@@ -39,9 +51,11 @@ from datetime import datetime, tzinfo
 from typing import Any
 
 from kbworker.digest_lines import night_of
+from kbworker.eval_persistence import PERSIST_NIGHTS
 from kbworker.weekly_instruments import clean_reports, run_start
 
 Report = tuple[datetime, dict[str, Any]]
+CASE_LINES_MAX = 5  # EVAL CASE alert lines before one '+N more' (digest.DIGEST_MAX_LINES = 20)
 
 
 def eval_epoch_line(counts: Mapping[str, Any]) -> str | None:
@@ -128,3 +142,87 @@ def epoch_suffix(reports: list[Report], tz: tzinfo | None = None) -> str:
         return ""
     first_at, first_meta = epoch_reports(reports)[0]
     return f" (epoch reset {night_of(run_start(first_at, first_meta), tz).isoformat()})"
+
+
+# --- E2: the EVAL RED alert, persistent cases, first passes ---------------------
+
+
+def _shown(v: Any) -> str:
+    return "?" if v is None else str(v)
+
+
+def _floor(counts: Mapping[str, Any], key: str, setting: str) -> str:
+    """The floor the detector compared tonight (``eval_floor_*``); an older run
+    without the key reads the configured floor at render time, as ever."""
+    v = counts.get(key)
+    if isinstance(v, int | float) and not isinstance(v, bool):
+        return f"{v:g}"
+    try:
+        from kbcore.config import settings
+
+        return f"{getattr(settings, setting):g}"
+    except Exception:  # noqa: BLE001 — a digest line may never cost the digest
+        return "?"
+
+
+def eval_red_line(counts: Mapping[str, Any]) -> str:
+    """``EVAL RED: hit@5 H (floor F), MRR M (floor G) - <cause>``.
+
+    The MRR and cause parts render only when the run carries them
+    (positive-only, like every digest line); a pre-E2 run reads exactly the
+    pre-E2 ``EVAL RED: hit@5 H (floor F)``.
+    """
+    line = (
+        f"EVAL RED: hit@5 {_shown(counts.get('eval_hit_at_5'))} "
+        f"(floor {_floor(counts, 'eval_floor_hit_at_5', 'kb_eval_min_hit5')})"
+    )
+    if counts.get("eval_mrr") is not None:
+        line += (
+            f", MRR {counts['eval_mrr']} "
+            f"(floor {_floor(counts, 'eval_floor_mrr', 'kb_eval_min_mrr')})"
+        )
+    cause = counts.get("eval_regression_cause")
+    if isinstance(cause, list) and cause:
+        line += f" - {'+'.join(str(c) for c in cause)}"
+    return line
+
+
+def _entries(counts: Mapping[str, Any], key: str) -> list[Mapping[str, Any]]:
+    v = counts.get(key)
+    return [e for e in v if isinstance(e, Mapping)] if isinstance(v, list) else []
+
+
+def eval_case_lines(counts: Mapping[str, Any]) -> list[str]:
+    """ALERT lines per persistent case: ``EVAL CASE #14 (263): red 3 nights since <date>``.
+
+    The first :data:`CASE_LINES_MAX` in golden order (the producer's order),
+    then ONE ``EVAL CASE +N more`` line for the rest — the EVAL RED line above
+    already names the 'persistent' cause, and the full list stays in meta.
+    """
+    entries = _entries(counts, "eval_case_persistent")
+    lines = [
+        f"EVAL CASE #{_shown(p.get('case'))} ({_shown(p.get('satisfier'))}): "
+        f"red {_shown(p.get('nights'))} nights since {_shown(p.get('since'))}"
+        for p in entries[:CASE_LINES_MAX]
+    ]
+    if len(entries) > CASE_LINES_MAX:
+        lines.append(f"EVAL CASE +{len(entries) - CASE_LINES_MAX} more")
+    return lines
+
+
+def first_pass_lines(counts: Mapping[str, Any]) -> list[str]:
+    """A NOTICE per case green tonight after >= PERSIST_NIGHTS red nights (fact tier).
+
+    Capped like :func:`eval_case_lines` (fix-round review D2): a mass-recovery
+    night shows the first :data:`CASE_LINES_MAX` then ONE ``eval case +N more
+    first passes``, so the facts after them survive the digest's 20-line cap.
+    """
+    entries = _entries(counts, "eval_case_first_pass")
+    lines = [
+        f"eval case #{_shown(p.get('case'))} ({_shown(p.get('satisfier'))}): "
+        f"first pass after {PERSIST_NIGHTS}+ red nights"
+        for p in entries[:CASE_LINES_MAX]
+    ]
+    if len(entries) > CASE_LINES_MAX:
+        lines.append(f"eval case +{len(entries) - CASE_LINES_MAX} more first passes")
+    return lines

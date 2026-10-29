@@ -165,6 +165,21 @@ def fake_embeddings(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_embed_identity_network(monkeypatch):
+    """The eval's embed-runtime identity GETs (kbcore.embed_identity._get) never leave
+    the box in a test: a test that swaps the real embed_texts back in records a REAL
+    configured host as the probe's server, and the identity read would then GET it.
+    Refused here (the read fails open: key absent + one warning); tests of the
+    identity read patch ``_get`` (or restore it and patch ``httpx.get``)."""
+    from kbcore import embed_identity
+
+    def _refuse(url):
+        raise RuntimeError(f"network refused in tests: GET {url}")
+
+    monkeypatch.setattr(embed_identity, "_get", _refuse)
+
+
+@pytest.fixture(autouse=True)
 def _neutral_feature_flags(monkeypatch):
     """Pin production feature flags to their code DEFAULTS for every test.
 

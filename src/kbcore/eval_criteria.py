@@ -26,14 +26,28 @@ MRR rank it claims):
 * ``forbid_item_id`` — the raw id must be absent (deliberately NEVER resolved:
   resolving it to the head would make every superseded-revision guard fail
   against itself).
+
+THE ECHO RULE (E2: pre-registered by review #9, KB 40402; landed at review #10;
+the helpers live in :mod:`kbcore.eval_echo`, re-exported here). For
+``expect_substr`` ONLY, a hit whose title+snippet+body carries the case's
+query (normalised, on word boundaries: :func:`is_echo`) KEEPS ITS SLOT — the
+real satisfier below it still reads rank 2 — but never satisfies, and EVERY
+such carrier in the top-K is reported (above and below the satisfier). Id
+criteria are exempt: a pinned item that quotes its own query is a legitimate
+source. A miss whose substrings only echo carriers hold reads CONTENT-ABSENT.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from kbcore import eval_echo
 from kbcore.db import connect
+
+# THE ESTABLISHED SEAM (review #10 fix round): the echo rule moved to
+# kbcore.eval_echo at this file's ratchet; every name still resolves HERE.
+from kbcore.eval_echo import ECHO_MIN_WORDS, _norm, echo_guarded, is_echo  # noqa: F401
 from kbcore.items import get_item
 
 # Positive criteria own the case's MRR rank and count toward n_positive.
@@ -44,11 +58,16 @@ CHAIN_DEPTH_CAP = 50  # supersession hops followed before giving up (cycle backs
 
 @dataclass
 class CriterionResult:
-    """One criterion's verdict for one case (name, ok, human-readable detail)."""
+    """One criterion's verdict for one case (name, ok, human-readable detail).
+
+    ``echo_skipped``: EVERY echo carrier in an ``expect_substr`` case's top-K
+    (E2 echo rule), in rank order; always empty for the other criteria.
+    """
 
     name: str
     ok: bool
     detail: str
+    echo_skipped: list[int] = field(default_factory=list)
 
 
 def has_positive(case: dict) -> bool:
@@ -71,13 +90,32 @@ def validate_case(case: dict) -> None:
         raise ValueError(f"golden case {query!r}: expect_rank_le needs a positive criterion")
 
 
-def _substr_rank(hits: Sequence, expected: list[str]) -> int | None:
-    """Legacy criterion: first rank whose title+snippet+FULL BODY has any substring."""
+def _substr_rank(
+    hits: Sequence, expected: list[str], query: str | None = None, echoes: list[int] | None = None
+) -> int | None:
+    """Legacy criterion: first rank whose title+snippet+FULL BODY has any substring.
+
+    With ``query`` the echo rule applies (module docstring): a carrier keeps
+    its slot — ``enumerate`` still counts it — but cannot satisfy. With
+    ``echoes`` given, EVERY carrier among ``hits`` is appended in rank order:
+    the scan runs on past the satisfier (same haystack per hit; the rank is
+    unchanged) so carriers BELOW it are named too. A call without ``query`` is
+    the pre-E2 criterion byte for byte — it stops at the first match.
+    """
+    rank: int | None = None
+    tail = echoes is not None and isinstance(query, str) and echo_guarded(query)
     for i, hit in enumerate(hits, start=1):
-        haystack = f"{hit.title}\n{hit.snippet}\n{get_item(hit.item_id).body}".lower()
-        if any(sub.lower() in haystack for sub in expected):
-            return i
-    return None
+        if rank is not None and not tail:
+            break
+        haystack = f"{hit.title}\n{hit.snippet}\n{get_item(hit.item_id).body}"
+        if is_echo(query, haystack):
+            if echoes is not None:
+                echoes.append(int(hit.item_id))
+            continue
+        lowered = haystack.lower()
+        if rank is None and any(sub.lower() in lowered for sub in expected):
+            rank = i
+    return rank
 
 
 def _chain_head(item_id: int) -> int:
@@ -119,9 +157,10 @@ def _content_exists(expected: list[str]) -> bool:
     """
     with connect() as conn:
         for sub in expected:
-            pattern = f"%{sub}%"
+            pattern = eval_echo.like_pattern(sub)  # literal: no LIKE wildcard (fix-round H2)
             row = conn.execute(
-                "SELECT 1 FROM items WHERE title ILIKE %s OR body ILIKE %s LIMIT 1",
+                "SELECT 1 FROM items WHERE title ILIKE %s ESCAPE '!' OR body ILIKE %s ESCAPE '!' "
+                "LIMIT 1",
                 (pattern, pattern),
             ).fetchone()
             if row is not None:
@@ -129,21 +168,73 @@ def _content_exists(expected: list[str]) -> bool:
     return False
 
 
+def _held_by(expected: list[str], query: str | None) -> str:
+    """The miss triage: the pre-E2 presence check, or the echo-aware one when armed."""
+    if isinstance(query, str) and echo_guarded(query):
+        return eval_echo.content_triage(expected, query)
+    return "present" if _content_exists(expected) else "absent"
+
+
 def substr_criterion(
-    hits: Sequence, expected: list[str], k: int
+    hits: Sequence, expected: list[str], k: int, query: str | None = None
 ) -> tuple[int | None, CriterionResult]:
-    """``expect_substr`` verdict + the rank it claims (None on a miss)."""
-    rank = _substr_rank(hits, expected)
+    """``expect_substr`` verdict + the rank it claims (None on a miss).
+
+    ``query`` (the case's ``q``) arms the echo rule; every carrier in the
+    top-K rides the verdict as ``echo_skipped`` and its detail as ``echo
+    skipped [ids]``, and a miss whose substrings only carriers hold is
+    CONTENT-ABSENT ``(only echo carriers hold it)`` (``eval_echo.content_triage``).
+    """
+    echoes: list[int] = []
+    rank = _substr_rank(hits, expected, query, echoes)
     if rank:
         detail = f"matched at rank {rank}"
-    elif not _content_exists(expected):
-        # Corpus problem, not retrieval: nothing in the corpus matches at all.
+    elif (held := _held_by(expected, query)) != "present":
+        # Corpus problem, not retrieval: nothing in the corpus (bar carriers) matches.
         detail = (
             f"CONTENT-ABSENT: no corpus row contains any of {expected} (stale case or lost content)"
         )
+        if held == "echo-only":
+            detail += " (only echo carriers hold it)"
     else:
         detail = f"no substring of {expected} in top-{k}"
-    return rank, CriterionResult("expect_substr", rank is not None, detail)
+    if echoes:
+        detail += f"; echo skipped {echoes}"
+    return rank, CriterionResult("expect_substr", rank is not None, detail, echoes)
+
+
+def fused_rank(case: dict, fused_ids: Sequence[int]) -> int | None:
+    """1-based position of the case's first satisfier in a search's PRE-RERANK order.
+
+    E2 telemetry (``eval_case_fused_rank``, order from ``kbcore.search_trace``)
+    under the harness's ownership: the CHAIN HEAD for ``expect_item_id``, the
+    id itself for ``expect_item_id_raw``, else a non-echo item whose title/body
+    holds an expected substring (one batched read). None: no satisfier fused.
+    """
+    if "expect_item_id" in case:
+        want = {_chain_head(int(case["expect_item_id"]))}
+    elif "expect_item_id_raw" in case:
+        want = {int(case["expect_item_id_raw"])}
+    elif case.get("expect_substr") and fused_ids:
+        want = _substr_satisfiers(case, list(fused_ids))
+    else:
+        return None
+    return next((i for i, item_id in enumerate(fused_ids, start=1) if item_id in want), None)
+
+
+def _substr_satisfiers(case: dict, ids: list[int]) -> set[int]:
+    """The ids among ``ids`` that satisfy ``expect_substr`` (title/body, echo rule applied)."""
+    expected = [str(s).lower() for s in case["expect_substr"]]
+    with connect() as conn:
+        rows = conn.execute("SELECT id, title, body FROM items WHERE id = ANY(%s)", (ids,))
+        found = rows.fetchall()
+    out: set[int] = set()
+    for item_id, title, body in found:
+        haystack = f"{title}\n{body or ''}"
+        lowered = haystack.lower()
+        if any(s in lowered for s in expected) and not is_echo(case.get("q"), haystack):
+            out.add(int(item_id))
+    return out
 
 
 def item_id_criterion(

@@ -88,6 +88,37 @@ def test_promote_missing_queue_row_errors(kb):
         review_mod.promote(999999)
 
 
+def _row(queue_id: int) -> tuple:
+    with db.connect() as conn:
+        return conn.execute(
+            "SELECT item_id, reason, resolved, detail, created_at FROM review_queue WHERE id = %s",
+            (queue_id,),
+        ).fetchone()
+
+
+def test_resolve_review_note_stamps_the_detail_and_stays_a_flip(kb):
+    """E2 (review #10): the sentinel closes an other-epoch regression row with
+    note='epoch changed' — a status flip plus a detail stamp, nothing else."""
+    from datetime import datetime
+
+    detail = {"baseline_hit_at_5": 0.9836, "baseline_mrr": 0.8607}
+    noted = queue_review(None, "search_regression", detail)
+    plain = queue_review(None, "search_regression", dict(detail))
+    bystander = queue_review(None, "search_regression", {"baseline_mrr": 0.5})
+    before = _row(noted)
+
+    review_mod.resolve_review(noted, note="epoch changed")
+    item_id, reason, resolved, stamped, created_at = _row(noted)
+    assert resolved is True and (item_id, reason, created_at) == (None, before[1], before[4])
+    resolved_at = stamped.pop("resolved_at")
+    assert stamped == {**detail, "resolution": "epoch changed"}, "merged, nothing else touched"
+    assert datetime.fromisoformat(resolved_at).utcoffset().total_seconds() == 0, "a UTC stamp"
+
+    review_mod.resolve_review(plain)  # no note: the pre-E2 flip, detail byte-identical
+    assert _row(plain)[2] is True and _row(plain)[3] == detail
+    assert _row(bystander)[2] is False and _row(bystander)[3] == {"baseline_mrr": 0.5}
+
+
 # --- llm extractor helpers (mock Ollama HTTP) --------------------------------
 
 

@@ -33,6 +33,14 @@ Golden case schema (all criteria optional, at least one required; additive):
                   assert a fact as-of an instant or reach a superseded revision;
                   review #8 H5, the E1 prerequisite)
 
+ECHO RULE + PER-CASE TELEMETRY (E2, review #10): ``expect_substr`` replays the
+case's query into the criterion, so an item quoting the query verbatim keeps
+its slot but cannot satisfy (kbcore.eval_criteria); and every CaseResult now
+carries its final top-K, the hits ranked above its first satisfier, every
+echo carrier in its top-K, the satisfier's PRE-RERANK fused position
+(kbcore.search_trace) and the embed host that served its query —
+kbworker.eval_cases folds them into META-only dicts keyed by query.
+
 Metrics: hit@5 counts CASES PASSED (all present criteria ok) / all cases. MRR
 averages 1/rank over cases carrying a positive criterion (expect_substr,
 expect_item_id or expect_item_id_raw) — forbid-only cases never dilute it. For
@@ -57,13 +65,14 @@ kbcore.search has no extractor path, so the 14B is never invoked here.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from pathlib import Path
 
 import yaml
 
-from kbcore import eval_criteria, rerank, search_expand
+from kbcore import embed, eval_criteria, rerank, search_expand, search_trace
 
 # THE ESTABLISHED SEAMS (mechanical splits at this file's 300-line ratchet):
 # usage mining moved to kbcore.eval_mine (review #5 Wave F) and the criterion
@@ -95,11 +104,12 @@ ALLOWED_CASE_KWARGS = frozenset(
     {"boost_project", "expand", "as_of", "include_superseded", "type", "domain", "tags"}
 )
 _CRITERIA_KEYS = eval_criteria.CRITERIA_KEYS
+logger = logging.getLogger("kbcore.eval_harness")
 
 
 @dataclass
 class CaseResult:
-    """Per-case outcome: MRR rank, overall pass, and every criterion's verdict."""
+    """Per-case outcome: MRR rank, overall pass, every criterion's verdict, E2 telemetry."""
 
     query: str
     rank: int | None  # positive-criterion match rank (MRR basis); None if unmatched
@@ -107,6 +117,14 @@ class CaseResult:
     criteria: list[CriterionResult] = field(default_factory=list)
     chain_resolved: bool = False  # expect_item_id followed superseded_by to a live head
     rerank: str = "off"  # this case's rerank participation: active | fallback | off (#9a)
+    # E2 telemetry (module docstring) — report-only, never part of a verdict:
+    top_ids: list[int] = field(default_factory=list)  # the final top-K ids, in rank order
+    above: list[list] = field(default_factory=list)  # [id, type, trust] above the satisfier
+    echo_skipped: list[int] = field(default_factory=list)  # every echo carrier in the top-K
+    fused_rank: int | None = None  # the first satisfier's PRE-RERANK fused position
+    n_fused: int | None = None  # the fused list's length; None = no trace was captured
+    fused_error: bool = False  # the fused-rank read RAISED: no fused keys for this case
+    embed_host: str | None = None  # the configured host that served this case's query
 
 
 def load_golden(golden_path: Path | None = None) -> list[dict]:
@@ -172,15 +190,19 @@ def _evaluate_case(case: dict) -> CaseResult:
     # every top-5 golden-hit item 'recently used' one day before archive_stale's
     # 180-day cutoff, permanently exempting it from archiving and growing
     # access_log ~125 rows/night. Eval reads are not usage (review finding).
-    hits = search(query, k=K, tool=None, **_search_kwargs(case))
+    search_trace.begin()  # E2: this search's PRE-RERANK order rides back for telemetry
+    try:
+        hits = search(query, k=K, tool=None, **_search_kwargs(case))
+    finally:
+        fused_ids = search_trace.end()
     outcome = rerank.last_outcome()  # per-case: search() notes exactly one outcome per call
     hit_ids = [h.item_id for h in hits]
     criteria: list[CriterionResult] = []
     rank: int | None = None
     chain_resolved = False
 
-    if "expect_substr" in case:
-        rank, verdict = eval_criteria.substr_criterion(hits, case["expect_substr"], K)
+    if "expect_substr" in case:  # the query arms the E2 echo rule
+        rank, verdict = eval_criteria.substr_criterion(hits, case["expect_substr"], K, query)
         criteria.append(verdict)
 
     # An id criterion is the precise one — it owns the MRR rank over a substr
@@ -200,7 +222,46 @@ def _evaluate_case(case: dict) -> CaseResult:
     if "forbid_item_id" in case:
         criteria.append(eval_criteria.forbid_criterion(hit_ids, case["forbid_item_id"], K))
 
-    return CaseResult(query, rank, all(c.ok for c in criteria), criteria, chain_resolved, outcome)
+    result = CaseResult(query, rank, all(c.ok for c in criteria), criteria, chain_resolved, outcome)
+    _telemetry(result, case, hits, fused_ids)
+    return result
+
+
+def _telemetry(result: CaseResult, case: dict, hits: list, fused_ids: list[int] | None) -> None:
+    """Fill ``result``'s E2 telemetry fields from the search it just judged.
+
+    The satisfier is the hit at the case's claimed rank (the id criterion owns
+    it over a substr match, exactly as the MRR rank does); "above" is every hit
+    ranked over it — the whole top-K when nothing satisfied. The fused rank is
+    fail-open: a broken read costs that case's FUSED fields, never the case —
+    ``fused_error`` is set and ``n_fused``/``fused_rank`` stay None, so
+    kbworker.eval_cases names the case in ``eval_case_fused_error`` instead of
+    writing a null that would read as "no satisfier fused".
+
+    RRF TIE ARTEFACT (review #10 F5): when the case's rerank is NOT 'active'
+    (off / fallback) a fused-vs-final rank gap can be pure tie order — the
+    capture keeps exact fused-score ties in leg order (the reranker's view),
+    while ``kbcore.search._to_hits`` re-sorts ties by trust and recency. Read
+    such a gap as rerank attribution only on 'active' cases. TWIN COLLAPSE
+    (fix-round review H5): with ``kb_collapse_alternatives`` on, search folds
+    cross-project twins AFTER the capture, on ANY case — a dropped loser fused
+    above the satisfier moves it up a place, a winner taking the pair's max
+    score can pass it — and ``n_fused`` counts the dropped losers too.
+    """
+    result.top_ids = [h.item_id for h in hits]
+    above = hits if result.rank is None else hits[: result.rank - 1]
+    result.above = [[h.item_id, getattr(h, "type", None), getattr(h, "trust", None)] for h in above]
+    result.echo_skipped = [i for c in result.criteria for i in c.echo_skipped]
+    result.embed_host = embed.last_query_host()
+    if fused_ids is None:
+        return
+    try:
+        result.fused_rank = eval_criteria.fused_rank(case, fused_ids)
+    except Exception:  # noqa: BLE001 — telemetry may never cost the measurement
+        result.fused_error = True
+        logger.warning("fused-rank telemetry failed; the case's verdict stands", exc_info=True)
+        return
+    result.n_fused = len(fused_ids)
 
 
 def evaluate(

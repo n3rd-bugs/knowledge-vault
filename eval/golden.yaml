@@ -323,6 +323,9 @@
 # again observed rank + 2. Same provenance rule: ranks observed live
 # 2026-08-08 via kb_search, k=5, expand unset (hops 0).
 
+# KNOWN RED #2 since E2 (review #10): candidate-generation miss -- the satisfier's
+# best chunk sits outside the vector leg's 40-row window (EPOCHS.md E2). Criteria
+# untouched. Do not re-point.
 - q: "service dies at boot but starts fine manually afterwards"
   # GOTCHA-BY-SYMPTOM: the query carries none of the answer's identifiers
   # (isc-dhcp-server, NetworkManager, network-online.target) — the user has the
@@ -419,13 +422,12 @@
   # forbid-only: no MRR contribution (hit@5 counts it as a pass). 2026-09-16: 101 absent from
   # the default top-5.
   forbid_item_id: 101
-- q: "mTLS fleet agent deferred config-sync"
-  # Transaction time (Invariant 5 — everything stays retrievable WITH a flag):
-  # asked for, the superseded revision IS retrievable. expect_item_id would
-  # resolve 101 to its live chain head (473); expect_item_id_raw (E1 harness
-  # key) skips _chain_head and asserts 101 ITSELF. 2026-09-16 under the flag:
-  # 101 rank 1, 473 rank 3. Bound = 1 + 2.
-  expect_item_id_raw: 101
+# E2 (review #10, 2026-10-29): replaces the retired positive raw-101 pin (an OPEN
+# doc-refresh chain that lost one rank per revision -- see EPOCHS.md E2). Closed-chain
+# raw pin: 21851/28469 -> 31854 (manual verified note, no source URI, cannot
+# doc-refresh). Bound = E2-day rank + 2, cap 5.
+- q: "why is a gibberish query never logged as a search miss"
+  expect_item_id_raw: 28469
   expect_rank_le: 3
   kwargs: {include_superseded: true}
 

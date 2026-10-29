@@ -53,7 +53,7 @@ from kbworker.digest_lines import (  # noqa: F401
     night_of,
 )
 from kbworker.digest_recency_lines import auto_resolve_held_line, judge_held_line, judged_line
-from kbworker.eval_epoch_lines import eval_epoch_line  # E1: first night of a golden epoch
+from kbworker.eval_epoch_lines import eval_case_lines, eval_epoch_line, first_pass_lines  # E1/E2
 
 logger = logging.getLogger("kbworker.tail_steps")
 
@@ -75,8 +75,8 @@ def digest_lines(counts: Mapping[str, Any]) -> list[str]:
 def _alert_lines(counts: Mapping[str, Any]) -> list[str]:
     """The lines that must survive a truncated phone preview, rendered first."""
     lines: list[str] = []
-    if counts.get("eval_regression"):
-        lines.append(_eval_red_line(counts))
+    if counts.get("eval_regression"):  # E2: + one EVAL CASE line per persistent golden case
+        lines += [_eval_red_line(counts), *eval_case_lines(counts)]
     if counts.get("eval_trust_status") == "watch":
         lines.append(_trust_watch_line(counts))
     # Untriaged rows reaching the age at which a TRIAGED row would close. Since
@@ -184,6 +184,7 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
         lines.append(promote_runs)
     if epoch := eval_epoch_line(counts):  # E1: tonight's eval has no WoW prior — say so
         lines.append(epoch)
+    lines += first_pass_lines(counts)  # E2: a case green again after a red streak (notice)
     # The rerank tally on a clean night is a routine fact (H7a: rendered
     # verbatim either way; a fallback night carried it in the alert tier).
     tally = counts.get("eval_rerank_tally")

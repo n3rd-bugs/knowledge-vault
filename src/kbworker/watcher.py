@@ -22,7 +22,7 @@ from kbcore import jobs, logsafe
 from kbcore.config import settings
 from kbcore.deepsearch import deep_search
 from kbcore.ingest import archive_raw, ingest
-from kbworker import consolidate, reposcan
+from kbworker import consolidate, eval_cases, reposcan
 from kbworker.watcher_parsers import is_supported, parse
 
 logger = logging.getLogger("kbworker.watcher")
@@ -199,7 +199,9 @@ def _drain_consolidation_requests() -> None:
         return
     logger.info("on-demand consolidation requested (row %s) — running", req_id)
     try:
-        result = consolidate.main()
+        # Query-keyed eval dicts stay in the report META: never in the stored result
+        # (kb_consolidate / the CLI / GET /api/consolidate) nor in journald.
+        result = eval_cases.loggable(consolidate.main())
         jobs.finish_consolidation(req_id, result, ok=True)
         logger.info("on-demand consolidation row %s done: %s", req_id, result)
     except Exception as e:  # noqa: BLE001 — one bad run must not kill the watcher

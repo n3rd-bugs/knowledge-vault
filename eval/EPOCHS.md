@@ -5,20 +5,24 @@ sentinel (`kbworker.eval_sentinel` → `kbworker.eval_regression`) holds it to.
 
 **The rule.** `golden.yaml` and ranking changes land only at a **review boundary**, in **one
 batched commit**, with a new entry here — never dribbled between reviews. Every report carries the
-golden set's hash (`eval_golden_hash`); when the hash changes, the week-over-week baseline
-(`kbcore.eval_baseline.previous_eval_metrics`) **resets** — tonight is compared only with reports of
-the same epoch, never with a prior set whose case count or quantum differs. Floors are re-anchored
-per the epoch's entry below, and `.env` (`KB_EVAL_MIN_HIT5`, `KB_EVAL_MIN_MRR`) is the live
-anchor; the `kbcore.config` defaults (0.75 / 0.5) are vestigial and stay untouched.
+**epoch key** (`eval_golden_hash`): the golden set's hash through E1; from E2 on, the first 12 hex of
+sha256 over the golden bytes, `kb_embed_model` and the configured embed hosts, NUL-separated
+(`kbcore.eval_epoch.golden_hash`; details under E2). When the key changes, the week-over-week
+baseline (`kbcore.eval_baseline.previous_eval_metrics`) **resets** — tonight is compared only with
+reports of the same epoch, never with a prior set whose case count or quantum differs — and an open
+regression row from another epoch closes as `epoch changed`. Floors are re-anchored per the epoch's
+entry below, and `.env` (`KB_EVAL_MIN_HIT5`, `KB_EVAL_MIN_MRR`) is the live anchor; the
+`kbcore.config` defaults (0.75 / 0.5) are vestigial and stay untouched.
 
 Reading an MRR delta: one case slipping rank 1 → 2 moves MRR by exactly `0.5 / n_positive` (the
 **quantum**). A per-case diff (`eval_case_ranks`, keyed by query text) names the slipped case; a
 scalar never does.
 
-| Epoch | Since | Cases (positive) | Quantum | Clean baseline hit@5 / MRR | Floors hit@5 / MRR | Golden hash |
+| Epoch | Since | Cases (positive) | Quantum | Clean baseline hit@5 / MRR | Floors hit@5 / MRR | Epoch key |
 |-------|-------|------------------|---------|----------------------------|--------------------|-------------|
 | E0 | wave F (`9c7ab4e`) | 52 (52) | 0.5/52 = 0.0096 | 0.9808 / 0.9269 (review #9a, KB 32942) | 0.97 / 0.90 | n/a (key lands with E1) |
 | E1 | 2026-09-16 | 61 (59) | 0.5/59 = 0.0085 | 0.9836 / 0.8975 (daytime replay 2026-09-16, fallback-free; expected first clean night 0.9836 / 0.889 — see below) | 0.97 / 0.86 (MRR re-anchored 2026-09-17, see night 1) | `f687077853bd` |
+| E2 | 2026-10-29 | 61 (59) | 0.5/59 = 0.0085 | 0.9672 / 0.8650 (gate 2026-10-29: two back-to-back replays, fallback-free) | 0.950 / 0.845 | `092b054e8e9e` |
 
 ## E0 — the 52-case set (wave F, `9c7ab4e`, through 2026-09-16)
 
@@ -111,3 +115,183 @@ GPU by 0.999717; the case hit at rank 1 in six replays at 10:35 and missed in ev
 behaviour. hit@5 trips on any flap night by design (a second miss). Nothing in the golden set or
 the ranking moves before review #9; E2 decides among widening the case's expectation, the rerank
 window, the floor semantics, and pinning the embedder to one always-warm host (the Orin plan).
+
+## E2 — 2026-10-29 (review #10; amends review #9's pre-registered E2, KB 40402 → superseded by KB 56704)
+
+**Why E1 ended.** E1 read red on 60 of its 69 reports: its night-1 pair (09-16/17, hit@5 0.9672 under the
+0.97 floor) and every report from 2026-09-24 on, except the two rerank-fallback measurement nights (09-30,
+10-01). There was no ranking regression: no ranking or eval
+code changed after `61737cb`, and every per-case move traces to data — new items, supersedes, summary
+refreshes and curation.
+
+The honest E1 read never rose above 59/61 = 0.9672. The seven 0.9836 reports (09-18..09-23) were
+echo-satisfied (review #9). So two values were unreachable:
+- the 0.97 floor, which allows one miss, and the canary always takes that miss;
+- the 0.9836 recovery anchor on row 35091, frozen from an echo night.
+
+The sentinel pushed a KB ALERT on 34 of 36 days. Every genuine per-case move after 09-24 surfaced only as a
+different number inside that same alert.
+
+**E1 restated** (case 48 counted as a miss wherever echo carrier 38552 satisfied it):
+
+| Reports | Dates | Honest hit@5 / MRR | As read | Failing cases |
+|---------|-------|--------------------|---------|---------------|
+| 38206–38551 | 09-16/17 | 0.9672 / 0.8607 | same | 7, 48 |
+| 39050–39744 | 09-18..23 | 0.9672 / 0.8523 | 0.9836 / 0.8607 | 7, 48 |
+| 40202 | 09-24 | 0.9344 / 0.8475 | 0.9508 / 0.8559 | 7, 14, 48, 54 |
+| 40399 | 09-25 03:15 | 0.9508 / 0.8489 | 0.9672 / 0.8573 | 7, 14, 48 |
+| 40410–49676 | 09-25..10-13 | 0.9344 / 0.8593–0.8771 | same | 7, 14, 48, 54 (42198/42635 = fallback measurement nights, excluded) |
+| 50226–56662 | 10-14..10-29 | 0.9508 / 0.8508–0.8763 | same | 7, 48, 54 |
+
+**What changed — one commit (the one that adds this entry).**
+
+1. **golden.yaml.**
+   - Case 54 (the positive raw pin on 101 with `include_superseded`) is **retired** and replaced in place, so
+     every other case keeps its index.
+   - The new case 54 is a closed-chain raw pin on **28469**, with a new query. The chain is 21851/28469 →
+     31854, a manual verified note with no source URI, so it can never be doc-refreshed. Its bound is the
+     E2-day rank + 2, capped at 5: rank 1 at the gate, so **≤ 3**.
+   - Case 53 (the forbid-101 guard) is unchanged.
+   - Case 48 gets a comment-only KNOWN RED #2 annotation.
+   - Every other case is byte-identical. Still 61 cases, 59 positive, quantum 0.0085.
+2. **Echo rule** (`kbcore.eval_echo`, re-exported by `eval_criteria`; used by `eval_composition` too).
+   - A hit whose title, snippet or body contains the case's normalized query, as whole words, keeps its slot
+     but cannot satisfy an `expect_substr` case.
+   - It applies only when the query has ≥ 4 words and is not identifier-dominant, using `search_legs`' own
+     test. Id criteria are exempt.
+   - Every carrier in the top-K is recorded, including those ranked below the satisfier
+     (`eval_echo_skips` / `eval_echo_skipped`); the rank is still the first real satisfier.
+   - A miss whose substring only echo carriers hold reads `CONTENT-ABSENT … (only echo carriers hold it)`.
+     The content checks match substrings literally (LIKE metacharacters escaped).
+3. **Detector** (`eval_regression`, `eval_detector_io`, `eval_persistence`).
+   - Open `search_regression` rows from another epoch are closed as `epoch changed`, every one of them
+     (at most 20 a night), and their anchors are never inherited (`eval_regression_epoch_closed`, plus
+     `_count` past one). An other-epoch row newer than an open same-epoch row closes only once that row
+     resolves. New rows carry `golden_hash`.
+   - Floors are written to meta every night, with a warning when they sit at the code defaults.
+     `eval_regression_cause` names the trip, and the WARNING prints the anchor the resolve test reads.
+   - Drops are compared at the metrics' stored 4-decimal precision: a drop of exactly epsilon is no trip.
+   - **Persistence trip** `eval_case_persistent`. A case trips when it passed on at least one same-epoch,
+     fallback-free night and then failed on the 3 most recent such nights. Fallback nights are skipped,
+     not reset, and the night's last clean run counts. The trip alerts, opens the single row, and blocks
+     auto-resolve. It is reported by index and satisfier id.
+     - The history window (60 reports) counts eligible reports only. A streak longer than the window
+       stays armed: each case's newest listing in `eval_case_persistent` carries it, and a report that
+       merely omits a red case cannot drop it.
+     - A night whose persistence cannot be read is UNKNOWN (`eval_persistence_status='error'`): no
+       persistence trip and no auto-resolve that night; the floors and drops still gate.
+     - Tonight's night is the local, noon-rollover night (`digest_lines.night_of`) of `run_started_at`, a
+       UTC stamp taken when the run starts.
+   - The `eval_case_first_pass` notice fires when a long-red case turns green.
+   - The digest caps the case lines and the first-pass notices at 5 each, plus one `+N more` line, so the
+     other alerts survive its 20-line cap.
+4. **Telemetry.** E2 adds **no line to the indexed report body** (`kbcore.report_meta.body_scalars`,
+   final reviews FB-1 and F1): every key below lives in report meta only. Read it as the owner (`GET
+   /api/items/{id}`, SQL) or in the journald `consolidation done` line.
+   - Dicts and lists: `eval_case_passed`, `eval_case_top5`, `eval_case_satisfier`,
+     `eval_case_fused_rank`, `eval_case_n_fused`, `eval_case_above_satisfier`, `eval_echo_skips`,
+     `eval_case_fused_error`, `eval_case_persistent`, `eval_case_first_pass`.
+   - Scalars: the embed identity — `eval_embed_model`, `eval_embed_hosts_key`, `eval_embed_host` (the
+     serving hosts as runs, e.g. `A,B,A`), `eval_embed_fingerprint`, `eval_embed_fingerprint_host`,
+     `eval_embed_runtime` (server build + model digest), `eval_embed_query_prefix_sha`, `eval_embed_device`
+     — the floors (`eval_floor_hit_at_5`, `eval_floor_mrr`, `eval_floors_at_defaults`), `run_started_at`,
+     `eval_echo_skipped`, the epoch-close keys and the two error statuses.
+   - Why: a body line is indexed and one report lands every night, so its key-name words and values
+     become keyword candidates, and one rare lexeme is enough for the OR fallback to admit an item. An
+     index-only census found 9 golden cases sharing a lexeme with the identity and floor lines, 2 of them
+     with two; the other E2 scalars share none today, but would be exposed at the next golden edit.
+   - Reading the fingerprint: it is an exact-equality flag. A new value beside an unchanged
+     `eval_embed_runtime` is a model reload (the preferred host is not load-deterministic), a query-prefix
+     or device change (see the sha and device beside it) or a partial CPU offload, which nothing records.
+     An unchanged value does not prove bit-identical vectors.
+   - Sinks: every query-keyed dict stays out of log lines and stored job results
+     (`kbworker.eval_cases.loggable`). A non-owner reading a run report (`GET /api/items/{id}`,
+     `GET /api/timeline`) sees only its body scalars plus the `consolidation` flag (`kbcore.report_meta`);
+     the owner sees everything.
+     `GET /api/consolidate` shows a run's result to the owner only (`c73d0b9`, landed separately).
+5. **Epoch key** = the first 12 hex of sha256(golden bytes ␀ `kb_embed_model` ␀ `embed_hosts_key()`),
+   where `embed_hosts_key()` is the configured embed hosts in preference order, comma-joined and
+   credential-free (`kbcore.eval_epoch`). Falling back to another serving host does not change it, nor
+   does a credential, query or trailing-slash edit to a host URL. **Restart rule:** a change to
+   `KB_EMBED_MODEL` or to the configured host list opens a new epoch, and ANY edit to `KB_EMBED_MODEL`,
+   `KB_EMBED_URL`, `OLLAMA_URL` or the floors in `.env` needs a kb-worker restart (it runs on-demand
+   consolidations in-process with the settings it started with).
+
+**Known reds.**
+
+- **Case 7** is the canary, kept red since 2026-08-04. The best satisfier chunk sits at exact vector rank 691.
+- **Case 48** (satisfier 9832) is a **candidate-generation miss**.
+  - Its best chunk sits at exact vector rank 44, but the vector leg window holds 40 rows. 25 of the 43
+    closer chunks belong to items created after 2026-09-17.
+  - It has 0 AND-keyword matches, and none of its 12 satisfiers is among its 34 fused candidates.
+  - It was an honest miss on 69/69 E1 reports; its only passes were echo-satisfied (38552).
+  - Review #9's "window-edge sentinel, keep unchanged" verdict is superseded. The criteria stay
+    untouched. The fix is a candidate-generation change, which belongs to E3.
+
+**Case 54 retirement record.**
+- The raw-101 doc-refresh chain grew from 4 revisions to 7: 101 → 473 → 38195 → 39780 → 43713 → 50442 →
+  53424.
+- Each new revision cost 101 one rank: 3 → 4 at 40202, → 5 at 43847, → miss at 50532 (10-16). The README
+  head in `eval_satisfier_ids` swapped on exactly those reports, plus 53573.
+- Today 101 sits at fused 22, outside the 20-item rerank window. A 40-item window lifts it only to rank 4,
+  still above its bound of 3.
+- Superseded echo 38164 is re-admitted at fused 5 by `include_superseded`.
+
+**Case 14 trace; review #9 D6 = NO** (stays a sentinel under the persistence trip).
+- Satisfier 263 is vector #1 and fused #2. The reranker lifts 3856 (fused 18), 954 (11) and 40201 (14)
+  above it, so it reads rank 5 (the gate's top-5: 3856, 954, 40201, 257, 263); with rerank off it reads
+  rank 2.
+- The miss from 09-24 to 10-13 began when summary 40201 appeared (created 09-23). It ended when the 10-13
+  nightly refreshed 949 → 50177 and 37195 → 50153.
+- Backtest of the persistence trip over E1 in the **E2 frame** (honest echo-rule reads, E2 floors, the new
+  case 54 assumed passing): exactly this episode fires (night 09-25 → clear at 50226), nothing else, at
+  every history window from 5 reports to unlimited.
+
+**Floors** (`.env`, applied with the commit and before the first E2 run; kb-worker restarted).
+- **hit@5** = (n − known_reds − 1)/n = (61 − 2 − 1)/61 = 0.9508 → **0.950**. That leaves one failure of
+  slack beyond the two known reds. Single-case losses are the persistence trip's job.
+- **MRR** = the lower of two back-to-back gate replays minus 2 quanta (0.0169), rounded down to 0.005:
+  min(0.86497, 0.86497) − 0.01695 = 0.84802 → **0.845**.
+- The backtest of E1 in the same E2 frame gives 0 floor trips. KB ALERT reports drop from 60 to the 32 of the
+  case-14 episode.
+
+**E1 environment changes recorded late.**
+- **2026-10-11:** the reranker sidecar's host-RAM prompt cache was disabled with an `LLAMA_ARG_CACHE_RAM=0`
+  drop-in on the live unit, and the nightly moved 01:00 → 01:30 (`47c288e`).
+- **2026-10-25:** Ollama 0.31.1 → 0.40.11 on the KB host (`5686ac4`). Local embeddings sit at median
+  cosine 0.99973 against 0.31.1 and are now bit-deterministic. The rerank sidecar was pinned to a 0.31.1
+  runtime copy.
+- **New rule:** an embed or rerank runtime upgrade is a ranking-input change and gets a ledger line here.
+  `eval_embed_runtime`, `eval_embed_host` and `eval_embed_fingerprint` now record it.
+
+**Gate (2026-10-29 15:22 UTC, read-only replays, `tool=None`, fallback-free).** Two back-to-back replays of
+the E2 set on the live corpus, after 40402 → 56704, with the E2 code; rerank warmed (2 calls, ok).
+- Both replays: hit@5 59/61 = **0.9672**, MRR **0.8650** (0.86497), failing exactly **{7, 48}**. Ranks:
+  46 at 1, 9 at 2, 1 at 3, 1 at 5, and 4 without a rank (7, 48 and the two forbid-only cases).
+- Case 7: one echo carrier skipped (13061). Case 14: rank 5 on 263 (fused 2). Case 54: rank 1 on 28469
+  (fused 7) in both replays, so its bound is 3. No item holds case 54's query words in order.
+- Embed: served by the preferred host only (`192.168.1.100:11434`); runtime `ollama 0.32.5
+  qwen3-embedding:0.6b@ac6da0dfba84`, fingerprint `e7676e44450d`, device `auto`, prefix sha
+  `df4b2898bf22`.
+- The gated set keyed `d7abe903a1c7` (case 54's bound still the placeholder 5); with the bound written it
+  keys **`092b054e8e9e`**, the key night 1 records.
+
+**Night 1.** Pending: the 2026-10-30 01:30 PKT nightly. Expected: `eval_golden_hash` `092b054e8e9e`,
+`eval_epoch_reset` (first night, floors only), meta floors 0.95 / 0.845 with no
+`eval_floors_at_defaults`, row 35091 resolved `epoch changed` (the WARNING names `untracked`),
+`eval_regression` False, no KB ALERT, and no E2 line in the report body.
+
+**Deferred to E3.**
+- Per-item leg windows and capped chunks per item in the OR leg (case 48).
+- Rerank window 20/30/40.
+- Reranker trust handling. In 7 cases (11, 22, 31, 32, 35, 59, 60) a verified fused-#1 satisfier is
+  demoted to #2 behind an unverified extraction (5 cases) or a summary (2 cases): −0.059 MRR every night.
+  The reranker is still net +0.054 MRR against rerank-off.
+- Deterministic SQL tie-breakers. 53/61 fused orders differ between back-to-back calls.
+- The summaries GO rule. Decide its reading first: 3 cases qualify on today's replay under the narrow
+  reading, 6 under the literal one.
+- Multilingual cases.
+- The D7/D8 embedder pin.
+- `eval_satisfier_unsatisfied_cases`.
+- Whether `kb_embed_query_prefix` joins the epoch key (today a prefix edit is recorded, not keyed), and
+  recording a partial CPU offload (Ollama `/api/ps` `size_vram` against `size`).

@@ -34,3 +34,36 @@ def test_report_body_omits_nested_telemetry_but_meta_keeps_it(kb):
     assert "eval_case_ranks" not in body and "eval_top5_item_ids" not in body
     assert meta["eval_case_ranks"] == counts["eval_case_ranks"], "meta keeps the telemetry"
     assert meta["eval_rerank_tally"]["active"] == 51
+
+
+def test_e2_adds_no_body_line(kb):
+    """E2 final reviews FB-1 / F1: every scalar E2 introduced is search vocabulary no
+    earlier report carried (key-name words, model, hosts, runtime), and one report
+    lands every night — so all of them live in meta only (report_meta.body_scalars)."""
+    counts = {
+        "eval_mrr": 0.865,
+        "eval_regression": False,
+        "run_started_at": "2026-10-30T20:30:01+00:00",
+        "eval_echo_skipped": 1,
+        "eval_regression_epoch_closed": 35091,
+        "eval_regression_epoch_closed_count": 2,
+        "eval_persistence_status": "error",
+        "eval_replay_telemetry_status": "error",
+        "eval_embed_model": "probe-model:0.6b",
+        "eval_embed_hosts_key": "http://10.9.8.7:11434,http://127.0.0.1:11434",
+        "eval_embed_host": "http://10.9.8.7:11434",
+        "eval_embed_fingerprint": "0123456789ab",
+        "eval_embed_runtime": "ollama 0.40.11 probe-model:0.6b@790764642607",
+        "eval_embed_device": "auto",
+        "eval_floor_hit_at_5": 0.95,
+        "eval_floor_mrr": 0.845,
+        "eval_floors_at_defaults": True,
+    }
+    report_id = run_report._write_report(dict(counts))
+    with connect() as conn:
+        body, meta = conn.execute(
+            "SELECT body, meta FROM items WHERE id = %s", (report_id,)
+        ).fetchone()
+    assert body.splitlines()[2:] == ["- eval_mrr: 0.865", "- eval_regression: False"]
+    assert "probe-model" not in body and "10.9.8.7" not in body and "ollama" not in body
+    assert {k: meta[k] for k in counts} == counts, "meta keeps every one of them"

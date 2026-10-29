@@ -26,18 +26,49 @@ epoch tracking and are ineligible too — the E1 reset is deliberate ("reset
 the WoW baseline in the same commit"), so the first night of an epoch has
 no prior and the anchored floors alone gate it. Without a hash the read is
 byte-identical to before (the unfiltered callers and their tests).
+
+PER-CASE HISTORY (E2, review #10): :func:`case_history` is the persistence
+trip's read (``kbworker.eval_persistence``) — the same epoch and fallback rules,
+keeping only reports that carry ``eval_case_passed`` (E2 night 1 onward; an
+older report is simply not history). The eligibility filters run in the SQL
+WHERE (fix F1), so its LIMIT counts ELIGIBLE reports — weekly reports,
+deep-search saves, fallback runs and other epochs no longer dilute the window
+until a still-red case's last pass falls out of it.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 from kbcore.consolidation import EVAL_BASELINE_LOOKBACK
 from kbcore.db import connect
 
 logger = logging.getLogger("kbcore.eval_baseline")
+CASE_HISTORY_LOOKBACK = 60  # ELIGIBLE reports read for the E2 persistence trip
+# The meta keys case_history projects (in this order) — the per-case dicts are
+# the bulky part of a report's meta, so only what the trip reads leaves the DB
+# (``eval_case_persistent``: the trip's own verdict, read back for sticky arming).
+_HISTORY_KEYS = (
+    "eval_status",
+    "eval_golden_hash",
+    "eval_rerank_tally",
+    "run_secs",
+    "eval_case_passed",
+    "eval_case_satisfier",
+    "eval_case_persistent",
+)
+# case_history's eligibility in SQL: completed, tonight's epoch, verdict-bearing, and
+# fallback-free by rerank_fallbacks' rule (a fallback is a JSON integer > 0; anything
+# else — absent, 0, a float, a string, a bool — reads as no fallback).
+_ELIGIBLE = (
+    "meta ->> 'eval_status' = 'ok' AND meta ->> 'eval_golden_hash' = %s "
+    "AND jsonb_typeof(meta -> 'eval_case_passed') = 'object' "
+    "AND NOT COALESCE(jsonb_typeof(meta #> '{eval_rerank_tally,fallback}') = 'number' "
+    "AND (meta #>> '{eval_rerank_tally,fallback}') ~ '^[1-9][0-9]*$', false)"
+)
 
 
 def rerank_fallbacks(meta: Any) -> int:
@@ -135,3 +166,41 @@ def read_baseline(
             continue
         return prior, skips
     return None, skips
+
+
+def case_history(
+    golden_hash: str | None, lookback: int | None = None
+) -> list[tuple[datetime, dict[str, Any]]]:
+    """Same-epoch, FALLBACK-FREE completed evals carrying per-case verdicts, OLDEST first.
+
+    The newest ``lookback`` (default :data:`CASE_HISTORY_LOOKBACK`, read at
+    call time) kb-system reports that are ELIGIBLE — ``eval_status`` 'ok',
+    ``eval_golden_hash`` equal to ``golden_hash``, an ``eval_case_passed``
+    dict, a tally with no fallback (:func:`rerank_fallbacks`' rule). The
+    filters run in SQL (:data:`_ELIGIBLE`), so the LIMIT counts eligible
+    reports only, and again in Python (defence in depth). Returns
+    ``(created_at, meta)`` pairs whose ``meta`` holds only :data:`_HISTORY_KEYS`.
+    No hash, no history (an untracked run is not an epoch). Read-only, one query.
+    """
+    if golden_hash is None:
+        return []
+    limit = CASE_HISTORY_LOOKBACK if lookback is None else lookback
+    projection = "SELECT created_at" + ", meta -> %s" * len(_HISTORY_KEYS)  # keys are params
+    with connect() as conn:
+        rows = conn.execute(
+            projection
+            + " FROM items WHERE project = 'kb-system' AND type = 'report' AND "
+            + _ELIGIBLE
+            + " ORDER BY created_at DESC, id DESC LIMIT %s",
+            (*_HISTORY_KEYS, golden_hash, limit),
+        ).fetchall()
+    history: list[tuple[datetime, dict[str, Any]]] = []
+    for created_at, *values in rows:
+        meta = dict(zip(_HISTORY_KEYS, values, strict=True))
+        if meta["eval_status"] != "ok" or meta["eval_golden_hash"] != golden_hash:
+            continue
+        if rerank_fallbacks(meta) or not isinstance(meta["eval_case_passed"], dict):
+            continue
+        history.append((created_at, meta))
+    history.reverse()
+    return history

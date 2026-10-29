@@ -27,11 +27,20 @@ from __future__ import annotations
 
 import pytest
 
-from kbcore import db, graph, rerank, search_expand
+from kbcore import (
+    db,
+    eval_criteria,
+    eval_harness,
+    graph,
+    rerank,
+    search_expand,
+    search_trace,
+    supersede,
+)
 from kbcore.config import Settings, settings
 from kbcore.ingest import ingest
 from kbcore.search import search
-from kbworker import eval_sentinel
+from kbworker import eval_cases, eval_sentinel, run_report
 
 pytestmark = pytest.mark.usefixtures("kb")
 
@@ -567,3 +576,230 @@ def test_documents_fall_back_to_body_for_chunkless_candidates():
         1: "t1\nthe matching chunk",
         2: "t2\nb2",
     }
+
+
+# --- 4. E2: the pre-rerank trace + per-case telemetry (review #10) -----------------
+
+
+@pytest.fixture()
+def _reversing_rerank(monkeypatch):
+    """A stub sidecar that scores the window in REVERSE, plus a spy on the fused
+    candidates exactly as ``rerank_fused`` receives them (sorted, its own view)."""
+    monkeypatch.setattr(settings, "kb_rerank_url", "http://127.0.0.1:9")
+    seen: dict = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            n = seen["n"]
+            return {"results": [{"index": i, "relevance_score": (i + 1) / n} for i in range(n)]}
+
+    def post(url, *, json=None, timeout=None):
+        seen["n"] = len(json["documents"])
+        return _Resp()
+
+    real = rerank.rerank_fused
+
+    def spy(conn, query, fused, top_n, evidence=None):
+        seen["pre"] = [t[0] for t in sorted(fused, key=lambda t: -t[1])]
+        return real(conn, query, fused, top_n, evidence=evidence)
+
+    monkeypatch.setattr(rerank.httpx, "post", post)
+    monkeypatch.setattr(rerank, "rerank_fused", spy)
+    return seen
+
+
+def _traced(query: str) -> tuple[list, list[int] | None]:
+    search_trace.begin()
+    try:
+        hits = search(query, tool=None)
+    finally:
+        captured = search_trace.end()
+    return hits, captured
+
+
+def test_search_trace_capture_equals_the_pre_rerank_order(kb, _reversing_rerank):
+    _seed_mixed_trust_corpus()
+    hits, captured = _traced("widget calibration")
+    assert captured == _reversing_rerank["pre"], "the reranker's own input order"
+    assert len(captured) == 4 and rerank.last_outcome() == "active"
+    assert [h.item_id for h in hits] == captured[::-1], "the stub reversed the window"
+
+
+def test_with_rerank_off_the_capture_is_the_final_order(kb):
+    _seed_mixed_trust_corpus()
+    hits, captured = _traced("widget calibration")
+    assert captured == [h.item_id for h in hits], "distinct fused scores: _to_hits keeps the order"
+
+
+def test_search_results_are_identical_with_and_without_an_active_trace(kb, _reversing_rerank):
+    _seed_mixed_trust_corpus()
+    plain = [(h.item_id, h.score, h.snippet) for h in search("widget calibration", tool=None)]
+    hits, captured = _traced("widget calibration")
+    assert [(h.item_id, h.score, h.snippet) for h in hits] == plain
+    assert captured is not None
+    # Inert outside a trace: nothing is recorded, nothing raises — even on junk rows.
+    search_trace.capture([(1, 0.5, "x")])
+    assert search_trace.end() is None
+    search_trace.begin()
+    search_trace.capture([("not-an-id",)])
+    assert search_trace.end() is None, "a malformed row records no order, never raises"
+
+
+def test_above_satisfier_and_fused_telemetry_shape(kb, monkeypatch, _reversing_rerank):
+    _seed_mixed_trust_corpus()
+    q = "widget calibration"
+    final = search(q, tool=None)
+    pre = _reversing_rerank["pre"]
+    target = final[2]  # sits at final rank 3 — two hits above it
+    golden = [
+        {"q": q, "expect_item_id": target.item_id},
+        {"q": q, "expect_substr": ["zz-no-such-token"]},  # unsatisfied: all of top-K is above
+    ]
+    monkeypatch.setattr(eval_sentinel.eval_harness, "load_golden", lambda golden_path=None: golden)
+    monkeypatch.setattr(eval_sentinel.eval_epoch, "golden_hash", lambda path=None: "a1a1a1a1a1a1")
+    counts: dict = {}
+    eval_sentinel.run_sentinel(counts)
+    assert counts["eval_case_passed"] == {q: True, f"{q} #2": False}
+    assert counts["eval_case_top5"][q] == [h.item_id for h in final]
+    assert counts["eval_case_satisfier"] == {q: target.item_id, f"{q} #2": None}
+    assert counts["eval_case_above_satisfier"][q] == [
+        [h.item_id, h.type, h.trust] for h in final[:2]
+    ], "[id, type, trust] per hit ranked above the satisfier"
+    assert counts["eval_case_above_satisfier"][f"{q} #2"] == [
+        [h.item_id, h.type, h.trust] for h in final
+    ]
+    assert counts["eval_case_fused_rank"] == {q: pre.index(target.item_id) + 1, f"{q} #2": None}
+    assert counts["eval_case_ranks"][q] == 3 != counts["eval_case_fused_rank"][q], (
+        "the fused position is the PRE-rerank one"
+    )
+    assert counts["eval_case_n_fused"] == {q: 4, f"{q} #2": 4}
+    assert counts["eval_echo_skips"] == {} and counts["eval_echo_skipped"] == 0
+    report_id = run_report._write_report(dict(counts))
+    with db.connect() as conn:
+        body = conn.execute("SELECT body FROM items WHERE id = %s", (report_id,)).fetchone()[0]
+    assert q not in body and "eval_case_" not in body, "per-case dicts are META only"
+
+
+def test_a_search_the_trace_never_sees_leaves_the_fused_keys_unset(kb, monkeypatch):
+    """A stubbed search never reaches capture: no fake zeros, the case simply has no key."""
+    monkeypatch.setattr(eval_harness, "search", lambda *a, **k: [])
+    (r,), _h, _m = eval_harness.evaluate(golden=[{"q": "x y", "expect_substr": ["z"]}])
+    assert (r.n_fused, r.fused_rank, r.top_ids, r.above) == (None, None, [], [])
+    keys = eval_cases.replay_keys([r])
+    assert "x y" not in keys["eval_case_n_fused"] and "x y" not in keys["eval_case_fused_rank"]
+    assert keys["eval_case_passed"] == {"x y": False} and keys["eval_case_satisfier"] == {
+        "x y": None
+    }
+
+
+# --- 5. review #10 fix round: the verdict, the capture's sort, fused-rank edges ------
+
+
+def _note(n: int, project: str = "hw-lab") -> int:
+    return ingest(
+        project,
+        "note",
+        f"Widget calibration observation {n}",
+        f"Observed widget calibration drift on bench {n}; median of three reads.",
+        kind="chat",
+        uri=f"probe:{n}",
+        trust="verified",
+    )
+
+
+def test_eval_case_passed_is_the_full_verdict(kb):
+    """TA-2: a matched positive criterion with a failing forbid is a FAILED case."""
+    item = _note(1)
+    q = "widget calibration"
+    golden = [{"q": q, "expect_substr": ["median of three"], "forbid_item_id": item}]
+    results, _h, _m = eval_harness.evaluate(golden=golden)
+    (r,) = results
+    assert r.rank == 1 and r.passed is False
+    keys = eval_cases.replay_keys(results)
+    assert keys["eval_case_passed"] == {q: False}
+    assert keys["eval_case_satisfier"] == {q: item}, "the matched id, though the case failed"
+
+
+def test_the_capture_sorts_by_fused_score_not_list_order():
+    """TA-4: _apply_bonuses rescores without re-sorting; capture is the reranker's view."""
+    search_trace.begin()
+    search_trace.capture([(1, 0.1, ""), (2, 0.5, ""), (3, 0.3, "")])
+    assert search_trace.end() == [2, 3, 1]
+
+
+def test_the_capture_matches_the_rerank_input_under_a_reordering_bonus(
+    kb, monkeypatch, _reversing_rerank
+):
+    _seed_mixed_trust_corpus()  # blinded: the keyword leg alone ranks them
+    boosted = _blind(_note(9, project="hw-lab"))  # ranks below rank 1; the 1.25x boost lifts it
+    handed: dict = {}
+    real = search_trace.capture
+
+    def spy(fused):
+        handed["raw"] = [t[0] for t in fused]
+        real(fused)
+
+    monkeypatch.setattr(search_trace, "capture", spy)
+    search_trace.begin()
+    try:
+        search("widget calibration", tool=None, boost_project="hw-lab")
+    finally:
+        captured = search_trace.end()
+    assert boosted in captured and handed["raw"] != captured, "fixture: the bonus re-scored"
+    assert captured == _reversing_rerank["pre"], "the capture is the reranker's own order"
+
+
+def test_n_fused_is_the_fused_length_not_the_top_k(kb):
+    """TA-8: seven candidates fuse; only K reach the top-K."""
+    for n in range(7):
+        _note(n)
+    golden = [{"q": "widget calibration", "expect_substr": ["bench 6"]}]
+    (r,), _h, _m = eval_harness.evaluate(golden=golden)
+    assert len(r.top_ids) == eval_harness.K and r.n_fused == 7
+    keys = eval_cases.replay_keys([r])
+    assert keys["eval_case_n_fused"]["widget calibration"] > len(
+        keys["eval_case_top5"]["widget calibration"]
+    )
+
+
+def test_the_fused_satisfier_is_the_chain_head_or_the_raw_id(kb):
+    """TA-12: expect_item_id resolves to the CHAIN HEAD, expect_item_id_raw never does."""
+    old = _note(1)
+    new = supersede.supersede(
+        old, new_body="Widget calibration revised: median of five.", reason="r"
+    )
+    assert eval_criteria.fused_rank({"q": "x", "expect_item_id": old}, [new, old]) == 1
+    assert eval_criteria.fused_rank({"q": "x", "expect_item_id_raw": old}, [new, old]) == 2
+
+
+def test_the_fused_substr_satisfier_reads_the_title_too(kb):
+    item = ingest("hw-lab", "note", "Zephyr torque stripe", "nothing else here", kind="chat")
+    assert eval_criteria.fused_rank({"q": "z", "expect_substr": ["torque stripe"]}, [item]) == 1
+
+
+def test_a_raising_fused_read_omits_the_fused_keys_and_names_the_case(kb, monkeypatch):
+    """F13: an error is never written as a null that reads 'no satisfier fused'."""
+    _seed_mixed_trust_corpus()
+    real = eval_criteria.fused_rank
+
+    def flaky(case, fused_ids):
+        if case.get("expect_substr") == ["zz-broken"]:
+            raise RuntimeError("fused read broke")
+        return real(case, fused_ids)
+
+    monkeypatch.setattr(eval_criteria, "fused_rank", flaky)
+    q = "widget calibration"
+    golden = [{"q": q, "expect_substr": ["zz-broken"]}, {"q": q, "expect_substr": ["median"]}]
+    results, _h, _m = eval_harness.evaluate(golden=golden)
+    assert [r.fused_error for r in results] == [True, False]
+    assert (results[0].n_fused, results[0].fused_rank) == (None, None)
+    keys = eval_cases.replay_keys(results)
+    assert keys["eval_case_fused_error"] == [q], "the case key, by name"
+    assert q not in keys["eval_case_fused_rank"] and q not in keys["eval_case_n_fused"]
+    assert (
+        keys["eval_case_fused_rank"][f"{q} #2"] == 1 and keys["eval_case_n_fused"][f"{q} #2"] == 4
+    )
+    assert "eval_case_fused_error" not in eval_cases.replay_keys(results[1:]), "only when one broke"

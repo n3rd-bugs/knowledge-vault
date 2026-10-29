@@ -245,20 +245,13 @@ def _promote_runs_line(counts: Mapping[str, Any]) -> str | None:
 
 
 def _eval_red_line(counts: Mapping[str, Any]) -> str:
-    """The red-eval digest line: observed hit@5 against the anchored floor.
+    """The red-eval digest line — since E2 rendered by
+    :func:`kbworker.eval_epoch_lines.eval_red_line` (hit@5 AND MRR against the
+    floors the detector compared tonight, plus the trip cause). Lazy import:
+    that module imports this one."""
+    from kbworker.eval_epoch_lines import eval_red_line
 
-    The floor is read lazily (the digest's convention — a broken import costs
-    ONE line, never the digest) at RENDER time, so the line always names the
-    floor the sentinel actually compared against tonight.
-    """
-    try:
-        from kbcore.config import settings
-
-        floor: str = f"{settings.kb_eval_min_hit5:g}"
-    except Exception:  # noqa: BLE001 — a digest line may never cost the digest
-        floor = "?"
-    hit = counts.get("eval_hit_at_5")
-    return f"EVAL RED: hit@5 {hit if hit is not None else '?'} (floor {floor})"
+    return eval_red_line(counts)
 
 
 def _trust_watch_line(counts: Mapping[str, Any]) -> str:

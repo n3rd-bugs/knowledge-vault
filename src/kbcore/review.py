@@ -78,14 +78,20 @@ def open_review_by_reason(reason: str) -> tuple[int, dict[str, Any]] | None:
     return int(row[0]), (row[1] if isinstance(row[1], dict) else {})
 
 
-def resolve_review(queue_id: int) -> None:
+def resolve_review(queue_id: int, note: str | None = None) -> None:
     """Mark a review row resolved (status flip, Invariant 5 — no item mutation).
 
     A generic close for item-less rows (the search-quality sentinel's regression
     flag) that promote/reject/supersede — all of which require an item — cannot.
+    ``note`` merges ``{resolution, resolved_at}`` into the detail in the SAME UPDATE.
     """
-    with transaction() as conn:
-        conn.execute("UPDATE review_queue SET resolved = true WHERE id = %s", (queue_id,))
+    stamp = {"resolution": note, "resolved_at": datetime.now(UTC).isoformat()} if note else None
+    with transaction() as conn:  # no note: NULL merge -> COALESCE keeps the detail byte-identical
+        conn.execute(
+            "UPDATE review_queue SET resolved = true, "
+            "detail = COALESCE(detail || %s::jsonb, detail) WHERE id = %s",
+            (Jsonb(stamp) if stamp else None, queue_id),
+        )
 
 
 def _visibility_gate() -> tuple[str, list]:

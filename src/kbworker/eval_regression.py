@@ -28,6 +28,24 @@ the first, as ever. A same-epoch night that fell back is walked over as
 ``skipped_fallback`` (never as an epoch skip: ``read_baseline`` applies the
 epoch filter first), so the night after it has no clean prior either — floors
 only — but it is NOT the epoch's first night and must not re-print the reset.
+
+E2 (review #9 KB 40402, landed at review #10): FIRST on every night, every open
+row whose detail has no / another ``golden_hash`` is resolved 'epoch changed',
+oldest first up to tonight's own open row (kbworker.eval_detector_io; a status
+flip, Invariant 5 — row 35091's 0.984 anchor was an echo night's; a WARNING
+names both hashes), so neither the anchor nor the dedup inherits it;
+new rows carry ``golden_hash``, ``cause`` and any ``persistent_cases``. The
+floors land in meta every run (they live only in the unbacked .env; floors AT
+the code defaults pass every red night, so that is a WARNING +
+``eval_floors_at_defaults``). Every trip names its ``cause``, and the WARNING
+prints the anchor the resolve test actually reads — the STORED one when a row
+is open. The PERSISTENCE trip (kbworker.eval_persistence) trips a night by
+itself and so blocks the auto-resolve until the case passes; when tonight's
+persistence is UNKNOWN (its read or fold raised) nothing trips on it, the
+floors and drops still gate, and no row auto-resolves that night
+(``eval_persistence_status='error'``) — a night that cannot see the case cannot
+prove it recovered. A drop is compared at the metrics' stored 4-decimal
+precision, so a drop of exactly epsilon (or a night exactly at a floor) is no trip.
 """
 
 from __future__ import annotations
@@ -38,12 +56,28 @@ from typing import Any
 
 from kbcore import eval_baseline
 from kbcore import review as review_mod
-from kbcore.config import settings
+from kbcore.config import Settings, settings
+
+# THE ESTABLISHED SEAM (mechanical split, review #10 fix round): the detector's
+# STATE-TOUCHING inputs — the epoch-changed close over the review rows and the
+# persistence history read — moved to kbworker.eval_detector_io at this file's
+# ratchet; every name keeps resolving here (``eval_regression.REVIEW_REASON``).
+from kbworker.eval_detector_io import (  # noqa: F401
+    EPOCH_CHANGED,
+    EPOCH_CLOSE_MAX,
+    REVIEW_REASON,
+    _close_other_epoch_rows,
+    _persistence,
+)
 
 logger = logging.getLogger("kbworker.eval_sentinel")
 
 REGRESSION_EPSILON = 0.05  # absolute hit@5 / MRR drop vs the prior run that trips it
-REVIEW_REASON = "search_regression"
+# The Settings model's CODE defaults: floors equal to these mean the .env lost them.
+DEFAULT_FLOORS = (
+    Settings.model_fields["kb_eval_min_hit5"].default,
+    Settings.model_fields["kb_eval_min_mrr"].default,
+)
 
 
 def _tonights_fallbacks(counts: Mapping[str, Any]) -> int:
@@ -55,12 +89,51 @@ def _tonights_fallbacks(counts: Mapping[str, Any]) -> int:
     return eval_baseline.rerank_fallbacks(counts)
 
 
+def _record_floors(counts: dict[str, Any]) -> tuple[float, float]:
+    """Tonight's anchored floors, recorded in meta EVERY run (module docstring)."""
+    floor_h, floor_m = settings.kb_eval_min_hit5, settings.kb_eval_min_mrr
+    counts["eval_floor_hit_at_5"] = floor_h
+    counts["eval_floor_mrr"] = floor_m
+    if (floor_h, floor_m) == DEFAULT_FLOORS:
+        counts["eval_floors_at_defaults"] = True
+        logger.warning(
+            "eval floors %g/%g are the CODE defaults: KB_EVAL_MIN_HIT5 / KB_EVAL_MIN_MRR are "
+            "missing from .env — the anchored floors are not being applied",
+            floor_h,
+            floor_m,
+        )
+    return floor_h, floor_m
+
+
+def _dropped(prior: float, tonight: float) -> bool:
+    """A drop beyond epsilon, compared at the stored 4-decimal precision — so a
+    decimal drop of exactly epsilon is no trip, whatever the float subtraction says."""
+    return round(prior - tonight, 4) > REGRESSION_EPSILON
+
+
+def _trip_cause(
+    hit_at_5: float,
+    mrr: float,
+    floors: tuple[float, float],
+    prior: Mapping[str, Any] | None,
+    persistent: list[dict[str, Any]],
+) -> list[str]:
+    """The trips that fired tonight, sorted (``eval_regression_cause``); [] = none."""
+    fired = {
+        "floor_hit_at_5": hit_at_5 < floors[0],
+        "floor_mrr": mrr < floors[1],
+        "drop_hit_at_5": prior is not None and _dropped(prior["hit_at_5"], hit_at_5),
+        "drop_mrr": prior is not None and _dropped(prior["mrr"], mrr),
+        "persistent": bool(persistent),
+    }
+    return sorted(name for name, hit in fired.items() if hit)
+
+
 def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> None:
     golden_hash = counts.get("eval_golden_hash")
+    open_row = _close_other_epoch_rows(counts, golden_hash)  # E2: FIRST, every night
+    floor_h, floor_m = _record_floors(counts)
     prior, skips = eval_baseline.read_baseline(golden_hash)
-    open_row = review_mod.open_review_by_reason(REVIEW_REASON)
-    floor_h = settings.kb_eval_min_hit5
-    floor_m = settings.kb_eval_min_mrr
     fallbacks = _tonights_fallbacks(counts)
     if prior is None and skips["skipped_epoch"] > 0 and skips["skipped_fallback"] == 0:
         # First night of a new eval epoch (module docstring): every prior eval was
@@ -82,15 +155,17 @@ def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> N
             floor_m,
         )
 
-    # Two independent trips: (1) a drop beyond epsilon vs the previous run, and
-    # (2) an ANCHORED ABSOLUTE floor. The floor catches a gradual sub-epsilon drift
-    # the previous-run comparison can never see (0.90 → 0.0 at 0.05/night is silent
-    # otherwise), and it fixes the downward-ratcheting auto-resolve baseline (finding).
-    below_floor = hit_at_5 < floor_h or mrr < floor_m
-    dropped = prior is not None and (
-        prior["hit_at_5"] - hit_at_5 > REGRESSION_EPSILON or prior["mrr"] - mrr > REGRESSION_EPSILON
-    )
-    if (below_floor or dropped) and fallbacks:
+    # Independent trips: (1) a drop beyond epsilon vs the previous run, (2) an
+    # ANCHORED ABSOLUTE floor, and (3) since E2 a PERSISTENT case. The floor catches a
+    # gradual sub-epsilon drift the previous-run comparison can never see (0.90 → 0.0
+    # at 0.05/night is silent otherwise), and it fixes the downward-ratcheting
+    # auto-resolve baseline (finding). Persistence is never read on a fallback night.
+    # ONE comparison per trip (_trip_cause); the measurement's flags read the cause.
+    persistent = [] if fallbacks else _persistence(counts, golden_hash)
+    cause = _trip_cause(hit_at_5, mrr, (floor_h, floor_m), prior, persistent or [])
+    below_floor = "floor_hit_at_5" in cause or "floor_mrr" in cause
+    dropped = "drop_hit_at_5" in cause or "drop_mrr" in cause
+    if cause and fallbacks:
         # A trip on a fallback night is a MEASUREMENT (module docstring): say so,
         # record it, and leave the queue alone — the next fallback-free night
         # re-measures against the same clean baseline; the floor still backstops.
@@ -99,70 +174,82 @@ def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> N
             "hit_at_5": round(hit_at_5, 4),
             "mrr": round(mrr, 4),
             "below_floor": below_floor,
-            "dropped": bool(dropped),
+            "dropped": dropped,
+            "cause": cause,
         }
         logger.warning(
-            "SEARCH-QUALITY measurement (rerank fallback %d): hit@5 %.3f MRR %.3f tripped "
-            "(prior %s, floor %.2f/%.2f, epsilon %.2f) on a replay measured partly on the "
+            "SEARCH-QUALITY measurement (rerank fallback %d): hit@5 %.3f MRR %.3f tripped %s "
+            "(prior %s, floor %g/%g, epsilon %.2f) on a replay measured partly on the "
             "fused order — not recorded as a corpus regression",
             fallbacks,
             hit_at_5,
             mrr,
+            "+".join(cause),
             f"{prior['hit_at_5']:.3f}/{prior['mrr']:.3f}" if prior else "none",
             floor_h,
             floor_m,
             REGRESSION_EPSILON,
         )
         return
-    if below_floor or dropped:
+    if cause:
         counts["eval_regression"] = True
-        # Recovery ANCHOR = the pre-drift baseline we must climb back to. Never let
-        # it ratchet DOWN: take the max of the prior run, the floor, and any anchor
-        # already on the open row — so a partial rebound cannot self-close a still
-        # degraded state (the flap the finding describes).
-        base_h = max(prior["hit_at_5"] if prior else 0.0, floor_h)
-        base_m = max(prior["mrr"] if prior else 0.0, floor_m)
+        counts["eval_regression_cause"] = cause
+        # Recovery ANCHOR = the pre-drift baseline we must climb back to: the max of
+        # the prior run and the floor, minted ONCE with the row and never rewritten
+        # (dedup) — so a partial rebound cannot self-close a still degraded state.
+        # With a row open the auto-resolve below reads ITS stored anchor, so that is
+        # the anchor the WARNING prints (pre-E2 it printed a recomputed max no
+        # resolve ever read).
         if open_row is not None:
-            _qid, det = open_row
-            base_h = max(base_h, float(det.get("baseline_hit_at_5", 0.0)))
-            base_m = max(base_m, float(det.get("baseline_mrr", 0.0)))
+            anchor_h = float(open_row[1].get("baseline_hit_at_5", 0.0))
+            anchor_m = float(open_row[1].get("baseline_mrr", 0.0))
+        else:
+            anchor_h = max(prior["hit_at_5"] if prior else 0.0, floor_h)
+            anchor_m = max(prior["mrr"] if prior else 0.0, floor_m)
         logger.warning(
-            "SEARCH-QUALITY REGRESSION: hit@5 %.3f MRR %.3f (prior %s, floor %.2f/%.2f, "
-            "recovery anchor %.3f/%.3f, epsilon %.2f)",
+            "SEARCH-QUALITY REGRESSION: %s — hit@5 %.3f MRR %.3f (prior %s, floor %g/%g, "
+            "recovery anchor %.3f/%.3f %s, epsilon %.2f)",
+            "+".join(cause),
             hit_at_5,
             mrr,
             f"{prior['hit_at_5']:.3f}/{prior['mrr']:.3f}" if prior else "none",
             floor_h,
             floor_m,
-            base_h,
-            base_m,
+            anchor_h,
+            anchor_m,
+            f"stored on open row {open_row[0]}" if open_row is not None else "for a new row",
             REGRESSION_EPSILON,
         )
         if open_row is None:  # dedup: exactly one open flag at a time
-            review_mod.queue_review(
-                None,
-                REVIEW_REASON,
-                {
-                    "baseline_hit_at_5": round(base_h, 4),
-                    "baseline_mrr": round(base_m, 4),
-                    "observed_hit_at_5": round(hit_at_5, 4),
-                    "observed_mrr": round(mrr, 4),
-                    "floor_hit_at_5": floor_h,
-                    "floor_mrr": floor_m,
-                    "epsilon": REGRESSION_EPSILON,
-                },
-            )
+            row: dict[str, Any] = {
+                "baseline_hit_at_5": round(anchor_h, 4),
+                "baseline_mrr": round(anchor_m, 4),
+                "observed_hit_at_5": round(hit_at_5, 4),
+                "observed_mrr": round(mrr, 4),
+                "floor_hit_at_5": floor_h,
+                "floor_mrr": floor_m,
+                "epsilon": REGRESSION_EPSILON,
+                "golden_hash": golden_hash,
+                "cause": cause,
+            }
+            if persistent:
+                row["persistent_cases"] = persistent
+            review_mod.queue_review(None, REVIEW_REASON, row)
         return
     # No regression: self-heal a stale flag only on FULL recovery to the SAME
     # anchor (>= baseline, not baseline − epsilon) AND above the floor, so a partial
     # rebound never auto-retracts a still-degraded state and drags the baseline down.
     # Never on a fallback night: a stalled replay's number is not evidence either way.
-    if open_row is not None and fallbacks:
+    # Nor when tonight's persistence is UNKNOWN: a night that cannot see the cases cannot
+    # prove the persistent one recovered (fix F2 — a read error used to self-heal the row).
+    if open_row is not None and (fallbacks or persistent is None):
         logger.info(
-            "search-quality: open regression row %d left as is — tonight's replay fell back "
-            "on %d case(s), so its numbers cannot prove recovery",
+            "search-quality: open regression row %d left as is — %s, so its numbers cannot "
+            "prove recovery",
             open_row[0],
-            fallbacks,
+            f"tonight's replay fell back on {fallbacks} case(s)"
+            if fallbacks
+            else "tonight's persistence is unknown",
         )
         return
     if open_row is not None:

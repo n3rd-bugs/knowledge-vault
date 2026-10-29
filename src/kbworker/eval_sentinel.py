@@ -138,6 +138,7 @@ def _run(counts: dict[str, Any]) -> None:
     counts["eval_mrr"] = round(mrr, 4)
     counts["eval_queries"] = len(golden)
     counts["eval_golden_hash"] = eval_epoch.golden_hash()  # E1: the eval EPOCH this n belongs to
+    counts.update(eval_epoch.key_inputs())  # E2: the key's model + hosts (meta-only scalars)
     counts["eval_regression"] = False
     # Chain-resolution telemetry (review #5 ret-eval-1): how many id pins the
     # harness followed to a live chain head tonight — doc-refresh churn becomes
@@ -145,8 +146,9 @@ def _run(counts: dict[str, Any]) -> None:
     # returning bare tuples (the sentinel test rig) still counts 0.
     counts["eval_chain_resolved"] = sum(1 for r in _results if getattr(r, "chain_resolved", False))
     # Per-case ranks + rerank outcomes keyed by query (review #9a EV-4): E1's
-    # per-case diff. ADDED keys, shape-tolerant to the stubbed rig above.
-    counts.update(eval_cases.per_case_keys(_results))
+    # per-case diff; E2 verdicts/top-5/fused/echo + embed identity. ADDED keys,
+    # shape-tolerant to the stubbed rig above, GUARDED: the detector always runs.
+    eval_cases.replay_telemetry(counts, _results)
     # Review #5 ops-4 / review #6 instrument fix / review #8 H7a: which rerank
     # path scored tonight's replay, PER CASE — kbcore.rerank accumulates a
     # thread-local {active, fallback} tally across the harness's searches,

@@ -181,8 +181,11 @@ def _matching_hits(case: Mapping[str, Any], hits: list[Any]) -> list[Any]:
     ``expect_item_id`` owns the case (chain-resolved exactly like the harness,
     so a doc-refresh head still counts); ``expect_item_id_raw`` owns it too but
     UNRESOLVED (the harness's transaction-time pin); otherwise ANY-of
-    ``expect_substr`` over title + snippet + full body, case-insensitive. Order
-    preserved, so ``[0]`` is the rank-first satisfier.
+    ``expect_substr`` over title + snippet + full body, case-insensitive, with
+    the harness's E2 ECHO RULE (``eval_criteria.is_echo``): a hit quoting the
+    case's query verbatim never satisfies, so ``eval_satisfier_ids`` can never
+    list an echo carrier. Order preserved, so ``[0]`` is the rank-first
+    satisfier.
     """
     if "expect_item_id" in case:
         want = eval_harness._chain_head(int(case["expect_item_id"]))
@@ -195,8 +198,10 @@ def _matching_hits(case: Mapping[str, Any], hits: list[Any]) -> list[Any]:
         return []
     out: list[Any] = []
     for hit in hits:
-        haystack = f"{hit.title}\n{hit.snippet}\n{_body(hit.item_id)}".lower()
-        if any(sub in haystack for sub in expected):
+        haystack = f"{hit.title}\n{hit.snippet}\n{_body(hit.item_id)}"
+        if eval_criteria.is_echo(case.get("q"), haystack):
+            continue  # an echo carrier keeps its slot but never satisfies
+        if any(sub in haystack.lower() for sub in expected):
             out.append(hit)
     return out
 

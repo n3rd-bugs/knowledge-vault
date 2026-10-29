@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from kbcore import rerank as rerank_mod
-from kbcore import scope, search_expand, search_rank
+from kbcore import scope, search_expand, search_rank, search_trace
 from kbcore.config import settings
 from kbcore.db import connect, transaction
 from kbcore.ingest import _as_utc
@@ -185,6 +185,7 @@ def search(
         fused = _apply_bonuses(
             conn, fused, boost_project, id_tokens, expansion_origin, rare_only, rare_tokens
         )
+        search_trace.capture(fused)  # E2 eval telemetry: PRE-RERANK order (inert untraced)
         # Optional cross-encoder rerank of the top window (kb_rerank_url set):
         # reorders only, fail-open, scores remapped so the order survives the
         # _to_hits re-sort (see kbcore.rerank). Reuses the legs' connection.

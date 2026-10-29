@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from kbcore import consolidation
+from kbcore import consolidation, report_meta
 from kbcore.config import settings
 from kbcore.ingest import ingest
 
@@ -118,9 +118,10 @@ def _write_report(counts: dict[str, Any]) -> int:
     # chunked + embedded like any item; nested telemetry (per-case ranks keyed by
     # the golden QUERY TEXT, id lists, tallies) belongs in meta alone — dumping
     # it here put all 52 golden queries verbatim into every nightly report, and
-    # four reports then outranked the real answers (hit@5 0.981 -> 0.923).
+    # four reports then outranked the real answers (hit@5 0.981 -> 0.923). E2
+    # adds no body line: its scalars are meta-only too (kbcore.report_meta).
     body = "Nightly consolidation report\n\n" + "\n".join(
-        f"- {k}: {v}" for k, v in counts.items() if not isinstance(v, dict | list | tuple)
+        f"- {k}: {v}" for k, v in report_meta.body_scalars(counts).items()
     )
     return ingest(
         "kb-system",

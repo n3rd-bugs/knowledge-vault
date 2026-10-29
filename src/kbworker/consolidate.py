@@ -69,6 +69,7 @@ from kbworker.drainloop import (  # noqa: F401
     _drain_ingest_queue,
     _drain_step,
 )
+from kbworker.eval_cases import loggable
 
 # The power guard moved to kbworker.powerguard (mechanical split, 2026-08-21,
 # review #5) — re-imported for the same seam reason: should_stop resolves the
@@ -275,6 +276,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         run_t0 = time.monotonic()  # wall clock for the digest run line (review #8 H7)
         since = consolidation.last_consolidation_at()
         counts: dict[str, Any] = {
+            "run_started_at": datetime.now(UTC).isoformat(),  # ADDED key (E2): tonight's START
             "queued_drained": 0,
             "queued_items_saved": 0,
             # Review #6: rows the WEEKDAY drain budget shed (weekend catches up).
@@ -471,9 +473,9 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         counts["skipped"] = False
         # P0-2: the only part of the pass an owner sees without going looking.
         counts["digest_pushed"] = tail_steps.push_run_digest(counts)
-        logger.info("consolidation done: %s", counts)
+        logger.info("consolidation done: %s", loggable(counts))  # query-keyed dicts: meta only
         return counts
 
 
 if __name__ == "__main__":
-    print(nightly())
+    print(loggable(nightly()))

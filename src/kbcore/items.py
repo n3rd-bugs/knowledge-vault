@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from kbcore import scope
+from kbcore import report_meta, scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
 from kbcore.models import CodeRef, ItemDetail, ProjectInfo, Relation
@@ -85,7 +85,7 @@ def get_item(item_id: int, with_relations: bool = True) -> ItemDetail:
         if sup_by is not None and not scope.readable_item_ids(conn, [sup_by]):
             sup_by = None
             sup_reason = None
-    meta = meta if isinstance(meta, dict) else {}
+    meta = report_meta.visible_meta(meta, project, type_)  # a run report: owner's (H1)
     code_ref = CodeRef(**meta["code_ref"]) if meta.get("code_ref") else None
     return ItemDetail(
         item_id=id_,
@@ -205,7 +205,7 @@ def timeline(
         valid_from,
         valid_to,
     ) in rows:
-        meta = meta if isinstance(meta, dict) else {}
+        meta = report_meta.visible_meta(meta, proj, type_)  # a run report: owner's (H1)
         code_ref = CodeRef(**meta["code_ref"]) if meta.get("code_ref") else None
         if sup is not None and sup not in readable_sup:
             sup = None  # withheld successor: byte-identical to a non-superseded row

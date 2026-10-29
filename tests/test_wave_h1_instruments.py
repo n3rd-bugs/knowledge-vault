@@ -399,6 +399,8 @@ def test_a_trip_on_a_fallback_night_is_a_measurement_not_a_regression(kb, caplog
         "mrr": 0.6,
         "below_floor": True,
         "dropped": True,
+        # E2 (review #10): the trips that fired ride the measurement too
+        "cause": ["drop_hit_at_5", "drop_mrr", "floor_hit_at_5"],
     }
     assert "measurement (rerank fallback 15)" in caplog.text
     assert "REGRESSION:" not in caplog.text

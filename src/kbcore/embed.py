@@ -2,12 +2,25 @@
 
 GPU is a guest: every call sets a short keep_alive so bge-m3 unloads quickly
 after use (Invariant 8). ``KB_EMBED_DEVICE=cpu`` forces CPU as an escape hatch.
+
+E2 eval identity (review #10): :func:`configured_hosts` is the ONE preference
+list both the call path and the eval epoch key (``kbcore.eval_epoch``) read;
+which of those hosts actually SERVED a query embed is recorded per thread
+(:func:`last_query_host` -> ``eval_embed_host``), and :func:`query_fingerprint`
+hashes a fixed probe's query vector (``eval_embed_fingerprint``) — so a night
+measured on the fallback host or a changed embedder is visible in meta. The
+probe's own host and that host's server/model identity are read by
+:mod:`kbcore.embed_identity` (``eval_embed_fingerprint_host`` /
+``eval_embed_runtime``).
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
 import time
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -53,6 +66,57 @@ def _mark_up(host: str) -> None:
 def reset_host_health() -> None:
     """Forget all breaker state — for tests and for an explicit operator retry."""
     _down_until.clear()
+
+
+# Serving-host telemetry (E2): thread-local like kbcore.rerank's participation
+# marker — the eval replays its golden searches synchronously on one thread.
+_served = threading.local()
+# FIXED probe for query_fingerprint. Changing it re-keys every fingerprint series.
+FINGERPRINT_PROBE = "knowledge vault embed fingerprint probe: hybrid search over engineering notes"
+
+
+def configured_hosts() -> list[str]:
+    """The embed hosts in PREFERENCE order: ``KB_EMBED_URL``'s, then the main Ollama.
+
+    Configuration only — the breaker's runtime "down" verdicts are applied on
+    top by :func:`embed_texts`, so a serving fallback never changes this list
+    (nor, therefore, the eval epoch key built from it).
+    """
+    hosts = [settings.embed_url]
+    if settings.embed_url != settings.ollama_url.rstrip("/"):
+        hosts.append(settings.ollama_url.rstrip("/"))
+    return hosts
+
+
+def public_host(url: str) -> str:
+    """``url`` without userinfo, query or fragment — safe for report meta and logs."""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
+
+
+def last_query_host() -> str | None:
+    """The configured host (credential-free) that served this thread's last SUCCESSFUL
+    query embedding; None before any, or when a test double served it."""
+    return getattr(_served, "query", None)
+
+
+def query_fingerprint() -> str:
+    """12-hex sha256 of :data:`FINGERPRINT_PROBE`'s QUERY embedding rounded to 4 decimals.
+
+    One embed call (through :func:`embed_query`, so the query prefix is part of
+    the identity). ``+ 0.0`` folds -0.0 into 0.0 so a sign flip of a component
+    that rounds to zero cannot change the hash.
+
+    An EXACT-equality flag over the 4-decimal probe vector, nothing softer: a
+    host that is not load-deterministic (EPOCHS.md: the preferred host measured
+    cosine 0.999837 between two loads) yields a NEW value after every model
+    load, so a CHANGE is only meaningful read together with
+    ``eval_embed_runtime`` and ``eval_embed_fingerprint_host`` (which host,
+    which server build, which model digest served the probe); NO change proves
+    bit-level identity of the 4-decimal vector.
+    """
+    canon = ",".join(f"{round(x, 4) + 0.0:.4f}" for x in embed_query(FINGERPRINT_PROBE))
+    return hashlib.sha256(canon.encode("ascii")).hexdigest()[:12]
 
 
 # The INTERACTIVE budget. A user's kb_search must never inherit the drain's
@@ -126,9 +190,7 @@ def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> li
     # main host, which is slower under VRAM contention but always there. Only
     # CONNECTIVITY falls back; a 4xx is about the content and would fail
     # identically anywhere, so retrying it elsewhere just doubles the cost.
-    hosts = [settings.embed_url]
-    if settings.embed_url != settings.ollama_url.rstrip("/"):
-        hosts.append(settings.ollama_url.rstrip("/"))
+    hosts = configured_hosts()
     # Skip a host known to be down. Failover WITHOUT memory retries the dead box on
     # every single call and pays the connect timeout each time: measured 2026-07-29,
     # 73 consecutive fallbacks x 10s = 12 minutes of a drain spent waiting on a
@@ -142,6 +204,7 @@ def embed_texts(texts: list[str], *, timeout: httpx.Timeout | None = None) -> li
             resp = httpx.post(f"{host}/api/embed", json=payload, timeout=timeout or _TIMEOUT)
             resp.raise_for_status()
             _mark_up(host)
+            _served.host = host  # E2 telemetry: which configured host answered
             if i:
                 # Observable on purpose: a silent fallback would hide the remote
                 # box being gone, which is the whole reason we made it observable.
@@ -205,5 +268,9 @@ def embed_query(text: str) -> list[float]:
     failures via embed_one intercept query embeds too. Asserted in
     tests/test_embed_query_prefix.py; do not inline an HTTP call here.
     """
+    _served.host = None  # E2: only a host that serves THIS call may be recorded
     # The interactive budget, not the drain's: this is the read path.
-    return embed_one(settings.kb_embed_query_prefix + text, timeout=_QUERY_TIMEOUT)
+    vec = embed_one(settings.kb_embed_query_prefix + text, timeout=_QUERY_TIMEOUT)
+    host = getattr(_served, "host", None)
+    _served.query = public_host(host) if host else None
+    return vec

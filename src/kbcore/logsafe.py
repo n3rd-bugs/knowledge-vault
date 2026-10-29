@@ -38,7 +38,11 @@ from kbcore import scrub
 # AccessFormatter takes a 5-tuple apart), so they are redacted argument by argument
 # instead of being collapsed into one pre-formatted string.
 _POSITIONAL_ARGS_LOGGERS = frozenset({"uvicorn.access"})
-_MAX_MESSAGE = 8192  # chars of one record that are emitted
+_MAX_MESSAGE = 8192  # chars of one record that are emitted (a request-serving process)
+# The worker's own records are the system's diagnostics, not request text: the
+# nightly's one "consolidation done: {...}" summary is ~20 KB and was cut to 8 KiB
+# on its first night (2026-10-29). Workers install with this cap instead.
+WORKER_MAX_MESSAGE = 262144
 _MAX_ACCESS = 2048  # ...of one uvicorn access line (a URL longer than this is not diagnostics)
 _MAX_TRACEBACK = 16384  # head and tail of a traceback (its last line names the error)
 # Scanned PAST every cut, so a secret that crosses a cut is seen whole (a Google
@@ -80,6 +84,7 @@ _SECRET_QUERY = re.compile(
 _WITHHELD = "[log record withheld: redaction failed (%s)]"
 
 _installed = False
+_max_message = _MAX_MESSAGE
 
 
 def redact(text: str) -> str:
@@ -217,7 +222,7 @@ def _redact_exception(record: logging.LogRecord) -> None:
 def _redact_record(record: logging.LogRecord) -> None:
     _redact_exception(record)
     positional = record.name in _POSITIONAL_ARGS_LOGGERS and isinstance(record.args, tuple)
-    limit = _MAX_ACCESS if positional else _MAX_MESSAGE
+    limit = _MAX_ACCESS if positional else _max_message
     try:
         full = record.getMessage()
     except Exception:  # noqa: BLE001 — logging reports a bad call itself, printing msg AND args
@@ -243,9 +248,12 @@ def _withhold(record: logging.LogRecord, why: Exception, msg, args) -> None:
     record.msg, record.args = _WITHHELD % type(why).__name__, None
 
 
-def install() -> None:
-    """Route every LogRecord this process creates through :func:`redact`. Idempotent."""
-    global _installed
+def install(max_message: int = _MAX_MESSAGE) -> None:
+    """Route every LogRecord this process creates through :func:`redact`. Idempotent;
+    ``max_message`` is the cap on one record (the default suits a request-serving
+    process; workers pass :data:`WORKER_MAX_MESSAGE`)."""
+    global _installed, _max_message
+    _max_message = max_message
     if _installed:
         return
     base = logging.getLogRecordFactory()

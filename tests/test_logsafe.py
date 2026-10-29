@@ -495,4 +495,29 @@ def test_every_long_running_entry_point_installs_the_funnel(module_name):
     import importlib
 
     source = inspect.getsource(importlib.import_module(module_name).main)
-    assert "logsafe.install()" in source, f"{module_name}.main() logs without kbcore.logsafe"
+    assert "logsafe.install(" in source, f"{module_name}.main() logs without kbcore.logsafe"
+    # Request-serving processes keep the default cap; only the workers raise it.
+    worker = module_name.startswith("kbworker.")
+    assert ("WORKER_MAX_MESSAGE" in source) == worker, f"{module_name}: wrong record cap"
+
+
+def test_a_worker_logs_its_own_long_summary_whole(monkeypatch, caplog):
+    """The nightly's one-line counts summary (~20 KB) was cut to 8 KiB on its first
+    night; a worker installs with WORKER_MAX_MESSAGE, a server keeps the default."""
+    original = logging.getLogRecordFactory()
+    monkeypatch.setattr(logsafe, "_installed", False)
+    summary = {f"step_{i}": {"n": i, "note": "x" * 40} for i in range(300)}  # ~20 KB
+    try:
+        logsafe.install(logsafe.WORKER_MAX_MESSAGE)
+        with caplog.at_level(logging.INFO, logger="kbworker.consolidate"):
+            logging.getLogger("kbworker.consolidate").info("consolidation done: %s", summary)
+        [line] = [r.getMessage() for r in caplog.records if r.name == "kbworker.consolidate"]
+        assert "chars dropped" not in line and line.endswith("}}")
+        logsafe.install()  # a server's install: the default 8 KiB cap again
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="kbworker.consolidate"):
+            logging.getLogger("kbworker.consolidate").info("consolidation done: %s", summary)
+        [line] = [r.getMessage() for r in caplog.records if r.name == "kbworker.consolidate"]
+        assert "chars dropped by kbcore.logsafe" in line
+    finally:
+        logging.setLogRecordFactory(original)

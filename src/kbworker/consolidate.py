@@ -263,7 +263,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
     never mistaken for a broken one.
     """
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    logsafe.install()  # no secret reaches journald, whichever library logs it
+    logsafe.install(logsafe.WORKER_MAX_MESSAGE)  # no secret reaches journald, any library
     with advisory_lock(ADVISORY_KEY) as acquired:
         if not acquired:
             logger.info("another consolidation holds lock %d; skipping this run", ADVISORY_KEY)

@@ -109,6 +109,7 @@ def _no_leaked_log_record_factory(monkeypatch):
 
     original = logging.getLogRecordFactory()
     monkeypatch.setattr(logsafe, "_installed", False)
+    monkeypatch.setattr(logsafe, "_max_message", logsafe._MAX_MESSAGE)
     yield
     logging.setLogRecordFactory(original)
 

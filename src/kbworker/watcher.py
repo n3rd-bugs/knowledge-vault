@@ -160,7 +160,7 @@ class _InboxHandler(FileSystemEventHandler):
 def main() -> None:
     """Run the watcher loop: watchdog observer + poll fallback + daily reposcan."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    logsafe.install()  # no secret reaches journald, whichever library logs it
+    logsafe.install(logsafe.WORKER_MAX_MESSAGE)  # no secret reaches journald, any library
     inbox = settings.inbox
     inbox.mkdir(parents=True, exist_ok=True)
     logger.info("watching inbox %s (poll every %ss)", inbox, int(POLL_INTERVAL))

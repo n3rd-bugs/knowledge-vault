@@ -7,8 +7,9 @@ skipped silently at their reachability probe, and an enrolment could strand a
 brand-new box with no credential. The fix lives at the ONE layer every
 credentialed request already flows through — the curl-config emitters that feed
 ``curl -K -`` — so every consumer (mcp-call, brief, flush, install/enrol)
-inherits the pin from a single edit, and the two bare reachability probes carry
-``-4`` so the gate tests the same address family as the call it gates.
+inherits the pin from a single edit, and the two reachability probes (the MCP
+one bare, the REST one carrying the bearer on stdin) carry ``-4`` so the gate
+tests the same address family as the call it gates.
 
 Structural tests derive the guarded set mechanically (every EXECUTED curl must
 be family-pinned, via config or flag) so the class is guarded, not the found
@@ -143,20 +144,86 @@ def test_the_ntfy_push_keeps_its_explicit_ipv4_flag():
     )
 
 
-def test_the_brief_reachability_probes_pin_the_same_family_as_the_calls_they_gate():
-    """A probe on the wrong address family is a false gate: it was exactly the
-    'briefs skip silently' half of the transient. Both bare probes (MCP and
-    REST) must carry -4 to match the pinned real call behind them."""
-    probes = [
+def _brief_probes() -> list[str]:
+    # Wave C (KB 1195): no hook curl carries --connect-timeout; the probes are the
+    # two `--max-time 3` GETs against the transport URLs (the manifest fetch is 6,
+    # the search "$ST").
+    return [
         ln
         for ln in _invoked_curl_lines(BRIEF.read_text())
-        # Wave C (KB 1195): no hook curl carries --connect-timeout; the probes
-        # are the two bare `--max-time 3` GETs against the transport URLs.
-        if re.search(r"--max-time\s+\d+", ln) and "-K -" not in ln
+        if re.search(r"--max-time\s+3(\s|$)", ln)
     ]
+
+
+def test_the_brief_reachability_probes_pin_the_same_family_as_the_calls_they_gate():
+    """A probe on the wrong address family is a false gate: it was exactly the
+    'briefs skip silently' half of the transient. Both probes (MCP and REST) must
+    carry -4 to match the pinned real call behind them; the REST one also reads
+    the shared config (`-K -`, for its bearer), which pins ipv4 a second time."""
+    probes = _brief_probes()
     assert len(probes) == 2, f"expected the two reachability probes, found: {probes}"
     for ln in probes:
         assert re.search(r"(^|\s)-4(\s|$)", ln), f"unpinned reachability probe: {ln}"
+
+
+def test_the_rest_probe_authenticates_and_the_mcp_probe_stays_bare():
+    """kb-rest logs every 401 as a WARNING and counts it toward its burst alert
+    (kbrest.auth_alert: 20 in 10 min, then an hour of cooldown). The bare REST
+    probe was every `GET /` 401 kb-rest logged on 2026-10-29 (42 lines, three
+    boxes), so it now sends the bearer through the shared config -- past the
+    gate `/` is FastAPI's 404 -- and is skipped once the SessionStart manifest
+    fetch has answered. The MCP probe stays bare ON PURPOSE: a session-less
+    request past the gate makes the stateful streamable-HTTP manager register a
+    new MCP session, and nothing ever expires it."""
+    probes = _brief_probes()
+    rest = [ln for ln in probes if '"$KB_REST_URL"' in ln]
+    mcp = [ln for ln in probes if '"$KB_MCP_URL"' in ln]
+    assert len(rest) == 1 and "kb_curl_auth_config | curl" in rest[0], rest
+    assert "-K -" in rest[0], f"the REST probe went bare again: {rest[0]}"
+    assert len(mcp) == 1 and "-K -" not in mcp[0], f"the MCP probe gained a bearer: {mcp}"
+    text = BRIEF.read_text()
+    assert '[ "$_kb_reached" = 1 ] ||' in text, "the manifest-proved skip is gone"
+    assert text.count("_kb_reached=1") == 1, "only the version check may mark the base reached"
+
+
+def _curl_statements(text: str) -> list[str]:
+    """Executed curl STATEMENTS with backslash continuations joined, so a curl
+    whose URL sits on a continuation line (the manifest fetch, the search) is
+    one string — `_executed_curl_lines` sees only the line holding `curl`."""
+    out: list[str] = []
+    buf = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not buf and (not line or line.startswith("#")):
+            continue
+        if line.endswith("\\"):
+            buf += line[:-1] + " "
+            continue
+        full, buf = (buf + line).strip(), ""
+        if full.startswith(("printf ", "echo ")):
+            continue
+        if re.search(r"(^|[|&;(\s])curl\s+-", full) and not re.search(
+            r"curl\s+--(help|version)\b", full
+        ):
+            out.append(full)
+    return out
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(CONTRIB.glob("*.sh"), key=lambda p: p.name),
+    ids=lambda p: p.name,
+)
+def test_every_curl_at_the_rest_base_reads_the_stdin_config(path: Path):
+    """kb-rest 401s a bearer-less request, logs it as a WARNING and counts it
+    toward the 401-burst alert, so no hook may reach the REST base without the
+    shared stdin config (`-K -`, which carries the bearer). Joined statements:
+    the URL of the manifest fetch and of the search sits on a continuation line."""
+    rest = [s for s in _curl_statements(path.read_text()) if "KB_REST_URL" in s]
+    offenders = [s for s in rest if "-K -" not in s]
+    assert not offenders, f"{path.name} reaches the REST base without -K -: {offenders}"
+    if path == BRIEF:
+        assert len(rest) >= 3, f"manifest, probe and search not all seen: {rest}"
 
 
 # ---------------------------------------------------------------------------

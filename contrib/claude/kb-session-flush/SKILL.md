@@ -224,11 +224,22 @@ host it lands in REMOTE mode — just fill in `KB_REST_URL` + `KB_TOKEN`.
   fork/memory pressure) `kb_timeout` now bails with an error rather than running the
   command unbounded, and the caller degrades to no recall for that firing.
 - **Reachability probe / no prompt stalls** — because `UserPromptSubmit` recall runs
-  synchronously (15 s hook budget), a cheap reachability check runs first: a
+  synchronously (40 s hook budget; the brief child gets 34 s), a cheap reachability check runs first: a
   `curl --max-time 3` connect to the KB (MCP/REMOTE) or a trivial local check
   (LOCAL). A dead/blackholed KB skips recall in ~3 s instead of stalling the prompt
-  for the whole budget. All inner search timeouts are kept strictly under the hook
-  budget (recall ≤ ~8 s, connector recall ≤ 12 s). **No hook curl carries
+  for the whole budget. The REMOTE probe carries the bearer (the same stdin
+  config as the search), so kb-rest answers it past its bearer gate instead of
+  logging a `401 unauthorized ... GET /` WARNING and counting it toward the
+  401-burst alert; a `SessionStart` whose authenticated manifest fetch already
+  answered skips it (rig case 49). Carrying the bearer, the probe's answer now
+  waits on the gate's credential lookup (a `kbg_` token is one indexed SELECT,
+  cached 60 s), so a stalled KB database reads as `unreachable rc=28` — the rc
+  tells that timeout apart from a refused connect (`rc=7`). The MCP probe stays
+  bare on purpose: a session-less request past the gate opens a stateful MCP
+  session that never expires (mcp 1.28 / fastmcp 3.4 set no session idle timeout).
+  All inner search timeouts are kept strictly under the brief child's 34 s
+  budget (recall: the 3 s probe + a 30 s search, connector recall ≤ 30 s; the
+  SessionStart brief search ≤ 20 s, connector brief ≤ 25 s). **No hook curl carries
   `--connect-timeout`** (KB 1195: on Git Bash/Schannel it aborts healthy slow
   requests) — every bound is a `--max-time`; the ingest POST additionally carries
   `--retry`/`--retry-max-time` and never `--fail` (a 401/403 must not be retried).

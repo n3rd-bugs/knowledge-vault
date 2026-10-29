@@ -395,6 +395,11 @@ fi
 
 INPUT=$(cat)
 EV=$(printf '%s' "$INPUT" | kb_json_get hook_event_name)
+# The dispatcher passes the event as $1 (kb-hook-dispatch.sh): an event whose
+# stdin arrived EMPTY (the residual Windows bug) still names itself there, so an
+# empty-stdin prompt exits at the prompt gates instead of falling through to the
+# SessionStart branch (a manifest fetch, a k=5 search and an injected pre-brief).
+[ -n "$EV" ] || EV="${1:-}"
 SRC=$(printf '%s' "$INPUT" | kb_json_get source)
 CWD=$(printf '%s' "$INPUT" | kb_json_get cwd)
 SID=$(printf '%s' "$INPUT" | kb_json_get session_id)
@@ -453,8 +458,11 @@ PROJ_TOKEN=$(eval "printf '%s' \"\${KB_TOKEN_${PROJ_KEY}:-}\"" 2>/dev/null || tr
 # way once on this system. `curl -K -` reads the same options from a config file,
 # so the token never becomes a process argument. Empty bearer => a config holding
 # only the address-family pin, i.e. an unauthenticated request that the server
-# refuses — which is what we want it to do, rather than the caller silently
-# skipping the request.
+# refuses. In THIS hook no caller gets that far any more: kb-rest can only 401 a
+# bearer-less request, and every 401 counts toward its 401-burst alert, so the
+# manifest fetch, the probe and the search each skip when no token resolved (rig
+# case 49 step G). The empty-bearer branch stays for parity with the flush
+# hook's copy and as defence in depth.
 # `ipv4` pins every `curl -K -` consumer to the A record at this one layer: on
 # this network the AAAA record resolves first and IPv6 egress fails, which took
 # out flush/brief/enrol together during an AAAA-only transient while the ntfy
@@ -467,9 +475,16 @@ kb_curl_auth_config() { # -> curl config on stdout
 }
 
 # Per-event query + gating. K=result count; ST/HELPER_TO/CONN_TO are inner search
-# timeouts kept STRICTLY under the registered hook budget (recall 15s, brief 30s)
-# so recall never stalls a prompt; ALLOW_CONN gates the token-costly connector
+# timeouts kept STRICTLY under this child's 34 s dispatcher budget (registered
+# UserPromptSubmit 40 s / SessionStart 35 s, kb-hook-dispatch.sh) so recall never
+# stalls a prompt; ALLOW_CONN gates the token-costly connector
 # path, MODE selects the output header.
+#
+# _kb_reached: 1 ONLY when the SessionStart version check below got a parsed
+# manifest version back from a bearer-authenticated GET at this REST base --
+# reachability already proven in THIS run, so the REST probe is skipped. Set
+# here, after both config files were sourced, so neither can preset it.
+_kb_reached=0
 if [ "$EV" = "UserPromptSubmit" ]; then
   [ "${KB_PROMPT_RECALL:-1}" = "0" ] && exit 0
   PROMPT=$(printf '%s' "$INPUT" | kb_json_get prompt)
@@ -519,7 +534,7 @@ if [ "$EV" = "UserPromptSubmit" ]; then
   # A CEILING, not a cost. Steady-state recall is ~1.4s, so raising this does
   # not slow a healthy KB — it only matters when the KB is reachable but slow,
   # which is exactly the cold start after a restart (~9s while the embedder
-  # loads). A DEAD KB still fails in ~2s via the reachability probe below, so
+  # loads). A DEAD KB still fails in ~3s via the reachability probe below, so
   # the full budget is never spent on an unreachable host.
   ST=30
   HELPER_TO=32
@@ -559,19 +574,27 @@ else
   # A HOT BREAKER skips this too: it is one more request to the very server we
   # just decided is not answering, and "return fast" is the whole point. It is
   # FYI-only, so losing it for one session costs nothing. Its own failures never
-  # trip the breaker — an unauthenticated box gets a 401 here as a matter of
+  # trip the breaker — a refused credential gets a 401 here as a matter of
   # course, and letting that disable recall would be a self-inflicted outage.
-  if [ "${KB_VERSION_CHECK:-1}" = "1" ] && [ "$BRK_HOT" = "0" ] && [ -n "${KB_REST_URL:-}" ]; then
+  #
+  # NO TOKEN, NO FETCH: the manifest route sits behind kb-rest's bearer gate, so
+  # a bearer-less fetch can never return a version — it is only one more
+  # `401 unauthorized` WARNING and one more count toward the 401-burst alert
+  # (two of them helped fire the self-inflicted 2026-10-24 KB ALERT).
+  if [ "${KB_VERSION_CHECK:-1}" = "1" ] && [ "$BRK_HOT" = "0" ] && [ -n "${KB_REST_URL:-}" ] &&
+    [ -n "${KB_TOKEN:-}" ]; then
     _hooks_dir="$HOME/.claude/hooks"
     _stamp="$_hooks_dir/.setup-version"
-    # ${KB_TOKEN:-}, via the stdin config: the resolver above ran first, so this
-    # sees the project token on a default-enrolled box — and even with nothing
-    # resolved it degrades to an unauthenticated 401 instead of killing the
-    # subshell on an unbound variable (which is how this warning went dead).
+    # ${KB_TOKEN}, via the stdin config: the resolver above ran first, so this
+    # sees the project token on a default-enrolled box.
     _remote=$(kb_curl_auth_config | curl -fsS -K - --max-time 6 \
       "${KB_REST_URL%/}/api/setup/manifest.json" 2>/dev/null \
       | tr -d ' \n' | sed -n 's/.*"version":"\([a-f0-9]*\)".*/\1/p' || true)
     if [ -n "$_remote" ]; then
+      # A parsed version is this KB answering a bearer-authenticated, IPv4-pinned
+      # GET at the very base the REST search uses, a moment ago: the REST
+      # reachability probe below has nothing left to prove.
+      _kb_reached=1
       # Compare against the version recorded at install time. A missing stamp
       # means these hooks predate versioning, which is itself worth reporting.
       _local=$(cat "$_stamp" 2>/dev/null || echo "")
@@ -766,6 +789,11 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
   # -4 matches the pinned real call (kb_curl_auth_config emits `ipv4`): a probe
   # testing a different address family than the call it gates is a false gate —
   # exactly the "briefs skip silently" failure of the AAAA-only transient.
+  # BARE ON PURPOSE (the REST probe below carries the bearer): a session-less
+  # request that PASSES the bearer gate reaches the stateful streamable-HTTP
+  # session manager, which registers a brand-new MCP session for it before it
+  # refuses the GET -- with no idle timeout, so every prompt would leak one.
+  # A request the gate refuses never gets that far.
   if curl -sS -4 -o /dev/null --max-time 3 "$KB_MCP_URL" >/dev/null 2>&1; then
     HELPER="$HOOKDIR/kb-mcp-call.sh"
     # boost_project mirrors LOCAL mode's --boost-project so recall ranking does
@@ -801,11 +829,25 @@ elif [ -n "${KB_MCP_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
 # model calls for a search the bearer could do for free, and attributing the two
 # halves of the same install to different transports.
 elif [ -n "${KB_REST_URL:-}" ] && [ -n "${KB_TOKEN:-}" ]; then
-  # REACHABILITY PROBE: cheap connect check so a dead KB skips recall in ~2s
+  # REACHABILITY PROBE: cheap connect check so a dead KB skips recall in ~3s
   # instead of consuming the full hook budget on the search request. -4 matches
   # the pinned real call below — a probe on the wrong address family is a false
   # gate (see the MCP probe above).
-  if curl -sS -4 -o /dev/null --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
+  # It carries the BEARER, on stdin like every credentialed curl here (the
+  # config pins ipv4 as well). Bare, every firing was a `401 unauthorized ...
+  # GET /` WARNING on kb-rest and one more 401 toward its burst alert
+  # (kbrest/auth_alert.py: 20 in 10 min pushes a KB ALERT, then an hour of
+  # cooldown in which a real scan raises nothing). Past the gate, `/` is
+  # FastAPI's 404: any HTTP answer still means reachable, and a refused
+  # credential is still a 401 that the search below logs as `credential
+  # refused`. One difference from the bare probe: the answer now waits on the
+  # gate's credential lookup (a kbg_ token is one indexed SELECT, cached 60 s),
+  # so a STALLED KB database times the probe out and reads as `unreachable
+  # rc=28` -- the rc tells that apart from a refused connect (rc=7). Skipped
+  # outright once this run's SessionStart manifest fetch has reached this base
+  # (_kb_reached).
+  if [ "$_kb_reached" = 1 ] ||
+    kb_curl_auth_config | curl -sS -4 -K - -o /dev/null --max-time 3 "$KB_REST_URL" >/dev/null 2>&1; then
     ENC=$(printf '%s' "$QUERY" | kb_urlencode)
     # Bearer on STDIN (curl -K -), never on argv — see kb_curl_auth_config.
     # -w puts the status on its own LAST line, because `curl -sS` (no -f, which

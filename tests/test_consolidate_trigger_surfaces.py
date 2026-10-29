@@ -50,6 +50,31 @@ def test_rest_consolidate_requires_auth(rest):
     assert rest.get("/api/consolidate").status_code == 401
 
 
+def test_rest_consolidate_status_hides_the_result_from_a_grantee(rest):
+    """The status row's ``result`` is the run's whole counts dict — per-case eval
+    telemetry keyed by golden query text, cross-project item ids, project names.
+    A minted ``kbg_`` grantee may poll the run's state, never its result; the
+    owner still sees it. (POST stays owner-only: a grantee cannot START a run.)"""
+    from kbcore import principals
+
+    req_id, _ = jobs.request_consolidation("rest")
+    jobs.finish_consolidation(req_id, {"eval_case_top5": {"a synthetic query": [9001]}})
+    _pid, token = principals.create_principal("status-grantee", kind="token", role="reviewer")
+    grantee = {"Authorization": f"Bearer {token}"}
+
+    r = rest.get("/api/consolidate", headers=grantee)
+    assert r.status_code == 200, r.text
+    st = r.json()["status"]
+    assert st["id"] == req_id and st["status"] == "done", st
+    assert "result" not in st, "a grantee read the run's result payload"
+    assert "a synthetic query" not in r.text
+
+    owner = rest.get("/api/consolidate", headers=AUTH).json()["status"]
+    assert owner["result"] == {"eval_case_top5": {"a synthetic query": [9001]}}
+    denied = rest.post("/api/consolidate", headers=grantee)
+    assert denied.status_code == 400, denied.text  # the owner gate, as on /api/review
+
+
 def test_rest_cors_preflight_allows_web_origin(kb, monkeypatch):
     monkeypatch.setattr(settings, "kb_token", TEST_TOKEN)
     monkeypatch.setattr(settings, "kb_bind", "127.0.0.1")

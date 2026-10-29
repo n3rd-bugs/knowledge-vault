@@ -374,7 +374,14 @@ def _register_write(app: FastAPI) -> None:
 
     @app.get("/api/consolidate")
     def api_consolidate_status() -> dict:
-        return {"status": jobs.latest_consolidation_status()}
+        # A grantee may see whether a run is in flight, never what it found: the
+        # result is the run's whole counts dict (golden-case telemetry keyed by
+        # query text, cross-project item ids, project names). Owner-only, as on
+        # kbweb's /jobs, which strips it for everyone.
+        st = jobs.latest_consolidation_status()
+        if st is not None and not scope.current().is_owner:
+            st = {k: v for k, v in st.items() if k != "result"}
+        return {"status": st}
 
     @app.post("/api/review/{queue_id}/resolve")
     def api_review_resolve(queue_id: int, payload: ReviewResolveRequest) -> dict:

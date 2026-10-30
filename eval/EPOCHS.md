@@ -298,6 +298,29 @@ the E2 set on the live corpus, after 40402 → 56704, with the E2 code; rerank w
   so it did not move. The fix waits for an owner decision: it changes what the nightly measures, so it
   gets its own ledger line.
 
+**Prefix fix (2026-10-30, KB 57359; the commit that adds this paragraph).** Owner-approved. `kbcore.config`
+now decodes every literal backslash-n in `KB_EMBED_QUERY_PREFIX` into a newline (a field validator), so a
+unit that loads `.env` through `EnvironmentFile` resolves the same prefix as the containers and shell
+runs: `df4b2898bf22` (92 characters) everywhere, where the units had `945a97534ce6` (93). Neither `.env`
+nor the units changed. On kb-worker's own environment (`/proc/<pid>/environ`) the previous code resolves
+`945a97534ce6` and the fix resolves `df4b2898bf22`.
+- Same-corpus A/B (2026-10-30 18:50 PKT): read-only replays on the live corpus, `tool=None`, two runs per
+  prefix, alternating, rerank warmed, fallback-free. Both prefixes read hit@5 **0.9672** / MRR
+  **0.8734**, failing exactly {7, 48}, and both runs of each were identical. No case's rank moved; 15 of
+  the 61 top-5 id lists differ in other positions. So the fix moves no golden rank on this corpus. Night
+  1's guess that the split explains part of E1's day/night gap is not supported here, and night 1's MRR
+  above the gate's (0.8734 against 0.8650) comes from the corpus the drain changed (522 new items), not
+  from the prefix.
+- What night 2 records: `eval_embed_query_prefix_sha` `df4b2898bf22`, and `eval_embed_fingerprint` moves
+  once, because the prefix is part of what it hashes. No code compares either across nights, so the
+  change raises no alert. The epoch key leaves the prefix out, so E2 continues. Earlier nights were
+  measured under the systemd prefix, and the readers that look back (the persistence trip, the trust
+  week-on-week, the weekly series) read across that mix. On this corpus the two prefixes rank every case
+  the same.
+- Only `\n` is decoded, the one escape the prefix uses. Any other escaped `.env` value (`\t`, text after
+  the closing quote) would still read differently under the units than in the containers. Whether the
+  prefix joins the epoch key stays on the E3 list below.
+
 **Deferred to E3.**
 - Per-item leg windows and capped chunks per item in the OR leg (case 48).
 - Rerank window 20/30/40.

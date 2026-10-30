@@ -11,7 +11,7 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from kbcore.config_fleet import FleetSettings
@@ -147,6 +147,16 @@ class Settings(SettingsViews, LLMSettings, FleetSettings, BaseSettings):
         "Instruct: Given a web search query, retrieve relevant passages that "
         "answer the query\nQuery: "
     )
+
+    # KB 57359: systemd's EnvironmentFile= keeps a "\n" inside double quotes as two characters
+    # where python-dotenv and compose decode it, and the process env beats the .env read, so the
+    # units embedded queries with a prefix production never used. Decoded here for every launcher.
+    # Launchers still disagree on escapes such as \t and on any text after the closing quote.
+    @field_validator("kb_embed_query_prefix")
+    @classmethod
+    def _decode_prefix_newlines(cls, v: str) -> str:
+        return v.replace("\\n", "\n")
+
     # qwen3:14b won the 6-model extractor benchmark (KB item 313): best granularity, 100% verbatim
     # grounding. gemma3:12b is the approved fast fallback. How many queued jobs the drain extracts
     # as ONE cohort. With OLLAMA_MAX_LOADED_MODELS=1 every model switch is a full load, so running

@@ -276,10 +276,27 @@ the E2 set on the live corpus, after 40402 → 56704, with the E2 code; rerank w
 - The gated set keyed `d7abe903a1c7` (case 54's bound still the placeholder 5); with the bound written it
   keys **`092b054e8e9e`**, the key night 1 records.
 
-**Night 1.** Pending: the 2026-10-30 01:30 PKT nightly. Expected: `eval_golden_hash` `092b054e8e9e`,
-`eval_epoch_reset` (first night, floors only), meta floors 0.95 / 0.845 with no
-`eval_floors_at_defaults`, row 35091 resolved `epoch changed` (the WARNING names `untracked`),
-`eval_regression` False, no KB ALERT, and no E2 line in the report body.
+**Night 1 (2026-10-30, 01:30–05:24 PKT, report 57358): clean, as expected.**
+- `eval_golden_hash` `092b054e8e9e`; `eval_epoch_reset` {61 queries, 28 earlier reports skipped as
+  another epoch}; floors 0.95 / 0.845 in meta, no `eval_floors_at_defaults`.
+- Row 35091 resolved `epoch changed` at 00:23:47 UTC (`eval_regression_epoch_closed` 35091; the WARNING
+  names `untracked`). `eval_regression` False with no cause, no open regression row, no KB ALERT.
+- hit@5 0.9672 / MRR 0.8734, failing exactly {7, 48}; rerank active 60 / off 1 / fallback 0. Ranks: 49 at
+  1, 8 at 2, 1 at 3, 1 at 5, and 2 without a rank (7, 48). Case 7 skips echo 13061, case 14 reads rank 5
+  on 263, case 54 rank 1 on 28469. `eval_case_persistent` and `eval_case_first_pass` are empty. The drain
+  had saved 522 new items since the gate.
+- The report body carries no E2 line (103 lines).
+- **Finding: the nightly's query prefix is not production's.** `eval_embed_query_prefix_sha` reads
+  `945a97534ce6`; the gate's was `df4b2898bf22`. The systemd units load `.env` through `EnvironmentFile`,
+  which keeps the `\n` inside the double-quoted `KB_EMBED_QUERY_PREFIX` as a literal backslash-n, and the
+  process environment overrides pydantic-settings' own `.env` read, which would turn it into a newline.
+  The search containers (kb-mcp, kb-rest) and shell runs such as the gate get the newline. It is the
+  only one of the 38 `.env` keys that systemd parses differently, and `eval_embed_fingerprint` differs
+  (`ece945c52a65`) for the same reason. So the nightly eval (and kb-worker's on-demand runs) has been
+  embedding queries with a prefix production never uses, probably since the prefix setting landed
+  (`01c9d4f`, 2026-07-18) — likely part of E1's day/night replay gap. The epoch key leaves the prefix out,
+  so it did not move. The fix waits for an owner decision: it changes what the nightly measures, so it
+  gets its own ledger line.
 
 **Deferred to E3.**
 - Per-item leg windows and capped chunks per item in the OR leg (case 48).

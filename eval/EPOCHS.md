@@ -321,6 +321,18 @@ nor the units changed. On kb-worker's own environment (`/proc/<pid>/environ`) th
   the closing quote) would still read differently under the units than in the containers. Whether the
   prefix joins the epoch key stays on the E3 list below.
 
+**Night 2 (2026-10-31, 01:30–07:14 PKT, report 57745): clean, on production's prefix.**
+- `eval_embed_query_prefix_sha` `df4b2898bf22`; `eval_embed_fingerprint` `e7676e44450d`, the gate's value
+  on the same host (night 1 read `ece945c52a65`). Key `092b054e8e9e`, floors 0.95 / 0.845 in meta.
+- hit@5 0.9672 / MRR 0.8734, failing exactly {7, 48}, with night 1's ranks (49 at 1, 8 at 2, 1 at 3, 1 at
+  5, 2 without a rank), as the A/B predicted. Case 7 skips echo 13061, case 14 reads rank 5 on 263, case
+  54 rank 1 on 28469. Rerank active 60 / off 1 / fallback 0.
+- `eval_regression` False, no open regression row, no KB ALERT; `eval_case_persistent` and
+  `eval_case_first_pass` empty; the report body carries no E2 line.
+- The run: success, 0 errors, 57 routine warnings, 178 rows drained to 311 items (queue empty), eval step
+  94 s. It ran 5 h 44 m against night 1's 3 h 54 m, the extra time in review triage (plus an 83-minute
+  top-up pass), evidence refresh and contradiction queueing, not in the eval.
+
 **Deferred to E3.**
 - Per-item leg windows and capped chunks per item in the OR leg (case 48).
 - Rerank window 20/30/40.

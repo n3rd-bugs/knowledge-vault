@@ -87,7 +87,13 @@ def window_fingerprint(windows: list[str]) -> str:
 
 
 def save_window_checkpoint(
-    queue_id: int, *, fp: str, done: list[int], saved: int, rejected: int
+    queue_id: int,
+    *,
+    fp: str,
+    done: list[int],
+    saved: int,
+    rejected: int,
+    upto_id: int | None = None,
 ) -> None:
     """Record which windows of a multi-window group are already extracted.
 
@@ -111,6 +117,9 @@ def save_window_checkpoint(
         "rejected": int(rejected),
         "at": datetime.now(UTC).isoformat(),
     }
+    if upto_id is not None:
+        # KB 57972: the newest row the windows were cut from (see :func:`pinned_rows`).
+        payload["upto_id"] = int(upto_id)
     with transaction() as conn:
         conn.execute(
             "UPDATE ingest_queue SET meta = coalesce(meta, '{}'::jsonb) || %(patch)s "
@@ -165,3 +174,24 @@ def resume_windows(
     saved = cp["saved"] if isinstance(cp.get("saved"), int) else 0
     rejected = cp["rejected"] if isinstance(cp.get("rejected"), int) else 0
     return done, saved, rejected
+
+
+def pinned_rows(group: dict[str, Any], enabled: bool = True) -> list[dict[str, Any]]:
+    """An OVERDUE group's rows, cut back to the row set its checkpoint was cut from.
+
+    KB 57972: an overdue group is a session still being written, so by the next run
+    an interrupted one has always gained rows, and the fingerprint (taken over the
+    WHOLE assembled text) would discard every banked window. Rows past ``upto_id``
+    stay 'pending' (the flip is by id) and drain as the next piece. The fingerprint
+    is still the safety check: pinned rows whose text moved re-extract in full. A
+    quiet group, a checkpoint without ``upto_id``, or the kill switch
+    (``enabled=False``) leaves the rows exactly as fetched. Never raises on a
+    malformed ``meta``: the drain calls this outside its per-group isolation.
+    """
+    rows = group["rows"]
+    meta = rows[0].get("meta") if enabled and group.get("overdue") else None
+    cp = window_checkpoint(meta) if isinstance(meta, dict) else None
+    upto = cp.get("upto_id") if cp else None
+    if not isinstance(upto, int) or isinstance(upto, bool):
+        return rows
+    return [r for r in rows if r["id"] <= upto] or rows

@@ -66,7 +66,9 @@ is not a code index).
 
 One durable table. Rows are deduped by content hash, capped at 1 MB, and
 coalesced per `(project, session)` after a quiet period — so one session becomes
-one job, never a cross-project blend.
+one job, never a cross-project blend. A session that is never quiet (always-on)
+drains once its oldest row has waited `COALESCE_MAX_WAIT_HOURS` (20 h): one piece
+a night, and rows that land meanwhile wait for the next.
 
 ## 3 · Nightly
 

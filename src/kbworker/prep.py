@@ -193,7 +193,7 @@ def _assemble_jobs(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     jobs: list[dict[str, Any]] = []
     for group in groups:
-        rows = group["rows"]
+        rows = ingest_queue.pinned_rows(group, settings.kb_drain_window_checkpoint)
         row = rows[0]
         ids = [r["id"] for r in rows]
         try:

@@ -145,6 +145,7 @@ def _record_window(state: dict[str, Any], job: dict[str, Any]) -> None:
             done=state["windows_done"],
             saved=state["saved"],
             rejected=state["rejected"],
+            upto_id=max(state["ids"]),  # KB 57972: what a live group is pinned back to
         )
     except Exception:  # noqa: BLE001 — never let bookkeeping fail the group
         _COHORT_STATS["cohort_checkpoint_failures"] = (
@@ -168,6 +169,9 @@ def _fail_group(ids: list[int], error: str) -> None:
         _COHORT_STATS["attempts_cap_retirements"] = (
             _COHORT_STATS.get("attempts_cap_retirements", 0) + 1
         )
+    elif any(terminal):  # KB 57972: an always-on group's rows join on different nights
+        retired = _COHORT_STATS.get("attempts_cap_rows_retired", 0)
+        _COHORT_STATS["attempts_cap_rows_retired"] = retired + sum(terminal)
 
 
 def _drain_job(

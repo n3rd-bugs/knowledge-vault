@@ -144,6 +144,7 @@ def _drain_ingest_queue() -> tuple[int, int]:
         processed.update((g["project"], g["group_uri"]) for g in groups)
         _COHORT_STATS["cohort_refills"] += 1
         _COHORT_STATS["cohort_groups_considered"] += len(groups)
+        _COHORT_STATS["cohort_groups_overdue"] += sum(1 for g in groups if g.get("overdue"))
         _COHORT_STATS["cohort_eligible"] += len(groups)
 
         jobs = _assemble_jobs(groups)

@@ -27,15 +27,18 @@ def test_queue_groups_split_is_invisible_through_ingest_queue():
     from kbcore import queue_groups
 
     for name in (
+        "COALESCE_MAX_WAIT_HOURS",
         "COALESCE_QUIET_MINUTES",
         "_DEGENERATE_URI_SQL",
         "_DRAINABLE",
         "group_key",
         "normalise_source_uri",
-        "pending",
         "pending_groups",
     ):
         assert getattr(ingest_queue, name) is getattr(queue_groups, name), name
+    # The inspection helper moved back to ingest_queue (KB 57972), where every
+    # caller already reached it.
+    assert callable(ingest_queue.pending) and not hasattr(queue_groups, "pending")
 
 
 def test_powerguard_split_is_invisible_through_consolidate():

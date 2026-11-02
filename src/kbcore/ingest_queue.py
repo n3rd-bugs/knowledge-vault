@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
@@ -24,6 +25,7 @@ from kbcore.errors import InvalidOperation
 from kbcore.queue_checkpoint import (  # noqa: F401
     CHECKPOINT_KEY,
     CHECKPOINT_PRESERVE_SQL,
+    pinned_rows,
     resume_windows,
     save_window_checkpoint,
     window_checkpoint,
@@ -33,10 +35,10 @@ from kbcore.queue_enqueue import EnqueueResult, enqueue  # noqa: F401
 from kbcore.queue_groups import (  # noqa: F401
     _DEGENERATE_URI_SQL,
     _DRAINABLE,
+    COALESCE_MAX_WAIT_HOURS,
     COALESCE_QUIET_MINUTES,
     group_key,
     normalise_source_uri,
-    pending,
     pending_groups,
 )
 from kbcore.queue_repair import (  # noqa: F401
@@ -190,6 +192,40 @@ def queue_depth(before: datetime | None = None) -> int:
         sql = "SELECT count(*) FROM ingest_queue WHERE status = 'pending' AND created_at < %s"
         row = conn.execute(sql, (before or datetime.max.replace(tzinfo=UTC),)).fetchone()
     return int(row[0])
+
+
+def pending(limit: int = 50) -> list[dict[str, Any]]:
+    """TEST/INSPECTION helper: up to ``limit`` drainable rows, deferred-last.
+
+    ZERO production callers — the drain reads through :func:`pending_groups`.
+    Moved back here from :mod:`kbcore.queue_groups` (KB 57972) to make room
+    there for the bounded wait; callers always reached it as ``ingest_queue.pending``.
+    Corrected 2026-08-21 (review #5): the ``FOR UPDATE SKIP LOCKED`` here is
+    NOT a concurrency guarantee — the row locks die at ``connect()``'s context
+    exit, so they never outlive the call; advisory lock 42
+    (``kbworker.consolidate.ADVISORY_KEY``) is the real single-drainer
+    guarantee. Drainable is :data:`_DRAINABLE` — still 'pending', or
+    retryable-'failed' and not content-failed TODAY (the per-DAY attempt
+    budget, review #4). Ordering: fresh (never-deferred) pending rows first,
+    THEN already-deferred pending rows, then retryable failed rows, so a stuck
+    row drifts to the back as it accumulates deferrals (review finding).
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT id, project, kind, content, meta
+            FROM ingest_queue
+            WHERE {_DRAINABLE}
+            ORDER BY (status = 'failed'), deferrals, id
+            LIMIT %(limit)s
+            FOR UPDATE SKIP LOCKED
+            """,  # noqa: S608 — _DRAINABLE is a constant fragment
+            {"maxa": MAX_ATTEMPTS, "day0": drain_day_start(), "limit": limit},
+        ).fetchall()
+    return [
+        {"id": r[0], "project": r[1], "kind": r[2], "content": r[3], "meta": r[4] or {}}
+        for r in rows
+    ]
 
 
 def mark_group_extracted(ids: list[int], saved: int, rejected: int) -> None:

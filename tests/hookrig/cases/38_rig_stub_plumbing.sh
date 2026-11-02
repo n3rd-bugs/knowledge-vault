@@ -11,7 +11,7 @@
 #           repeat (no oracle, rules 10/12). The legacy (kind, project, hash)
 #           arbiter applies only when no session_uri arrives or it is degenerate
 #           ('session:'), mirroring src/kbcore/queue_enqueue.py:180,202-206,268-270
-#           and src/kbcore/queue_groups.py:55-83. Before this re-key the stub
+#           and src/kbcore/queue_groups.py:65-93. Before this re-key the stub
 #           deduped on sha256(text) alone, LOOSER than the server, so case 27's
 #           "second sweep is a no-op" passed for the wrong reason.
 #         * 202 BODY is exactly today's four keys (case 08 pins it through the

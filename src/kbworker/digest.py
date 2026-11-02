@@ -146,6 +146,8 @@ def _fact_lines(counts: Mapping[str, Any]) -> list[str]:
     # LAST act — the owner hears it here or from nobody.
     if retired := counts.get("attempts_cap_retirements"):
         lines.append(f"drain: {retired} group(s) retired at attempts cap")
+    if rows := counts.get("attempts_cap_rows_retired"):  # KB 57972: a live group, partly
+        lines.append(f"drain: {rows} row(s) of a still-retrying group retired at attempts cap")
     # Review #5 val-3/strat-8: wall-blocked reject suggestions given their
     # terminal (reversible) disposition tonight.
     if closed := counts.get("wall_blocked_closed"):

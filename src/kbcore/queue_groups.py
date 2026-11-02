@@ -29,7 +29,17 @@ logger = logging.getLogger("kbcore.ingest_queue")
 # extract the rest separately.
 COALESCE_QUIET_MINUTES = 30
 
-# The drainable set both readers below share: still pending, or failed but under
+# ...unless the group has already WAITED this long (KB 57972). kb-flush-sweep backfills
+# a live session every 1800 s (+120 s jitter), so an always-on session gains a row every
+# 30-32 min and its newest row is almost never quiet: it drained only on the nights it
+# happened to pause. An overdue group drains as it stands; rows that land meanwhile stay
+# pending for the next run, because the flip is by id (ingest_queue.mark_group_extracted).
+# Deliberately SHORTER than a day: those leftovers start landing minutes after a fetch, so
+# at the next 01:30 the oldest is 24 h minus one sweep gap old, and a 24 h bound drained
+# the session only every OTHER night (~48 h waits, double batches).
+COALESCE_MAX_WAIT_HOURS = 20
+
+# The drainable set pending_groups + ingest_queue.pending share: still pending, or failed but under
 # the retry budget AND not content-failed TODAY — attempts are budgeted per DAY,
 # not per run, since a per-RUN exclusion let the 08-15 boot catch-up double-burn
 # a group failed at 01:00 (review #4; %(day0)s = queue_repair.drain_day_start(),
@@ -93,45 +103,12 @@ def group_key(project: str, uri: str) -> str:
     return f"{project}::{uri}"
 
 
-def pending(limit: int = 50) -> list[dict[str, Any]]:
-    """TEST/INSPECTION helper: up to ``limit`` drainable rows, deferred-last.
-
-    ZERO production callers — the drain reads through :func:`pending_groups`.
-    Corrected 2026-08-21 (review #5): the ``FOR UPDATE SKIP LOCKED`` here is
-    NOT a concurrency guarantee — the row locks die at ``connect()``'s context
-    exit, so they never outlive the call; advisory lock 42
-    (``kbworker.consolidate.ADVISORY_KEY``) is the real single-drainer
-    guarantee. Drainable is :data:`_DRAINABLE` — still 'pending', or
-    retryable-'failed' and not content-failed TODAY (the per-DAY attempt
-    budget, review #4). Ordering: fresh (never-deferred) pending rows first,
-    THEN already-deferred pending rows, then retryable failed rows, so a stuck
-    row drifts to the back as it accumulates deferrals (review finding).
-    """
-    from kbcore.ingest_queue import MAX_ATTEMPTS, drain_day_start
-
-    with connect() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT id, project, kind, content, meta
-            FROM ingest_queue
-            WHERE {_DRAINABLE}
-            ORDER BY (status = 'failed'), deferrals, id
-            LIMIT %(limit)s
-            FOR UPDATE SKIP LOCKED
-            """,  # noqa: S608 — _DRAINABLE is a constant fragment
-            {"maxa": MAX_ATTEMPTS, "day0": drain_day_start(), "limit": limit},
-        ).fetchall()
-    return [
-        {"id": r[0], "project": r[1], "kind": r[2], "content": r[3], "meta": r[4] or {}}
-        for r in rows
-    ]
-
-
 def pending_groups(
     limit: int = 200,
     quiet_minutes: int = COALESCE_QUIET_MINUTES,
     max_groups: int | None = None,
     exclude: Iterable[tuple[str, str]] | None = None,
+    max_wait_hours: int = COALESCE_MAX_WAIT_HOURS,
 ) -> list[dict[str, Any]]:
     """Drainable rows grouped by the SESSION they belong to, WITHIN A PROJECT.
 
@@ -184,9 +161,11 @@ def pending_groups(
 
     A group is returned only when its newest row has been quiet for
     ``quiet_minutes`` — a session still being written would otherwise be
-    extracted in halves. Rows with no (or a degenerate) source_uri fall back to
-    their own ``queue:<kind>:<id>`` and come back as groups of one, which is what
-    they already were.
+    extracted in halves — OR once its oldest row has waited ``max_wait_hours``
+    (KB 57972: an always-on session is never quiet, so the wait is bounded; such a
+    group comes back with ``overdue=True``). Rows with no (or a degenerate)
+    source_uri fall back to their own ``queue:<kind>:<id>`` and come back as groups
+    of one, which is what they already were.
 
     Each returned group carries the unique ``uri`` key (see :func:`group_key`),
     the ``project``, the raw ``source_uri`` it was derived from, and
@@ -222,17 +201,22 @@ def pending_groups(
                 -- still being submitted. A group of ONE row cannot be split, so
                 -- it drains immediately — which also keeps every single-shot
                 -- submission (an ad-hoc ingest, a small session) as responsive
-                -- as it was before coalescing existed.
-                SELECT project, uri, min(created_at) AS oldest, count(*) AS n
+                -- as it was before coalescing existed. The oldest row's age
+                -- BOUNDS the wait (KB 57972); 'overdue' marks a group that only
+                -- that bound let through.
+                SELECT project, uri, min(created_at) AS oldest, count(*) AS n,
+                       count(*) > 1 AND max(created_at)
+                           >= now() - make_interval(mins => %(quiet)s) AS overdue
                   FROM d GROUP BY project, uri
                  HAVING count(*) = 1
                      OR max(created_at) < now() - make_interval(mins => %(quiet)s)
+                     OR min(created_at) < now() - make_interval(hours => %(wait)s)
             ),
             elig AS (
                 -- Oldest-first, with a running row total so the ROW cap can be
                 -- applied to a PREFIX of that order instead of to whatever the
                 -- planner happened to emit first.
-                SELECT project, uri, oldest, n,
+                SELECT project, uri, oldest, n, overdue,
                        sum(n) OVER (ORDER BY oldest, project, uri
                                     ROWS UNBOUNDED PRECEDING) AS cum
                   FROM g
@@ -246,12 +230,12 @@ def pending_groups(
                 -- cum = n is the FIRST group in the order: it is taken even when
                 -- it alone exceeds the row cap, because skipping it would return
                 -- nothing and one oversized session would wedge the queue.
-                SELECT project, uri, oldest FROM elig
+                SELECT project, uri, oldest, overdue FROM elig
                  WHERE cum <= %(rows)s OR cum = n
                  ORDER BY oldest, project, uri
                  LIMIT %(groups)s::bigint  -- NULL = no group cap
             )
-            SELECT q.id, q.project, q.kind, q.content, q.meta, d.uri, d.suri
+            SELECT q.id, q.project, q.kind, q.content, q.meta, d.uri, d.suri, c.overdue
               FROM chosen c
               JOIN d ON d.project = c.project AND d.uri = c.uri
               JOIN ingest_queue q ON q.id = d.id
@@ -261,6 +245,7 @@ def pending_groups(
                 "maxa": MAX_ATTEMPTS,
                 "day0": drain_day_start(),
                 "quiet": int(quiet_minutes),
+                "wait": int(max_wait_hours),
                 "rows": max(1, int(limit)),
                 "groups": None if max_groups is None else max(1, int(max_groups)),
                 "ex_projects": ex_projects,
@@ -272,11 +257,13 @@ def pending_groups(
     # Insertion order is the SQL order, so the groups come back oldest-first.
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     source_uris: dict[tuple[str, str], str | None] = {}
-    for rid, project, kind, content, meta, uri, suri in rows:
+    overdue: dict[tuple[str, str], bool] = {}
+    for rid, project, kind, content, meta, uri, suri, late in rows:
         groups.setdefault((project, uri), []).append(
             {"id": rid, "project": project, "kind": kind, "content": content, "meta": meta or {}}
         )
         source_uris[(project, uri)] = suri
+        overdue[(project, uri)] = bool(late)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for (project, uri), members in groups.items():
@@ -294,6 +281,7 @@ def pending_groups(
                 "project": project,
                 "group_uri": uri,
                 "source_uri": source_uris[(project, uri)],
+                "overdue": overdue[(project, uri)],
                 "rows": members,
             }
         )

@@ -50,6 +50,9 @@ def reset_cohort_stats(cohort_size: int) -> None:
             # coming back, and there would otherwise be no way to see it.
             "cohort_refills": 0,
             "cohort_groups_considered": 0,
+            # ADDED 2026-11-02 (KB 57972): groups taken only because their oldest row
+            # waited out queue_groups.COALESCE_MAX_WAIT_HOURS (an always-on session).
+            "cohort_groups_overdue": 0,
             # Per-window checkpoint telemetry (ADDED 2026-08-10, never renamed): windows
             # a resumed group skipped, groups resumed, failed writes (swallowed in cohort).
             "cohort_windows_resumed": 0,
@@ -69,6 +72,9 @@ def reset_cohort_stats(cohort_size: int) -> None:
             # sub-cap content failures stay report-only (they retry tomorrow).
             "content_failures": 0,
             "attempts_cap_retirements": 0,
+            # ADDED 2026-11-02 (KB 57972): rows of a group that is still retrying (an
+            # always-on session's rows carry different attempt counts) retired at the cap.
+            "attempts_cap_rows_retired": 0,
             # Malformed-JSON recovery (ADDED 2026-09-12): extractor replies that
             # parsed only after the seed+1 re-ask, that were salvaged item by
             # item, and that stayed unparseable (kbcore.llm_json.recover_items).

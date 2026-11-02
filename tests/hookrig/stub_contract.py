@@ -17,7 +17,7 @@ queue_enqueue.py:98-113 _probe + queue_guard.py:85-98 find_prior). A resubmissio
 of that pair under another project is REFUSED and answered exactly like a
 same-project live duplicate: queue_id null, duplicate true, no oracle
 (queue_enqueue.py:63-95). Anything else -- no session_uri, a degenerate one
-('session:' -> None, src/kbcore/queue_groups.py:55-83), kind 'memory' -- falls
+('session:' -> None, src/kbcore/queue_groups.py:65-93), kind 'memory' -- falls
 back to the legacy arbiter UNIQUE (kind, project, content_hash)
 (queue_enqueue.py:268-270). Before this re-key the stub deduped on sha256(text)
 alone, LOOSER than the server, so "a second sweep is a no-op" passed for the
@@ -193,7 +193,7 @@ def flush_consistent(stamp: dict[str, Any], raw_len: int) -> bool | None:
 
 
 def normalise_source_uri(value: str | None) -> str | None:
-    """src/kbcore/queue_groups.py:55-83 verbatim: a degenerate identity is None.
+    """src/kbcore/queue_groups.py:65-93 verbatim: a degenerate identity is None.
 
     Degenerate = empty/whitespace, or a bare scheme with nothing after it
     ('session:', 'session://', 'file:/'). 'session:' is the wildcard grouping

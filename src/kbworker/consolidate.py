@@ -27,6 +27,7 @@ from kbcore import (
     llm,  # noqa: F401 — patch surface: tests patch `consolidate.llm.*`
     logsafe,
     review_auto,
+    review_moot,
     review_rejects,
     review_triage,
 )
@@ -332,10 +333,10 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         if settings.kb_auto_supersede_doc_refresh:
             _run_step(counts, "doc_refresh_resolved", lambda: _doc_refresh(projects))
         _run_step(counts, "duplicates_marked", lambda: sum(_dedupe(p) for p in projects))
-        # WP-1 (owner decision 2026-07-18): sweep review rows made moot by any
-        # retirement path — including this run's freshly-marked duplicates, which
-        # is why this sits right after the dedupe step. Status flips only.
+        # WP-1 (2026-07-18) + KB 57973: close review rows made moot by any retirement path,
+        # this run's fresh duplicates included (hence right after dedupe). Status flips only.
         _run_step(counts, "review_moot_closed", review_auto.close_moot_rows)
+        _run_step(counts, "moot_contradictions_closed", review_moot.close_moot_contradictions)
         # WP-2 (owner decision 2026-07-18): the 14B TRIAGES pending unverified
         # extractions — SUGGESTIONS only, stored in review_queue.detail.triage;
         # a human applies them (kb review apply-triage / kb_review_bulk). Runs

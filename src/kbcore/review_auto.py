@@ -25,6 +25,7 @@ from kbcore import review, review_promote
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation
 from kbcore.review_expire import EXPIRY_GATE, QUIET_ELIGIBLE, REJECT_TRIAGE_ACTIONS
+from kbcore.review_moot import open_moot_contradictions
 from kbcore.triage_sql import (
     TRIAGE_KEY,
     TRIAGE_PRIOR_KEY,
@@ -50,7 +51,9 @@ def close_moot_rows() -> int:
     One parameterized UPDATE in one transaction, idempotent (a second run finds
     nothing open). Each closed row's ``detail`` is stamped via jsonb merge with
     ``auto_resolution = {kind: 'item_retired', item_status, at}`` for audit.
-    Returns the number of rows closed.
+    Returns the number of rows closed. Contradiction rows are the next nightly
+    step's (:func:`kbcore.review_moot.close_moot_contradictions`, KB 57973), under
+    their own report key, so this one keeps its meaning night over night.
     """
     at = datetime.now(UTC).isoformat()
     with transaction() as conn:
@@ -103,6 +106,8 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
       expiry is off (``expire_days <= 0``) or nothing can expire.
     * ``contradiction_suggestions_pending`` — open contradiction rows carrying a
       decisive ``suggested_resolution`` that has not been executed yet.
+    * ``moot_contradictions_open`` — open contradiction rows with a retired side: owner
+      vetoes, questions kept for the owner, pairs mooted later tonight (KB 57973). ADDED.
 
     EXAMINED-BEFORE-EXPIRY (Package O). The 08-19..09-01 expiry cliff had to be
     reconstructed by hand, so the pool quiet-expiry drains is first-class
@@ -221,6 +226,7 @@ def curation_counts(expire_days: int) -> dict[str, Any]:
         # The PROMOTE PROGRAM's queue depth (kbcore.review_promote): same
         # predicate as `kb review promote-candidates`, so digest and table agree.
         "promote_candidates": review_promote.count_promote_candidates(),
+        "moot_contradictions_open": open_moot_contradictions(),
     }
 
 

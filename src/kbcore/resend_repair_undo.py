@@ -28,6 +28,7 @@ from datetime import UTC, datetime
 
 from kbcore.db import connect, transaction
 from kbcore.resend_repair import REPAIR_BY, SESSION_ROWS_SQL, RepairSelector, selector_sql
+from kbcore.review_moot import reopen_unmooted_in
 
 REPLAY_MODE = "replay"
 _NOT_REPLAY = "{col}meta->'repair'->>'mode' IS DISTINCT FROM 'replay'"
@@ -137,6 +138,7 @@ def undo_items(ids: list[int]) -> tuple[int, int]:
                 {"ids": review_ids},
             )
             reopened = cur.rowcount or 0
+        reopen_unmooted_in(conn, [int(r[0]) for r in rows])  # swept contradiction rows
     return len(rows), reopened
 
 

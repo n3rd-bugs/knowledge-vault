@@ -51,6 +51,7 @@ from kbcore.review_apply_rows import (
     invalidate_dead_dup,
     mark_triage_unresolvable,
 )
+from kbcore.review_moot import reopen_unmooted_in
 
 #: Stamp kinds :func:`undo_auto_applied` can reverse. Both are effects THIS
 #: module produced; a row carrying any other kind (a human's dismissal, a quiet
@@ -281,6 +282,7 @@ def undo_auto_applied(since: datetime, *, dry_run: bool = False) -> list[int]:
                     "WHERE id = %s AND status = %s",
                     (item_id, expected),
                 )
+                reopen_unmooted_in(conn, [item_id])  # its swept contradiction rows too
             conn.execute(
                 "UPDATE review_queue SET resolved = false, "
                 "detail = COALESCE(detail, '{}'::jsonb) || %s WHERE id = %s",

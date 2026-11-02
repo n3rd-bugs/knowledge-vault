@@ -59,7 +59,8 @@ def test_moot_sweep_closes_rows_for_retired_items(kb):
         )
     assert consolidation.archive_stale(datetime.now(UTC) - timedelta(days=180)) == 1
 
-    # A contradiction row for a retired item is NOT the moot sweep's business.
+    # A contradiction row is NOT this sweep's business: it closes in its own nightly
+    # step under its own report key (review_moot.close_moot_contradictions, KB 57973).
     q_contra = queue_review(sup, "contradiction", {"a_id": sup, "b_id": winner})
 
     assert review_auto.close_moot_rows() == 3

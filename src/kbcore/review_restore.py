@@ -48,6 +48,7 @@ from kbcore import scope
 from kbcore.db import connect, transaction
 from kbcore.errors import InvalidOperation, NotFound
 from kbcore.review import queue_review_in
+from kbcore.review_moot import reopen_unmooted_in
 from kbcore.review_recency import AUTO_RESOLVE_REASON, HOLD_KEY, HOLD_RESTORED, RESOLVED_KIND
 from kbcore.supersede import supersede
 
@@ -188,6 +189,8 @@ def restore_auto_resolved(
             """,
             {"reopen": plan.reopen_window, "rec": Jsonb(record), "id": retired_id},
         )
+        # BEFORE the twin veto below: a twin the moot sweep closed comes back VETOED.
+        reopen_unmooted_in(conn, [retired_id])
         veto: dict[str, Any] = {
             HOLD_KEY: {
                 "kind": HOLD_RESTORED,

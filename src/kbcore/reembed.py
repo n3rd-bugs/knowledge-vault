@@ -27,7 +27,7 @@ from kbcore.db import transaction
 
 BATCH = 64
 
-# "deadline" / "battery" / None — see ``kbworker.consolidate.should_stop``.
+# "lock lost" / "deadline" / "battery" / None — see ``kbworker.consolidate.should_stop``.
 StopCheck = Callable[[], "str | None"]
 
 

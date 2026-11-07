@@ -142,8 +142,8 @@ def run_triage(batch: int, should_stop: Callable[[], str | None] | None = None) 
     validation-rejected verdict stores nothing. Returns suggestions stored.
 
     ``should_stop`` is the caller's stand-down guard (the nightly passes
-    :func:`kbworker.consolidate.should_stop`, which answers 'deadline' /
-    'battery' / None). It is asked every :data:`STOP_CHECK_EVERY` rows — this is
+    :func:`kbworker.consolidate.should_stop`, which answers 'lock lost' /
+    'deadline' / 'battery' / None). It is asked every :data:`STOP_CHECK_EVERY` rows — this is
     a 14B call per row and it used to run unbounded past the drain's deadline —
     and a stop leaves the remaining rows exactly as an outage does: open,
     untriaged, no penalty, re-selected by :func:`pending_triage` next run. The

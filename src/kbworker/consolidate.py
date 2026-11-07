@@ -32,7 +32,7 @@ from kbcore import (
     review_triage,
 )
 from kbcore.config import settings
-from kbcore.db import advisory_lock
+from kbcore.db import advisory_lock, check_lock, lock_lost
 from kbworker import (
     allocator,
     ensemble,
@@ -202,7 +202,7 @@ def reset_stop_cache() -> None:
 
 
 def should_stop() -> str | None:
-    """``'deadline'`` / ``'battery'`` / ``None`` — the ONE stand-down question.
+    """``'lock lost'`` / ``'deadline'`` / ``'battery'`` / ``None`` — the ONE stand-down question.
 
     Both guards existed but were asked at exactly ONE site (between drain
     cohorts, first batch exempt), so the LLM TAIL — triage, contradictions,
@@ -213,14 +213,15 @@ def should_stop() -> str | None:
     next run (Invariant 3 makes the retry idempotent).
 
     The verdict is cached for a few seconds so a per-item check costs a
-    dictionary lookup rather than a wall-clock parse plus a SQLite read; neither
+    dictionary lookup rather than a wall-clock parse plus a SQLite read; no
     signal can meaningfully change inside one LLM call.
     """
     global _stop_cache
     now = time.monotonic()
     if _stop_cache is not None and now - _stop_cache[0] < _STOP_CACHE_SECONDS:
         return _stop_cache[1]
-    reason = "deadline" if _past_deadline() else ("battery" if _on_battery() else None)
+    reason = "lock lost" if lock_lost() else None  # KB 61595: another session holds the lock
+    reason = reason or ("deadline" if _past_deadline() else ("battery" if _on_battery() else None))
     _stop_cache = (now, reason)
     return reason
 
@@ -437,10 +438,10 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
             lambda: tail_steps.review_triaged_topup(counts, stop),
         )
 
-        # Search-quality regression sentinel (§8): replay the golden eval, record
-        # hit@5/MRR, flag a drop vs the previous run. Advisory — never aborts the
-        # run. Runs before the counts below so a freshly-enqueued regression row
-        # is reflected in review_queue_open.
+        # Search-quality regression sentinel (§8): replay the golden eval, record hit@5/MRR, flag
+        # a drop vs the previous run. Advisory, never aborts the run. Runs before the counts below
+        # so a freshly-enqueued regression row is reflected in review_queue_open.
+        check_lock()  # KB 61595: a lock lost in the last working step stops the pass HERE
         eval_sentinel.run_sentinel(counts)
 
         # WHY the run is as short as it is, and how much it left behind. Rides

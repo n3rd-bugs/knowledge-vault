@@ -33,6 +33,10 @@ class AlreadySuperseded(InvalidOperation):
     """
 
 
+class LockLost(KBError):
+    """A held advisory lock went to another session after its connection dropped (KB 61595)."""
+
+
 class EmbedderUnavailable(KBError):
     """The Ollama embedding endpoint could not be reached or returned an error."""
 

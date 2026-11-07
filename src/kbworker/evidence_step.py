@@ -17,6 +17,7 @@ from typing import Any
 
 from kbcore import evidence, review_recency
 from kbcore.config import settings
+from kbcore.db import lock_lost
 from kbcore.errors import AlreadySuperseded, ExtractorUnavailable
 from kbcore.review import close_contradiction_rows_for
 from kbworker.tail_ops import STOP_CHECK_EVERY, StopCheck
@@ -173,6 +174,9 @@ def _evidence(
     no_verdict_run = 0  # consecutive per-pair judge failures: 2 trip the pass breaker
     unresolved: list[tuple[int, int, int, str | None]] = []  # (qid, keep, retire, hold kind)
     for n, (queue_id, sugg, streak) in enumerate(candidates):
+        if lock_lost():  # KB 61595: another session holds the lock; retire nothing beside it
+            _seam()._note_stop("evidence_refreshed", "lock lost", len(candidates) - n)
+            break
         # Only a BATTERY stand-down stops phase 2: on a deadline the collected rows still
         # resolve (the reserve's promise). Asked of the power guard DIRECTLY: past the
         # deadline should_stop() answers "deadline" and never looks at the battery.
@@ -262,6 +266,8 @@ def _evidence(
         review_recency.HOLD_FAILED: ("auto_resolve_judge_failed", "auto_resolve_judge_failed_open"),
         review_recency.GATE_RETRY: ("auto_resolve_judge_retry", None),
     }
+    if lock_lost():
+        unresolved = []  # ...and close nothing either: the next step's check_lock ends the pass
     for queue_id, keep, retire, kind in unresolved:
         try:
             if not review_recency.pair_moot(keep, retire):

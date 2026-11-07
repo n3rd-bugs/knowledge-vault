@@ -249,7 +249,7 @@ class TailReserve:
         """Wrap ``base`` so a step also stands down once it has spent its ``share``.
 
         Returns :data:`TRIAGE_SHARE_REASON` when the share is exhausted, else
-        ``base()`` — the run's deadline/battery verdict, which STILL preempts within
+        ``base()`` — the run's lock/deadline/battery verdict, which STILL preempts within
         the share (an inner bound, never a way to run longer). When the share is
         inert (kill switch, no deadline, ``share <= 0``) this is ``base`` UNCHANGED,
         so the pooled behaviour is reproduced byte for byte and the knob is opt-in.

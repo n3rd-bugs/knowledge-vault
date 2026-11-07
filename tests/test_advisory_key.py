@@ -72,8 +72,8 @@ def test_the_peer_check_never_breaks_the_lock_path(caplog):
 def test_the_real_lock_path_still_grants_and_releases():
     """The added read must not disturb acquisition semantics."""
     with db.advisory_lock(4242) as first:
-        assert first is True
+        assert bool(first) is True
         with db.advisory_lock(4242) as second:
-            assert second is False, "a second holder was not refused"
+            assert bool(second) is False, "a second holder was not refused"
     with db.advisory_lock(4242) as again:
-        assert again is True, "the lock was not released"
+        assert bool(again) is True, "the lock was not released"

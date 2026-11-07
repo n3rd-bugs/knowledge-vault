@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import zlib
 from collections.abc import Iterator
@@ -17,7 +18,8 @@ from contextvars import ContextVar
 import psycopg
 
 from kbcore.config import settings
-from kbcore.errors import DatabaseUnavailable
+from kbcore.db_lock import LockHold
+from kbcore.errors import DatabaseUnavailable, LockLost
 
 logger = logging.getLogger("kbcore.db")
 
@@ -198,15 +200,18 @@ def _warn_on_foreign_advisory_keys(conn, scoped: int, acquired: bool) -> None:
         logger.info("advisory key %s (acquired=%s)", scoped, acquired)
 
 
+_HOLDS: list[LockHold] = []  # the locks held in this process now (check_lock reads them)
+
+
 @contextmanager
-def advisory_lock(key: int) -> Iterator[bool]:
+def advisory_lock(key: int) -> Iterator[LockHold]:
     """Hold a session-level ``pg_advisory_lock`` for the block (ARCH-5).
 
-    Yields whether the lock was acquired. Uses its OWN autocommit connection so
-    the lock survives the whole ``with`` regardless of the transaction()
-    connections the work opens (each opens/closes its own), and is released when
-    this connection closes. Non-blocking: a second holder yields ``False`` so the
-    caller can skip rather than queue.
+    Yields a :class:`LockHold`, truthy iff the lock was acquired. Uses its OWN autocommit
+    connection so the lock survives the whole ``with`` regardless of the transaction()
+    connections the work opens (each opens/closes its own), and is released when this
+    connection closes. Non-blocking: a second holder gets a falsy hold so the caller can
+    skip rather than queue. While held, the hold re-takes the lock after a Postgres restart.
     """
     # SCHEMA-SCOPED. A pg advisory lock is per-DATABASE, not per-schema, so
     # kb_test and public shared key 42: running the suite while a real nightly
@@ -219,14 +224,37 @@ def advisory_lock(key: int) -> Iterator[bool]:
     from kbcore.config import settings
 
     scoped = (key << 16) ^ (zlib.crc32(settings.kb_db_schema.encode()) & 0xFFFF)
-    conn = connect()
-    conn.autocommit = True
-    acquired = False
+    hold = LockHold(scoped, connect(), reconnect=connect)
+    hold.conn.autocommit = True
     try:
-        acquired = bool(conn.execute("SELECT pg_try_advisory_lock(%s)", (scoped,)).fetchone()[0])
-        _warn_on_foreign_advisory_keys(conn, scoped, acquired)
-        yield acquired
+        row = hold.conn.execute("SELECT pg_try_advisory_lock(%s)", (scoped,)).fetchone()
+        hold.acquired = hold.held = bool(row[0])
+        _warn_on_foreign_advisory_keys(hold.conn, scoped, hold.acquired)
+        if hold.acquired:
+            _HOLDS.append(hold)
+            hold.keep_alive()
+        yield hold
     finally:
-        if acquired:
-            conn.execute("SELECT pg_advisory_unlock(%s)", (scoped,))
-        conn.close()
+        if hold in _HOLDS:
+            _HOLDS.remove(hold)
+        hold.release()
+
+
+def check_lock() -> None:
+    """Raise :class:`~kbcore.errors.LockLost` if a lock this thread holds went to another
+    session after its connection dropped (KB 61595). The consolidation pass asks between
+    steps (``kbworker.run_report._run_step``), so it stops there instead of running on beside
+    the new holder."""
+    if lock_lost():
+        raise LockLost("an advisory lock this pass held went to another session")
+
+
+def lock_lost() -> bool:
+    """Whether a lock this thread holds went to another session (the non-raising check; the
+    consolidation stand-down guard asks it, so a long step stops inside, not only after)."""
+    return any(h.lost for h in _HOLDS if h.owner == threading.get_ident())
+
+
+def lock_retaken() -> int:
+    """How many times this thread's held locks were taken again after a Postgres restart."""
+    return sum(h.retaken for h in _HOLDS if h.owner == threading.get_ident())

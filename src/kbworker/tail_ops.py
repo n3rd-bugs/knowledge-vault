@@ -39,7 +39,7 @@ _CONTRA_STATS: dict[str, int] = dict.fromkeys(
 _CONTRA_BLANK: list[list[int]] = []  # [a_id, b_id] of each no-verdict pair this run (KB 55589)
 _SUMMARY_STATS: dict[str, int] = {"summaries_capped": 0, "summary_sources_left_out": 0}
 
-# "deadline" / "battery" / None — see ``consolidate.should_stop``.
+# "lock lost" / "deadline" / "battery" / None — see ``consolidate.should_stop``.
 StopCheck = Callable[[], "str | None"]
 
 # How often a per-item loop asks ``consolidate.should_stop``. The answer is

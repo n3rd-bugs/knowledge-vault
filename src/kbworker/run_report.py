@@ -18,6 +18,7 @@ from typing import Any
 
 from kbcore import consolidation, report_meta
 from kbcore.config import settings
+from kbcore.db import check_lock, lock_retaken
 from kbcore.ingest import ingest
 
 logger = logging.getLogger("kbworker.consolidate")
@@ -98,6 +99,9 @@ def _run_step(counts: dict[str, Any], key: str, fn) -> None:
     consolidation_requests.result, so "where did the hour go" is answerable from
     data on the next run rather than by instrumenting after the fact.
     """
+    check_lock()  # KB 61595: a pass whose lock went to another session stops HERE, uncaught
+    if retaken := lock_retaken():  # ...and one that took it back says so in its report
+        counts["advisory_lock_retaken"] = retaken
     t0 = time.monotonic()
     try:
         counts[key] = fn()
@@ -113,6 +117,8 @@ def _run_step(counts: dict[str, Any], key: str, fn) -> None:
 
 
 def _write_report(counts: dict[str, Any]) -> int:
+    if retaken := lock_retaken():  # a re-take after the last step still reaches the report
+        counts["advisory_lock_retaken"] = retaken
     ts = datetime.now(UTC)
     # BODY = scalar counts ONLY (review #9a follow-up, 2026-09-09). The body is
     # chunked + embedded like any item; nested telemetry (per-case ranks keyed by

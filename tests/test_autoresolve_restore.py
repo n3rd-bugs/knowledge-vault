@@ -26,6 +26,9 @@ from kbcore.supersede import supersede
 from kbworker import consolidate
 from kbworker.digest_recency_lines import auto_resolve_held_line
 
+# Each pass here is a night: the KB 61594 night rule is tested in test_evidence_nights.py.
+pytestmark = pytest.mark.usefixtures("each_pass_a_night")
+
 T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
 

@@ -370,7 +370,7 @@ def test_quiet_expiry_runs_BEFORE_the_llm_tail(kb, monkeypatch):
         consolidate, "_contradictions_all", lambda p, s=None: (order.append("contra"), 0)[1]
     )
     monkeypatch.setattr(
-        consolidate, "_evidence", lambda s=None: (order.append("evidence"), (0, 0))[1]
+        consolidate, "_evidence", lambda s=None, p=None: (order.append("evidence"), (0, 0, 0))[1]
     )
 
     result = consolidate.main(stop=lambda: None)  # guarded, and never stopped

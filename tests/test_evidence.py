@@ -431,7 +431,7 @@ def lopsided_pair(contradiction_pair, monkeypatch):
     return ids
 
 
-def test_two_night_streak_auto_resolves(lopsided_pair):
+def test_two_night_streak_auto_resolves(lopsided_pair, each_pass_a_night):
     from kbworker import consolidate
 
     ids = lopsided_pair
@@ -485,9 +485,12 @@ def test_streak_resets_when_evidence_flips(lopsided_pair, monkeypatch):
         ).fetchone()[0]
     assert detail["suggested_resolution"]["keep"] == ids["b"], "suggestion flipped"
     assert detail["suggestion_streak"] == 1, "streak reset on flip"
+    assert detail[evidence.STREAK_STAMP] == r2["run_started_at"], "a flip re-stamps the streak"
 
 
-def test_auto_resolve_flag_off_suggests_but_never_acts(lopsided_pair, monkeypatch):
+def test_auto_resolve_flag_off_suggests_but_never_acts(
+    lopsided_pair, monkeypatch, each_pass_a_night
+):
     from kbworker import consolidate
 
     monkeypatch.setattr(settings, "kb_auto_resolve_evidence", False)

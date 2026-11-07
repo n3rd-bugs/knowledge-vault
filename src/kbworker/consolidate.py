@@ -160,10 +160,9 @@ EVIDENCE_PAIR_CAP: int | None = None
 # never-enriched rows first — right for a fresh contradiction, fatal for a
 # nearly-resolved one: with 57 open contradictions and a cap of 20, twelve
 # decisive suggestions sat at streak=1 for weeks because the window never came
-# back to them, and AUTO_RESOLVE_STREAK=2 needs exactly one more visit. This
-# changes SCHEDULING only — the suggestion thresholds and the two-night
-# stability rule (evidence.SUGGEST_* / AUTO_RESOLVE_STREAK) are untouched
-# settled design.
+# back to them, and AUTO_RESOLVE_STREAK=2 needs one more visit a night later. This changes
+# SCHEDULING only — the thresholds and the two-night rule (evidence.SUGGEST_* /
+# AUTO_RESOLVE_STREAK / STREAK_MIN_GAP) are untouched settled design.
 EVIDENCE_STREAK_RESERVE_DIVISOR = 2  # half the cap
 
 
@@ -399,7 +398,7 @@ def main(stop: StopCheck | None = None) -> dict[str, Any]:
         # Step 3b AFTER contradictions so rows queued seconds ago get evidence
         # in the same run (open_contradiction_rows orders never-enriched first).
         def _ev() -> int:
-            refreshed, auto_resolved, moot = _evidence(stop)
+            refreshed, auto_resolved, moot = _evidence(stop, counts["run_started_at"])
             counts["evidence_auto_resolved"] = auto_resolved
             counts["auto_resolve_moot"] = moot
             counts.update(_EVIDENCE_STATS)  # recency guard: held tonight / held open

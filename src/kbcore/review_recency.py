@@ -2,7 +2,7 @@
 
 THE DEFECT (owner-verified on live data, 2026-10-24). The nightly evidence pass
 retires the side of a contradiction pair with weaker trust-weighted
-corroboration once the suggestion holds for ``AUTO_RESOLVE_STREAK`` refreshes.
+corroboration once the suggestion holds for ``AUTO_RESOLVE_STREAK`` nights.
 Corroboration favours whatever has been in the KB LONGER — an old snapshot
 accumulates neighbours, a fresh correction has none yet. In the 60 days to
 2026-10-22 the step auto-resolved 92 pairs and 46 of them retired the NEWER
@@ -197,7 +197,7 @@ def resolve_contradiction(queue_id: int, keep: int, retire: int, *, judge: bool 
 
     Owner V4 refinement (2026-07): supersede the evidence-losing side with the
     winner and close the row. Invoked ONLY by the nightly worker after the same
-    suggestion persisted for AUTO_RESOLVE_STREAK consecutive refreshes; fully
+    suggestion persisted for AUTO_RESOLVE_STREAK nights (KB 61594); fully
     audited (supersede reason + relation + an ``auto_resolution`` stamp on the
     row + report count + log line) and reversible (``kb review restore``).
 

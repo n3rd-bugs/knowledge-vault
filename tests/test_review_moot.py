@@ -176,7 +176,7 @@ def _evidence_suggests(monkeypatch, on: tuple[int, int], keep: int, retire: int)
     monkeypatch.setattr(settings, "kb_auto_resolve_evidence", True)
 
 
-def test_a_restore_reopens_swept_rows_and_vetoes_a_swept_twin(kb, monkeypatch):
+def test_a_restore_reopens_swept_rows_and_vetoes_a_swept_twin(kb, monkeypatch, each_pass_a_night):
     k, r, x = _item("k"), _item("r"), _item("x")
     for a, b in ((k, r), (r, k), (r, x)):  # (r, k) is the twin: its own relation + row
         assert consolidation.record_contradiction(a, b) is True

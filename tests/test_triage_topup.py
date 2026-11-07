@@ -338,7 +338,7 @@ def test_the_topup_is_the_LAST_tail_step(kb, monkeypatch, open_window):
         consolidate, "_contradictions_all", lambda p, s=None, c=None: (order.append("contra"), 0)[1]
     )
     monkeypatch.setattr(
-        consolidate, "_evidence", lambda s=None: (order.append("evidence"), (0, 0))[1]
+        consolidate, "_evidence", lambda s=None, p=None: (order.append("evidence"), (0, 0, 0))[1]
     )
     monkeypatch.setattr(consolidate, "_summaries", lambda since, s=None: 0)
     monkeypatch.setattr(

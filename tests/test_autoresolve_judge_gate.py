@@ -33,6 +33,9 @@ from kbcore.ingest import ingest
 from kbworker import consolidate, digest, evidence_step, tail_ops
 from kbworker.digest_recency_lines import judge_held_line
 
+# Each pass here is a night: the KB 61594 night rule is tested in test_evidence_nights.py.
+pytestmark = pytest.mark.usefixtures("each_pass_a_night")
+
 T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 SEAT = "bonsai-2:27b"
 

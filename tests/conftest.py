@@ -352,6 +352,17 @@ def _isolated_state_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
+def each_pass_a_night(monkeypatch):
+    """Count every evidence pass as a new night (the KB 61594 gap off), for tests whose premise
+    is "night 1, night 2" run back to back. The night rule itself: tests/test_evidence_nights.py."""
+    from datetime import timedelta
+
+    from kbcore import evidence
+
+    monkeypatch.setattr(evidence, "STREAK_MIN_GAP", timedelta(0))
+
+
+@pytest.fixture()
 def kb(kb_schema):
     """Function-scoped clean slate inside kb_test (truncate, keep layout).
 

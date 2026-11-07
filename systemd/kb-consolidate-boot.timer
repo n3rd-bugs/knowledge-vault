@@ -1,10 +1,10 @@
-# kb-consolidate-boot.timer — catch-up drain after an unclean shutdown, ordered
-# behind the day's backup.
+# kb-consolidate-boot.timer — a catch-up consolidation pass 10 min after every boot (meant for
+# an unclean shutdown, it fires after any boot), ordered behind the day's backup.
 # (Folded in from a LIVE-ONLY unit on 2026-08-01: it ran on this machine but was
 # never in the repo, so the next install_systemd.sh run would have removed the
 # only protection against an interrupted nightly.)
 [Unit]
-Description=Knowledge Vault catch-up drain after an unclean shutdown
+Description=Knowledge Vault catch-up consolidation pass after a boot
 
 [Timer]
 # Persistent=true on the nightly timer only covers a MISSED window. It does not
@@ -15,7 +15,10 @@ Description=Knowledge Vault catch-up drain after an unclean shutdown
 # 10 minutes after boot, so the network, Postgres and Ollama are up first.
 # Safe to fire when there is nothing to do: the drain takes a non-blocking
 # advisory lock and exits immediately if the nightly is already running, and an
-# empty queue is a cheap no-op. Ingest is idempotent (Invariant 3), so rows left
+# empty queue drains nothing. But it is the WHOLE pass, not only the drain:
+# triage, contradictions, evidence and the eval run too (2026-11-07: two
+# reboots, two full passes). Its evidence refresh does not advance a streak the
+# day's nightly took (KB 61594). Ingest is idempotent (Invariant 3), so rows left
 # 'pending' by the cut are re-drained normally rather than duplicated.
 #
 # Triggers the boot GUARD (kb-consolidate-boot.service), NOT kb-consolidate.service

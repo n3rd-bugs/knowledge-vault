@@ -16,7 +16,7 @@ from kbworker import consolidate, digest
 T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 
 
-def test_the_nightly_counts_and_digest_carry_held_pairs(kb, monkeypatch):
+def test_the_nightly_counts_and_digest_carry_held_pairs(kb, monkeypatch, each_pass_a_night):
     old = ingest("wire", "qa", "old eval", "no regression", uri="wo", trust="unverified")
     new = ingest("wire", "qa", "new eval", "below the floor", uri="wn", trust="unverified")
     with db.transaction() as conn:

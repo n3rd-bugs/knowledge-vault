@@ -364,7 +364,7 @@ def test_the_tail_RUNS_after_the_drain_stands_down_for_the_reserve(kb, monkeypat
         consolidate, "_contradictions_all", lambda p, s=None, c=None: (order.append("contra"), 0)[1]
     )
     monkeypatch.setattr(
-        consolidate, "_evidence", lambda s=None: (order.append("evidence"), (0, 0))[1]
+        consolidate, "_evidence", lambda s=None, p=None: (order.append("evidence"), (0, 0, 0))[1]
     )
     monkeypatch.setattr(consolidate, "_summaries", lambda since, s=None: 0)
     monkeypatch.setattr(consolidate.eval_sentinel, "run_sentinel", lambda counts: None)

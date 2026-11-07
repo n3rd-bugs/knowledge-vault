@@ -13,8 +13,8 @@ the nightly consolidation worker (Invariant 8).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import UTC, datetime
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -37,6 +37,13 @@ SUGGEST_MIN_SUPPORTERS = 2
 SUGGEST_MIN_WEIGHT = 4
 SUGGEST_MARGIN = 3
 AUTO_RESOLVE_STREAK = 2
+# ...and each streak step needs a new NIGHT (KB 61594): the pass taking it must START at least
+# STREAK_MIN_GAP after the pass that took the row's step before. Nightly passes start 24 h
+# apart; a boot catch-up or an owner's run after the day's nightly starts sooner than that, so
+# it refreshes a row the nightly stepped without advancing it. (2026-11-07: two reboots'
+# catch-up passes resolved rows 10 h after their first refresh.)
+STREAK_MIN_GAP = timedelta(hours=23)
+STREAK_STAMP = "streak_pass_at"  # detail key: START (UTC ISO) of the pass that took the step
 
 
 def open_contradiction_rows() -> list[tuple[int, int, int, dict[str, Any]]]:
@@ -87,6 +94,42 @@ def suggestion_for(
                 ),
             }
     return None
+
+
+def next_streak(
+    prior: Mapping[str, Any], sugg: Mapping[str, Any] | None, pass_at: datetime
+) -> tuple[int, str | None]:
+    """``(suggestion_streak, STREAK_STAMP)`` after a refresh in the pass started ``pass_at``.
+
+    No suggestion: 0. A new or changed one: 1, stamped with this pass. The same one again: one
+    more and a new stamp only when this pass started :data:`STREAK_MIN_GAP` after the stamped
+    one; sooner, the streak and its stamp stand. A row streaked before the stamp existed is
+    judged by its last refresh (``evidence_updated``), which set its streak; one with neither
+    time advances, as every row did before.
+    """
+    if not sugg:
+        return 0, None
+    prev = prior.get("suggested_resolution") or {}
+    streak = int(prior.get("suggestion_streak") or 0)
+    if streak < 1 or (prev.get("keep"), prev.get("retire")) != (sugg["keep"], sugg.get("retire")):
+        return 1, pass_at.isoformat()
+    stamp = prior.get(STREAK_STAMP) or prior.get("evidence_updated")
+    last = utc_instant(stamp)
+    if last is None or pass_at - last >= STREAK_MIN_GAP:
+        return streak + 1, pass_at.isoformat()
+    return streak, str(stamp)
+
+
+def utc_instant(value: Any) -> datetime | None:
+    """An ISO-8601 instant as an aware datetime (naive = UTC, Invariant 7); None if unreadable."""
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def candidate_texts(item_ids: Sequence[int]) -> dict[int, tuple[str, str, str]]:

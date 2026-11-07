@@ -19,6 +19,9 @@ from kbcore.consolidation import record_contradiction
 from kbcore.ingest import ingest
 from kbworker import consolidate, evidence_step
 
+# Each pass here is a night: the KB 61594 night rule is tested in test_evidence_nights.py.
+pytestmark = pytest.mark.usefixtures("each_pass_a_night")
+
 # The supersede_reason the live auto-resolutions carry (kbcore.review_recency).
 AUTO_RESOLVE_REASON = "auto: evidence margin stable across nightly refreshes"
 T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)

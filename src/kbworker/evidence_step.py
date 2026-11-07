@@ -11,6 +11,7 @@ patched ``consolidate.EVIDENCE_PAIR_CAP`` keeps its exact pre-split meaning.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from types import ModuleType
 from typing import Any
 
@@ -53,7 +54,7 @@ def _evidence_batch(rows: list[Row]) -> list[Row]:
     """Cap the nightly evidence batch, RESERVING a slice for near-decided rows.
 
     A row whose last refresh produced a suggestion (``suggestion_streak >= 1``)
-    is ONE more visit away from auto-resolution, but it sorts LAST — the query
+    is ONE more visit (a night later) from auto-resolution, but it sorts LAST — the query
     puts never-enriched rows first — so a cap smaller than the open set starved
     it forever (12 suggestions stuck at streak=1 against 57 open rows and a cap
     of 20). Up to ``_evidence_pair_cap() // EVIDENCE_STREAK_RESERVE_DIVISOR`` of
@@ -77,13 +78,15 @@ def _evidence_batch(rows: list[Row]) -> list[Row]:
     return batch
 
 
-def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
+def _evidence(
+    stop: StopCheck | None = None, pass_at: str | datetime | None = None
+) -> tuple[int, int, int]:
     """Step 3b: refresh evidence for open contradictions; auto-resolve stable ones.
 
     Counts accumulate night over night as repo seeds and session flushes add
     corroborating items; never-enriched rows come first (evidence.py ordering)
     so the cap can't starve brand-new contradictions. A decisive suggestion
-    that holds for AUTO_RESOLVE_STREAK consecutive refreshes is executed
+    that holds for AUTO_RESOLVE_STREAK nights (below) is executed
     (owner V4 refinement; kill switch kb_auto_resolve_evidence). Per-pair
     isolation. ``stop`` (asked every :data:`STOP_CHECK_EVERY` pairs) bounds the
     step by wall clock/power as well as by the pair cap; an unreached row
@@ -111,7 +114,14 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
     Resolutions run AFTER every refresh (two phases) so the judge — another model
     on a one-slot card — loads once per pass; once it is unreachable the rest of
     the pass defers what needs it while the recency guard and moot path still act.
+
+    NIGHTS, NOT PASSES (KB 61594): ``pass_at`` is this pass's START (consolidate hands in
+    ``counts['run_started_at']``; None = now). A streak advances only in a pass started
+    ``STREAK_MIN_GAP`` after the one that took its last step (:func:`evidence.next_streak`),
+    so a boot catch-up after the nightly refreshes the rows that nightly stepped without
+    advancing them.
     """
+    started = evidence.utc_instant(pass_at) or datetime.now(UTC)
     rows = evidence.open_contradiction_rows()
     refreshed = 0
     auto_resolved = 0
@@ -145,14 +155,8 @@ def _evidence(stop: StopCheck | None = None) -> tuple[int, int, int]:
         try:
             detail = evidence.gather_evidence(a_id, b_id)
             sugg = detail.get("suggested_resolution")
-            if sugg:
-                prior_sugg = prior.get("suggested_resolution") or {}
-                same = prior_sugg.get("keep") == sugg["keep"] and prior_sugg.get(
-                    "retire"
-                ) == sugg.get("retire")
-                detail["suggestion_streak"] = prior.get("suggestion_streak", 0) + 1 if same else 1
-            else:
-                detail["suggestion_streak"] = 0  # overwrite any stale streak
+            streak, stamp = evidence.next_streak(prior, sugg, started)  # 0 overwrites a stale one
+            detail["suggestion_streak"], detail[evidence.STREAK_STAMP] = streak, stamp
             still_open = evidence.update_review_detail(queue_id, detail)
             if still_open:
                 refreshed += 1

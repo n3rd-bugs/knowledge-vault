@@ -1,5 +1,5 @@
 # kb-consolidate-boot.service — boot-path GUARD: the day's backup runs before the
-# catch-up drain does.
+# catch-up pass does.
 #
 # The boot catch-up (kb-consolidate-boot.timer, OnBootSec=10min) can start a
 # 4.5-7h drain. A boot between 00:00 and 00:30 fires that catch-up BEFORE the
@@ -32,7 +32,7 @@
 # is a pure ordering barrier and does no work of its own. It has no [Install]:
 # only kb-consolidate-boot.timer starts it, never a boot target directly.
 [Unit]
-Description=Knowledge Vault boot catch-up guard (local backup before the catch-up drain)
+Description=Knowledge Vault boot catch-up guard (local backup before the catch-up pass)
 Wants=kb-backup-local.service
 After=kb-backup-local.service
 Wants=kb-consolidate.service

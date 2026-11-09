@@ -12,10 +12,10 @@ scope/status/valid-time WHERE fragment the caller (kbcore.search) builds:
   AND yields fewer than KW_OR_FALLBACK_MIN rows on a multi-word query, rerun as
   an OR over the query's PARSED lexemes (so file/host tokens like
   ``psycopg.errors.undefinedcolumn`` still match) — one non-matching token no
-  longer kills the whole leg. OR rows are ordered by how many DISTINCT query
-  lexemes the whole item matches, then ts_rank_cd — an item stuffed with one
-  common term cannot outrank a broad match — and must match at least two
-  lexemes. AND matches keep their ranks ahead of OR-only matches;
+  longer kills the whole leg. OR rows, ONE PER ITEM (its best chunk), are ordered
+  by IDF-weighted lexeme coverage, then ts_rank_cd — an item stuffed with one common
+  term cannot outrank a broad match — and an item matching a single lexeme is admitted
+  only when that lexeme is rare. AND matches keep their ranks ahead of OR-only matches;
 - identifier leg: word-boundary (``\m..\M``) match of the query's identifier
   tokens over item titles + chunks, ranked by distinct-token match count then
   recency. Runs only for identifier-DOMINANT queries (at least half the words
@@ -196,8 +196,8 @@ def _keyword_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[
 
     The AND pass is the pre-existing leg, unchanged. The fallback ORs the
     query's parsed lexemes (still parameterized — never interpolated), same
-    WHERE wall, same CANDIDATES cap, ordered by distinct-lexeme item coverage
-    then ts_rank_cd, and requires >= 2 matched lexemes per item. Single-word
+    WHERE wall, same CANDIDATES cap, ordered by IDF-weighted item coverage then
+    ts_rank_cd; a single-lexeme item is admitted only for a rare lexeme. Single-word
     queries never fall back (their OR is the AND query again; a lone symbol
     like drv_spi_write is the identifier leg's job, not a drv|spi|write soup).
     """
@@ -234,7 +234,7 @@ def _keyword_leg(conn, query: str, where: str, params: list[Any]) -> list[tuple[
 def _or_coverage_rows(
     conn, lexemes: list[str], where: str, params: list[Any]
 ) -> list[tuple[int, str]]:
-    """OR-matched chunk rows ordered by IDF-WEIGHTED item lexeme coverage.
+    """OR-matched ITEMS, each by its best chunk, ordered by IDF-WEIGHTED lexeme coverage.
 
     Each lexeme carries weight ln(1 + N_items/df); an item's key is the sum over
     its DISTINCT matched lexemes, so one rare topic anchor ("polarity",
@@ -242,6 +242,15 @@ def _or_coverage_rows(
     stuffed with common terms cannot bury the on-topic hit. Items matching a
     single lexeme are admitted only when that lexeme is RARE (df at most
     max(8, N/100)): the one term that matters, unstemmed variants and all.
+
+    ONE ROW PER ITEM (E3, eval/EPOCHS.md). The key is an item's, so a long document's
+    chunks all sort together: under a LIMIT on chunk rows the first few documents filled
+    the leg (a median of 4 items in 40 rows on real queries), and a short item holding the
+    answer never reached fusion. An item's row is its best chunk over the KEPT lexemes:
+    ranked over all of them it was the chunk with the most stopwords, and that chunk is
+    what fusion's snippet and the reranker read for an item only this leg found.
+    ``sum(w ORDER BY w)``: float addition depends on order, and under a hash plan items
+    with equal weights differed by an ulp, which outranked every tie rule below it.
     """
     return conn.execute(
         f"""
@@ -277,7 +286,7 @@ def _or_coverage_rows(
             WHERE NOT EXISTS (SELECT 1 FROM sel)
         ),
         cov AS (
-            SELECT item_id, count(*) AS n, sum(w) AS wsum, min(df) AS min_df
+            SELECT item_id, count(*) AS n, sum(w ORDER BY w) AS wsum, min(df) AS min_df
             FROM (
                 SELECT DISTINCT c.item_id, t.tq::text AS lex, t.df,
                        ln(1.0 + (SELECT n_items FROM stats)
@@ -285,20 +294,32 @@ def _or_coverage_rows(
                 FROM chunks c JOIN selected t ON c.tsv @@ t.tq
             ) m
             GROUP BY item_id
+        ),
+        kept AS (
+            SELECT string_agg(tq::text, ' | ') FILTER (WHERE numnode(tq) > 0)::tsquery AS q
+            FROM selected
+        ),
+        best AS (
+            SELECT DISTINCT ON (c.item_id) c.item_id, c.id AS chunk_id, cov.wsum,
+                   ts_rank_cd(c.tsv, kept.q) AS r
+            FROM chunks c
+            JOIN cov ON cov.item_id = c.item_id
+            JOIN items i ON i.id = c.item_id
+            LEFT JOIN projects p ON p.name = i.project
+            CROSS JOIN kept
+            WHERE c.tsv @@ kept.q AND {where}
+                  AND (cov.n >= 2
+                       OR cov.min_df <= GREATEST(8, (SELECT n_items FROM stats) / 100))
+            ORDER BY c.item_id, r DESC, c.ord
+        ),
+        top AS (
+            SELECT * FROM best ORDER BY wsum DESC, r DESC, item_id DESC LIMIT {CANDIDATES}
         )
-        SELECT c.item_id, c.text
-        FROM chunks c
-        JOIN cov ON cov.item_id = c.item_id
-        JOIN items i ON i.id = c.item_id
-        LEFT JOIN projects p ON p.name = i.project,
-        websearch_to_tsquery('simple', %s) q
-        WHERE c.tsv @@ q AND {where}
-              AND (cov.n >= 2
-                   OR cov.min_df <= GREATEST(8, (SELECT n_items FROM stats) / 100))
-        ORDER BY cov.wsum DESC, ts_rank_cd(c.tsv, q) DESC
-        LIMIT {CANDIDATES}
+        SELECT top.item_id, c.text
+        FROM top JOIN chunks c ON c.id = top.chunk_id
+        ORDER BY top.wsum DESC, top.r DESC, top.item_id DESC
         """,
-        [lexemes, MAX_OR_LEXEMES, " OR ".join(lexemes), *params],
+        [lexemes, MAX_OR_LEXEMES, *params],
     ).fetchall()
 
 

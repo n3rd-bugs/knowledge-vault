@@ -53,7 +53,7 @@ from kbworker.digest_lines import (  # noqa: F401
     night_of,
 )
 from kbworker.digest_recency_lines import auto_resolve_held_line, judge_held_line, judged_line
-from kbworker.eval_epoch_lines import eval_case_lines, eval_epoch_line, first_pass_lines  # E1/E2
+from kbworker.eval_epoch_lines import escalates, eval_case_lines, eval_epoch_line, first_pass_lines
 
 logger = logging.getLogger("kbworker.tail_steps")
 
@@ -225,7 +225,7 @@ def push_run_digest(counts: Mapping[str, Any]) -> bool:
         try:
             from kbcore import notify
 
-            if counts.get("eval_regression"):
+            if escalates(counts):
                 # Red eval night (review #5 ops-1): a SUCCESSFUL unit run whose
                 # quality regressed — OnFailure never fires, so the digest itself
                 # must escalate. Green nights keep the byte-identical default call.

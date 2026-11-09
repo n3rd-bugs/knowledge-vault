@@ -47,16 +47,18 @@
   # at rank 3 behind two gateway eval-QA notes, 6884/6858); tags=['hw:drv8706']
   # excludes those and leaves 981 at rank 1 (2026-08-09) — the tag filter rescues
   # precision. The unfiltered symbol path is still measured by the bare
-  # 'drv_spi_write' cases and the KNOWN-RED canary below.
+  # 'drv_spi_write' cases and the canary below.
   expect_item_id: 981
   expect_rank_le: 3
   kwargs: {tags: ["hw:drv8706"]}
 - q: "have we hit SPI problems anywhere"               # cross-project gotcha phrasing 2
-  # KNOWN RED (2026-08-04): code-symbol dilution — the i-redis stack-pointer
+  # RED from 2026-08-04 to E3: code-symbol dilution — the i-redis stack-pointer
   # ("sp") corpus outranks the DRV8706 gotcha for this vague phrasing (the
-  # dilution itself is recorded as item 6858). Kept red on purpose: it is the
+  # dilution itself is recorded as item 6858). Never re-pointed: it is the
   # canary for vague cross-project recall; do not repoint it to whatever
   # happens to rank — fixing it means fixing retrieval, not the case.
+  # Green at E3's gate; ranks and margins live in EPOCHS.md. Still the canary: a relapse means
+  # vague cross-project recall regressed.
   expect_substr: ["DRV8706"]
 - q: "systemd service keeps restarting how to debug"
   # 983 pinned + type-filter exercise: with type='runbook' the rm3 fleet-ops spec
@@ -323,9 +325,9 @@
 # again observed rank + 2. Same provenance rule: ranks observed live
 # 2026-08-08 via kb_search, k=5, expand unset (hops 0).
 
-# KNOWN RED #2 since E2 (review #10): candidate-generation miss -- the satisfier's
-# best chunk sits outside the vector leg's 40-row window (EPOCHS.md E2). Criteria
-# untouched. Do not re-point.
+# Red at E2 (review #10) as a candidate-generation miss; green at E3's gate, once long documents
+# stopped filling the OR leg. Ranks and margins live in EPOCHS.md: they move, and this file
+# cannot change without opening an epoch. Criteria untouched. Do not re-point.
 - q: "service dies at boot but starts fine manually afterwards"
   # GOTCHA-BY-SYMPTOM: the query carries none of the answer's identifiers
   # (isc-dhcp-server, NetworkManager, network-online.target) — the user has the

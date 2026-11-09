@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from kbcore import rerank, search
+from kbcore import db, rerank, search
 from kbcore.config import settings
 from kbcore.ingest import ingest
 
@@ -71,20 +71,24 @@ def test_reorders_window_and_survives_tohits(kb, monkeypatch, _rerank_url):
     )
     assert a and b
 
+    seen = {}
+
     # Sidecar says: LAST presented doc is the most relevant → order must flip.
     def post(url, *, json=None, timeout=None):
         n = len(json["documents"])
+        seen["last"] = json["documents"][-1]
         return_scores = [0.1] * n
         return_scores[-1] = 0.99
         fake = _fake_post(return_scores)
         return fake(url, json=json, timeout=timeout)
 
     monkeypatch.setattr(rerank.httpx, "post", post)
-    baseline_ids = [h.item_id for h in search.search("widget knowledge")]
+    hits = search.search("widget knowledge")
+    baseline_ids = [h.item_id for h in hits]
     assert len(baseline_ids) >= 2
-    # The reranked winner is whichever id the fused order put LAST in the window;
+    # The reranked winner is whichever document the fused order put LAST in the window;
     # it must now come FIRST, having survived _to_hits' score sort.
-    assert baseline_ids[0] == baseline_ids[0]  # sanity
+    assert seen["last"].startswith(hits[0].title)
     # run again — deterministic mock keeps the flip stable
     again = [h.item_id for h in search.search("widget knowledge")]
     assert again == baseline_ids
@@ -124,3 +128,43 @@ def test_score_multiset_preserved():
     assert [t[0] for t in out] == [3, 2, 1]
     assert sorted((t[1] for t in out), reverse=True) == [0.5, 0.3, 0.2]
     assert out[0][1] == 0.5  # winner inherits the window's best fused score
+
+
+def test_tied_window_scores_keep_the_rerank_order():
+    """Vector and OR ranks at one position tie exactly, and _to_hits would re-sort a tie by trust
+    and recency: the assigned scores must decrease strictly, staying on the fused scale."""
+    fused = [(1, 0.5, "s1"), (2, 0.5, "s2"), (3, 0.5, "s3"), (4, 0.25, "s4")]
+
+    class _Conn:
+        def execute(self, *a):
+            class _R:
+                def fetchall(self):
+                    return [(i, f"t{i}", f"b{i}") for i in (1, 2, 3)]
+
+            return _R()
+
+    import kbcore.rerank as rr
+
+    orig = rr._scores
+    rr._scores = lambda q, docs: [0.5, 0.1, 0.9]  # 3 best, then 1, then 2
+    try:
+        out = rr.rerank_fused(_Conn(), "q", fused, top_n=3)
+    finally:
+        rr._scores = orig
+    assert [t[0] for t in out] == [3, 1, 2, 4]
+    scores = [t[1] for t in out]
+    assert scores[0] == 0.5, "the top of the window keeps its fused score"
+    assert scores[0] > scores[1] > scores[2] > scores[3], "and no tie is left to re-sort"
+    assert scores[2] == pytest.approx(0.5), "the scale stays as fused"
+    assert scores[3] == 0.25, "the tail is never touched"
+
+
+def test_tied_scores_keep_the_rerank_order_through_to_hits(kb, monkeypatch):
+    """Through _to_hits: a tie used to fall to trust and recency, so the newer item came first."""
+    older = ingest("p", "note", "older", "older body about things")
+    newer = ingest("p", "note", "newer", "newer body about things")
+    monkeypatch.setattr(rerank, "_scores", lambda q, docs: [0.9, 0.1])  # the older item wins
+    with db.connect() as conn:
+        out = rerank.rerank_fused(conn, "q", [(older, 0.5, "a"), (newer, 0.5, "b")], top_n=2)
+
+    assert [h.item_id for h in search._to_hits(out)] == [older, newer]

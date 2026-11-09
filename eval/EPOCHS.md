@@ -23,6 +23,7 @@ scalar never does.
 | E0 | wave F (`9c7ab4e`) | 52 (52) | 0.5/52 = 0.0096 | 0.9808 / 0.9269 (review #9a, KB 32942) | 0.97 / 0.90 | n/a (key lands with E1) |
 | E1 | 2026-09-16 | 61 (59) | 0.5/59 = 0.0085 | 0.9836 / 0.8975 (daytime replay 2026-09-16, fallback-free; expected first clean night 0.9836 / 0.889 — see below) | 0.97 / 0.86 (MRR re-anchored 2026-09-17, see night 1) | `f687077853bd` |
 | E2 | 2026-10-29 | 61 (59) | 0.5/59 = 0.0085 | 0.9672 / 0.8650 (gate 2026-10-29: two back-to-back replays, fallback-free) | 0.950 / 0.845 | `092b054e8e9e` |
+| E3 | 2026-11-09 | 61 (59) | 0.5/59 = 0.0085 | 1.0000 / 0.9017 (gate 2026-11-09: two back-to-back replays, fallback-free) | 0.950 / 0.860 | `291ffdd667b2` |
 
 ## E0 — the 52-case set (wave F, `9c7ab4e`, through 2026-09-16)
 
@@ -281,8 +282,8 @@ the E2 set on the live corpus, after 40402 → 56704, with the E2 code; rerank w
   another epoch}; floors 0.95 / 0.845 in meta, no `eval_floors_at_defaults`.
 - Row 35091 resolved `epoch changed` at 00:23:47 UTC (`eval_regression_epoch_closed` 35091; the WARNING
   names `untracked`). `eval_regression` False with no cause, no open regression row, no KB ALERT.
-- hit@5 0.9672 / MRR 0.8734, failing exactly {7, 48}; rerank active 60 / off 1 / fallback 0. Ranks: 49 at
-  1, 8 at 2, 1 at 3, 1 at 5, and 2 without a rank (7, 48). Case 7 skips echo 13061, case 14 reads rank 5
+- hit@5 0.9672 / MRR 0.8734, failing exactly {7, 48}; rerank active 60 / off 1 / fallback 0. Ranks: 47 at
+  1, 8 at 2, 1 at 3, 1 at 5, and 4 without a rank (7, 48 and the two forbid-only cases). Case 7 skips echo 13061, case 14 reads rank 5
   on 263, case 54 rank 1 on 28469. `eval_case_persistent` and `eval_case_first_pass` are empty. The drain
   had saved 522 new items since the gate.
 - The report body carries no E2 line (103 lines).
@@ -324,8 +325,8 @@ nor the units changed. On kb-worker's own environment (`/proc/<pid>/environ`) th
 **Night 2 (2026-10-31, 01:30–07:14 PKT, report 57745): clean, on production's prefix.**
 - `eval_embed_query_prefix_sha` `df4b2898bf22`; `eval_embed_fingerprint` `e7676e44450d`, the gate's value
   on the same host (night 1 read `ece945c52a65`). Key `092b054e8e9e`, floors 0.95 / 0.845 in meta.
-- hit@5 0.9672 / MRR 0.8734, failing exactly {7, 48}, with night 1's ranks (49 at 1, 8 at 2, 1 at 3, 1 at
-  5, 2 without a rank), as the A/B predicted. Case 7 skips echo 13061, case 14 reads rank 5 on 263, case
+- hit@5 0.9672 / MRR 0.8734, failing exactly {7, 48}, with night 1's ranks (47 at 1, 8 at 2, 1 at 3, 1 at
+  5, and 4 without a rank (7, 48 and the two forbid-only cases)), as the A/B predicted. Case 7 skips echo 13061, case 14 reads rank 5 on 263, case
   54 rank 1 on 28469. Rerank active 60 / off 1 / fallback 0.
 - `eval_regression` False, no open regression row, no KB ALERT; `eval_case_persistent` and
   `eval_case_first_pass` empty; the report body carries no E2 line.
@@ -347,3 +348,151 @@ nor the units changed. On kb-worker's own environment (`/proc/<pid>/environ`) th
 - `eval_satisfier_unsatisfied_cases`.
 - Whether `kb_embed_query_prefix` joins the epoch key (today a prefix edit is recorded, not keyed), and
   recording a partial CPU offload (Ollama `/api/ps` `size_vram` against `size`).
+
+## E3 — 2026-11-09 (owner go 2026-11-06 on a measured recommendation; pack ~/kb/packs/e3-2026-11-05/, pre-registration PREREG.md there)
+
+**Why E2 ended.** E2 carried two known reds: 7, the canary, kept red on purpose, and 48, whose fix it deferred to E3
+as a candidate-generation change. The 2026-11-02 screening A/B read that as vector-leg depth plus a wider rerank
+window. The E3 measurements found the cause in another leg, and it was 7's cause too.
+
+**The cause.** The OR-coverage query is the keyword leg whenever AND finds fewer than 5 chunk rows: 57 of the 61
+golden cases. It sorted chunk rows by an ITEM-level coverage key, so all of a long document's chunks sort together,
+and its LIMIT 40 counted rows. On 150 sampled real queries those 40 rows held a median of 4 distinct items, and fewer
+than 40 on 149 of them. On case 48 they held 1 (2 in a 200-row window). In place since `c602753` (2026-07-17). E2's
+known-reds note blamed the vector window, though its deferred list had also named OR-leg chunk caps: item 23, case 48's
+rank-1 answer on 2026-08-08, was crowded out of the OR leg. 9832 at vector rank 44 was only the nearest other satisfier.
+
+**What changed — one commit (the one that adds this entry).**
+1. `kbcore.search_legs._or_coverage_rows` returns one row per item, ordered by coverage, then that row's rank, then
+   newest item. `LIMIT 40` now counts items. Three rules travel with it:
+   - An item's row is its best chunk over the KEPT lexemes, not all of them. Ranked over all of them it was the chunk
+     with the most stopwords, and that chunk is what the snippet and the reranker read for an item only this leg found.
+   - `sum(w ORDER BY w)`: float addition depends on order, and under a hash plan items with equal weights differed by an
+     ulp, which outranked every tie rule below it.
+   - Chunk text is joined only for the final 40.
+2. `kbcore.rerank.rerank_fused` assigns strictly decreasing scores, so the reranker's order survives `_to_hits`. Without
+   this, tied RRF scores fell to trust and recency: the final top-5 left the reranker's top-5 on 6 of 150 real queries.
+3. `kbworker.eval_epoch_lines.escalates`: a repeat night of a persistence trip already reported (row open, nobody new
+   joined, no floor or drop) goes out as an ordinary digest. 7 and 48 are now armed and sit near an edge (below); without
+   this a relapse would push a high-priority KB ALERT every night until the next boundary, which is E1's failure. The one
+   alert is best-effort: a failed push on the trip night is not retried, and the EVAL lines still lead later digests. A second
+   case that first lists past night 3 (only after an unreadable history night) joins without its own alert.
+   `eval_persistence_repeat` is the new meta key, out of the report body by its prefix.
+4. `kbcore.search._to_hits` reads `left(body, 300)`, not the whole body: the same snippet, for every fused candidate.
+5. `golden.yaml`, comments only: case 7's and case 48's annotations, and the canary mention in case 6's. Every case
+   parses identical. Still 61 cases, 59 positive, quantum 0.0085. Any byte change opens the epoch.
+6. This ledger: the E2 night-1 and night-2 rank census read 49 at 1 and 2 without a rank; reports 57358 and 57745 say 47
+   at 1 and 4 without a rank (7, 48 and the two forbid-only cases). Corrected above. **Restart rule, extended:** a landing
+   that changes ranking code merges while kb-consolidate is inactive, restarts kb-worker right after the merge (it holds
+   `search_legs` in memory and would key the new epoch on old code), then rebuilds the image and recreates the four
+   HTTP services (the nightly reads the host tree, the services read the image).
+Not changed: the AND query, the vector leg, the identifier legs, the rerank window (20), its timeout, the warm-up.
+
+**Candidates measured** (read-only replays on one corpus, 2026-11-05, `tool=None`, warmed, fallback-free. Golden cells
+are two identical runs, except those marked one run. Sample 1 = 150 real queries, no boost. Sample 2 = 200 fresh real
+queries with `boost_project` set to the logged principal's project, the production call shape. nDCG@5 is against E2.
+Raw tables: `final/tables.txt` in the pack.)
+
+| Variant | hit@5 | MRR | Fails | Sample 1 nDCG@5 diff | Sample 2 nDCG@5 diff |
+|---------|-------|-----|-------|----------------------|----------------------|
+| E2 (0.7760 / 0.7588) | 0.9672 | 0.8805 | 7, 48 | | |
+| Row windows 200 → 40 items, R=40 (the screening winner) | 1.0000 | 0.9093 | | +0.0184 | |
+| The same at R=30 | 0.9836 | 0.8932 | 48 | | |
+| W=60, R=30 / 40 / 50 | 0.9836 | 0.8862-0.9082 | 48 or 7 | | |
+| OR by item as first written, R=20 | 1.0000 | 0.8932 | | +0.0106 | |
+| **OR by item with the kept-lexeme rule and strict order, R=20 (E3)** | **1.0000** | **0.8932** | | **+0.0097 (-0.0180, +0.0392)** | **+0.0217 (-0.0026, +0.0471)** |
+| + no project boost for OR-only items (one run) | 1.0000 | 0.8932 | | | +0.0200 (-0.0037, +0.0454) |
+| + the 12 longest lexemes instead of the alphabetically first 12 (one run with strict order) | 1.0000 | 0.8932 | | +0.0055 | |
+| E3 at R=30 (golden: one run, first-written query) | 1.0000 | 0.9017 | | | +0.0263 (+0.0047, +0.0505) |
+| E3 at R=40 (golden: one run; golden and sample 1: first-written query) | 1.0000 | 0.9093 | | +0.0250 | +0.0194 (-0.0047, +0.0453) |
+
+Per-item windows on the keyword-AND query changed no result on 150 of 150 queries; on the vector leg, 6 of 150 top-5
+sets, a 2-2 panel. Neither landed.
+
+**Gates.** Written before each run; PREREG.md carries the order they were written in, addenda included. The judged
+readings of real queries disagree in size and in sign, and none shows a large effect. Two written lines were missed:
+- G1 golden: eligible. No case lost; case 45 slips 1→2 and passes.
+- G2 H1 on E3's code, mined search→get pairs (these favour the old ranking): top 50, 0 exits, 1 entry; top 200, 2 exits, 4
+  entries; MRR on confirmed items 0.0918 → 0.0968. The screening winner read 4 exits, 0 entries, 0.0827 on the same pairs.
+- G2b, blind list-vs-list panel on sample 1, as first written: 99 of 150 top-5 sets differ; E3 30, E2 38, tie 31, so 44.1% of
+  decided queries (p = 0.40). **The written line was 45%. This missed it by one query.**
+- G2c, pooled graded relevance (added after the miss, rule written before it ran): two blind judges per batch, exact
+  agreement 91.9% and 93.2%. Sample 1 +0.0097, up 38 down 37: passes.
+- Boost, first read: 78 queries of sample 1 replayed under boost, judges not told the author's project: E3 -0.0253 (-0.0735,
+  +0.0189). **That FAILED Addendum 7's line (>= -0.01, CI lower >= -0.03), whose rule was fix or do not land.** No fix landed. The
+  one tried (no boost for OR-only items) did nothing, and the window's local share was not up (10.5 → 9.3 of 20).
+- Boost, second read (Addendum 8, written after the failure, replacing it): sample 2, judges told the author's project: +0.0217, up 57
+  down 39: passes. So: no harm at the written margin on the larger sample with the better-informed judges, one earlier failed read on
+  a smaller one, no proven gain. Selection took E3 over Addendum 8's first-listed variant (no boost for OR-only items): E3 passes without that patch and is
+  strictly smaller, 0.0017 apart.
+- The owner decided on that reading: `Please contine as recomended` (2026-11-06, answering "Should I land E3? I recommend yes on 11-09 after the fifth morning").
+- G4 H2, five mornings, base and candidate twice each: five PASS lines, 2026-11-05 through 2026-11-09, all on the final code (the first-written code's 11-05 run is kept apart in `h2/first-written-*`). Base 0.9672 / 0.8805 on 11-05 to 11-08 and 0.9672 / 0.8720 on 11-09; candidate 1.0000 / 0.8932, then
+  1.0000 / 0.9017 on 11-09. Both 11-09 moves are case 45, one quantum each: E2 1 → 2 and E3 2 → 1, as the corpus changed under a
+  near-tie between its satisfier 56693 and summary 33761. Every morning: no case lost, no candidate failure, 0 fallbacks in four
+  replays, case 48 rank 1 on 23, case 7 rank 4, case 14 rank 5; rerank p95 0.43-0.82 s (0.82 the morning that ran beside the
+  nightly, PREREG Addendum 9).
+- Retro cuts (corpus at `created_at <= D`, today's statuses): 10-01 and 10-15 fail {34} where E2 fails {7, 34}; 10-29 none where
+  E2 fails {7}; 11-02 none where E2 fails {7, 48}. No cut loses a case.
+- Rerank off (the fail-open path): E2 0.9344 / 0.8023, E3 0.9344 / 0.8734, both failing {7, 48, 51, 54}.
+- Rerank timing. R is unchanged, but its input grew: 12,971 → 16,375 characters per call, from longer chunks entering the window.
+  Alternating pair at load ~10: p50 0.398 → 0.482 s, p95 0.530 → 0.614 s, max 0.587 → 0.640 s. So R=20 keeps its margin at the 2 s timeout.
+- Cost, alternating pairs at load ~10: the OR query p50 226/234 → 212/214 ms, p95 639/652 → 584/596 ms, max 814/865 → 750/762 ms over sample 1,
+  fewer chunks ranked with the kept lexemes. Filtered searches (project small, mid, big; type; tag) unchanged within noise. Fused candidates
+  median 44 → 69 on golden, 43 → 79 on sample 2; `search()` on golden, alternating pair: p50 0.858, 0.834 → 0.969, 0.972 s; p95 1.786, 1.717 → 1.831, 1.722 s.
+- For E4's reading, R=40 on the screening winner's lighter input (26,782 characters per call; E3's family reads 31,302): serial p50 0.64 s, p95
+  0.80 s at load 6, p95 1.15 s at load ~27; 2 clients p95 1.28 s, 0 fallbacks; 3 clients p95 1.88 s, 3 of 180 fall back. A FIFO model over 30 days
+  of real search times, excluding one 469-search burst on 10-08, puts 2-8% of searches over the 2 s timeout at that R, against 0% at R=20.
+- Gate 2026-11-09 (09:40-09:42 PKT): two back-to-back in-tree replays: hit@5 61/61 = 1.0000, MRR 0.9017 (0.90169), no case fails. Ranks: 49 at 1, 7 at 2, 2 at 4, 1 at 5, and 2 without a rank (the forbid-only cases); 11-05 read 48 at 1, 8 at 2,
+  the difference being case 45. Ranks and top-5 lists are identical to morning 5's candidate replays. The gate ran on the tree rebased
+  onto `e4d7c5e` (the KB 61594/61595 fixes, which touch no ranking file); H2 measured the same code on `08f9890`. This landing's
+  id-only KB note (62790) was saved before the gate and enters no top-5. Rerank active 60 / off 1 / fallback 0. Embed: served by the preferred host only (`192.168.1.100:11434`); runtime `ollama 0.32.5
+  qwen3-embedding:0.6b@ac6da0dfba84`, fingerprint `e7676e44450d`, prefix sha `df4b2898bf22` (the 11-09 nightly's `eval_embed_*`). pgvector `0.8.4`. The gated set keys **`291ffdd667b2`**.
+
+**Collateral.** 32 of 61 top-5 lists change, 25 of them as sets; top-1 changes on 45, 47, 48, 52. Echo slots 1 → 1; eval-day ids in top-5
+slots 14 → 16. 56680, 56701 and 57360, flagged by the screening critic, are repo docs from the nightly scan, not eval notes. Case 34's reranker
+input: unchanged on the 13 window items E2 and E3 share. Leg fill: 150 of 150 OR reads reach 40 items (E2: 1 of 150).
+`eval_top5_unverified_share` 0.623 → 0.584, `eval_top5_summary_share` 0.200 → 0.216, `eval_top5_verified_lift` 18.43 → 20.36, so the trust
+watch should stay quiet (its week-on-week resets on query count, not epoch, and compares E3 with E2 for up to six nights). On real queries the
+change is broad: 116 of 200 top-5 sets differ on sample 2.
+
+**Known reds: none. Four passes sit near an edge (ranks as of 11-05; re-read at the gate on 11-09: unchanged, except case 48's OR
+rank, 6 → 7).**
+- **Case 7** is no longer red. Rank 4 on 963 (fused 8; the case's best fused rank is 7, on 961), behind echo 13061 at rank 1. It stays the canary:
+  a relapse means vague cross-project recall regressed.
+- **Case 14** stays at rank 5 on 263; fused 2 → 5.
+- **Case 59** reads rank 4, from a new summary (58880) on 11-03, unchanged by E3. Its satisfier sits behind items the reranker scores near 1.
+- **Case 48** reads rank 1 on 23 with a reranker score of 0.94 against 0.66, so inside the window it is safe. Getting into the window is the edge: 23
+  is OR-only, fused 14 of 20, at OR rank 6, and it leaves R=20 near OR rank 9-10. Corpus cuts by `created_at` over today's statuses read OR rank 1 at
+  10-29, 3 at 10-30, 4 at 10-31, 6 at 11-03; that is not the real history (a refreshed document is missing from earlier cuts), so the slope comes from
+  the forward series in `h2/verdicts.txt`: OR rank 6 on 11-05 to 11-08 and 7 on 11-09, fused 14 every morning.
+  One rank in four days would leave roughly 8-12 days before 23 exits R=20 near OR rank 9-10, but five mornings are too few for a
+  rate, so the margin is unknown beyond about a week. If it relapses it costs 1/59 of MRR and one case
+  of hit@5, the persistence trip alerts once, and the digest keeps saying so.
+- A case red on night 1 never arms (the rule needs an earlier pass in the epoch). So night 1's read checks by hand that 7 and 48 passed.
+
+**Floors** (`.env`, applied with the commit and before the first E3 run; kb-worker restarted). This keeps E2's arithmetic with known_reds = 2:
+7 and 48 pass today, but they are boundary passes kept inside the slack, so one night's relapse is the persistence trip's job, not a floor's.
+- **hit@5** = (61 − 2 − 1)/61 = 0.9508 → **0.950** (unchanged). Trips at the 4th simultaneous failure.
+- **MRR** = lower gate replay − the reciprocal mass of 7 and 48 in that replay ((1/4 + 1/1)/59 = 0.02119 at the gate's ranks 4 and 1) − 2 quanta (0.01695),
+  rounded down to 0.005: **0.860** (0.90169 − 0.02119 − 0.01695 = 0.86356; 11-05's 0.8932 would have given 0.855). Trips past about 2.25 of reciprocal lost, about a third rank-1 failure.
+
+**Comparability.** Fused-rank and fused-count telemetry does not compare across the boundary. Thin-miss counts in fallback mode will fall, because more top
+hits have a keyword contribution; that is not a quality gain. No `eval_case_first_pass` fires for 7 or 48: their red history belongs to E2.
+
+**Night-1 predictions.** `eval_golden_hash` the new key; `eval_epoch_reset` present; `eval_case_first_pass` and `eval_case_persistent` empty; floors in meta;
+no `eval_regression`; rerank tally active 60 / off 1 / fallback 0; one digest line for the new epoch. By hand, by index, printing no key: case 7's and case
+48's verdicts pass, their satisfiers read 963 and 23, and no echo carrier beyond 13061.
+
+**Deferred to E4.**
+- The OR key itself: item-level coverage favours long documents, which is what is sliding case 48. A best-chunk coverage key should hold its margin better. Unmeasured.
+- Rerank window. R=30 reads best under boost and clears zero, at +0.46 s p50 and +1.13 s p95 on sample 2 (a loaded hour; +0.25 s p50 on golden) and the queueing
+  above. It needs the timing gate, and 156 of 1,208 real searches are hook repeats of the same query within 2 s: cutting those first would pay for part of it.
+- The sidecar under host CPU load: R=40 p50 0.64 s at load 6, 0.93 s at load ~27. No priority or thread setting measured.
+- `lexemes[:MAX_OR_LEXEMES]` runs on alphabetical order: 57 of 150 real queries are over 12 lexemes, 207 rare lexemes cut. Longest-12 did not help (above); a real
+  rarity cut has not been tried.
+- A lexeme with df = 0 passes the df filter and disables the all-common fallback. `websearch_to_tsquery` re-parses lexemes, turning signed numbers into NOT.
+- Deterministic tie-breakers on the AND query: E2's "53/61 fused orders differ" did not reproduce (0/61 between replays on 2026-11-05).
+- `exact_id_match_counts` scales with the candidates' total chunks; not a problem measured end to end, worth a phase timing.
+- With `expand=true`, more seeds are two-leg, so query-blind neighbours can take window slots. Re-arm the expansion A/B before raising `KB_GRAPH_EXPAND_HOPS`.
+- Carried over: reranker trust handling, the summaries GO rule, multilingual cases, the D7/D8 embedder pin, `eval_satisfier_unsatisfied_cases`, the query prefix in
+  the epoch key, recording a partial CPU offload.

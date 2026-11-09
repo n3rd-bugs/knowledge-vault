@@ -305,13 +305,13 @@ def _to_hits(top: list[tuple[int, float, str]]) -> list[SearchHit]:
             """
             SELECT i.id, i.title, i.type, i.project, p.domain, i.status,
                    s.trust, i.tags, i.created_at, s.uri, i.meta, i.superseded_by,
-                   i.valid_from, i.valid_to, i.body
+                   i.valid_from, i.valid_to, left(i.body, %s)
             FROM items i
             LEFT JOIN projects p ON p.name = i.project
             LEFT JOIN sources s ON s.id = i.source_id
             WHERE i.id = ANY(%s)
             """,
-            (list(by_id),),
+            (SNIPPET_CHARS, list(by_id)),
         ).fetchall()
         # Batch-mask superseded_by pointers into withheld projects (one scoped lookup)
         # — parity with get_item/timeline; owner sees everything. sup_by is column 11.

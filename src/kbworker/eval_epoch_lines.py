@@ -58,6 +58,23 @@ Report = tuple[datetime, dict[str, Any]]
 CASE_LINES_MAX = 5  # EVAL CASE alert lines before one '+N more' (digest.DIGEST_MAX_LINES = 20)
 
 
+def escalates(counts: Mapping[str, Any]) -> bool:
+    """Whether tonight's digest goes out as a high-priority KB ALERT (E3, eval/EPOCHS.md).
+
+    Any red eval night, except a persistence trip that already alerted: only that trip
+    fired, its review row was open before tonight, and no case joined it tonight. E1 alerted
+    on 34 of 36 days, and a per-case trip can stay red for weeks; those nights keep the EVAL
+    lines in an ordinary-priority digest. A floor or a drop escalates every night, as ever.
+    """
+    if not counts.get("eval_regression"):
+        return False
+    if counts.get("eval_regression_cause") != ["persistent"]:
+        return True
+    cases = counts.get("eval_case_persistent") or []
+    joined = any(isinstance(c, Mapping) and c.get("nights") == PERSIST_NIGHTS for c in cases)
+    return joined or not counts.get("eval_persistence_repeat")
+
+
 def eval_epoch_line(counts: Mapping[str, Any]) -> str | None:
     """The digest's first-night-of-an-epoch fact, or None when the run has no reset.
 

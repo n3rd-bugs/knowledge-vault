@@ -194,6 +194,7 @@ def _detect_regression(counts: dict[str, Any], hit_at_5: float, mrr: float) -> N
     if cause:
         counts["eval_regression"] = True
         counts["eval_regression_cause"] = cause
+        counts["eval_persistence_repeat"] = open_row is not None  # eval_epoch_lines.escalates
         # Recovery ANCHOR = the pre-drift baseline we must climb back to: the max of
         # the prior run and the floor, minted ONCE with the row and never rewritten
         # (dedup) — so a partial rebound cannot self-close a still degraded state.

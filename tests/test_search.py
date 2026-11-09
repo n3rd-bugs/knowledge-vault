@@ -89,4 +89,6 @@ def test_a_query_of_only_common_words_still_returns_something(kb):
             "It works by doing the thing that the other thing does.",
         )
     hits = search_mod.search("how does the it work", k=5)
-    assert hits, "an all-common query returned nothing — the fallback is not firing"
+    # With N=3 every df is under the filter, so this does not reach the all-common fallback:
+    # tests/test_search_or_by_item.py exercises it. This only pins that some leg answers.
+    assert hits, "an all-common query returned nothing"

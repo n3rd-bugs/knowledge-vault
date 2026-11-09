@@ -23,7 +23,7 @@ from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
-from kbcore import db, eval_baseline, eval_epoch, eval_harness
+from kbcore import db, eval_baseline, eval_epoch, eval_harness, notify
 from kbcore import review as review_mod
 from kbcore.ingest import ingest
 from kbworker import digest, eval_persistence, eval_regression, eval_sentinel, run_report
@@ -273,10 +273,13 @@ def test_the_trip_sets_eval_regression_and_blocks_auto_resolve_until_the_case_pa
     assert lines[0] == "EVAL RED: hit@5 0.95 (floor 0.75), MRR 0.85 (floor 0.5) - persistent"
     assert lines[1] == "EVAL CASE #1 (11): red 3 nights since 2026-11-02"
     assert all(A not in ln and B not in ln for ln in lines) and all(ln.isascii() for ln in lines)
+    assert digest.escalates(third), "the night the trip fires is a high-priority KB ALERT"
     # Night 5: still red, metrics AT the anchor — the persistent case blocks the resolve.
     fourth = _night(monkeypatch, 5, False)
     assert fourth["eval_regression"] is True and fourth["eval_case_persistent"][0]["nights"] == 4
     assert _open_row()[0] == qid, "never rewritten, never auto-resolved while persistent"
+    assert not digest.escalates(fourth), "already reported: an ordinary digest from here on"
+    assert digest.digest_lines(fourth)[0].startswith("EVAL RED"), "and the lines still say so"
     # Night 6: the case passes again — the row self-heals and the first pass is a notice.
     healed = _night(monkeypatch, 6, True, sat_a=12)
     assert healed["eval_regression"] is False and _open_row() is None
@@ -685,3 +688,73 @@ def test_the_real_report_writer_persists_what_sticky_arming_reads_back(kb, monke
     history = eval_baseline.case_history(E2)
     assert len(history) == 3 and history[-1][1]["eval_case_persistent"][0]["nights"] == 7
     assert _open_row() is not None
+
+
+@pytest.mark.parametrize(
+    ("counts", "expected"),
+    [
+        ({}, False),
+        ({"eval_regression": False}, False),
+        ({"eval_regression": True}, True),  # a report from before the keys
+        ({"eval_regression": True, "eval_regression_cause": ["persistent"]}, True),
+        (
+            {
+                "eval_regression": True,
+                "eval_regression_cause": ["persistent"],
+                "eval_persistence_repeat": False,
+            },
+            True,
+        ),
+        (
+            {
+                "eval_regression": True,
+                "eval_regression_cause": ["persistent"],
+                "eval_persistence_repeat": True,
+            },
+            False,
+        ),
+        (  # another case joined tonight: it has not been reported yet
+            {
+                "eval_regression": True,
+                "eval_regression_cause": ["persistent"],
+                "eval_persistence_repeat": True,
+                "eval_case_persistent": [{"case": 1, "nights": 9}, {"case": 2, "nights": 3}],
+            },
+            True,
+        ),
+        (
+            {
+                "eval_regression": True,
+                "eval_regression_cause": ["persistent"],
+                "eval_persistence_repeat": True,
+                "eval_case_persistent": [{"case": 1, "nights": 9}],
+            },
+            False,
+        ),
+        (  # a floor beside it always escalates, even with the row open
+            {
+                "eval_regression": True,
+                "eval_regression_cause": ["floor_mrr", "persistent"],
+                "eval_persistence_repeat": True,
+            },
+            True,
+        ),
+    ],
+)
+def test_a_repeat_persistence_night_does_not_escalate(counts, expected):
+    assert digest.escalates(counts) is expected
+
+
+def test_a_repeat_persistence_night_pushes_the_default_digest(monkeypatch):
+    calls: list[dict] = []
+    monkeypatch.setattr(notify, "push_digest", lambda lines, **kw: calls.append(kw) or True)
+    repeat = {
+        "eval_regression": True,
+        "eval_regression_cause": ["persistent"],
+        "eval_persistence_repeat": True,
+        "eval_hit_at_5": 0.98,
+    }
+    assert digest.push_run_digest(repeat) is True
+    assert calls[-1] == {}, "byte-identical to a green night's call"
+    assert digest.push_run_digest({**repeat, "eval_persistence_repeat": False}) is True
+    assert calls[-1] == {"title": "KB ALERT", "priority": "high"}

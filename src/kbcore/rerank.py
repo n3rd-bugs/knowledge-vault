@@ -12,10 +12,10 @@ returns the fused order unchanged — the reranker may only ever REORDER, never
 drop, add, or fail a search. Inert unless ``kb_rerank_url`` is set.
 
 Score handling: ``_to_hits`` re-sorts by score (verified-first tie-break), so
-reordering the list alone would be undone. Instead the existing score
-MULTISET of the reranked window is reassigned to the new order (best rerank
-gets the window's highest fused score, and so on) — order survives the
-re-sort and the score SCALE stays as fused. Within the window that
+reordering the list alone would be undone. Instead the window's own fused
+scores are reassigned to the new order (best rerank gets the highest, and so
+on; a tie drops by an ulp) — order survives the re-sort within the window and
+the score SCALE stays as fused. Within the window that
 reassignment CAN reorder an expansion neighbor above its seed (review #5
 val-2): deliberate — the cross-encoder read both documents against the query,
 which outranks the query-blind seed clamp. The tail beyond the window is
@@ -25,6 +25,7 @@ never touched.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 
@@ -37,10 +38,9 @@ logger = logging.getLogger("kbcore.rerank")
 _DOC_BODY_CHARS = 1500  # title + this much body per candidate document
 
 # --- participation telemetry (review #5 ops-4 / ret-rerank-2 / val-1) ---------
-# Which ranking system did THIS search actually measure? Thread-local so
-# concurrent server threads cannot cross-talk; writer and reader share a thread
-# by construction (kbcore.search reads inline right after the rerank step, and
-# the eval sentinel replays the harness synchronously on one thread). CORRECTED
+# Which ranking system did THIS search measure? Thread-local so concurrent server
+# threads cannot cross-talk (kbcore.search reads inline right after the rerank
+# step; the eval sentinel replays the harness on one thread). CORRECTED
 # (review #6): a single read observes only the LAST rerank on its thread — a
 # harness-wide read after N cases reflects case N alone. The per-case picture
 # is the ARMED TALLY below (reset_tally / outcome_tally): _note accumulates
@@ -290,10 +290,11 @@ def rerank_fused(
     by_id = {t[0]: t for t in head}
     rerank_order = [i for _, i in sorted(zip(scores, ranked_ids, strict=True), key=lambda p: -p[0])]
     rerank_order += [t[0] for t in head if t[0] not in docs_by_id]  # doc-less keep rank
-    # Reassign the window's own fused scores to the new order (see module docstring).
+    # Reassign the window's own fused scores to the new order (see module docstring), strictly
+    # decreasing: equal RRF scores are common, and _to_hits would re-sort a tie by recency.
     window_scores = sorted((t[1] for t in head), reverse=True)
-    new_head = [
-        (item_id, score, by_id[item_id][2])
-        for item_id, score in zip(rerank_order, window_scores, strict=True)
-    ]
+    new_head, floor = [], math.inf
+    for item_id, score in zip(rerank_order, window_scores, strict=True):
+        floor = min(score, math.nextafter(floor, -math.inf))
+        new_head.append((item_id, floor, by_id[item_id][2]))
     return new_head + tail

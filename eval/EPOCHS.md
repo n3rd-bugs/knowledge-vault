@@ -483,6 +483,18 @@ hits have a keyword contribution; that is not a quality gain. No `eval_case_firs
 no `eval_regression`; rerank tally active 60 / off 1 / fallback 0; one digest line for the new epoch. By hand, by index, printing no key: case 7's and case
 48's verdicts pass, their satisfiers read 963 and 23, and no echo carrier beyond 13061.
 
+**Night 1 (2026-11-10, 01:30–04:50 PKT, report 63317): clean, as predicted.**
+- `eval_golden_hash` `291ffdd667b2`; `eval_epoch_reset` {61 queries, 27 earlier reports skipped as another epoch}; floors 0.95 / 0.86
+  in meta, no `eval_floors_at_defaults`. `eval_regression` False, no open regression row, no KB ALERT; `eval_case_first_pass` and
+  `eval_case_persistent` empty. One digest line for the new epoch.
+- hit@5 1.0000 / MRR 0.9017, no case fails, the gate's numbers exactly, with 434 new items saved since the gate. Rerank active 60 / off
+  1 / fallback 0. Ranks: 49 at 1, 7 at 2, 2 at 4, 1 at 5, and 2 without a rank (the forbid-only cases), the gate's census.
+- By hand, by golden index: case 7 passes at rank 4 on 963 (fused 7 of 79), with echo 13061 skipped, the only echo carrier. Case 48
+  passes at rank 1 on 23 (fused 14 of 69). Case 14 reads rank 5 on 263, case 45 rank 1 on 56693, case 59 rank 4 on 34161.
+- `eval_top5_unverified_share` 0.5869, `eval_top5_summary_share` 0.2295, `eval_top5_verified_lift` 20.92.
+- Embed: `eval_embed_fingerprint` `e7676e44450d` and `eval_embed_query_prefix_sha` `df4b2898bf22`, the gate's values.
+- The run: success, 0 errors, 48 routine warnings, 137 rows drained to 434 items, eval step 105 s.
+
 **Deferred to E4.**
 - The OR key itself: item-level coverage favours long documents, which is what is sliding case 48. A best-chunk coverage key should hold its margin better. Unmeasured.
 - Rerank window. R=30 reads best under boost and clears zero, at +0.46 s p50 and +1.13 s p95 on sample 2 (a loaded hour; +0.25 s p50 on golden) and the queueing
